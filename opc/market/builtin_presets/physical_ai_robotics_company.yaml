@@ -1,0 +1,289 @@
+id: physical-ai-robotics-company
+name: Physical AI Robotics Company
+description: >
+  Founding-AI-native org for a Physical AI / robotics company. Staffs the
+  robot-learning flywheel end to end: teleoperation data collection, robot
+  foundation-model (VLA) training, sim2real evaluation, perception /
+  manipulation / motion-planning integration, field deployment, and fleet
+  telemetry that feeds the next round of data. Modeled on how top Physical AI
+  companies hire (RoboForce, Physical Intelligence, Figure, 1X, Apptronik,
+  Agility). See docs/physical-ai-founding-roles.md.
+category: robotics
+collaboration_pattern: hierarchical
+dag_summary: Brief->Taxonomy->[Data||Sim||Perception]->Policy Train->[Manip||Motion]->Sim2Real Eval->Field Pilot->Fleet Telemetry->Learning Loop->Delivery
+tags:
+  - physical-ai
+  - robotics
+  - embodied-ai
+  - founding-ai-native
+  - robot-learning
+  - vla
+  - sim2real
+team_size: 6-11
+emoji: "\U0001F916"
+color: '#0e7490'
+toolsets:
+  coordination:
+    - file_read
+    - file_search
+    - list_dir
+    - todo_write
+    - todo_read
+    - web_search
+    - web_fetch
+  research:
+    - file_read
+    - file_search
+    - list_dir
+    - todo_write
+    - todo_read
+    - web_search
+    - web_fetch
+    - browser_navigate
+    - browser_snapshot
+    - browser_wait_for
+    - browser_scroll
+    - browser_take_screenshot
+  engineering:
+    - file_read
+    - file_search
+    - list_dir
+    - todo_write
+    - todo_read
+    - web_search
+    - web_fetch
+    - shell_exec
+    - file_write
+    - file_edit
+  field:
+    - shell_exec
+    - file_read
+    - file_write
+    - file_edit
+    - file_search
+    - list_dir
+    - web_search
+    - web_fetch
+    - todo_write
+    - todo_read
+    - browser_navigate
+    - browser_snapshot
+roles:
+  - id: founding_ai_native_lead
+    name: Founding AI Native Lead
+    responsibility: >
+      Owns the capability thesis and runs the company as an AI-native loop:
+      which physical task to crack first, what "done" means as a success-rate
+      bar on real hardware, and the go/no-go on deployment. Final decider and
+      owner-facing aggregation.
+    reports_to: owner
+    can_spawn:
+      - robot_learning_lead
+      - robotics_software_lead
+      - deployment_field_engineer
+      - ai_infra_reliability_engineer
+    icon: leader
+    toolset: coordination
+    prompt_refs:
+      - Anchor every decision to a measurable capability target on real hardware (task success rate, cycle time, precision), not model metrics in isolation.
+      - Keep the team driving the robot-learning flywheel end to end; do not let the org stall in research without a path to a deployed task.
+      - Final deliverable must state the target task, the achieved capability level, the data/sim/eval evidence, the deployment readiness verdict, and the next flywheel iteration.
+  - id: robot_learning_lead
+    name: Robot Learning Lead
+    responsibility: >
+      Owns the learning strategy — imitation vs RL, the data budget, the
+      training curriculum, and the eval bar the policy must clear before
+      integration. Coordinates the foundation-model, data, and sim teams.
+    reports_to: founding_ai_native_lead
+    can_spawn:
+      - foundation_model_scientist
+      - data_engine_engineer
+      - sim2real_engineer
+    icon: strategy
+    toolset: coordination
+    prompt_refs:
+      - 'Define the learning plan explicitly: task taxonomy, data requirements, model family (VLA / diffusion / flow-matching policy), and the success-rate gate.'
+      - Require evidence (eval curves, held-out success rates), not narrative claims, before advancing a policy to integration.
+  - id: foundation_model_scientist
+    name: Foundation Model Scientist
+    responsibility: >
+      Trains the robot foundation model / policy — behavior cloning,
+      flow-matching or diffusion policies, and RL fine-tuning. Owns model
+      architecture and the observation-to-action mapping.
+    reports_to: robot_learning_lead
+    icon: analytics
+    toolset: research
+  - id: data_engine_engineer
+    name: Data Engine Engineer
+    responsibility: >
+      Owns the teleoperation-to-dataset pipeline: collection protocol, RLDS-style
+      (image, instruction, action) formatting, diversity and coverage, dedup, and
+      the data-quality gate that guards training.
+    reports_to: robot_learning_lead
+    icon: database
+    toolset: engineering
+  - id: sim2real_engineer
+    name: Sim2Real Engineer
+    responsibility: >
+      Owns the simulator of the specific robot and task (Isaac Sim / MuJoCo),
+      domain randomization, and the sim-to-real transfer evaluation that predicts
+      real-world success before hardware time is spent.
+    reports_to: robot_learning_lead
+    icon: cube
+    toolset: engineering
+  - id: robotics_software_lead
+    name: Robotics Software Lead
+    responsibility: >
+      Owns the on-robot software stack that turns a trained policy into reliable
+      motion: perception, manipulation, and motion planning integration on real
+      hardware.
+    reports_to: founding_ai_native_lead
+    can_spawn:
+      - perception_engineer
+      - manipulation_engineer
+      - motion_planning_engineer
+    icon: code
+    toolset: coordination
+    prompt_refs:
+      - Integrate perception, manipulation, and motion planning against the trained policy; surface interface contracts and real-time constraints early.
+  - id: perception_engineer
+    name: Perception Engineer
+    responsibility: >
+      3D vision, state estimation, and SLAM — turns raw sensors into the world
+      state the policy and planners consume. Owns calibration and perception
+      robustness under real-site lighting and clutter.
+    reports_to: robotics_software_lead
+    icon: eye
+    toolset: engineering
+  - id: manipulation_engineer
+    name: Manipulation Engineer
+    responsibility: >
+      Grasping and contact-rich manipulation (pick, place, press, twist, connect).
+      Owns gripper/end-effector control and force-aware skills for precise
+      industrial tasks.
+    reports_to: robotics_software_lead
+    icon: hand
+    toolset: engineering
+  - id: motion_planning_engineer
+    name: Motion Planning Engineer
+    responsibility: >
+      Trajectory generation, collision-free path planning, and real-time control
+      of the arm and mobile base. Owns motion safety envelopes and cycle time.
+    reports_to: robotics_software_lead
+    icon: route
+    toolset: engineering
+  - id: deployment_field_engineer
+    name: Deployment & Field Engineer
+    responsibility: >
+      Takes the robot to the real site, runs the deployment pilot, and owns
+      on-site reliability and the Robot-as-a-Service surface (setup, monitoring,
+      operator handoff).
+    reports_to: founding_ai_native_lead
+    icon: rocket
+    toolset: field
+  - id: ai_infra_reliability_engineer
+    name: AI Infra & Reliability Engineer
+    responsibility: >
+      Owns the evaluation harness, fleet telemetry, safety gates, and uptime.
+      Reviewer on the sim2real and deployment gates; turns field telemetry into
+      the next round of learning signal.
+    reports_to: founding_ai_native_lead
+    icon: shield
+    toolset: engineering
+    prompt_refs:
+      - 'Gate on measured evidence: reject any policy or deployment that lacks held-out success rates or violates a safety envelope.'
+work_item_templates:
+  - id: capability_brief
+    title: Capability Brief
+    role_id: founding_ai_native_lead
+    dependencies: []
+    parallel_group: null
+  - id: task_taxonomy
+    title: Task Taxonomy & Learning Plan
+    role_id: robot_learning_lead
+    dependencies:
+      - capability_brief
+    parallel_group: null
+  - id: teleop_data_plan
+    title: Teleop Data Engine
+    role_id: data_engine_engineer
+    dependencies:
+      - task_taxonomy
+    parallel_group: buildout
+  - id: sim_environment
+    title: Simulation Environment
+    role_id: sim2real_engineer
+    dependencies:
+      - task_taxonomy
+    parallel_group: buildout
+  - id: perception_stack
+    title: Perception Stack
+    role_id: perception_engineer
+    dependencies:
+      - task_taxonomy
+    parallel_group: buildout
+  - id: policy_training
+    title: Policy / Foundation Model Training
+    role_id: foundation_model_scientist
+    dependencies:
+      - teleop_data_plan
+      - sim_environment
+    parallel_group: null
+    gate:
+      type: review
+      reviewer_role: robot_learning_lead
+  - id: manipulation_integration
+    title: Manipulation Integration
+    role_id: manipulation_engineer
+    dependencies:
+      - policy_training
+      - perception_stack
+    parallel_group: integration
+  - id: motion_planning_integration
+    title: Motion Planning Integration
+    role_id: motion_planning_engineer
+    dependencies:
+      - policy_training
+      - perception_stack
+    parallel_group: integration
+  - id: sim2real_eval
+    title: Sim2Real Evaluation
+    role_id: sim2real_engineer
+    dependencies:
+      - manipulation_integration
+      - motion_planning_integration
+    parallel_group: null
+    gate:
+      type: review
+      reviewer_role: ai_infra_reliability_engineer
+  - id: field_pilot
+    title: Field Deployment Pilot
+    role_id: deployment_field_engineer
+    dependencies:
+      - sim2real_eval
+    parallel_group: null
+    gate:
+      type: review
+      reviewer_role: ai_infra_reliability_engineer
+  - id: fleet_telemetry
+    title: Fleet Telemetry & Safety
+    role_id: ai_infra_reliability_engineer
+    dependencies:
+      - field_pilot
+    parallel_group: null
+  - id: learning_feedback
+    title: Learning Feedback Loop
+    role_id: robot_learning_lead
+    dependencies:
+      - fleet_telemetry
+    parallel_group: null
+  - id: capability_delivery
+    title: Capability Delivery & Next Iteration
+    role_id: founding_ai_native_lead
+    dependencies:
+      - learning_feedback
+      - field_pilot
+    parallel_group: null
+    gate:
+      type: approval
+      reviewer_role: founding_ai_native_lead

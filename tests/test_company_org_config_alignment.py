@@ -12,6 +12,7 @@ EXPECTED_ROLE_COUNTS = {
     "game-development-studio": 5,
     "research-report-studio": 3,
     "vc-investment-firm": 21,
+    "roboforce-titan": 11,
 }
 OPTIONAL_LOCAL_ROLE_COUNTS = {
     "hkuds": 2,
