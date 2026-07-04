@@ -17,8 +17,41 @@
 
 ![OpenOPC hero banner](docs/assets/chat.png)
 
+## Built For Physical AI: Staff The Founding AI-Native Role
+
+**The one-sentence idea:** a Physical AI company is really one loop turning fast — people teach a
+robot a task, the robot learns a brain, the brain is tested against reality, the robot goes to a
+real job site, and what happens there becomes the next lesson. OpenOPC lets **one founder run that
+whole loop as an AI-native company** — staffing it with role-agents instead of a 20-person team.
+
+That loop is the **robot-learning flywheel**, and it is the org this repo now ships out of the box:
+
+> teach *(teleop data)* → learn *(a Vision-Language-Action policy)* → test *(sim2real + eval)* →
+> deploy *(field pilot)* → observe *(fleet telemetry)* → teach again.
+
+The anchor is a **real, currently-open job**: RoboForce's **Founding AI Native Lead**. This repo is
+built to make *that* role runnable — the founding AI-native person plus a staffed flywheel — and it
+generalizes across the whole Physical AI / robotics industry (Physical Intelligence, Figure, 1X,
+Apptronik, Agility), not RoboForce alone.
+
+Two artifacts make it concrete (the OpenOPC engine below runs them):
+
+| What | Where | For the engineer |
+|---|---|---|
+| **Physical AI Robotics Company** — the industry-generalized org (11 roles, a flywheel work-item DAG) | `opc/market/builtin_presets/physical_ai_robotics_company.yaml` (a built-in Marketplace architecture preset) | `opc market apply-preset physical-ai-robotics-company` |
+| **RoboForce Titan** — one concrete instance of that preset, the prototype | `.opc/config/company_orgs/org_roboforce-titan_config.yaml` (a saved Company-Mode org) | `opc chat -p demo --mode org --org roboforce-titan "…"` |
+| **Robotics talent + role skill** — 10 hireable role templates + domain knowledge | `opc/market/talent_presets.py` (`category: robotics`), `skills/core/physical_ai.md` | `opc talent list` |
+
+The JD research behind these roles — RoboForce's verified careers taxonomy plus the cross-industry
+role archetypes — is in **[`docs/physical-ai-founding-roles.md`](docs/physical-ai-founding-roles.md)**.
+
+**Everything below is the engine.** OpenOPC is a general AI-company runtime (Self-Built, Self-Run,
+Self-Grown); the Physical AI org above is one architecture it runs. The rest of this README
+documents the engine.
+
 ## Table Of Contents
 
+- [Built For Physical AI](#built-for-physical-ai-staff-the-founding-ai-native-role)
 - [Real-World Applications](#real-world-applications)
 - [When To Use OpenOPC](#when-to-use-openopc)
 - [How OpenOPC Works](#how-openopc-works)

@@ -1,0 +1,675 @@
+schema_version: 2
+kind: opc_org_architecture
+organization_id: roboforce-titan
+organization_name: RoboForce Titan Robo-Labor
+company:
+  name: RoboForce Titan Robo-Labor
+  topology: Corporate Structure
+  company_profile: custom
+  execution_model: actor_runtime
+  final_decider_role_id: founding_ai_native_lead
+  company_profiles:
+  - corporate
+  - custom
+roles:
+- id: founding_ai_native_lead
+  name: Founding AI Native Lead
+  responsibility: 'Owns the capability thesis and runs the company as an AI-native
+    loop: which physical task to crack first, what "done" means as a success-rate
+    bar on real hardware, and the go/no-go on deployment. Final decider and owner-facing
+    aggregation.
+
+    '
+  reports_to: owner
+  icon: leader
+  can_spawn:
+  - robot_learning_lead
+  - robotics_software_lead
+  - deployment_field_engineer
+  - ai_infra_reliability_engineer
+  tools:
+  - file_read
+  - file_search
+  - list_dir
+  - todo_write
+  - todo_read
+  - web_search
+  - web_fetch
+  preferred_external_agent: claude_code
+  prompt_refs:
+  - "You are the Founding AI Native Lead. Owns the capability thesis and runs the\
+    \ company as an AI-native loop: which physical task to crack first, what \"done\"\
+    \ means as a success-rate bar on real hardware, and the go/no-go on deployment.\
+    \ Final decider and owner-facing aggregation.\n Coordinate work with: Robot Learning\
+    \ Lead, Robotics Software Lead, Deployment & Field Engineer, AI Infra & Reliability\
+    \ Engineer. Delegate tasks appropriately and aggregate results. Review outputs\
+    \ for quality and correctness. Approve quality work or request changes."
+  - Anchor every decision to a measurable capability target on real hardware (task
+    success rate, cycle time, precision), not model metrics in isolation.
+  - Keep the team driving the robot-learning flywheel end to end; do not let the org
+    stall in research without a path to a deployed task.
+  - Final deliverable must state the target task, the achieved capability level, the
+    data/sim/eval evidence, the deployment readiness verdict, and the next flywheel
+    iteration.
+  skill_refs: []
+  handoff_template_ref: null
+  memory_policy_ref: null
+  artifact_contract_ref: null
+  runtime_policy:
+    execution_strategy: native
+    allowed_downstream_roles:
+    - robot_learning_lead
+    - robotics_software_lead
+    - deployment_field_engineer
+    - ai_infra_reliability_engineer
+    review_role: null
+    default_turn_type: work
+    shell_timeout_override: null
+    setup_env_type: null
+    coordination_hints: {}
+    signal_capabilities: []
+    parallelism_constraints: []
+    gate_preferences: {}
+  capabilities: []
+  role_type: coordinator
+  coordinator_policy: null
+- id: robot_learning_lead
+  name: Robot Learning Lead
+  responsibility: 'Owns the learning strategy — imitation vs RL, the data budget,
+    the training curriculum, and the eval bar the policy must clear before integration.
+    Coordinates the foundation-model, data, and sim teams.
+
+    '
+  reports_to: founding_ai_native_lead
+  icon: strategy
+  can_spawn:
+  - foundation_model_scientist
+  - data_engine_engineer
+  - sim2real_engineer
+  tools:
+  - file_read
+  - file_search
+  - list_dir
+  - todo_write
+  - todo_read
+  - web_search
+  - web_fetch
+  preferred_external_agent: null
+  prompt_refs:
+  - "You are the Robot Learning Lead. Owns the learning strategy — imitation vs RL,\
+    \ the data budget, the training curriculum, and the eval bar the policy must clear\
+    \ before integration. Coordinates the foundation-model, data, and sim teams.\n\
+    \ Coordinate work with: Foundation Model Scientist, Data Engine Engineer, Sim2Real\
+    \ Engineer. Delegate tasks appropriately and aggregate results. Review outputs\
+    \ for quality and correctness. Approve quality work or request changes."
+  - 'Define the learning plan explicitly: task taxonomy, data requirements, model
+    family (VLA / diffusion / flow-matching policy), and the success-rate gate.'
+  - Require evidence (eval curves, held-out success rates), not narrative claims,
+    before advancing a policy to integration.
+  skill_refs: []
+  handoff_template_ref: null
+  memory_policy_ref: null
+  artifact_contract_ref: null
+  runtime_policy:
+    execution_strategy: native
+    allowed_downstream_roles:
+    - foundation_model_scientist
+    - data_engine_engineer
+    - sim2real_engineer
+    review_role: null
+    default_turn_type: work
+    shell_timeout_override: null
+    setup_env_type: null
+    coordination_hints: {}
+    signal_capabilities: []
+    parallelism_constraints: []
+    gate_preferences: {}
+  capabilities: []
+  role_type: coordinator
+  coordinator_policy: null
+- id: foundation_model_scientist
+  name: Foundation Model Scientist
+  responsibility: 'Trains the robot foundation model / policy — behavior cloning,
+    flow-matching or diffusion policies, and RL fine-tuning. Owns model architecture
+    and the observation-to-action mapping.
+
+    '
+  reports_to: robot_learning_lead
+  icon: analytics
+  can_spawn: []
+  tools:
+  - file_read
+  - file_search
+  - list_dir
+  - todo_write
+  - todo_read
+  - web_search
+  - web_fetch
+  - browser_navigate
+  - browser_snapshot
+  - browser_wait_for
+  - browser_scroll
+  - browser_take_screenshot
+  preferred_external_agent: null
+  prompt_refs:
+  - "You are the Foundation Model Scientist. Trains the robot foundation model / policy\
+    \ — behavior cloning, flow-matching or diffusion policies, and RL fine-tuning.\
+    \ Owns model architecture and the observation-to-action mapping.\n Focus on delivering\
+    \ quality work within your area of expertise."
+  skill_refs: []
+  handoff_template_ref: null
+  memory_policy_ref: null
+  artifact_contract_ref: null
+  runtime_policy:
+    execution_strategy: auto
+    allowed_downstream_roles: []
+    review_role: null
+    default_turn_type: work
+    shell_timeout_override: null
+    setup_env_type: null
+    coordination_hints: {}
+    signal_capabilities: []
+    parallelism_constraints: []
+    gate_preferences: {}
+  capabilities: []
+  role_type: worker
+  coordinator_policy: null
+- id: data_engine_engineer
+  name: Data Engine Engineer
+  responsibility: 'Owns the teleoperation-to-dataset pipeline: collection protocol,
+    RLDS-style (image, instruction, action) formatting, diversity and coverage, dedup,
+    and the data-quality gate that guards training.
+
+    '
+  reports_to: robot_learning_lead
+  icon: database
+  can_spawn: []
+  tools:
+  - file_read
+  - file_search
+  - list_dir
+  - todo_write
+  - todo_read
+  - web_search
+  - web_fetch
+  - shell_exec
+  - file_write
+  - file_edit
+  preferred_external_agent: claude_code
+  prompt_refs:
+  - "You are the Data Engine Engineer. Owns the teleoperation-to-dataset pipeline:\
+    \ collection protocol, RLDS-style (image, instruction, action) formatting, diversity\
+    \ and coverage, dedup, and the data-quality gate that guards training.\n Focus\
+    \ on delivering quality work within your area of expertise."
+  skill_refs: []
+  handoff_template_ref: null
+  memory_policy_ref: null
+  artifact_contract_ref: null
+  runtime_policy:
+    execution_strategy: auto
+    allowed_downstream_roles: []
+    review_role: null
+    default_turn_type: work
+    shell_timeout_override: null
+    setup_env_type: null
+    coordination_hints: {}
+    signal_capabilities: []
+    parallelism_constraints: []
+    gate_preferences: {}
+  capabilities: []
+  role_type: worker
+  coordinator_policy: null
+- id: sim2real_engineer
+  name: Sim2Real Engineer
+  responsibility: 'Owns the simulator of the specific robot and task (Isaac Sim /
+    MuJoCo), domain randomization, and the sim-to-real transfer evaluation that predicts
+    real-world success before hardware time is spent.
+
+    '
+  reports_to: robot_learning_lead
+  icon: cube
+  can_spawn: []
+  tools:
+  - file_read
+  - file_search
+  - list_dir
+  - todo_write
+  - todo_read
+  - web_search
+  - web_fetch
+  - shell_exec
+  - file_write
+  - file_edit
+  preferred_external_agent: null
+  prompt_refs:
+  - "You are the Sim2Real Engineer. Owns the simulator of the specific robot and task\
+    \ (Isaac Sim / MuJoCo), domain randomization, and the sim-to-real transfer evaluation\
+    \ that predicts real-world success before hardware time is spent.\n Focus on delivering\
+    \ quality work within your area of expertise."
+  skill_refs: []
+  handoff_template_ref: null
+  memory_policy_ref: null
+  artifact_contract_ref: null
+  runtime_policy:
+    execution_strategy: auto
+    allowed_downstream_roles: []
+    review_role: null
+    default_turn_type: work
+    shell_timeout_override: null
+    setup_env_type: null
+    coordination_hints: {}
+    signal_capabilities: []
+    parallelism_constraints: []
+    gate_preferences: {}
+  capabilities: []
+  role_type: worker
+  coordinator_policy: null
+- id: robotics_software_lead
+  name: Robotics Software Lead
+  responsibility: 'Owns the on-robot software stack that turns a trained policy into
+    reliable motion: perception, manipulation, and motion planning integration on
+    real hardware.
+
+    '
+  reports_to: founding_ai_native_lead
+  icon: code
+  can_spawn:
+  - perception_engineer
+  - manipulation_engineer
+  - motion_planning_engineer
+  tools:
+  - file_read
+  - file_search
+  - list_dir
+  - todo_write
+  - todo_read
+  - web_search
+  - web_fetch
+  preferred_external_agent: claude_code
+  prompt_refs:
+  - "You are the Robotics Software Lead. Owns the on-robot software stack that turns\
+    \ a trained policy into reliable motion: perception, manipulation, and motion\
+    \ planning integration on real hardware.\n Coordinate work with: Perception Engineer,\
+    \ Manipulation Engineer, Motion Planning Engineer. Delegate tasks appropriately\
+    \ and aggregate results."
+  - Integrate perception, manipulation, and motion planning against the trained policy;
+    surface interface contracts and real-time constraints early.
+  skill_refs: []
+  handoff_template_ref: null
+  memory_policy_ref: null
+  artifact_contract_ref: null
+  runtime_policy:
+    execution_strategy: native
+    allowed_downstream_roles:
+    - perception_engineer
+    - manipulation_engineer
+    - motion_planning_engineer
+    review_role: null
+    default_turn_type: work
+    shell_timeout_override: null
+    setup_env_type: null
+    coordination_hints: {}
+    signal_capabilities: []
+    parallelism_constraints: []
+    gate_preferences: {}
+  capabilities: []
+  role_type: coordinator
+  coordinator_policy: null
+- id: perception_engineer
+  name: Perception Engineer
+  responsibility: '3D vision, state estimation, and SLAM — turns raw sensors into
+    the world state the policy and planners consume. Owns calibration and perception
+    robustness under real-site lighting and clutter.
+
+    '
+  reports_to: robotics_software_lead
+  icon: eye
+  can_spawn: []
+  tools:
+  - file_read
+  - file_search
+  - list_dir
+  - todo_write
+  - todo_read
+  - web_search
+  - web_fetch
+  - shell_exec
+  - file_write
+  - file_edit
+  preferred_external_agent: null
+  prompt_refs:
+  - "You are the Perception Engineer. 3D vision, state estimation, and SLAM — turns\
+    \ raw sensors into the world state the policy and planners consume. Owns calibration\
+    \ and perception robustness under real-site lighting and clutter.\n Focus on delivering\
+    \ quality work within your area of expertise."
+  skill_refs: []
+  handoff_template_ref: null
+  memory_policy_ref: null
+  artifact_contract_ref: null
+  runtime_policy:
+    execution_strategy: auto
+    allowed_downstream_roles: []
+    review_role: null
+    default_turn_type: work
+    shell_timeout_override: null
+    setup_env_type: null
+    coordination_hints: {}
+    signal_capabilities: []
+    parallelism_constraints: []
+    gate_preferences: {}
+  capabilities: []
+  role_type: worker
+  coordinator_policy: null
+- id: manipulation_engineer
+  name: Manipulation Engineer
+  responsibility: 'Grasping and contact-rich manipulation (pick, place, press, twist,
+    connect). Owns gripper/end-effector control and force-aware skills for precise
+    industrial tasks.
+
+    '
+  reports_to: robotics_software_lead
+  icon: hand
+  can_spawn: []
+  tools:
+  - file_read
+  - file_search
+  - list_dir
+  - todo_write
+  - todo_read
+  - web_search
+  - web_fetch
+  - shell_exec
+  - file_write
+  - file_edit
+  preferred_external_agent: null
+  prompt_refs:
+  - "You are the Manipulation Engineer. Grasping and contact-rich manipulation (pick,\
+    \ place, press, twist, connect). Owns gripper/end-effector control and force-aware\
+    \ skills for precise industrial tasks.\n Focus on delivering quality work within\
+    \ your area of expertise."
+  skill_refs: []
+  handoff_template_ref: null
+  memory_policy_ref: null
+  artifact_contract_ref: null
+  runtime_policy:
+    execution_strategy: auto
+    allowed_downstream_roles: []
+    review_role: null
+    default_turn_type: work
+    shell_timeout_override: null
+    setup_env_type: null
+    coordination_hints: {}
+    signal_capabilities: []
+    parallelism_constraints: []
+    gate_preferences: {}
+  capabilities: []
+  role_type: worker
+  coordinator_policy: null
+- id: motion_planning_engineer
+  name: Motion Planning Engineer
+  responsibility: 'Trajectory generation, collision-free path planning, and real-time
+    control of the arm and mobile base. Owns motion safety envelopes and cycle time.
+
+    '
+  reports_to: robotics_software_lead
+  icon: route
+  can_spawn: []
+  tools:
+  - file_read
+  - file_search
+  - list_dir
+  - todo_write
+  - todo_read
+  - web_search
+  - web_fetch
+  - shell_exec
+  - file_write
+  - file_edit
+  preferred_external_agent: null
+  prompt_refs:
+  - "You are the Motion Planning Engineer. Trajectory generation, collision-free path\
+    \ planning, and real-time control of the arm and mobile base. Owns motion safety\
+    \ envelopes and cycle time.\n Focus on delivering quality work within your area\
+    \ of expertise."
+  skill_refs: []
+  handoff_template_ref: null
+  memory_policy_ref: null
+  artifact_contract_ref: null
+  runtime_policy:
+    execution_strategy: auto
+    allowed_downstream_roles: []
+    review_role: null
+    default_turn_type: work
+    shell_timeout_override: null
+    setup_env_type: null
+    coordination_hints: {}
+    signal_capabilities: []
+    parallelism_constraints: []
+    gate_preferences: {}
+  capabilities: []
+  role_type: worker
+  coordinator_policy: null
+- id: deployment_field_engineer
+  name: Deployment & Field Engineer
+  responsibility: 'Takes the robot to the real site, runs the deployment pilot, and
+    owns on-site reliability and the Robot-as-a-Service surface (setup, monitoring,
+    operator handoff).
+
+    '
+  reports_to: founding_ai_native_lead
+  icon: rocket
+  can_spawn: []
+  tools:
+  - shell_exec
+  - file_read
+  - file_write
+  - file_edit
+  - file_search
+  - list_dir
+  - web_search
+  - web_fetch
+  - todo_write
+  - todo_read
+  - browser_navigate
+  - browser_snapshot
+  preferred_external_agent: claude_code
+  prompt_refs:
+  - "You are the Deployment & Field Engineer. Takes the robot to the real site, runs\
+    \ the deployment pilot, and owns on-site reliability and the Robot-as-a-Service\
+    \ surface (setup, monitoring, operator handoff).\n Focus on delivering quality\
+    \ work within your area of expertise."
+  skill_refs: []
+  handoff_template_ref: null
+  memory_policy_ref: null
+  artifact_contract_ref: null
+  runtime_policy:
+    execution_strategy: auto
+    allowed_downstream_roles: []
+    review_role: null
+    default_turn_type: work
+    shell_timeout_override: null
+    setup_env_type: null
+    coordination_hints: {}
+    signal_capabilities: []
+    parallelism_constraints: []
+    gate_preferences: {}
+  capabilities: []
+  role_type: worker
+  coordinator_policy: null
+- id: ai_infra_reliability_engineer
+  name: AI Infra & Reliability Engineer
+  responsibility: 'Owns the evaluation harness, fleet telemetry, safety gates, and
+    uptime. Reviewer on the sim2real and deployment gates; turns field telemetry into
+    the next round of learning signal.
+
+    '
+  reports_to: founding_ai_native_lead
+  icon: shield
+  can_spawn: []
+  tools:
+  - file_read
+  - file_search
+  - list_dir
+  - todo_write
+  - todo_read
+  - web_search
+  - web_fetch
+  - shell_exec
+  - file_write
+  - file_edit
+  preferred_external_agent: claude_code
+  prompt_refs:
+  - "You are the AI Infra & Reliability Engineer. Owns the evaluation harness, fleet\
+    \ telemetry, safety gates, and uptime. Reviewer on the sim2real and deployment\
+    \ gates; turns field telemetry into the next round of learning signal.\n Review\
+    \ outputs for quality and correctness. Approve quality work or request changes."
+  - 'Gate on measured evidence: reject any policy or deployment that lacks held-out
+    success rates or violates a safety envelope.'
+  skill_refs: []
+  handoff_template_ref: null
+  memory_policy_ref: null
+  artifact_contract_ref: null
+  runtime_policy:
+    execution_strategy: native
+    allowed_downstream_roles: []
+    review_role: null
+    default_turn_type: review
+    shell_timeout_override: null
+    setup_env_type: null
+    coordination_hints: {}
+    signal_capabilities: []
+    parallelism_constraints: []
+    gate_preferences: {}
+  capabilities: []
+  role_type: reviewer
+  coordinator_policy: null
+employees: []
+escalation_rules: []
+runtime_policies:
+  custom:
+    communication:
+      default_mode: dm
+      blocking_default: true
+      meeting_required_for: []
+      allow_broadcast: true
+    memory:
+      include_role_memory: false
+      include_project_memory: false
+      include_decision_log: true
+      include_artifact_index: true
+      recent_history_lines: 12
+    handoff:
+      require_structured_handoff: true
+      require_ack: true
+      include_risks: true
+      include_open_questions: true
+    artifact:
+      enforce_contract: false
+      require_artifact_index: true
+      required_kinds: []
+    review:
+      enable_work_item_gates: false
+      strict_gate_inference: true
+      require_reviewer_role: true
+      allow_human_override: true
+    gate_harness:
+      enabled: true
+      decision_mode: agent_first
+      default_degrade_policy: allow
+      auto_infer_turn_kind: true
+      auto_infer_gate_profile: true
+      max_rework_rounds_per_issue: 2
+      stagnation_threshold: 2
+      allow_pass_with_constraints: true
+      enable_delivery_constraints_propagation: true
+      agent_model: ''
+      agent_confidence_threshold: 0.55
+      fallback_to_rules_on_parse_error: true
+      builtin_blocker_map:
+        workspace_mismatch: rework_same_work_item
+        missing_required_artifact: rework_same_work_item
+        verification_missing: rework_same_work_item
+        dependency_not_ready: rework_same_work_item
+        cross_work_item_conflict: replan
+        external_secret_missing: await_user_decision
+        permission_missing: escalate
+        environment_capability_gap: pass_with_constraints
+        quality_gap: rework_same_work_item
+        goal_env_mismatch: replan
+        unresolved_user_visible_risk: pass_with_constraints
+      turn_kind_overrides: {}
+      gate_profile_overrides: {}
+    parallel:
+      auto_dispatch: true
+      review_gate_enabled: true
+      max_workers: 10
+    coordination:
+      inference_mode: llm_primary
+      fallback_mode: conservative
+      strict_gate_turn_kinds:
+      - verify
+      - deliver
+      mixed_gate_turn_kinds:
+      - synthesize
+      - review
+      - integration
+      allow_manager_release_for_mixed_only: true
+      allow_custom_signals: true
+talent_templates: []
+teams: []
+team_runtime:
+  default_team_id: ''
+  shared_role_session_scope: team
+  allow_shared_role_sessions: true
+  seat_refresh_interval_seconds: 30
+  metadata: {}
+installed_packages:
+- package_id: physical-ai-robotics-company
+  name: Physical AI Robotics Company
+  version: 1.0.0
+  installed_at: '2026-07-04T22:49:47.183376+00:00'
+  source_path: builtin
+  role_ids:
+  - founding_ai_native_lead
+  - robot_learning_lead
+  - foundation_model_scientist
+  - data_engine_engineer
+  - sim2real_engineer
+  - robotics_software_lead
+  - perception_engineer
+  - manipulation_engineer
+  - motion_planning_engineer
+  - deployment_field_engineer
+  - ai_infra_reliability_engineer
+  template_ids:
+  - capability_brief
+  - task_taxonomy
+  - teleop_data_plan
+  - sim_environment
+  - perception_stack
+  - policy_training
+  - manipulation_integration
+  - motion_planning_integration
+  - sim2real_eval
+  - field_pilot
+  - fleet_telemetry
+  - learning_feedback
+  - capability_delivery
+  work_item_template_ids:
+  - capability_brief
+  - task_taxonomy
+  - teleop_data_plan
+  - sim_environment
+  - perception_stack
+  - policy_training
+  - manipulation_integration
+  - motion_planning_integration
+  - sim2real_eval
+  - field_pilot
+  - fleet_telemetry
+  - learning_feedback
+  - capability_delivery
+role_serial_queue_enabled: true
+metadata:
+  source: org_mode
+  organization_config_file: company_orgs/org_roboforce-titan_config.yaml
