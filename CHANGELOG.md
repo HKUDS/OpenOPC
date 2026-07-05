@@ -6,6 +6,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+
+- **Refactor: extracted the default-org builder out of `opc/cli/app.py::init`.** `init()` was a
+  263-line god-function (flagged by `anyagent analyze`); ~170 of those lines were a pure, hardcoded
+  default "Corporate" org (roles + escalation rules). Extracted verbatim to
+  `_apply_default_corporate_org(config)` — a behaviour-preserving move that drops `init()` to **91
+  lines** and makes the command read as a clear sequence (resolve config → dirs → skills → memory →
+  project → trust → preflight). Verified identical behaviour: `tests/test_cli_app.py` **88 passed**
+  before and after; full suite unchanged (1655 passed, 24 pre-existing failures). *(The other
+  analyze-flagged CLI god-functions — `_exec_message` 146 lines, `status`, `channels_status` — are
+  the same kind of safe follow-up.)*
+
 ### Added
 
 - **Architecture, made contributor-legible.** A code-base deep dive (`anyagent analyze` → 75/100,
