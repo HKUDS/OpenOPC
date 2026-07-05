@@ -50,6 +50,9 @@ def test_physical_ai_preset_loads_and_infers_final_decider() -> None:
     template_ids = {t["id"] for t in preset.work_item_templates}
     assert {"teleop_data_plan", "policy_training", "sim2real_eval", "field_pilot",
             "learning_feedback", "capability_delivery"} <= template_ids
+    # Every role mounts the physical_ai domain skill via skill_refs.
+    for role in preset.roles:
+        assert "physical_ai" in (role.get("skill_refs") or []), role["id"]
 
 
 def test_physical_ai_preset_applies_to_config() -> None:

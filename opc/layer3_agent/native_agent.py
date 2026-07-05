@@ -439,6 +439,7 @@ class NativeAgent:
             context_assembler=self.context_assembler,
             preferences=self.preferences,
             skills=self.skills,
+            skill_refs=list(self.role.skill_refs or []),
         )
         output = await harness.build(
             system_prompt=prompt_bundle.stable_system_prompt,
@@ -581,6 +582,7 @@ class NativeAgent:
                     role_id=self.role.role_id,
                     user_facing=_memory_skill_user_facing(task, self.role.role_id),
                     final_decider_role_id=_final_decider_role_id(task),
+                    skill_refs=list(self.role.skill_refs or []),
                 )
                 or ""
             ).strip()

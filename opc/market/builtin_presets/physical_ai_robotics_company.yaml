@@ -71,6 +71,11 @@ toolsets:
 roles:
   - id: founding_ai_native_lead
     name: Founding AI Native Lead
+    skill_refs:
+      - physical_ai
+      - coding
+      - deployment
+      - writing
     responsibility: >
       Owns the capability thesis and runs the company as an AI-native loop:
       which physical task to crack first, what "done" means as a success-rate
@@ -90,6 +95,11 @@ roles:
       - Final deliverable must state the target task, the achieved capability level, the data/sim/eval evidence, the deployment readiness verdict, and the next flywheel iteration.
   - id: robot_learning_lead
     name: Robot Learning Lead
+    skill_refs:
+      - physical_ai
+      - coding
+      - deployment
+      - writing
     responsibility: >
       Owns the learning strategy — imitation vs RL, the data budget, the
       training curriculum, and the eval bar the policy must clear before
@@ -106,6 +116,11 @@ roles:
       - Require evidence (eval curves, held-out success rates), not narrative claims, before advancing a policy to integration.
   - id: foundation_model_scientist
     name: Foundation Model Scientist
+    skill_refs:
+      - physical_ai
+      - coding
+      - deployment
+      - writing
     responsibility: >
       Trains the robot foundation model / policy — behavior cloning,
       flow-matching or diffusion policies, and RL fine-tuning. Owns model
@@ -115,6 +130,11 @@ roles:
     toolset: research
   - id: data_engine_engineer
     name: Data Engine Engineer
+    skill_refs:
+      - physical_ai
+      - coding
+      - deployment
+      - writing
     responsibility: >
       Owns the teleoperation-to-dataset pipeline: collection protocol, RLDS-style
       (image, instruction, action) formatting, diversity and coverage, dedup, and
@@ -124,6 +144,11 @@ roles:
     toolset: engineering
   - id: sim2real_engineer
     name: Sim2Real Engineer
+    skill_refs:
+      - physical_ai
+      - coding
+      - deployment
+      - writing
     responsibility: >
       Owns the simulator of the specific robot and task (Isaac Sim / MuJoCo),
       domain randomization, and the sim-to-real transfer evaluation that predicts
@@ -133,6 +158,11 @@ roles:
     toolset: engineering
   - id: robotics_software_lead
     name: Robotics Software Lead
+    skill_refs:
+      - physical_ai
+      - coding
+      - deployment
+      - writing
     responsibility: >
       Owns the on-robot software stack that turns a trained policy into reliable
       motion: perception, manipulation, and motion planning integration on real
@@ -148,6 +178,11 @@ roles:
       - Integrate perception, manipulation, and motion planning against the trained policy; surface interface contracts and real-time constraints early.
   - id: perception_engineer
     name: Perception Engineer
+    skill_refs:
+      - physical_ai
+      - coding
+      - deployment
+      - writing
     responsibility: >
       3D vision, state estimation, and SLAM — turns raw sensors into the world
       state the policy and planners consume. Owns calibration and perception
@@ -157,6 +192,11 @@ roles:
     toolset: engineering
   - id: manipulation_engineer
     name: Manipulation Engineer
+    skill_refs:
+      - physical_ai
+      - coding
+      - deployment
+      - writing
     responsibility: >
       Grasping and contact-rich manipulation (pick, place, press, twist, connect).
       Owns gripper/end-effector control and force-aware skills for precise
@@ -166,6 +206,11 @@ roles:
     toolset: engineering
   - id: motion_planning_engineer
     name: Motion Planning Engineer
+    skill_refs:
+      - physical_ai
+      - coding
+      - deployment
+      - writing
     responsibility: >
       Trajectory generation, collision-free path planning, and real-time control
       of the arm and mobile base. Owns motion safety envelopes and cycle time.
@@ -174,6 +219,11 @@ roles:
     toolset: engineering
   - id: deployment_field_engineer
     name: Deployment & Field Engineer
+    skill_refs:
+      - physical_ai
+      - coding
+      - deployment
+      - writing
     responsibility: >
       Takes the robot to the real site, runs the deployment pilot, and owns
       on-site reliability and the Robot-as-a-Service surface (setup, monitoring,
@@ -183,6 +233,11 @@ roles:
     toolset: field
   - id: ai_infra_reliability_engineer
     name: AI Infra & Reliability Engineer
+    skill_refs:
+      - physical_ai
+      - coding
+      - deployment
+      - writing
     responsibility: >
       Owns the evaluation harness, fleet telemetry, safety gates, and uptime.
       Reviewer on the sim2real and deployment gates; turns field telemetry into

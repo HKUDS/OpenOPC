@@ -8601,6 +8601,11 @@ class OPCEngine:
                     role_id=str(role_id or ""),
                     user_facing=_memory_skill_user_facing(task, str(role_id or "")),
                     final_decider_role_id=_final_decider_role_id(task),
+                    skill_refs=(
+                        self.org_engine.get_role_skill_refs(str(role_id))
+                        if role_id and getattr(self, "org_engine", None)
+                        else None
+                    ),
                 )
                 or ""
             ).strip()

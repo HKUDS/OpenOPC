@@ -130,6 +130,7 @@ class SkillLibrary:
         role_id: str | None = None,
         user_facing: bool = False,
         final_decider_role_id: str | None = None,
+        skill_refs: list[str] | None = None,
     ) -> str:
         """Build prompt text: always-on skill bodies + summary list for the rest.
 
@@ -138,11 +139,20 @@ class SkillLibrary:
         ``modes`` list are hidden completely (both body and description)
         when the current ``execution_mode`` is not in that list. Skills
         with an empty ``modes`` list are always visible.
+
+        ``skill_refs`` scopes optional skills to a role. When it is non-empty,
+        a non-``always`` skill is offered to the role only if its ``name`` is
+        listed there — this is how a role mounts a subset of the library. An
+        empty or ``None`` ``skill_refs`` keeps the previous behaviour (every
+        mode-visible skill is offered), so roles that never set ``skill_refs``
+        are unaffected. ``always`` skills are global and ignore this scoping.
         """
         if project_id:
             self.load_all(project_id)
         elif not self._skills:
             self.load_all()
+
+        mounted = {str(ref).strip() for ref in (skill_refs or []) if str(ref).strip()}
 
         always_parts: list[str] = []
         summary_lines: list[str] = []
@@ -159,6 +169,8 @@ class SkillLibrary:
             if skill.always:
                 always_parts.append(f"## Skill: {skill.name}\n{skill.content}")
             else:
+                if mounted and str(skill.name).strip() not in mounted:
+                    continue
                 summary_lines.append(
                     f"- **{skill.name}**: {skill.description} [{skill.source_path}]"
                 )
