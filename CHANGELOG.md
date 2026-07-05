@@ -8,6 +8,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **One map for the physical-AI pack + a readiness self-assessment (compress · simplify · organize · invent).**
+  - `docs/physical-ai.md` — the single entry point, structured **Staff · Operate · Measure**, linking
+    every physical-AI doc, skill, preset, and infographic from one place. The canonical flywheel is
+    now stated once here; the README routes to the hub instead of duplicating cross-links.
+  - **Invented:** a **Physical AI Company Readiness self-assessment** — the operating doctrine turned
+    into 8 evidence-gated checks (`no evidence ⇒ No`) → a maturity level (L0 demo shop → L4 industrial
+    learning system), with safety as a hard prerequisite. Doctrine, made countable.
+    `landing/infographics/physical-ai-readiness.html` visualizes it.
+  - `tests/test_physical_ai_docs_hub.py` — link-integrity guard (every relative link in the hub must
+    resolve) + scorecard completeness, so the doc map can't silently rot.
 - **Physical AI operating-loop doctrine — the "AI-Native Physical AI Company" blueprint made runnable.**
   - `skills/core/physical_ai_operating_loop.md` — a mountable role skill encoding the outer loop
     (company learns about the robot), maker≠checker independent referee → capability scorecard,

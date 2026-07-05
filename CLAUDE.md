@@ -59,7 +59,7 @@ Cross-cutting: `opc/core/` (config, pydantic models in `models.py`, events), `op
 
 ### Domain packs (org architectures)
 
-A "domain pack" is how OpenOPC targets an industry without engine changes: a built-in architecture preset (structure only) + hireable talent templates + a role skill + a saved org instance. The reference example is the **Physical AI / robotics** pack — the repo is positioned around staffing the "founding AI-native role" for that industry (see `docs/physical-ai-founding-roles.md`):
+A "domain pack" is how OpenOPC targets an industry without engine changes: a built-in architecture preset (structure only) + hireable talent templates + a role skill + a saved org instance. The reference example is the **Physical AI / robotics** pack — start at the hub **`docs/physical-ai.md`** (Staff · Operate · Measure), which maps every physical-AI doc/skill/preset/infographic; `tests/test_physical_ai_docs_hub.py` guards its links from rot:
 
 - Preset: `opc/market/builtin_presets/physical_ai_robotics_company.yaml` (YAML `ArchitectureBlueprint`, auto-discovered by `load_architecture_presets_from_yaml`; operational config is *inferred* at install-time by `infer_collaboration_config`, so presets stay pure structure). **Gotcha:** any `prompt_refs` string containing a colon must be quoted, or YAML parses it as a mapping and `RoleConfig` validation fails.
 - Talent: `opc/market/talent_presets.py` (`BUILTIN_TALENT_TEMPLATES`, `category: robotics`); skill: `skills/core/physical_ai.md`.

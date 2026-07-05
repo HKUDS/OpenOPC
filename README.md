@@ -6,7 +6,7 @@
   </a>
 </p>
 <p align="center"><sub><b>One-click deploys the <a href="landing/index.html">landing page</a></b> (in <code>landing/</code>) to Vercel. OpenOPC itself is a local-first daemon — WebSocket, subprocess-driven agents, a browser, and SQLite — so the <em>app</em> runs on your machine via <code>opc ui</code>, not on serverless.</sub></p>
-<p align="center"><sub>📊 <b>Visual infographics</b> of the essential docs — <a href="landing/infographics/how-it-works.html">how it works</a> · <a href="landing/infographics/physical-ai.html">Physical AI roles</a> · <a href="landing/infographics/physical-ai-operating-loop.html">operating loop</a> · <a href="landing/infographics/metadata-ownership.html">metadata ownership</a> · <a href="landing/infographics/channels.html">channels</a> · <a href="landing/infographics/cli.html">CLI</a> — live in <a href="landing/infographics/"><code>landing/infographics/</code></a>. They render on the deployed site or open standalone in any browser.</sub></p>
+<p align="center"><sub>📊 <b>Visual infographics</b> of the essential docs — <a href="landing/infographics/how-it-works.html">how it works</a> · <a href="landing/infographics/physical-ai.html">Physical AI roles</a> · <a href="landing/infographics/physical-ai-operating-loop.html">operating loop</a> · <a href="landing/infographics/physical-ai-readiness.html">readiness</a> · <a href="landing/infographics/metadata-ownership.html">metadata ownership</a> · <a href="landing/infographics/channels.html">channels</a> · <a href="landing/infographics/cli.html">CLI</a> — live in <a href="landing/infographics/"><code>landing/infographics/</code></a>. They render on the deployed site or open standalone in any browser.</sub></p>
 
 🏗️ **Self-Built** — Fully automated to recruit role-specific AI employees and build the org.
 
@@ -38,6 +38,13 @@
 
 ## 📰 News
 
+- **2026-07-05** — **One map for the physical-AI pack + a readiness self-assessment.** After seven
+  units of additions, [`docs/physical-ai.md`](docs/physical-ai.md) is now the single entry point —
+  **Staff · Operate · Measure** — routing to every doc, skill, and infographic from one place (the
+  README no longer duplicates the cross-links). The *invention*: a **readiness self-assessment** that
+  turns the operating doctrine into 8 evidence-gated checks → a maturity level (L0 demo shop → L4
+  industrial learning system), with `no evidence ⇒ No` and safety as a hard prerequisite. Doctrine,
+  made countable. [Infographic](landing/infographics/physical-ai-readiness.html).
 - **2026-07-05** — **The "AI-Native Physical AI Company" blueprint is now runnable doctrine, not prose.**
   A manifesto argued the winning Physical AI companies win on the *outer loop* (the company learns
   about the robot), not the demo. We turned it into something the agents actually run: a mountable
@@ -95,11 +102,10 @@ Two artifacts make it concrete (the OpenOPC engine below runs them):
 | **RoboForce Titan** — one concrete instance of that preset, the prototype | `.opc/config/company_orgs/org_roboforce-titan_config.yaml` (a saved Company-Mode org) | `opc chat -p demo --mode org --org roboforce-titan "…"` |
 | **Robotics talent + role skills** — 10 hireable role templates + domain knowledge + operating doctrine | `opc/market/talent_presets.py` (`category: robotics`), `skills/core/physical_ai.md`, `skills/core/physical_ai_operating_loop.md` | `opc talent list` |
 
-The JD research behind these roles — RoboForce's verified careers taxonomy plus the cross-industry
-role archetypes — is in **[`docs/physical-ai-founding-roles.md`](docs/physical-ai-founding-roles.md)**.
-The **operating doctrine** — how a robotics role should actually run the outer loop (independent
-referee, safety-as-a-gate, the 0→5 release ladder, human-burden ratio), and how each idea maps to an
-existing OpenOPC primitive — is in **[`docs/physical-ai-operating-loop.md`](docs/physical-ai-operating-loop.md)**.
+**→ One map for the whole pack: [`docs/physical-ai.md`](docs/physical-ai.md)** — **Staff** (preset,
+roles, talent) · **Operate** (the outer-loop doctrine + how it maps to OpenOPC primitives) ·
+**Measure** (a readiness self-assessment that scores your company L0 demo-shop → L4 industrial
+learning system). It links every other physical-AI doc, skill, and infographic from one place.
 
 **Everything below is the engine.** OpenOPC is a general AI-company runtime (Self-Built, Self-Run,
 Self-Grown); the Physical AI org above is one architecture it runs. The rest of this README
