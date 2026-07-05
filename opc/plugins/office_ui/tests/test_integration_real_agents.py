@@ -33,6 +33,7 @@ from opc.core.models import (
     TaskResult,
     TaskStatus,
 )
+from opc.layer1_perception.context_assembler import ContextAssembler
 from opc.layer3_agent.native_agent import NativeAgent
 from opc.layer4_tools.registry import ToolDefinition, ToolRegistry
 from opc.layer4_tools.file_ops import (
@@ -80,9 +81,16 @@ def _load_llm_config() -> LLMConfig:
 
 _LLM_CFG = _load_llm_config()
 _HAS_KEY = bool(_LLM_CFG.api_key or os.environ.get(_LLM_CFG.api_key_env or "__NONE__", ""))
+# These are live integration tests: each makes real, paid LLM calls. They are
+# opt-in so a plain `pytest` run neither charges an API nor depends on model
+# availability. Enable with OPC_RUN_INTEGRATION=1 (plus a configured LLM key).
+_OPT_IN = os.environ.get("OPC_RUN_INTEGRATION", "").strip() not in ("", "0", "false", "False")
 
 pytestmark = [
-    pytest.mark.skipif(not _HAS_KEY, reason="No LLM API key configured"),
+    pytest.mark.skipif(
+        not (_HAS_KEY and _OPT_IN),
+        reason="Live LLM integration tests: set OPC_RUN_INTEGRATION=1 and a configured LLM key to run",
+    ),
     pytest.mark.asyncio,
     pytest.mark.timeout(180),
 ]
@@ -316,6 +324,7 @@ def _make_agent(
     skills = SkillLibrary(opc_home=opc_home)
     config = OPCConfig(system=SystemConfig(max_agent_iterations=max_iterations))
     tool_registry = _make_tool_registry(tools)
+    context_assembler = ContextAssembler(memory=memory)
 
     return NativeAgent(
         role=role,
@@ -326,6 +335,7 @@ def _make_agent(
         skills=skills,
         event_bus=event_bus,
         config=config,
+        context_assembler=context_assembler,
     )
 
 

@@ -23,7 +23,6 @@ from opc.database.store import OPCStore
 from opc.layer2_organization import phase_hooks  # noqa: F401  (register hooks)
 from opc.layer3_agent.adapters.base import ExternalAgentAdapter
 from opc.layer3_agent import company_runtime_contract
-from opc.layer3_agent import native_agent
 
 
 # ── Fix 4 structural validator removed: the adapter no longer drops
@@ -126,7 +125,7 @@ class ReviewPromptSchemaTests(unittest.TestCase):
         self.assertNotIn("auto-rejected", text.lower())
 
     def test_native_agent_prompt_keeps_suggested_schema(self) -> None:
-        text = native_agent._COMPANY_REVIEW_WORK_ITEM_GUIDELINES
+        text = company_runtime_contract._COMPANY_REVIEW_WORK_ITEM_GUIDELINES
         self.assertIn("review_verdict", text)
         self.assertIn("blocking_issues", text)
         self.assertNotIn("Mandatory verdict schema", text)
