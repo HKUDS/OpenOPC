@@ -8,6 +8,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **Vercel landing page + 1-click deploy button.** `landing/index.html` is a self-contained,
+  responsive, theme-aware marketing/get-started page (hero, the three loops, the Physical AI
+  flywheel, quickstart). A "Deploy to Vercel" button at the top of the README one-click-deploys
+  it (`root-directory=landing`). The button and its caption are explicit that it deploys the
+  *landing page* only — OpenOPC itself is a stateful local daemon (WebSocket + subprocess-driven
+  agents + Playwright + SQLite) that Vercel's serverless/static model cannot host, so the app runs
+  locally via `opc ui`. Verified with a headless render (content, images, zero console/network errors).
 - **Role-level skill mounting (roadmap #1).** `SkillLibrary.build_skills_summary` now accepts
   `skill_refs`: when a role's `skill_refs` is non-empty, the role is offered only those optional
   skills (empty keeps the prior "offer everything" behaviour; `always`-on skills stay global).
