@@ -43,7 +43,7 @@ CI (`.github/workflows/external-agent-smoke.yml`) runs only the external-agent p
 
 ## Architecture
 
-`opc/engine.py` is the central orchestrator wiring numbered layers together. The layer split is load-bearing — put new code in the layer that owns the concern:
+`opc/engine.py` is the central orchestrator wiring numbered layers together. For the full picture — the seven key technical decisions *with their why*, the request flow, and where each kind of contribution goes — see **`docs/architecture.md`** (+ its infographic `landing/infographics/architecture.html`) and **`CONTRIBUTING.md`**. The layer split is load-bearing — put new code in the layer that owns the concern:
 
 | Layer | Package | Owns |
 |---|---|---|

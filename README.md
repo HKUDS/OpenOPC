@@ -38,6 +38,15 @@
 
 ## 📰 News
 
+- **2026-07-05** — **The architecture, made contributor-legible (a docs "refactor" the quality score asked for).**
+  An `anyagent analyze` deep-dive scored the codebase **75/100** with documentation the standout gap
+  (**20%**) — so the highest-ROI refactor was docs, not risky engine surgery on a large runtime.
+  Revived the dormant Architecture section (above) as a two-reader map, and added: an
+  [**architecture infographic**](landing/infographics/architecture.html) (7-layer stack + brief→delivery
+  flow + a where-to-contribute table), [`docs/architecture.md`](docs/architecture.md) (the seven key
+  technical decisions **with their why**), and [`CONTRIBUTING.md`](CONTRIBUTING.md) (copy-paste recipes
+  to add an industry org / tool / channel / adapter). Goal: a newcomer finds their layer in minutes.
+
 - **2026-07-05** — **The employee-loop incentive, made runnable — from "close the loop" to a coded payout.**
   How do you get *every* employee (bottom-up, not top-down) to hunt and close loops while the Chief
   AI-Native Officer builds the infra and codes the culture into a smart contract? You design a game:
@@ -863,33 +872,36 @@ opc market export --id hku_lab --name "HKU Lab" --output-dir packages
 opc market install packages/hku_lab.opcpkg
 ```
 
-<!--
 ## Architecture
 
-OpenOPC is a coordination runtime, not just an agent launcher — it separates interaction, organization, execution, tools, memory, and observability into seven layers.
+**The one-picture idea:** OpenOPC is a **coordination runtime**, not just an agent launcher — think
+of a company with departments. It splits the code into **seven numbered layers** (who talks to you →
+who plans → who does the work → what tools they use → what they remember → who watches), and one
+file, [`opc/engine.py`](opc/engine.py), wires them together. The number tells you exactly where new
+code goes and where to look when debugging.
 
-<details>
-<summary><b>The seven layers</b></summary>
+**📊 See it in one page:** the [**architecture infographic**](landing/infographics/architecture.html)
+— the 7-layer stack, the `brief → route → plan → execute → gate → deliver` flow, and a
+*where-do-I-contribute* map. Deep dive with the *why* behind each decision:
+[`docs/architecture.md`](docs/architecture.md).
 
-| Layer | Name | Responsibilities |
-|---|---|---|
-| 0 | Interaction | CLI, Office UI, message bus, external channel runtime. |
-| 1 | Perception & Context | Context loading, routing metadata, context assembly. |
-| 2 | Organization | Work-item planning, company runtime, comms, escalation, approval, recovery, recruitment. |
-| 3 | Agent Execution | Native runtime, subagents, external agent adapters, permissions, tool planning. |
-| 4 | Tools | Shell, file ops, browser, web search, Python execution, git, collaboration tools. |
-| 5 | Memory & Evolution | Markdown memory, session compaction, preferences, skill library, talent import. |
-| 6 | Observability | Events, cost tracking, structured logs, UI/runtime snapshots. |
-</details>
+| # | Layer | Owns | Where |
+|---|---|---|---|
+| 0 | Interaction | CLI, Office UI, message bus, external chat channels | `opc/cli/`, `opc/channels/` |
+| 1 | Perception & Context | reads the brief, routes it, assembles context | `opc/layer1_perception/` |
+| 2 | Organization | Company Mode's brain: work-item DAG, review/approval gates, comms, escalation, recruitment | `opc/layer2_organization/` |
+| 3 | Agent Execution | native runtime loop + external-agent adapters, permissions, subagents | `opc/layer3_agent/` |
+| 4 | Tools | shell, files, browser, web search, Python, git — one registry | `opc/layer4_tools/` |
+| 5 | Memory & Evolution | markdown memory, compaction, skill library, per-employee experience | `opc/layer5_memory/` |
+| 6 | Observability | event bus, cost tracking, structured logs, snapshots | `opc/layer6_observability/` |
 
-<details>
-<summary><b>Core mechanisms</b></summary>
+Two execution modes share this one runtime: **Task Mode** (one agent) and **Company Mode** (an org
+of role-agents running the DAG). The load-bearing decisions — *why* two modes not two codebases,
+*why* domain packs are content not code, *why* Company Mode keeps two metadata records — are
+explained in [`docs/architecture.md`](docs/architecture.md).
 
-- **Collaboration** — Company Mode compiles a brief into a work-item graph; each role runs in its own session, with reviewers and final deciders as first-class runtime roles. Roles pause on `AWAITING_PEER`, hand off, meet, and pass review/delivery gates — all mirrored to the UI (chat, transcripts, Agents, Comms, Kanban, Execution Progress).
-- **Communication** — a file-backed, role-scoped `.opc-comms/` workspace (inboxes, meeting transcripts, shared memory) that can be audited, replayed, and used to wake blocked peers.
-- **Self-evolution** — runs feed employee experience, reviewer preferences, checklists, and learned skills into `employee_evolution.json`, so the org improves who it assigns and what context each role gets.
-</details>
--->
+**Want to contribute?** [`CONTRIBUTING.md`](CONTRIBUTING.md) has copy-paste recipes: add an industry
+org (zero engine changes), a tool, a channel, or an external-agent adapter.
 
 ## Roadmap
 

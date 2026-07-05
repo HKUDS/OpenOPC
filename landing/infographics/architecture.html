@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>OpenOPC Architecture — infographic</title>
+<meta name="description" content="How OpenOPC is built: a 7-layer coordination runtime, the brief→delivery request flow, and a where-to-contribute map — so a newcomer can find their way in minutes.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E%F0%9F%8F%97%EF%B8%8F%3C/text%3E%3C/svg%3E">
+<link rel="stylesheet" href="ig.css">
+<style>
+  .stack{display:flex;flex-direction:column;gap:8px}
+  .lyr{display:grid;grid-template-columns:34px 1fr auto;gap:14px;align-items:center;
+    background:var(--card);border:1px solid var(--line);border-radius:12px;padding:12px 16px}
+  .lyr .ln{width:34px;height:34px;border-radius:9px;background:var(--accent);color:var(--accent-ink);
+    display:grid;place-items:center;font-weight:800;font-size:15px}
+  .lyr h3{font-size:1rem;margin:0}
+  .lyr .r{color:var(--muted);font-size:.9rem;margin-top:2px}
+  .lyr .ct{font-family:ui-monospace,Menlo,monospace;font-size:.78rem;color:var(--accent);white-space:nowrap}
+  .engine{text-align:center;color:var(--muted);font-size:.9rem;margin:10px 0 2px}
+  .engine code{background:var(--card2);border-radius:5px;padding:1px 6px;color:var(--fg)}
+</style>
+</head>
+<body>
+<div class="topbar"><div class="wrap">
+  <a class="brand" href="index.html"><span class="dot">🤖</span>OpenOPC</a>
+  <span class="sp"></span>
+  <a class="tl" href="index.html">← All infographics</a>
+</div></div>
+
+<header class="hero"><div class="wrap">
+  <span class="eyebrow">Architecture · for contributors</span>
+  <h1>One brief in, a finished delivery out — across seven layers</h1>
+  <p class="lead">OpenOPC is a <b>coordination runtime</b>, not just an agent launcher. Like a company
+    with departments, it splits the work into seven layers — who talks to you, who plans, who does
+    the work, what tools they use, what they remember, and who watches it all. One file wires them
+    together: <span class="mono">opc/engine.py</span>.</p>
+</div></header>
+
+<section><div class="wrap">
+  <div class="sec-title"><span class="n">1</span><h2>The seven layers (top = closest to you)</h2></div>
+  <div class="stack">
+    <div class="lyr"><span class="ln">0</span><div><h3>Interaction</h3><div class="r">How you reach it: the CLI, the Office UI, the message bus, external chat channels.</div></div><span class="ct">cli · channels · layer0</span></div>
+    <div class="lyr"><span class="ln">1</span><div><h3>Perception &amp; Context</h3><div class="r">Reads your brief, routes it, and assembles the context an agent needs.</div></div><span class="ct">layer1 · 4 files</span></div>
+    <div class="lyr"><span class="ln">2</span><div><h3>Organization</h3><div class="r">Company Mode's brain — the work-item DAG, review/approval gates, comms, escalation, recruitment.</div></div><span class="ct">layer2 · 37 files</span></div>
+    <div class="lyr"><span class="ln">3</span><div><h3>Agent Execution</h3><div class="r">The native runtime loop + external agent adapters (Codex, Claude Code, Cursor, OpenCode), permissions, subagents.</div></div><span class="ct">layer3 · 28 files</span></div>
+    <div class="lyr"><span class="ln">4</span><div><h3>Tools</h3><div class="r">What agents can actually do: shell, files, a real browser, web search, Python, git — all in one registry.</div></div><span class="ct">layer4 · 16 files</span></div>
+    <div class="lyr"><span class="ln">5</span><div><h3>Memory &amp; Evolution</h3><div class="r">What the company remembers: markdown memory, session compaction, the skill library, per-employee experience.</div></div><span class="ct">layer5 · 11 files</span></div>
+    <div class="lyr"><span class="ln">6</span><div><h3>Observability</h3><div class="r">Who watches: the event bus, cost tracking, structured logs, UI/runtime snapshots.</div></div><span class="ct">layer6 · 3 files</span></div>
+  </div>
+  <div class="engine">All seven are wired together by <code>opc/engine.py</code> — the orchestrator. Cross-cutting: <code>core</code> (models/config), <code>llm</code>, <code>database</code>, <code>market</code> (presets/talent).</div>
+</div></section>
+
+<section><div class="wrap">
+  <div class="sec-title"><span class="n">2</span><h2>What happens when you send a brief</h2></div>
+  <div class="flow" style="justify-content:space-between">
+    <span class="step">Brief<small>you type it (L0)</small></span><span class="arr">→</span>
+    <span class="step">Route<small>task or company? (L1)</small></span><span class="arr">→</span>
+    <span class="step">Plan<small>work-item DAG (L2)</small></span><span class="arr">→</span>
+    <span class="step">Execute<small>agents + tools (L3–L4)</small></span><span class="arr">→</span>
+    <span class="step">Gate<small>review · safety · human (L2)</small></span><span class="arr">→</span>
+    <span class="step">Deliver<small>+ remember (L5–L6)</small></span>
+  </div>
+  <p style="margin-top:14px"><span class="callout"><b>Two modes, one runtime.</b> <b>Task Mode</b> = one agent does the job (fast). <b>Company Mode</b> =
+    an org of role-agents runs the DAG with manager decompose → review → escalate. Same engine; the mode just
+    decides how many players are on the field.</span></p>
+</div></section>
+
+<section><div class="wrap">
+  <div class="sec-title"><span class="n">3</span><h2>Where do I contribute? (find your layer)</h2></div>
+  <div class="scroll"><table class="matrix">
+    <thead><tr><th>I want to add…</th><th>Where it lives</th></tr></thead>
+    <tbody>
+      <tr><td>A new <b>industry org</b> (like the Physical AI pack)</td><td>a preset in <code>opc/market/builtin_presets/</code> + talent in <code>talent_presets.py</code> + a role skill — no engine change</td></tr>
+      <tr><td>A new <b>tool</b> agents can call</td><td><code>opc/layer4_tools/</code> + register it in <code>registry.py</code></td></tr>
+      <tr><td>A new <b>chat channel</b> (Slack-like)</td><td><code>opc/channels/</code> behind <code>provider_registry.py</code> (deny-by-default inbound)</td></tr>
+      <tr><td>A new <b>external agent</b> adapter</td><td><code>opc/layer3_agent/adapters/</code></td></tr>
+      <tr><td>A <b>role skill</b> / doctrine</td><td><code>skills/core/*.md</code>, mounted via a role's <code>skill_refs</code></td></tr>
+    </tbody>
+  </table></div>
+  <p style="margin-top:12px;color:var(--muted)">Start here: <a href="https://github.com/wjlgatech/physical-ai-native/blob/main/CONTRIBUTING.md">CONTRIBUTING.md</a> ·
+    deep dive: <a href="https://github.com/wjlgatech/physical-ai-native/blob/main/docs/architecture.md">docs/architecture.md</a> ·
+    tests: <span class="mono">uv run --with pytest python -m pytest</span></p>
+</div></section>
+
+<div class="footer"><div class="wrap">
+  <span>Source: <a href="https://github.com/wjlgatech/physical-ai-native/blob/main/docs/architecture.md">docs/architecture.md</a> · <a href="index.html">All infographics</a></span>
+  <span class="pills"><span class="pill">7 layers</span><span class="pill">engine.py wires them</span></span>
+</div></div>
+</body>
+</html>
