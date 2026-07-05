@@ -61,6 +61,7 @@ roles:
   - coding
   - deployment
   - writing
+  - employee_loop_incentive
   handoff_template_ref: null
   memory_policy_ref: null
   artifact_contract_ref: null
@@ -693,7 +694,7 @@ installed_packages:
 - package_id: physical-ai-robotics-company
   name: Physical AI Robotics Company
   version: 1.0.0
-  installed_at: '2026-07-05T07:01:28.758058+00:00'
+  installed_at: '2026-07-05T12:51:18.205245+00:00'
   source_path: builtin
   role_ids:
   - founding_ai_native_lead

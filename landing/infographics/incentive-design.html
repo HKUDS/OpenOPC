@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The Employee Loop Incentive — infographic</title>
+<meta name="description" content="How the CNO makes every employee hunt and close loops — visible gaps, cheap experiments, an independent referee, and an on-chain payout for verified compounding value.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E%F0%9F%94%81%3C/text%3E%3C/svg%3E">
+<link rel="stylesheet" href="ig.css">
+</head>
+<body>
+<div class="topbar"><div class="wrap">
+  <a class="brand" href="index.html"><span class="dot">🤖</span>OpenOPC</a>
+  <span class="sp"></span>
+  <a class="tl" href="index.html">← All infographics</a>
+</div></div>
+
+<header class="hero"><div class="wrap">
+  <span class="eyebrow">Culture &amp; incentives · the CNO's game</span>
+  <h1>You can't order people to close loops — you design a game</h1>
+  <p class="lead">Make gaps <b>visible</b>, experiments <b>cheap and safe</b>, verification
+    <b>independent</b>, and payout <b>automatic and proportional to verified compounding value</b>.
+    Top-down sets the rules; bottom-up plays. The CNO builds the kitchen — and never cooks.</p>
+</div></header>
+
+<section><div class="wrap">
+  <div class="sec-title"><span class="n">1</span><h2>The open kitchen — five mechanisms</h2></div>
+  <div class="tr">
+    <div class="row"><div class="plain">Discover the open loop</div><div class="to">→</div>
+      <div class="tech">An auto-surfaced <b>gap board</b> (a friction sensor + your readiness <code>No</code>s + high-burden workflows). Nobody is told where gaps are.</div></div>
+    <hr>
+    <div class="row"><div class="plain">Propose + experiment</div><div class="to">→</div>
+      <div class="tech">A <b>bounded closed-loop</b>: hypothesis + one metric + rollback. Cheap to spin up; the safety gate keeps it off production.</div></div>
+    <hr>
+    <div class="row"><div class="plain">Verify — the expo checks, not the cook</div><div class="to">→</div>
+      <div class="tech"><b>maker ≠ checker.</b> An independent referee decides if the metric moved. You need the metric, not a manager's blessing.</div></div>
+    <hr>
+    <div class="row"><div class="plain">Reward — the tip formula on the wall</div><div class="to">→</div>
+      <div class="tech">An on-chain contract pays the <b>verified close</b> — two signatures, compounding vesting, safety-zero. Not the chef's mood.</div></div>
+    <hr>
+    <div class="row"><div class="plain">See it compound</div><div class="to">→</div>
+      <div class="tech">A public ledger of closes + their <b>compounding curve</b>. Seeing your fix lift the whole line is the intrinsic reward.</div></div>
+  </div>
+</div></section>
+
+<section><div class="wrap">
+  <div class="sec-title"><span class="n">2</span><h2>What the contract rewards (the crux)</h2></div>
+  <div class="grid g3">
+    <div class="card"><div class="k">✍️</div><h3>maker ≠ checker</h3><p>Two signatures on-chain. If the maker can attest their own result for money, they grade their own homework. Encoded in Solidity, not a policy doc.</p></div>
+    <div class="card"><div class="k">📈</div><h3>compounding vesting</h3><p>The payout <b>streams</b>, and re-verifying durability extends it. A fix that keeps paying earns more than a one-shot — so people hunt <b>leverage</b>, not applause.</p></div>
+    <div class="card" style="border-top:3px solid var(--warn)"><div class="k">🔒</div><h3>safety = hard zero</h3><p>A safety failure zeroes the unreleased reward and halts — regardless of ROI. A terminal gate, never a weighted term.</p></div>
+  </div>
+  <p style="margin-top:12px;color:var(--muted)">Reference sketch (unaudited): <span class="mono">contracts/VerifiedClosePayout.sol</span>.
+    Reward triggers on a <b>verified close</b> — never a proposal, never effort.</p>
+</div></section>
+
+<section><div class="wrap">
+  <div class="sec-title"><span class="n">3</span><h2>Grade your incentive system: L0 → L4</h2></div>
+  <div class="grid g2">
+    <div class="card"><h3>0–1 · <span style="color:var(--warn)">L0 — Top-down</span></h3><p>Gaps found by managers; improvement is assigned, not hunted.</p></div>
+    <div class="card"><h3>2–3 · L1 — Suggestion box</h3><p>People can propose, but nothing is verified or reliably rewarded.</p></div>
+    <div class="card"><h3>4–5 · L2 — Refereed bounties</h3><p>An independent judge + a safety zero; verified closes get paid (even by hand).</p></div>
+    <div class="card"><h3>6–7 · L3 — Compounding culture</h3><p>Payout rewards leverage; visibility is public; people hunt gaps unprompted.</p></div>
+    <div class="card" style="border-top:3px solid var(--accent)"><h3>8 · <span style="color:var(--accent)">L4 — Self-incentivizing org</span></h3><p>The game runs on-chain and un-gameable; the company closes its own loops while leadership designs the next.</p></div>
+    <div class="card"><h3>Sequence it</h3><p><b>Culture first, contract second.</b> Pay the first verified close by hand; encode the math only after it's proven fair. Never code an incentive you haven't run by hand.</p></div>
+  </div>
+</div></section>
+
+<div class="footer"><div class="wrap">
+  <span>Source: <a href="https://github.com/wjlgatech/physical-ai-native/blob/main/docs/employee-loop-incentive.md">docs/employee-loop-incentive.md</a> · <a href="index.html">All infographics</a></span>
+  <span class="pills"><span class="pill">maker ≠ checker</span><span class="pill">pay the verified close</span></span>
+</div></div>
+</body>
+</html>
