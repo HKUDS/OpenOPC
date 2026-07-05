@@ -1,5 +1,12 @@
 <h1 align="center" style="font-size: 1.75em;">OpenOPC: Your Personal AI-Native Company —<br>Self-Built, Self-Run, Self-Grown</h1>
 
+<p align="center">
+  <a href="https://vercel.com/new/clone?repository-url=https%3A%2F%2Fgithub.com%2Fwjlgatech%2Fphysical-ai-native&project-name=openopc-landing&repository-name=openopc-landing&root-directory=landing">
+    <img src="https://vercel.com/button" alt="Deploy the OpenOPC landing page to Vercel">
+  </a>
+</p>
+<p align="center"><sub><b>One-click deploys the <a href="landing/index.html">landing page</a></b> (in <code>landing/</code>) to Vercel. OpenOPC itself is a local-first daemon — WebSocket, subprocess-driven agents, a browser, and SQLite — so the <em>app</em> runs on your machine via <code>opc ui</code>, not on serverless.</sub></p>
+
 🏗️ **Self-Built** — Fully automated to recruit role-specific AI employees and build the org.
 
 ⚙️ **Self-Run** — Fully automated to assign tasks, drive handoffs, and keep moving toward your goal.

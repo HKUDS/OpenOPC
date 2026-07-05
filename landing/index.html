@@ -1,0 +1,231 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>OpenOPC — Your Personal AI-Native Company</title>
+<meta name="description" content="OpenOPC assembles an AI company around your goal: it staffs role-agents, runs them through a work-item state machine, and learns from every run. Purpose-built to staff the founding AI-native role for the Physical AI / robotics industry.">
+<meta property="og:title" content="OpenOPC — Your Personal AI-Native Company">
+<meta property="og:description" content="Self-Built · Self-Run · Self-Grown. Staff the founding AI-native role for Physical AI & robotics.">
+<meta property="og:type" content="website">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E%F0%9F%A4%96%3C/text%3E%3C/svg%3E">
+<style>
+  :root{
+    --bg:#ffffff; --fg:#0b1220; --muted:#5a6678; --line:#e7ebf0;
+    --card:#f7f9fb; --accent:#0e7490; --accent-ink:#ffffff; --code-bg:#0d1524; --code-fg:#e6edf6;
+    --maxw:1080px;
+  }
+  @media (prefers-color-scheme:dark){
+    :root{ --bg:#0a0f18; --fg:#eaf0f6; --muted:#93a1b3; --line:#1e2a3a;
+      --card:#111826; --accent:#22b8cf; --accent-ink:#04121a; --code-bg:#070d16; --code-fg:#dbe6f2; }
+  }
+  *{box-sizing:border-box}
+  html{scroll-behavior:smooth}
+  body{margin:0;background:var(--bg);color:var(--fg);
+    font:16px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    -webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility}
+  a{color:inherit}
+  .wrap{max-width:var(--maxw);margin:0 auto;padding:0 22px}
+  .eyebrow{display:inline-block;font-size:.72rem;letter-spacing:.14em;text-transform:uppercase;
+    color:var(--accent);font-weight:700;margin-bottom:14px}
+  h1,h2,h3{line-height:1.12;letter-spacing:-.02em;margin:0}
+  h1{font-size:clamp(2.1rem,5.2vw,3.6rem);font-weight:800}
+  h2{font-size:clamp(1.5rem,3.3vw,2.15rem);font-weight:800}
+  h3{font-size:1.12rem;font-weight:700}
+  p{margin:.7em 0}
+  .lead{font-size:clamp(1.05rem,1.9vw,1.28rem);color:var(--muted);max-width:44ch}
+
+  /* nav */
+  nav{position:sticky;top:0;z-index:20;backdrop-filter:saturate(1.2) blur(8px);
+    background:color-mix(in srgb,var(--bg) 82%,transparent);border-bottom:1px solid var(--line)}
+  nav .wrap{display:flex;align-items:center;gap:18px;height:60px}
+  .brand{display:flex;align-items:center;gap:10px;font-weight:800;letter-spacing:-.02em}
+  .brand .dot{width:22px;height:22px;border-radius:7px;background:var(--accent);
+    display:grid;place-items:center;color:var(--accent-ink);font-size:13px}
+  nav .sp{flex:1}
+  nav a.navlink{color:var(--muted);text-decoration:none;font-size:.92rem;font-weight:600}
+  nav a.navlink:hover{color:var(--fg)}
+  @media(max-width:640px){nav a.navlink{display:none}}
+
+  /* buttons */
+  .btn{display:inline-flex;align-items:center;gap:8px;border-radius:11px;padding:12px 18px;
+    font-weight:700;font-size:.95rem;text-decoration:none;border:1px solid transparent;transition:.15s}
+  .btn.primary{background:var(--accent);color:var(--accent-ink)}
+  .btn.primary:hover{filter:brightness(1.07);transform:translateY(-1px)}
+  .btn.ghost{border-color:var(--line);color:var(--fg);background:var(--card)}
+  .btn.ghost:hover{border-color:var(--accent)}
+
+  /* hero */
+  header.hero{padding:64px 0 40px;position:relative;overflow:hidden}
+  header.hero::before{content:"";position:absolute;inset:-40% 40% auto auto;width:60vw;height:60vw;
+    background:radial-gradient(closest-side,color-mix(in srgb,var(--accent) 22%,transparent),transparent 70%);
+    opacity:.5;pointer-events:none;filter:blur(6px)}
+  .hero-grid{display:grid;grid-template-columns:1.05fr .95fr;gap:44px;align-items:center}
+  @media(max-width:860px){.hero-grid{grid-template-columns:1fr;gap:30px}}
+  .cta{display:flex;gap:12px;flex-wrap:wrap;margin-top:26px}
+  .pills{display:flex;gap:8px;flex-wrap:wrap;margin-top:22px}
+  .pill{font-size:.78rem;font-weight:600;color:var(--muted);border:1px solid var(--line);
+    background:var(--card);border-radius:999px;padding:5px 11px}
+  .shot{border:1px solid var(--line);border-radius:14px;overflow:hidden;box-shadow:0 24px 60px -30px rgba(2,12,27,.5);background:var(--card)}
+  .shot img{display:block;width:100%;height:auto}
+  .shot .bar{display:flex;gap:6px;padding:9px 12px;border-bottom:1px solid var(--line);background:color-mix(in srgb,var(--card) 60%,var(--bg))}
+  .shot .bar i{width:10px;height:10px;border-radius:50%;background:var(--line)}
+
+  section{padding:52px 0;border-top:1px solid var(--line)}
+  .sec-head{max-width:60ch;margin-bottom:30px}
+  .sec-head p{color:var(--muted)}
+
+  .three{display:grid;grid-template-columns:repeat(3,1fr);gap:18px}
+  @media(max-width:820px){.three{grid-template-columns:1fr}}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:22px}
+  .card .k{font-size:1.5rem;line-height:1;margin-bottom:12px}
+  .card h3{margin-bottom:6px}
+  .card p{margin:0;color:var(--muted);font-size:.95rem}
+
+  /* flywheel */
+  .flow{display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin-top:8px}
+  .flow .step{background:var(--card);border:1px solid var(--line);border-radius:10px;
+    padding:9px 13px;font-weight:600;font-size:.9rem}
+  .flow .arr{color:var(--accent);font-weight:800}
+
+  pre{background:var(--code-bg);color:var(--code-fg);border-radius:14px;padding:20px 22px;overflow:auto;
+    font:13.5px/1.65 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;border:1px solid var(--line)}
+  pre .c{color:#7d8ba0}
+  pre .g{color:var(--accent);font-weight:600}
+
+  .split{display:grid;grid-template-columns:1fr 1fr;gap:34px;align-items:center}
+  @media(max-width:820px){.split{grid-template-columns:1fr}}
+
+  footer{border-top:1px solid var(--line);padding:40px 0;color:var(--muted);font-size:.9rem}
+  footer .wrap{display:flex;justify-content:space-between;gap:16px;flex-wrap:wrap;align-items:center}
+  footer a{color:var(--muted);text-decoration:none;margin-left:16px}
+  footer a:hover{color:var(--fg)}
+  .note{font-size:.82rem;color:var(--muted);margin-top:14px;max-width:60ch}
+</style>
+</head>
+<body>
+
+<nav><div class="wrap">
+  <span class="brand"><span class="dot">🤖</span>OpenOPC</span>
+  <span class="sp"></span>
+  <a class="navlink" href="#how">How it works</a>
+  <a class="navlink" href="#physical-ai">Physical AI</a>
+  <a class="navlink" href="#start">Quickstart</a>
+  <a class="btn ghost" href="https://github.com/wjlgatech/physical-ai-native" style="padding:8px 14px">GitHub ↗</a>
+</div></nav>
+
+<header class="hero"><div class="wrap hero-grid">
+  <div>
+    <span class="eyebrow">One-Person Company · Physical AI edition</span>
+    <h1>Your personal AI-native company — self-built, self-run, self-grown.</h1>
+    <p class="lead">Hand OpenOPC a goal. It drafts the org chart, staffs it with role-agents,
+      drives them through a work-item state machine, and learns from every run — so the next
+      delivery is smarter. Purpose-built to staff the <strong>founding AI-native role</strong>
+      for the Physical AI &amp; robotics industry.</p>
+    <div class="cta">
+      <a class="btn primary" href="#start">Get started →</a>
+      <a class="btn ghost" href="https://github.com/wjlgatech/physical-ai-native">Star on GitHub ★</a>
+    </div>
+    <div class="pills">
+      <span class="pill">Python 3.10+</span>
+      <span class="pill">CLI + Office UI</span>
+      <span class="pill">Local-first</span>
+      <span class="pill">MIT</span>
+    </div>
+  </div>
+  <div class="shot">
+    <div class="bar"><i></i><i></i><i></i></div>
+    <img src="https://raw.githubusercontent.com/wjlgatech/physical-ai-native/main/docs/assets/chat.png"
+         alt="OpenOPC Office UI: chat, kanban, and role execution progress" loading="eager">
+  </div>
+</div></header>
+
+<section id="how"><div class="wrap">
+  <div class="sec-head">
+    <span class="eyebrow">How it works</span>
+    <h2>Three tightly-coupled loops turn a brief into a delivery</h2>
+    <p>Not just an agent launcher — a coordination runtime that separates who does the work,
+      how the work moves, and what the company remembers.</p>
+  </div>
+  <div class="three">
+    <div class="card">
+      <div class="k">🏗️</div><h3>Self-Built</h3>
+      <p>Given a goal, OpenOPC derives the roles and reporting lines the task needs, then a
+        recruiter agent fills each seat — reusing an experienced employee or onboarding a fresh hire.</p>
+    </div>
+    <div class="card">
+      <div class="k">⚙️</div><h3>Self-Run</h3>
+      <p>A manager decomposes work into a dependency DAG. Independent items run in parallel;
+        blockers pause the sender and wake the right peer, escalating to you only when judgment is needed.</p>
+    </div>
+    <div class="card">
+      <div class="k">🌱</div><h3>Self-Grown</h3>
+      <p>Every run is distilled into per-role experience and promoted into shared playbooks that
+        new hires inherit — so organizational knowledge compounds over time.</p>
+    </div>
+  </div>
+</div></section>
+
+<section id="physical-ai"><div class="wrap">
+  <div class="split">
+    <div>
+      <span class="eyebrow">Built for Physical AI</span>
+      <h2>Staff the robot-learning flywheel end to end</h2>
+      <p style="color:var(--muted)">A Physical AI company is one loop turning fast — people teach a robot,
+        the robot learns a brain, the brain is tested against reality, the robot goes to a real job site,
+        and what happens there becomes the next lesson. OpenOPC ships that org as a runnable preset.</p>
+      <div class="flow">
+        <span class="step">Teleop data</span><span class="arr">→</span>
+        <span class="step">VLA policy</span><span class="arr">→</span>
+        <span class="step">Sim2real eval</span><span class="arr">→</span>
+        <span class="step">Field pilot</span><span class="arr">→</span>
+        <span class="step">Fleet telemetry</span><span class="arr">↺</span>
+      </div>
+      <p class="note">Anchored on a real open role — RoboForce's <strong>Founding AI Native Lead</strong> —
+        and generalized across the industry (Physical Intelligence, Figure, 1X, Apptronik, Agility).
+        Ships as the <code>physical-ai-robotics-company</code> preset + a RoboForce-Titan prototype org.</p>
+    </div>
+    <div class="shot">
+      <div class="bar"><i></i><i></i><i></i></div>
+      <img src="https://raw.githubusercontent.com/wjlgatech/physical-ai-native/main/docs/assets/fig6.png"
+           alt="OpenOPC Office View: role-agents at work in an animated office" loading="lazy">
+    </div>
+  </div>
+</div></section>
+
+<section id="start"><div class="wrap">
+  <div class="sec-head">
+    <span class="eyebrow">Quickstart</span>
+    <h2>Running locally takes about a minute</h2>
+    <p>OpenOPC is a local-first daemon — it drives real agent CLIs, a browser, and a persistent
+      runtime on your machine. (That's also why this page is on Vercel and the app runs on your box.)</p>
+  </div>
+  <pre><span class="c"># Install with uv (recommended), then initialize local config</span>
+uv venv --python 3.12 &amp;&amp; source .venv/bin/activate
+uv pip install -e .
+uv run python -m playwright install chromium   <span class="c"># for browser tools</span>
+uv run opc init
+
+<span class="c"># Launch the Office UI (browser at http://localhost:8765)</span>
+<span class="g">uv run opc ui</span>
+
+<span class="c"># …or drive it from the CLI</span>
+uv run opc chat -p demo --mode company --company-profile corporate \
+  "Plan, implement, review, and document this feature"</pre>
+  <div class="cta" style="margin-top:22px">
+    <a class="btn primary" href="https://github.com/wjlgatech/physical-ai-native#quick-start">Full quickstart →</a>
+    <a class="btn ghost" href="https://github.com/wjlgatech/physical-ai-native/blob/main/docs/physical-ai-founding-roles.md">Physical AI roles doc</a>
+  </div>
+</div></section>
+
+<footer><div class="wrap">
+  <span>© OpenOPC · MIT · a self-built, self-run, self-grown AI company.</span>
+  <span>
+    <a href="https://github.com/wjlgatech/physical-ai-native">GitHub</a>
+    <a href="https://github.com/wjlgatech/physical-ai-native#readme">Docs</a>
+    <a href="https://github.com/wjlgatech/physical-ai-native/blob/main/CHANGELOG.md">Changelog</a>
+  </span>
+</div></footer>
+
+</body>
+</html>
