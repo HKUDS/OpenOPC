@@ -8,6 +8,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **Architecture, made contributor-legible.** A code-base deep dive (`anyagent analyze` → 75/100,
+  documentation the weakest axis at 20%) scoped the highest-ROI "refactor" to docs, not risky engine
+  surgery. Added [`landing/infographics/architecture.html`](landing/infographics/architecture.html)
+  (the 7-layer stack + brief→delivery flow + a where-to-contribute table),
+  [`docs/architecture.md`](docs/architecture.md) (the seven key technical decisions with their *why*,
+  plus the conventions that bite), and [`CONTRIBUTING.md`](CONTRIBUTING.md) (copy-paste recipes for
+  adding an industry org / tool / channel / external-agent adapter). Revived the README's dormant
+  (commented-out) Architecture section as a live two-reader map. `tests/test_docs_architecture.py`
+  guards the new docs' relative links.
 - **Employee-loop incentive doctrine — bottom-up loop-closing, made runnable (incl. a smart-contract sketch).**
   How to make every employee discover + close loops (not top-down), verified by an independent referee
   and rewarded on-chain for compounding value, while the CNO builds infra + culture:
