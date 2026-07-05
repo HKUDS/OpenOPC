@@ -39,8 +39,9 @@ class _StubSkills:
         role_id: str | None = None,
         user_facing: bool = False,
         final_decider_role_id: str | None = None,
+        skill_refs: list[str] | None = None,
     ) -> str:
-        _ = (project_id, execution_mode, role_id, user_facing, final_decider_role_id)
+        _ = (project_id, execution_mode, role_id, user_facing, final_decider_role_id, skill_refs)
         return ""
 
 

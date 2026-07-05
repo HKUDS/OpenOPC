@@ -823,7 +823,7 @@ OpenOPC is moving quickly. The areas below reflect active development priorities
 
 | Area | Planned direction |
 |---|---|
-| **Role-level skills** | Role config already carries `skill_refs`, and the Org UI surfaces skill metadata today. The next step is letting users select which skills mount to which roles directly from the Org page — feeding into a broader self-evolving skill ecosystem. |
+| **Role-level skills** | ✅ **Runtime now enforces `skill_refs`** — a role is offered only the skills its `skill_refs` lists (empty = all, backward-compatible; `always`-on skills stay global), so mounting a skill to a role actually scopes what that role sees in every prompt path (native, prompt-harness, external-agent). The Physical AI roles ship with `physical_ai` mounted. Remaining: an Org-page picker to edit `skill_refs` visually (the WebSocket `update_role` already persists it), feeding a broader self-evolving skill ecosystem. |
 | **Secretary settings** | The secretary will grow into a stronger configuration and memory steward: owning OPC system memory, analysing and comparing projects, and providing guided setup for OpenOPC YAML configuration. |
 | **Company-mode channels** | External channels will evolve beyond simple chat entrypoints into richer company-mode workflows — with role-aware notifications, structured approvals, and cross-platform collaboration. |
 | **CLI parity** | The CLI is functional today, but the Office UI remains the more complete surface. Upcoming work targets org editing, company-mode inspection, failure recovery, and long-running runtime control from the terminal. |

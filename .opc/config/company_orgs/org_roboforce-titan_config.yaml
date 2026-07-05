@@ -51,7 +51,11 @@ roles:
   - Final deliverable must state the target task, the achieved capability level, the
     data/sim/eval evidence, the deployment readiness verdict, and the next flywheel
     iteration.
-  skill_refs: []
+  skill_refs:
+  - physical_ai
+  - coding
+  - deployment
+  - writing
   handoff_template_ref: null
   memory_policy_ref: null
   artifact_contract_ref: null
@@ -106,7 +110,11 @@ roles:
     family (VLA / diffusion / flow-matching policy), and the success-rate gate.'
   - Require evidence (eval curves, held-out success rates), not narrative claims,
     before advancing a policy to integration.
-  skill_refs: []
+  skill_refs:
+  - physical_ai
+  - coding
+  - deployment
+  - writing
   handoff_template_ref: null
   memory_policy_ref: null
   artifact_contract_ref: null
@@ -156,7 +164,11 @@ roles:
     \ — behavior cloning, flow-matching or diffusion policies, and RL fine-tuning.\
     \ Owns model architecture and the observation-to-action mapping.\n Focus on delivering\
     \ quality work within your area of expertise."
-  skill_refs: []
+  skill_refs:
+  - physical_ai
+  - coding
+  - deployment
+  - writing
   handoff_template_ref: null
   memory_policy_ref: null
   artifact_contract_ref: null
@@ -201,7 +213,11 @@ roles:
     \ collection protocol, RLDS-style (image, instruction, action) formatting, diversity\
     \ and coverage, dedup, and the data-quality gate that guards training.\n Focus\
     \ on delivering quality work within your area of expertise."
-  skill_refs: []
+  skill_refs:
+  - physical_ai
+  - coding
+  - deployment
+  - writing
   handoff_template_ref: null
   memory_policy_ref: null
   artifact_contract_ref: null
@@ -246,7 +262,11 @@ roles:
     \ (Isaac Sim / MuJoCo), domain randomization, and the sim-to-real transfer evaluation\
     \ that predicts real-world success before hardware time is spent.\n Focus on delivering\
     \ quality work within your area of expertise."
-  skill_refs: []
+  skill_refs:
+  - physical_ai
+  - coding
+  - deployment
+  - writing
   handoff_template_ref: null
   memory_policy_ref: null
   artifact_contract_ref: null
@@ -294,7 +314,11 @@ roles:
     \ and aggregate results."
   - Integrate perception, manipulation, and motion planning against the trained policy;
     surface interface contracts and real-time constraints early.
-  skill_refs: []
+  skill_refs:
+  - physical_ai
+  - coding
+  - deployment
+  - writing
   handoff_template_ref: null
   memory_policy_ref: null
   artifact_contract_ref: null
@@ -342,7 +366,11 @@ roles:
     \ raw sensors into the world state the policy and planners consume. Owns calibration\
     \ and perception robustness under real-site lighting and clutter.\n Focus on delivering\
     \ quality work within your area of expertise."
-  skill_refs: []
+  skill_refs:
+  - physical_ai
+  - coding
+  - deployment
+  - writing
   handoff_template_ref: null
   memory_policy_ref: null
   artifact_contract_ref: null
@@ -387,7 +415,11 @@ roles:
     \ place, press, twist, connect). Owns gripper/end-effector control and force-aware\
     \ skills for precise industrial tasks.\n Focus on delivering quality work within\
     \ your area of expertise."
-  skill_refs: []
+  skill_refs:
+  - physical_ai
+  - coding
+  - deployment
+  - writing
   handoff_template_ref: null
   memory_policy_ref: null
   artifact_contract_ref: null
@@ -431,7 +463,11 @@ roles:
     \ planning, and real-time control of the arm and mobile base. Owns motion safety\
     \ envelopes and cycle time.\n Focus on delivering quality work within your area\
     \ of expertise."
-  skill_refs: []
+  skill_refs:
+  - physical_ai
+  - coding
+  - deployment
+  - writing
   handoff_template_ref: null
   memory_policy_ref: null
   artifact_contract_ref: null
@@ -478,7 +514,11 @@ roles:
     \ the deployment pilot, and owns on-site reliability and the Robot-as-a-Service\
     \ surface (setup, monitoring, operator handoff).\n Focus on delivering quality\
     \ work within your area of expertise."
-  skill_refs: []
+  skill_refs:
+  - physical_ai
+  - coding
+  - deployment
+  - writing
   handoff_template_ref: null
   memory_policy_ref: null
   artifact_contract_ref: null
@@ -525,7 +565,11 @@ roles:
     \ outputs for quality and correctness. Approve quality work or request changes."
   - 'Gate on measured evidence: reject any policy or deployment that lacks held-out
     success rates or violates a safety envelope.'
-  skill_refs: []
+  skill_refs:
+  - physical_ai
+  - coding
+  - deployment
+  - writing
   handoff_template_ref: null
   memory_policy_ref: null
   artifact_contract_ref: null
@@ -627,7 +671,7 @@ installed_packages:
 - package_id: physical-ai-robotics-company
   name: Physical AI Robotics Company
   version: 1.0.0
-  installed_at: '2026-07-04T22:49:47.183376+00:00'
+  installed_at: '2026-07-05T01:57:28.847166+00:00'
   source_path: builtin
   role_ids:
   - founding_ai_native_lead

@@ -8,6 +8,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **Role-level skill mounting (roadmap #1).** `SkillLibrary.build_skills_summary` now accepts
+  `skill_refs`: when a role's `skill_refs` is non-empty, the role is offered only those optional
+  skills (empty keeps the prior "offer everything" behaviour; `always`-on skills stay global).
+  Wired through all three role-prompt paths — native runtime (`native_agent.py`), the default
+  prompt harness (`prompt_harness/builder.py`, which gained a `skill_refs` param), and the
+  external-agent path (`engine.py`, resolved via `org_engine.get_role_skill_refs`). Previously
+  `skill_refs` was stored and surfaced in the UI but ignored at prompt-build time, so every role
+  saw every skill. The `physical-ai-robotics-company` preset roles now mount `physical_ai` (plus
+  `coding`/`deployment`/`writing`), and the `roboforce-titan` saved org carries them.
+  Tests: `tests/test_skill_refs_scoping.py`.
+
 - **Physical AI / robotics domain pack** — repositions OpenOPC to staff the "founding
   AI-native role" for the Physical AI industry, with RoboForce as the prototype:
   - `opc/market/builtin_presets/physical_ai_robotics_company.yaml` — an industry-generalized

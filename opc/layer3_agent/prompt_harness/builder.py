@@ -77,6 +77,7 @@ class PromptHarnessBuilder:
         context_assembler: Any,
         preferences: Any,
         skills: Any,
+        skill_refs: list[str] | None = None,
     ) -> None:
         self.task = task
         self.role_id = role_id
@@ -84,6 +85,7 @@ class PromptHarnessBuilder:
         self.context_assembler = context_assembler
         self.preferences = preferences
         self.skills = skills
+        self.skill_refs = list(skill_refs or [])
 
     async def build(
         self,
@@ -134,6 +136,7 @@ class PromptHarnessBuilder:
                     role_id=self.role_id,
                     user_facing=_memory_skill_user_facing(self.task, self.role_id),
                     final_decider_role_id=_final_decider_role_id(self.task),
+                    skill_refs=self.skill_refs,
                 )
                 or ""
             ).strip()
