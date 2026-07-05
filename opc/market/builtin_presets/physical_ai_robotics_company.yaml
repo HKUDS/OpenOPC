@@ -73,6 +73,7 @@ roles:
     name: Founding AI Native Lead
     skill_refs:
       - physical_ai
+      - physical_ai_operating_loop
       - coding
       - deployment
       - writing
@@ -93,10 +94,12 @@ roles:
       - Anchor every decision to a measurable capability target on real hardware (task success rate, cycle time, precision), not model metrics in isolation.
       - Keep the team driving the robot-learning flywheel end to end; do not let the org stall in research without a path to a deployed task.
       - Final deliverable must state the target task, the achieved capability level, the data/sim/eval evidence, the deployment readiness verdict, and the next flywheel iteration.
+      - Promote a capability up the release ladder (0 scripted -> 1 teleop -> 2 assisted -> 3 supervised -> 4 bounded autonomy -> 5 generalized) only on evidence within a defined operating domain, never on demo polish. Track human-minutes per useful robot-hour as the honest progress metric.
   - id: robot_learning_lead
     name: Robot Learning Lead
     skill_refs:
       - physical_ai
+      - physical_ai_operating_loop
       - coding
       - deployment
       - writing
@@ -118,6 +121,7 @@ roles:
     name: Foundation Model Scientist
     skill_refs:
       - physical_ai
+      - physical_ai_operating_loop
       - coding
       - deployment
       - writing
@@ -132,6 +136,7 @@ roles:
     name: Data Engine Engineer
     skill_refs:
       - physical_ai
+      - physical_ai_operating_loop
       - coding
       - deployment
       - writing
@@ -146,6 +151,7 @@ roles:
     name: Sim2Real Engineer
     skill_refs:
       - physical_ai
+      - physical_ai_operating_loop
       - coding
       - deployment
       - writing
@@ -160,6 +166,7 @@ roles:
     name: Robotics Software Lead
     skill_refs:
       - physical_ai
+      - physical_ai_operating_loop
       - coding
       - deployment
       - writing
@@ -180,6 +187,7 @@ roles:
     name: Perception Engineer
     skill_refs:
       - physical_ai
+      - physical_ai_operating_loop
       - coding
       - deployment
       - writing
@@ -194,6 +202,7 @@ roles:
     name: Manipulation Engineer
     skill_refs:
       - physical_ai
+      - physical_ai_operating_loop
       - coding
       - deployment
       - writing
@@ -208,6 +217,7 @@ roles:
     name: Motion Planning Engineer
     skill_refs:
       - physical_ai
+      - physical_ai_operating_loop
       - coding
       - deployment
       - writing
@@ -221,6 +231,7 @@ roles:
     name: Deployment & Field Engineer
     skill_refs:
       - physical_ai
+      - physical_ai_operating_loop
       - coding
       - deployment
       - writing
@@ -235,6 +246,7 @@ roles:
     name: AI Infra & Reliability Engineer
     skill_refs:
       - physical_ai
+      - physical_ai_operating_loop
       - coding
       - deployment
       - writing
@@ -247,6 +259,8 @@ roles:
     toolset: engineering
     prompt_refs:
       - 'Gate on measured evidence: reject any policy or deployment that lacks held-out success rates or violates a safety envelope.'
+      - 'You are the independent referee (maker != checker) — never let the policy that moved the robot grade its own homework. Emit a capability scorecard (task success, safety, robustness, efficiency, human burden, generalization), not a pass/fail label.'
+      - 'Safety is a terminal gate, not a weighted score: a safety failure blocks promotion regardless of any other result and rolls the change back. Every accepted fix must add a durable regression asset so a solved failure cannot silently return.'
 work_item_templates:
   - id: capability_brief
     title: Capability Brief

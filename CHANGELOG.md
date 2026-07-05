@@ -8,6 +8,23 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **Physical AI operating-loop doctrine — the "AI-Native Physical AI Company" blueprint made runnable.**
+  - `skills/core/physical_ai_operating_loop.md` — a mountable role skill encoding the outer loop
+    (company learns about the robot), maker≠checker independent referee → capability scorecard,
+    safety-as-a-terminal-gate, the 0→5 release ladder, human-burden ratio, and curated capability
+    memory. Mounted on all 11 `physical-ai-robotics-company` roles via `skill_refs`.
+  - Preset prompt_refs enriched: `ai_infra_reliability_engineer` is now the independent referee
+    (emit a scorecard, safety terminal gate, every fix adds a regression asset);
+    `founding_ai_native_lead` promotes capabilities up the release ladder on evidence and tracks
+    human-minutes per useful robot-hour. `roboforce-titan` saved org regenerated.
+  - `docs/physical-ai-operating-loop.md` — eval + gap analysis mapping each blueprint idea to an
+    OpenOPC primitive (present / partial / doctrine-only), plus the honest backlog a real robot
+    deployment still needs (episode schema, evaluator wiring, burden instrumentation).
+  - `landing/infographics/physical-ai-operating-loop.html` — the doctrine visualized.
+  - README restructured toward the anyagent pattern: thesis blockquote, inline nav, and a dated
+    `## 📰 News` highlight reel.
+  - Tests: `tests/test_physical_ai_robotics_org.py` asserts the doctrine skill mounts on every role
+    and the referee/ladder prompts are present.
 - **Infographics for the essential docs.** `landing/infographics/` — one visual, self-contained,
   theme-aware one-pager per essential doc (shared `ig.css`): How OpenOPC Works (the three loops +
   work-item state machine), Physical AI Founding Roles (the robot-learning flywheel + 10

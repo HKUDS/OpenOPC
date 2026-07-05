@@ -51,8 +51,13 @@ roles:
   - Final deliverable must state the target task, the achieved capability level, the
     data/sim/eval evidence, the deployment readiness verdict, and the next flywheel
     iteration.
+  - Promote a capability up the release ladder (0 scripted -> 1 teleop -> 2 assisted
+    -> 3 supervised -> 4 bounded autonomy -> 5 generalized) only on evidence within
+    a defined operating domain, never on demo polish. Track human-minutes per useful
+    robot-hour as the honest progress metric.
   skill_refs:
   - physical_ai
+  - physical_ai_operating_loop
   - coding
   - deployment
   - writing
@@ -112,6 +117,7 @@ roles:
     before advancing a policy to integration.
   skill_refs:
   - physical_ai
+  - physical_ai_operating_loop
   - coding
   - deployment
   - writing
@@ -166,6 +172,7 @@ roles:
     \ quality work within your area of expertise."
   skill_refs:
   - physical_ai
+  - physical_ai_operating_loop
   - coding
   - deployment
   - writing
@@ -215,6 +222,7 @@ roles:
     \ on delivering quality work within your area of expertise."
   skill_refs:
   - physical_ai
+  - physical_ai_operating_loop
   - coding
   - deployment
   - writing
@@ -264,6 +272,7 @@ roles:
     \ quality work within your area of expertise."
   skill_refs:
   - physical_ai
+  - physical_ai_operating_loop
   - coding
   - deployment
   - writing
@@ -316,6 +325,7 @@ roles:
     surface interface contracts and real-time constraints early.
   skill_refs:
   - physical_ai
+  - physical_ai_operating_loop
   - coding
   - deployment
   - writing
@@ -368,6 +378,7 @@ roles:
     \ quality work within your area of expertise."
   skill_refs:
   - physical_ai
+  - physical_ai_operating_loop
   - coding
   - deployment
   - writing
@@ -417,6 +428,7 @@ roles:
     \ your area of expertise."
   skill_refs:
   - physical_ai
+  - physical_ai_operating_loop
   - coding
   - deployment
   - writing
@@ -465,6 +477,7 @@ roles:
     \ of expertise."
   skill_refs:
   - physical_ai
+  - physical_ai_operating_loop
   - coding
   - deployment
   - writing
@@ -516,6 +529,7 @@ roles:
     \ work within your area of expertise."
   skill_refs:
   - physical_ai
+  - physical_ai_operating_loop
   - coding
   - deployment
   - writing
@@ -565,8 +579,16 @@ roles:
     \ outputs for quality and correctness. Approve quality work or request changes."
   - 'Gate on measured evidence: reject any policy or deployment that lacks held-out
     success rates or violates a safety envelope.'
+  - You are the independent referee (maker != checker) — never let the policy that
+    moved the robot grade its own homework. Emit a capability scorecard (task success,
+    safety, robustness, efficiency, human burden, generalization), not a pass/fail
+    label.
+  - 'Safety is a terminal gate, not a weighted score: a safety failure blocks promotion
+    regardless of any other result and rolls the change back. Every accepted fix must
+    add a durable regression asset so a solved failure cannot silently return.'
   skill_refs:
   - physical_ai
+  - physical_ai_operating_loop
   - coding
   - deployment
   - writing
@@ -671,7 +693,7 @@ installed_packages:
 - package_id: physical-ai-robotics-company
   name: Physical AI Robotics Company
   version: 1.0.0
-  installed_at: '2026-07-05T01:57:28.847166+00:00'
+  installed_at: '2026-07-05T07:01:28.758058+00:00'
   source_path: builtin
   role_ids:
   - founding_ai_native_lead

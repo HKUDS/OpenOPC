@@ -6,7 +6,7 @@
   </a>
 </p>
 <p align="center"><sub><b>One-click deploys the <a href="landing/index.html">landing page</a></b> (in <code>landing/</code>) to Vercel. OpenOPC itself is a local-first daemon — WebSocket, subprocess-driven agents, a browser, and SQLite — so the <em>app</em> runs on your machine via <code>opc ui</code>, not on serverless.</sub></p>
-<p align="center"><sub>📊 <b>Visual infographics</b> of the essential docs — <a href="landing/infographics/how-it-works.html">how it works</a> · <a href="landing/infographics/physical-ai.html">Physical AI roles</a> · <a href="landing/infographics/metadata-ownership.html">metadata ownership</a> · <a href="landing/infographics/channels.html">channels</a> · <a href="landing/infographics/cli.html">CLI</a> — live in <a href="landing/infographics/"><code>landing/infographics/</code></a>. They render on the deployed site or open standalone in any browser.</sub></p>
+<p align="center"><sub>📊 <b>Visual infographics</b> of the essential docs — <a href="landing/infographics/how-it-works.html">how it works</a> · <a href="landing/infographics/physical-ai.html">Physical AI roles</a> · <a href="landing/infographics/physical-ai-operating-loop.html">operating loop</a> · <a href="landing/infographics/metadata-ownership.html">metadata ownership</a> · <a href="landing/infographics/channels.html">channels</a> · <a href="landing/infographics/cli.html">CLI</a> — live in <a href="landing/infographics/"><code>landing/infographics/</code></a>. They render on the deployed site or open standalone in any browser.</sub></p>
 
 🏗️ **Self-Built** — Fully automated to recruit role-specific AI employees and build the org.
 
@@ -23,7 +23,52 @@
   <a href="https://github.com/HKUDS/.github/blob/main/profile/README.md"><img src="https://img.shields.io/badge/WeChat-Group-C5EAB4?style=flat-square&logo=wechat&logoColor=white" alt="WeChat" /></a>
 </p>
 
+<p align="center">
+  <a href="#-news">News</a> · <a href="#quick-start">Quick Start</a> · <a href="#how-openopc-works">How It Works</a> · <a href="#built-for-physical-ai-staff-the-founding-ai-native-role">Physical AI</a> · <a href="landing/infographics/">Infographics</a> · <a href="#cli-guide">CLI</a> · <a href="#configuration">Configuration</a>
+</p>
+
 ![OpenOPC hero banner](docs/assets/chat.png)
+
+---
+
+> **Most robotics companies ship a demo. An AI-native company ships a _loop_** — one that turns every
+> real-world attempt into a safer, more capable next attempt, judged by an independent referee, and
+> never lets a robot grade its own homework. OpenOPC is the runtime for that loop: it **staffs** the
+> company, **runs** the work through review-gated loops, and **learns** from every run.
+
+## 📰 News
+
+- **2026-07-05** — **The "AI-Native Physical AI Company" blueprint is now runnable doctrine, not prose.**
+  A manifesto argued the winning Physical AI companies win on the *outer loop* (the company learns
+  about the robot), not the demo. We turned it into something the agents actually run: a mountable
+  role skill ([`physical_ai_operating_loop`](skills/core/physical_ai_operating_loop.md)) mounted on
+  all 11 robotics roles, with the `ai_infra_reliability_engineer` prompted as the **independent
+  referee** (maker ≠ checker → a capability scorecard) and **safety as a terminal gate**, and the
+  `founding_ai_native_lead` prompted to promote up the **0→5 release ladder** on evidence. Full
+  eval + gap map: [`docs/physical-ai-operating-loop.md`](docs/physical-ai-operating-loop.md) ·
+  [infographic](landing/infographics/physical-ai-operating-loop.html).
+- **2026-07-05** — **Infographics for every essential doc.** One self-contained, theme-aware visual
+  one-pager per essential doc (how-it-works · Physical AI roles · operating loop · metadata
+  ownership · channels · CLI) under [`landing/infographics/`](landing/infographics/), each honoring
+  the two-reader standard (a plain mental model mapped 1-to-1 to the exact file/type/command).
+- **2026-07-05** — **1-click Vercel landing page.** A "Deploy to Vercel" button (top of this README)
+  ships the [landing page](landing/index.html). The app itself stays local-first — it's a stateful
+  daemon (WebSocket + subprocess agents + Playwright + SQLite) that serverless can't host, and the
+  button says so honestly.
+- **2026-07-05** — **Role-level skill mounting (roadmap #1).** `skill_refs` was stored and shown in
+  the UI but ignored at prompt-build time — every role saw every skill. Now
+  `SkillLibrary.build_skills_summary` scopes optional skills to a role's `skill_refs` (empty = all,
+  backward-compatible; `always`-on skills stay global), wired through all three prompt paths. New
+  tests in `tests/test_skill_refs_scoping.py`.
+- **2026-07-04** — **`main` greened, honestly.** A full-suite run surfaced 41 pre-existing failures
+  (none from the physical-AI work — proven by a baseline diff). Triaged and cut to 24: gated the 13
+  live-LLM integration tests behind `OPC_RUN_INTEGRATION` + fixed their stale helper, and repaired
+  doc/symbol drift. Zero regressions.
+- **2026-07-04** — **Physical AI domain pack.** The `physical-ai-robotics-company` architecture
+  preset (11 roles, a robot-learning-flywheel work-item DAG), a RoboForce-Titan prototype org, 10
+  `robotics` talent templates, and the `physical_ai` role skill — anchored on RoboForce's real open
+  **Founding AI Native Lead** role, generalized across the industry. See
+  [`docs/physical-ai-founding-roles.md`](docs/physical-ai-founding-roles.md).
 
 ## Built For Physical AI: Staff The Founding AI-Native Role
 
@@ -48,10 +93,13 @@ Two artifacts make it concrete (the OpenOPC engine below runs them):
 |---|---|---|
 | **Physical AI Robotics Company** — the industry-generalized org (11 roles, a flywheel work-item DAG) | `opc/market/builtin_presets/physical_ai_robotics_company.yaml` (a built-in Marketplace architecture preset) | `opc market apply-preset physical-ai-robotics-company` |
 | **RoboForce Titan** — one concrete instance of that preset, the prototype | `.opc/config/company_orgs/org_roboforce-titan_config.yaml` (a saved Company-Mode org) | `opc chat -p demo --mode org --org roboforce-titan "…"` |
-| **Robotics talent + role skill** — 10 hireable role templates + domain knowledge | `opc/market/talent_presets.py` (`category: robotics`), `skills/core/physical_ai.md` | `opc talent list` |
+| **Robotics talent + role skills** — 10 hireable role templates + domain knowledge + operating doctrine | `opc/market/talent_presets.py` (`category: robotics`), `skills/core/physical_ai.md`, `skills/core/physical_ai_operating_loop.md` | `opc talent list` |
 
 The JD research behind these roles — RoboForce's verified careers taxonomy plus the cross-industry
 role archetypes — is in **[`docs/physical-ai-founding-roles.md`](docs/physical-ai-founding-roles.md)**.
+The **operating doctrine** — how a robotics role should actually run the outer loop (independent
+referee, safety-as-a-gate, the 0→5 release ladder, human-burden ratio), and how each idea maps to an
+existing OpenOPC primitive — is in **[`docs/physical-ai-operating-loop.md`](docs/physical-ai-operating-loop.md)**.
 
 **Everything below is the engine.** OpenOPC is a general AI-company runtime (Self-Built, Self-Run,
 Self-Grown); the Physical AI org above is one architecture it runs. The rest of this README

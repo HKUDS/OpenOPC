@@ -50,9 +50,31 @@ def test_physical_ai_preset_loads_and_infers_final_decider() -> None:
     template_ids = {t["id"] for t in preset.work_item_templates}
     assert {"teleop_data_plan", "policy_training", "sim2real_eval", "field_pilot",
             "learning_feedback", "capability_delivery"} <= template_ids
-    # Every role mounts the physical_ai domain skill via skill_refs.
+    # Every role mounts the physical_ai domain skill + the operating-loop doctrine.
     for role in preset.roles:
-        assert "physical_ai" in (role.get("skill_refs") or []), role["id"]
+        refs = role.get("skill_refs") or []
+        assert "physical_ai" in refs, role["id"]
+        assert "physical_ai_operating_loop" in refs, role["id"]
+
+
+def test_operating_loop_doctrine_skill_and_gates_present() -> None:
+    from opc.market.architecture_registry import get_preset
+
+    # The doctrine ships as a mountable role skill.
+    skill = REPO_ROOT / "skills" / "core" / "physical_ai_operating_loop.md"
+    body = skill.read_text(encoding="utf-8")
+    for anchor in ("maker", "release ladder", "Human Burden", "safety is a gate"):
+        assert anchor.lower() in body.lower(), anchor
+
+    preset = get_preset("physical-ai-robotics-company")
+    roles = {r["id"]: r for r in preset.roles}
+    # The independent-referee role carries the maker!=checker + safety-terminal doctrine.
+    referee = " ".join(roles["ai_infra_reliability_engineer"].get("prompt_refs") or [])
+    assert "independent referee" in referee.lower()
+    assert "terminal gate" in referee.lower()
+    # The final decider carries the release-ladder promotion rule.
+    lead = " ".join(roles["founding_ai_native_lead"].get("prompt_refs") or [])
+    assert "release ladder" in lead.lower()
 
 
 def test_physical_ai_preset_applies_to_config() -> None:
