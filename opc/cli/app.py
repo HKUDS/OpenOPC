@@ -1189,28 +1189,7 @@ def status(
     config = _get_config()
     opc_home = get_opc_home()
 
-    console.print(Panel(f"[bold]OPC v{__version__}[/bold]", border_style="blue"))
-    console.print(f"  Home: {opc_home}")
-    console.print(f"  Model: {config.llm.default_model}")
-    console.print(f"  Log level: {config.system.log_level}")
-    console.print(f"  Max iterations: {config.system.max_agent_iterations}")
-    console.print(f"  Autonomy mode: {config.autonomy.mode}")
-    console.print(f"  Max auto-approve risk: {config.autonomy.max_auto_approve_risk}")
-
-    # Roles
-    console.print("\n[bold]Organization:[/bold]")
-    console.print(f"  Company: {config.org.company_name}")
-    for role in config.org.roles:
-        console.print(f"  - {role.name} ({role.id}): {role.responsibility[:60]}...")
-
-    # External agents
-    console.print("\n[bold]External Agents:[/bold]")
-    for name, agent_config in config.agents.agents.items():
-        status_str = "[success]enabled[/success]" if agent_config.enabled else "[warning]disabled[/warning]"
-        console.print(f"  - {name}: {status_str}")
-
-    if not config.agents.agents:
-        console.print("  (none configured)")
+    _print_status_summary(config, opc_home)
 
     console.print("\n[bold]External Agent Preflight:[/bold]")
     if external_agent_preflight:
@@ -1555,29 +1534,7 @@ async def _exec_message(
     project_id = str(project or "default").strip() or "default"
     event_state: dict[str, Any] = {"seq": 0, "task_id": "", "session_id": ""}
 
-    async def on_progress(*args: Any, **kwargs: Any) -> None:
-        if not stream_json:
-            return
-        _print_exec_event(
-            event_state,
-            "runtime_update",
-            project_id=project_id,
-            task_id=str(event_state.get("task_id", "") or ""),
-            session_id=str(event_state.get("session_id", "") or ""),
-            payload={"args": [_exec_event_payload(arg) for arg in args], "kwargs": kwargs},
-        )
-
-    async def on_runtime_event(event: Any) -> None:
-        if not stream_json:
-            return
-        _print_exec_event(
-            event_state,
-            "runtime_update",
-            project_id=project_id,
-            task_id=str(event_state.get("task_id", "") or ""),
-            session_id=str(event_state.get("session_id", "") or ""),
-            payload=_exec_event_payload(event),
-        )
+    on_progress, on_runtime_event = _make_exec_stream_callbacks(event_state, stream_json, project_id)
 
     try:
         async with OfficeServiceFactory(
@@ -2470,33 +2427,8 @@ def channels_status():
         console.print(f"  PID: {runtime_pid}")
     console.print("[bold]Channels:[/bold]")
     for spec in ordered_provider_specs():
-        if hasattr(manager, "get_status"):
-            status = manager.get_status(spec.name)
-        else:
-            channel = manager.get_channel(spec.name)
-            capability = channel.describe_capability() if channel is not None else {}
-            status = {
-                "name": spec.name,
-                "enabled": bool(getattr(getattr(config.channels, spec.name), "enabled", False)),
-                "available": capability.get("available", channel is not None),
-                "configured": capability.get("configured", channel is not None),
-                "delivery_mode": capability.get("delivery_mode", spec.delivery_mode),
-                "bridge_required": spec.bridge_required,
-                "last_error": capability.get("last_error", ""),
-            }
-        details: list[str] = ["enabled" if status["enabled"] else "disabled"]
-        if status["enabled"]:
-            details.append("available" if status["available"] else "dependency-missing")
-            details.append("configured" if status["configured"] else "config-missing")
-            if status["bridge_required"]:
-                details.append("bridge-required")
-            if status["delivery_mode"]:
-                details.append(str(status["delivery_mode"]))
-        if runtime_running and spec.name in runtime_channels:
-            details.append("runtime-active")
-        if status["last_error"]:
-            details.append(f"error={status['last_error']}")
-        console.print(f"  - {spec.name}: {', '.join(details)}")
+        line = _channel_status_line(manager, config, spec, runtime_running, runtime_channels)
+        console.print(f"  - {line}")
 
 
 @channels_app.command("start")
@@ -8369,3 +8301,87 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+
+def _print_status_summary(config: OPCConfig, opc_home: Path) -> None:
+    """Print the system, organization, and external-agent status sections."""
+    console.print(Panel(f"[bold]OPC v{__version__}[/bold]", border_style="blue"))
+    console.print(f"  Home: {opc_home}")
+    console.print(f"  Model: {config.llm.default_model}")
+    console.print(f"  Log level: {config.system.log_level}")
+    console.print(f"  Max iterations: {config.system.max_agent_iterations}")
+    console.print(f"  Autonomy mode: {config.autonomy.mode}")
+    console.print(f"  Max auto-approve risk: {config.autonomy.max_auto_approve_risk}")
+
+    # Roles
+    console.print("\n[bold]Organization:[/bold]")
+    console.print(f"  Company: {config.org.company_name}")
+    for role in config.org.roles:
+        console.print(f"  - {role.name} ({role.id}): {role.responsibility[:60]}...")
+
+    # External agents
+    console.print("\n[bold]External Agents:[/bold]")
+    for name, agent_config in config.agents.agents.items():
+        status_str = "[success]enabled[/success]" if agent_config.enabled else "[warning]disabled[/warning]"
+        console.print(f"  - {name}: {status_str}")
+
+    if not config.agents.agents:
+        console.print("  (none configured)")
+
+def _make_exec_stream_callbacks(event_state, stream_json, project_id):
+    """Build the stream-json progress + runtime-event callbacks for `exec`."""
+    async def on_progress(*args: Any, **kwargs: Any) -> None:
+        if not stream_json:
+            return
+        _print_exec_event(
+            event_state,
+            "runtime_update",
+            project_id=project_id,
+            task_id=str(event_state.get("task_id", "") or ""),
+            session_id=str(event_state.get("session_id", "") or ""),
+            payload={"args": [_exec_event_payload(arg) for arg in args], "kwargs": kwargs},
+        )
+
+    async def on_runtime_event(event: Any) -> None:
+        if not stream_json:
+            return
+        _print_exec_event(
+            event_state,
+            "runtime_update",
+            project_id=project_id,
+            task_id=str(event_state.get("task_id", "") or ""),
+            session_id=str(event_state.get("session_id", "") or ""),
+            payload=_exec_event_payload(event),
+        )
+    return on_progress, on_runtime_event
+
+def _channel_status_line(manager, config, spec, runtime_running, runtime_channels) -> str:
+    """Compute one provider's status line for `channels status`."""
+    if hasattr(manager, "get_status"):
+        status = manager.get_status(spec.name)
+    else:
+        channel = manager.get_channel(spec.name)
+        capability = channel.describe_capability() if channel is not None else {}
+        status = {
+            "name": spec.name,
+            "enabled": bool(getattr(getattr(config.channels, spec.name), "enabled", False)),
+            "available": capability.get("available", channel is not None),
+            "configured": capability.get("configured", channel is not None),
+            "delivery_mode": capability.get("delivery_mode", spec.delivery_mode),
+            "bridge_required": spec.bridge_required,
+            "last_error": capability.get("last_error", ""),
+        }
+    details: list[str] = ["enabled" if status["enabled"] else "disabled"]
+    if status["enabled"]:
+        details.append("available" if status["available"] else "dependency-missing")
+        details.append("configured" if status["configured"] else "config-missing")
+        if status["bridge_required"]:
+            details.append("bridge-required")
+        if status["delivery_mode"]:
+            details.append(str(status["delivery_mode"]))
+    if runtime_running and spec.name in runtime_channels:
+        details.append("runtime-active")
+    if status["last_error"]:
+        details.append(f"error={status['last_error']}")
+    return f"{spec.name}: {', '.join(details)}"

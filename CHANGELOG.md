@@ -8,6 +8,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- **Refactor batch 2: cleared two more `opc/cli/app.py` god-functions + shrank `exec`.** Continuing
+  PR #12, extracted (verbatim, behaviour-preserving): `status` 67→**46** lines and `channels_status`
+  54→**29** (both now below the god-function threshold — `anyagent analyze` no longer flags them) via
+  `_print_status_summary` and `_channel_status_line`; and `_exec_message` 153→**124** by lifting its
+  two `stream_json` callbacks into `_make_exec_stream_callbacks`. Verified identical behaviour:
+  `tests/test_cli_app.py` **88 passed** before and after; full suite unchanged (1655 passed, 24
+  pre-existing failures, zero regressions).
+
 - **Refactor: extracted the default-org builder out of `opc/cli/app.py::init`.** `init()` was a
   263-line god-function (flagged by `anyagent analyze`); ~170 of those lines were a pure, hardcoded
   default "Corporate" org (roles + escalation rules). Extracted verbatim to
