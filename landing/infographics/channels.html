@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>OpenOPC Channels — infographic</title>
+<meta name="description" content="Nine messaging providers behind one registry, deny-by-default inbound, and how bridge providers reach the walled ones.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E%F0%9F%92%AC%3C/text%3E%3C/svg%3E">
+<link rel="stylesheet" href="ig.css">
+</head>
+<body>
+<div class="topbar"><div class="wrap">
+  <a class="brand" href="index.html"><span class="dot">🤖</span>OpenOPC</a>
+  <span class="sp"></span>
+  <a class="tl" href="index.html">← All infographics</a>
+</div></div>
+
+<header class="hero"><div class="wrap">
+  <span class="eyebrow">Layer 0 · Channels</span>
+  <h1>Talk to your company from any chat app</h1>
+  <p class="lead">A channel runtime (<span class="mono">opc/channels/</span>) routes external messages into
+    the engine and sends replies back. Each provider is an optional adapter with its own dependency,
+    credentials, and — for some — a companion bridge. Metadata lives in
+    <span class="mono">provider_registry.py</span>.</p>
+</div></header>
+
+<section><div class="wrap">
+  <div class="sec-title"><span class="n">1</span><h2>Three ways a provider connects</h2></div>
+  <div class="grid g3">
+    <div class="card"><div class="k">🔌</div><h3>socket</h3><p>A live socket the provider pushes to — Slack, Discord, Feishu, DingTalk, QQ.</p></div>
+    <div class="card"><div class="k">🔁</div><h3>polling</h3><p>OpenOPC pulls for new messages — Telegram, Email, Matrix.</p></div>
+    <div class="card"><div class="k">🌉</div><h3>bridge</h3><p>A separate companion service you run; OpenOPC connects to it — WhatsApp, Mochat.</p></div>
+  </div>
+</div></section>
+
+<section><div class="wrap">
+  <div class="sec-title"><span class="n">2</span><h2>The provider matrix</h2></div>
+  <div class="scroll"><table class="matrix">
+    <thead><tr><th>Provider</th><th>Runtime</th><th>Install extra</th><th>Required config</th></tr></thead>
+    <tbody>
+      <tr><td><code>telegram</code></td><td>polling</td><td><code>channels-telegram</code></td><td><code>token</code></td></tr>
+      <tr><td><code>slack</code></td><td>socket</td><td><code>channels-slack</code></td><td><code>bot_token</code>, <code>app_token</code></td></tr>
+      <tr><td><code>discord</code></td><td>socket</td><td><code>channels-discord</code></td><td><code>token</code></td></tr>
+      <tr><td><code>feishu</code></td><td>socket</td><td><code>channels-feishu</code></td><td><code>app_id</code>, <code>app_secret</code></td></tr>
+      <tr><td><code>dingtalk</code></td><td>socket</td><td><code>channels-dingtalk</code></td><td><code>client_id</code>, <code>client_secret</code></td></tr>
+      <tr><td><code>qq</code></td><td>socket</td><td><code>channels-qq</code></td><td><code>app_id</code>, <code>secret</code></td></tr>
+      <tr><td><code>matrix</code></td><td>polling</td><td><code>channels-matrix</code></td><td><code>homeserver</code>, <code>access_token</code>, <code>user_id</code></td></tr>
+      <tr><td><code>email</code></td><td>polling</td><td><code>channels-email</code></td><td>IMAP/SMTP fields, <code>consent_granted</code></td></tr>
+      <tr><td><code>whatsapp</code> 🌉</td><td>bridge</td><td><code>channels-whatsapp</code></td><td><code>bridge_url</code></td></tr>
+      <tr><td><code>mochat</code> 🌉</td><td>bridge</td><td><code>channels-mochat</code></td><td><code>base_url</code>, <code>claw_token</code>, <code>agent_user_id</code></td></tr>
+    </tbody>
+  </table></div>
+</div></section>
+
+<section><div class="wrap">
+  <div class="sec-title"><span class="n">3</span><h2>Setup flow &amp; messaging semantics</h2></div>
+  <div class="grid g2">
+    <div class="card">
+      <h3>Wire a provider in 6 steps</h3>
+      <p style="margin-top:8px">
+        <b>1.</b> <span class="mono">opc init</span> &nbsp;
+        <b>2.</b> install the extra &nbsp;
+        <b>3.</b> edit <span class="mono">channel_config.yaml</span> &nbsp;
+        <b>4.</b> set <code>allow_from</code> &nbsp;
+        <b>5.</b> <span class="mono">opc channels login &lt;p&gt;</span> &nbsp;
+        <b>6.</b> <span class="mono">opc channels start -p demo</span> (or <span class="mono">opc run</span>)
+      </p>
+    </div>
+    <div class="card">
+      <h3>How messages flow</h3>
+      <div class="flow" style="margin-top:6px">
+        <span class="step">inbound</span><span class="arr">→</span>
+        <span class="step"><code>UserMessage</code></span><span class="arr">→</span>
+        <span class="step">engine</span><span class="arr">→</span>
+        <span class="step"><code>SystemMessage</code></span><span class="arr">→</span>
+        <span class="step">reply</span>
+      </div>
+      <p style="margin-top:8px">Session ids derive from provider chat/thread context when available.</p>
+    </div>
+  </div>
+  <p style="margin-top:16px"><span class="callout"><b>Security — deny by default.</b> Inbound sender allow-lists (<code>allow_from</code>) are enforced
+    <em>before</em> a message is accepted. An <b>empty <code>allow_from</code> denies everyone</b> — you opt senders in,
+    never out. Bridge providers additionally need their companion service running (OpenOPC does not manage it).</span></p>
+</div></section>
+
+<div class="footer"><div class="wrap">
+  <span>Source: <a href="https://github.com/wjlgatech/physical-ai-native/blob/main/docs/channels.md">docs/channels.md</a> + <a href="https://github.com/wjlgatech/physical-ai-native/blob/main/docs/channel-bridges.md">channel-bridges.md</a> · <a href="index.html">All infographics</a></span>
+  <span class="pills"><span class="pill">10 providers</span><span class="pill">deny-by-default</span></span>
+</div></div>
+</body>
+</html>

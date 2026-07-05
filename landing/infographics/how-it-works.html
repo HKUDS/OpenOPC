@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>How OpenOPC Works — infographic</title>
+<meta name="description" content="OpenOPC's three coupled loops (Self-Built, Self-Run, Self-Grown) and the work-item state machine, visualized.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E%E2%9A%99%EF%B8%8F%3C/text%3E%3C/svg%3E">
+<link rel="stylesheet" href="ig.css">
+</head>
+<body>
+<div class="topbar"><div class="wrap">
+  <a class="brand" href="index.html"><span class="dot">🤖</span>OpenOPC</a>
+  <span class="sp"></span>
+  <a class="tl" href="index.html">← All infographics</a>
+</div></div>
+
+<header class="hero"><div class="wrap">
+  <span class="eyebrow">How it works</span>
+  <h1>One brief → a staffed company → a delivery that gets smarter</h1>
+  <p class="lead">OpenOPC is a coordination runtime, not just an agent launcher. Given a goal it turns
+    three loops: it <b>staffs</b> the org, <b>runs</b> the work, and <b>learns</b> from the outcome.</p>
+</div></header>
+
+<section><div class="wrap">
+  <div class="flow" style="justify-content:space-between">
+    <span class="step">🏗️ Self-Built<small>staff the org</small></span>
+    <span class="arr">→</span>
+    <span class="step">⚙️ Self-Run<small>execute the work</small></span>
+    <span class="arr">→</span>
+    <span class="step">🌱 Self-Grown<small>learn from the run</small></span>
+    <span class="arr">↺</span>
+    <span class="step">smarter next time<small>compounding knowledge</small></span>
+  </div>
+</div></section>
+
+<section><div class="wrap">
+  <div class="sec-title"><span class="n">1</span><h2>Self-Built — staff the organization</h2></div>
+  <div class="tr">
+    <div class="row"><div class="plain">Draw the org chart the goal demands</div><div class="to">→</div>
+      <div class="tech">A recruiter derives roles + reporting lines; roles live in <code>RoleConfig</code> under a company profile.</div></div>
+    <hr>
+    <div class="row"><div class="plain">Fill each seat — reuse a veteran or hire fresh</div><div class="to">→</div>
+      <div class="tech">The <code>recruiter</code> agent picks an existing employee (carrying prior context) or a fresh template from the talent pool.</div></div>
+  </div>
+</div></section>
+
+<section><div class="wrap">
+  <div class="sec-title"><span class="n">2</span><h2>Self-Run — execute the work</h2></div>
+  <p class="lead" style="margin-bottom:16px">Real work can't be fully planned. A <b>work-item state machine</b> drives everything:
+    each item's <b>phase</b> decides three things at once.</p>
+  <div class="grid g3">
+    <div class="card"><div class="k">📋</div><h3>Its kanban column</h3><p>Where the item stands — planning, execution, review, blocked, done.</p></div>
+    <div class="card"><div class="k">👑</div><h3>Its owner</h3><p>Which role is responsible <em>at that phase</em> — decomposer, worker, reviewer, or final decider.</p></div>
+    <div class="card"><div class="k">✅</div><h3>Its runnability</h3><p>Whether it's ready to proceed, or waiting on a dependency (<code>AWAITING_PEER</code>).</p></div>
+  </div>
+  <p style="margin:18px 0 8px;color:var(--muted)">A manager works items across <b>five modes</b>; decomposition defines a dependency DAG.</p>
+  <div class="flow">
+    <span class="step">execute</span><span class="step">delegate</span><span class="step">review</span>
+    <span class="step">integrate</span><span class="step">rework</span>
+    <span class="arr" style="margin-left:6px">⇒</span>
+    <span class="step">⚡ independent items run in parallel</span>
+    <span class="step">⏳ dependents wait on prerequisites</span>
+  </div>
+  <p style="margin-top:16px"><span class="callout"><b>Blockers surface mid-run.</b> Inside the team, a blocking message pauses the sender and
+    wakes the best-positioned role. Beyond the team's authority, the runtime <b>escalates to the human owner</b> — invoking your judgment exactly when it's needed.</span></p>
+</div></section>
+
+<section><div class="wrap">
+  <div class="sec-title"><span class="n">3</span><h2>Self-Grown — learn from the run</h2></div>
+  <div class="tr">
+    <div class="row"><div class="plain">Credit and blame land where they were earned</div><div class="to">→</div>
+      <div class="tech">User feedback resolves into <em>per-employee</em> evaluations; only roles that owned the relevant work items update.</div></div>
+    <hr>
+    <div class="row"><div class="plain">Turn noisy traces into reusable lessons</div><div class="to">→</div>
+      <div class="tech">Each role's tasks are distilled into its private experience profile (<code>employee_evolution.json</code>).</div></div>
+    <hr>
+    <div class="row"><div class="plain">Recurring lessons become team playbooks</div><div class="to">→</div>
+      <div class="tech">Promoted into shared playbooks new hires inherit from day one — so org knowledge compounds.</div></div>
+  </div>
+</div></section>
+
+<div class="footer"><div class="wrap">
+  <span>Source: README “How OpenOPC Works”. · <a href="index.html">All infographics</a></span>
+  <span class="pills"><span class="pill">Layer 2: Organization</span></span>
+</div></div>
+</body>
+</html>
