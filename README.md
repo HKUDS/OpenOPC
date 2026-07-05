@@ -1,4 +1,4 @@
-<h1 align="center" style="font-size: 1.75em;">OpenOPC: Your Personal AI-Native Company —<br>Self-Built, Self-Run, Self-Grown</h1>
+<h1 align="center" style="font-size: 1.75em;">OpenOPC: Build Your Personal AI-Native Company — Self-Built, Self-Run, Self-Grown</h1>
 
 <p align="center">
   <a href="https://vercel.com/new/clone?repository-url=https%3A%2F%2Fgithub.com%2Fwjlgatech%2Fphysical-ai-native&project-name=openopc-landing&repository-name=openopc-landing&root-directory=landing">
@@ -903,3 +903,10 @@ OpenOPC is built with gratitude for several open-source projects that helped sha
 - [HKUDS/nanobot](https://github.com/HKUDS/nanobot) for inspiration around skill-oriented agent design and `SKILL.md`-style organization.
 - [pixel-agents-hq/pixel-agents](https://github.com/pixel-agents-hq/pixel-agents) for inspiration around the animated pixel-art office visualization of agent activity.
 
+---
+
+<p align="center">
+  <em> ❤️ Thanks for visiting ✨ OpenOPC!</em><br><br>
+  <img src="https://visitor-badge.laobi.icu/badge?page_id=HKUDS.OpenOPC&style=for-the-badge&color=00d4ff"
+  alt="Views">
+</p>
