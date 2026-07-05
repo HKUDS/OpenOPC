@@ -77,6 +77,7 @@ roles:
       - coding
       - deployment
       - writing
+      - employee_loop_incentive
     responsibility: >
       Owns the capability thesis and runs the company as an AI-native loop:
       which physical task to crack first, what "done" means as a success-rate

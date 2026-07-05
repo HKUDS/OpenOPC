@@ -6,7 +6,7 @@
   </a>
 </p>
 <p align="center"><sub><b>One-click deploys the <a href="landing/index.html">landing page</a></b> (in <code>landing/</code>) to Vercel — see the <a href="docs/deploy-vercel.md">deploy runbook</a> for the canonical, auto-redeploying setup (root directory <code>landing</code>). OpenOPC itself is a local-first daemon — WebSocket, subprocess-driven agents, a browser, and SQLite — so the <em>app</em> runs on your machine via <code>opc ui</code>, not on serverless.</sub></p>
-<p align="center"><sub>📊 <b>Visual infographics</b> of the essential docs — <a href="landing/infographics/how-it-works.html">how it works</a> · <a href="landing/infographics/physical-ai.html">Physical AI roles</a> · <a href="landing/infographics/physical-ai-operating-loop.html">operating loop</a> · <a href="landing/infographics/physical-ai-readiness.html">readiness</a> · <a href="landing/infographics/metadata-ownership.html">metadata ownership</a> · <a href="landing/infographics/channels.html">channels</a> · <a href="landing/infographics/cli.html">CLI</a> — live in <a href="landing/infographics/"><code>landing/infographics/</code></a>. They render on the deployed site or open standalone in any browser.</sub></p>
+<p align="center"><sub>📊 <b>Visual infographics</b> of the essential docs — <a href="landing/infographics/how-it-works.html">how it works</a> · <a href="landing/infographics/physical-ai.html">Physical AI roles</a> · <a href="landing/infographics/physical-ai-operating-loop.html">operating loop</a> · <a href="landing/infographics/physical-ai-readiness.html">readiness</a> · <a href="landing/infographics/incentive-design.html">incentive design</a> · <a href="landing/infographics/metadata-ownership.html">metadata ownership</a> · <a href="landing/infographics/channels.html">channels</a> · <a href="landing/infographics/cli.html">CLI</a> — live in <a href="landing/infographics/"><code>landing/infographics/</code></a>. They render on the deployed site or open standalone in any browser.</sub></p>
 
 🏗️ **Self-Built** — Fully automated to recruit role-specific AI employees and build the org.
 
@@ -37,6 +37,18 @@
 > company, **runs** the work through review-gated loops, and **learns** from every run.
 
 ## 📰 News
+
+- **2026-07-05** — **The employee-loop incentive, made runnable — from "close the loop" to a coded payout.**
+  How do you get *every* employee (bottom-up, not top-down) to hunt and close loops while the Chief
+  AI-Native Officer builds the infra and codes the culture into a smart contract? You design a game:
+  make gaps visible, experiments cheap, verification independent, and payout automatic + proportional
+  to *verified compounding value*. Shipped as a mountable CNO skill
+  ([`employee_loop_incentive`](skills/core/employee_loop_incentive.md), mounted on the
+  `founding_ai_native_lead`), a hub + **incentive-design self-assessment** (L0 top-down → L4
+  self-incentivizing) in [`docs/employee-loop-incentive.md`](docs/employee-loop-incentive.md), an
+  [infographic](landing/infographics/incentive-design.html), and a reference Solidity sketch
+  [`contracts/VerifiedClosePayout.sol`](contracts/VerifiedClosePayout.sol) that encodes the three
+  non-negotiables in code: **maker ≠ checker**, **compounding vesting**, and a **safety-zero gate**.
 
 - **2026-07-05** — **One map for the physical-AI pack + a readiness self-assessment.** After seven
   units of additions, [`docs/physical-ai.md`](docs/physical-ai.md) is now the single entry point —

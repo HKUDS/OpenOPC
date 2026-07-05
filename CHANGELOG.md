@@ -8,6 +8,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **Employee-loop incentive doctrine — bottom-up loop-closing, made runnable (incl. a smart-contract sketch).**
+  How to make every employee discover + close loops (not top-down), verified by an independent referee
+  and rewarded on-chain for compounding value, while the CNO builds infra + culture:
+  - `skills/core/employee_loop_incentive.md` — the CNO's-game doctrine, mounted on the
+    `founding_ai_native_lead` (the CNO-equivalent) via `skill_refs`; `roboforce-titan` org regenerated.
+  - `docs/employee-loop-incentive.md` — the Inspire→Verify→Reward→Measure map (each pinned to an
+    OpenOPC primitive + the WorkflowX friction sensor) + an 8-check **incentive-design self-assessment**
+    (L0 top-down → L4 self-incentivizing org).
+  - `contracts/VerifiedClosePayout.sol` — a reference (unaudited) Solidity sketch encoding the three
+    non-negotiables in code: **maker ≠ checker** (two signatures), **compounding vesting** (streamed
+    payout that re-verification extends), and a **safety-zero gate** (a safety fail zeroes the
+    unreleased reward). Reward triggers on a *verified close*, never a proposal.
+  - `landing/infographics/incentive-design.html` — the doctrine visualized.
+  - `tests/test_employee_loop_incentive.py` — hub link-integrity, scorecard completeness, CNO-only
+    skill mount, and the contract's three encoded invariants.
 - **One map for the physical-AI pack + a readiness self-assessment (compress · simplify · organize · invent).**
   - `docs/physical-ai.md` — the single entry point, structured **Staff · Operate · Measure**, linking
     every physical-AI doc, skill, preset, and infographic from one place. The canonical flywheel is
