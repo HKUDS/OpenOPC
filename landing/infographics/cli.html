@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>OpenOPC CLI &amp; Slash Commands — infographic</title>
+<meta name="description" content="Task vs Company mode, the CLI command groups, and the interactive slash console — the OpenOPC terminal surface at a glance.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E%E2%8C%A8%EF%B8%8F%3C/text%3E%3C/svg%3E">
+<link rel="stylesheet" href="ig.css">
+</head>
+<body>
+<div class="topbar"><div class="wrap">
+  <a class="brand" href="index.html"><span class="dot">🤖</span>OpenOPC</a>
+  <span class="sp"></span>
+  <a class="tl" href="index.html">← All infographics</a>
+</div></div>
+
+<header class="hero"><div class="wrap">
+  <span class="eyebrow">CLI · interactive slash console</span>
+  <h1>Drive the whole company from the terminal</h1>
+  <p class="lead"><span class="mono">opc chat</span> opens an interactive slash console for context, sessions,
+    runtime visibility, company work items, and org assets — no Office UI required. Source of truth:
+    <span class="mono">_SLASH_COMMANDS</span> in <span class="mono">opc/cli/app.py</span>.</p>
+</div></header>
+
+<section><div class="wrap">
+  <div class="sec-title"><span class="n">1</span><h2>Two execution modes</h2></div>
+  <div class="grid g2">
+    <div class="card" style="border-top:3px solid var(--accent)">
+      <h3>🎯 task</h3>
+      <p>One agent does the job — <code>native</code>, <code>codex</code>, <code>claude_code</code>,
+        <code>cursor</code>, or <code>opencode</code>. A card is usually one task-backed chat session.</p>
+    </div>
+    <div class="card" style="border-top:3px solid var(--warn)">
+      <h3>🏢 company</h3>
+      <p>An org of role-agents runs a work-item DAG with manager decompose / review / escalate.
+        <span class="mono">--mode org</span> is a compatibility selector for a saved org architecture.</p>
+    </div>
+  </div>
+  <p style="margin-top:14px;color:var(--muted)">Set it with <span class="mono">/mode task</span> or
+    <span class="mono">/mode company corporate</span>; pick a task agent with <span class="mono">/agent codex</span>.</p>
+</div></section>
+
+<section><div class="wrap">
+  <div class="sec-title"><span class="n">2</span><h2>Slash commands by group</h2></div>
+  <div class="grid g3">
+    <div class="card"><h3>Chat &amp; context</h3><p><code>/status</code> · <code>/mode</code> · <code>/agent</code> · <code>/domains</code> · <code>/queue</code> · <code>/help</code> · <code>/quit</code></p></div>
+    <div class="card"><h3>Project &amp; session</h3><p><code>/project list|create|switch</code> · <code>/session new|resume|send|complete</code> · <code>/stop</code> · <code>/continue</code></p></div>
+    <div class="card"><h3>Tasks &amp; runtime</h3><p><code>/tasks</code> · <code>/task show|move|done</code> · <code>/runtime</code> · <code>/logs</code> · <code>/comms</code> · <code>/checkpoints</code></p></div>
+    <div class="card"><h3>Recovery</h3><p><code>/recover</code> lists interrupted runtimes · <code>/recover resume|cancel|retry &lt;parent&gt;</code></p></div>
+    <div class="card"><h3>Company work &amp; board</h3><p><code>/staffing</code> · <code>/kanban [once|stop|all]</code> · <code>/board</code> · <code>/work-items list|show|role-status</code></p></div>
+    <div class="card"><h3>Org · talent · market</h3><p><code>/org role|policy|strategy|saved</code> · <code>/talent hire|import</code> · <code>/market apply-preset|install</code> · <code>/reorg</code></p></div>
+  </div>
+</div></section>
+
+<section><div class="wrap">
+  <div class="sec-title"><span class="n">3</span><h2>Flags &amp; safety</h2></div>
+  <div class="tr">
+    <div class="row"><div class="plain">Cap long lists</div><div class="to">→</div><div class="tech"><code>--limit N</code> (1–100 rows)</div></div>
+    <hr>
+    <div class="row"><div class="plain">See the full untruncated text</div><div class="to">→</div><div class="tech"><code>--full</code> expands compact terminal output</div></div>
+    <hr>
+    <div class="row"><div class="plain">Confirm anything destructive</div><div class="to">→</div><div class="tech"><code>--yes</code> is required for deletes / cancels</div></div>
+    <hr>
+    <div class="row"><div class="plain">Watch token spend</div><div class="to">→</div><div class="tech"><code>/cost</code> shows token &amp; cost counters</div></div>
+  </div>
+  <p style="margin-top:14px;color:var(--muted)">Aliases: <span class="mono">/p</span>=project, <span class="mono">/s</span>=session,
+    <span class="mono">/t</span>=task, <span class="mono">/recovery</span>=recover.</p>
+</div></section>
+
+<div class="footer"><div class="wrap">
+  <span>Source: <a href="https://github.com/wjlgatech/physical-ai-native/blob/main/docs/cli-chat-slash.md">docs/cli-chat-slash.md</a> · <a href="index.html">All infographics</a></span>
+  <span class="pills"><span class="pill">opc chat</span><span class="pill">task · company</span></span>
+</div></div>
+</body>
+</html>

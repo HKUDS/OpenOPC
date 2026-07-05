@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Company Metadata Ownership — infographic</title>
+<meta name="description" content="Which facts live on the DelegationWorkItem, which on the runtime Task, which are execution copies, and who wins a conflict.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E%F0%9F%97%82%EF%B8%8F%3C/text%3E%3C/svg%3E">
+<link rel="stylesheet" href="ig.css">
+</head>
+<body>
+<div class="topbar"><div class="wrap">
+  <a class="brand" href="index.html"><span class="dot">🤖</span>OpenOPC</a>
+  <span class="sp"></span>
+  <a class="tl" href="index.html">← All infographics</a>
+</div></div>
+
+<header class="hero"><div class="wrap">
+  <span class="eyebrow">Company Mode · engineering contract</span>
+  <h1>Two filing cabinets, one rule for who owns each fact</h1>
+  <p class="lead">Company Mode keeps two records with different jobs. Think of them as two filing cabinets:
+    one holds <b>what the business decided</b>, the other holds <b>how the machine ran it</b>. Put a fact in
+    the wrong cabinet and the invariant tests fail.</p>
+</div></header>
+
+<section><div class="wrap">
+  <div class="grid g2">
+    <div class="card" style="border-top:3px solid var(--accent)">
+      <h3><span class="badge own">work_item</span> &nbsp;DelegationWorkItem.metadata</h3>
+      <p>The <b>business</b> cabinet: everything scheduling, the board, collaboration, review/report, and user-visible
+        progress should read from.</p>
+    </div>
+    <div class="card" style="border-top:3px solid var(--warn)">
+      <h3><span class="badge rt">runtime_task</span> &nbsp;Task.metadata</h3>
+      <p>The <b>execution-infrastructure</b> cabinet: sessions, locks, recovery, runtime audit, replay. Never business facts.</p>
+    </div>
+  </div>
+</div></section>
+
+<section><div class="wrap">
+  <div class="sec-title"><span class="n">1</span><h2>The owner matrix</h2></div>
+  <div class="scroll"><table class="matrix">
+    <thead><tr><th>Owner</th><th>Examples</th><th>The rule</th></tr></thead>
+    <tbody>
+      <tr>
+        <td><span class="badge own">work_item</span></td>
+        <td><code>work_kind</code>, <code>current_turn_mode</code>, dependency/waiting ids, handoff/context preview,
+          prompt contracts, <code>progress_log</code>, role &amp; employee context, review/report metadata,
+          verification fields, delivery package, self-evolution fields</td>
+        <td>Scheduling, board projection, collaboration, review/report, and user-visible progress reads use
+          <code>DelegationWorkItem.metadata</code>.</td>
+      </tr>
+      <tr>
+        <td><span class="badge rt">runtime_task</span></td>
+        <td><code>runtime_v2</code>, <code>runtime_verification*</code>, <code>member_session_state</code>,
+          <code>external_resume_*</code>, <code>working_memory</code>, <code>interrupted_recovery</code>,
+          <code>last_stop_reason</code>, <code>peer_wait</code>, comms reactivation audit, <code>runtime_control_state</code></td>
+        <td>Execution infrastructure stores these only on runtime <code>Task.metadata</code>. They must not become
+          WorkItem business facts.</td>
+      </tr>
+      <tr>
+        <td><span class="badge">execution_copy</span></td>
+        <td><code>mode</code>, <code>execution_mode</code>, <code>runtime_model</code>, <code>company_profile</code>,
+          org/runtime topology, delegation ids, seat/role routing, execution-agent selection, workspace/comms roots,
+          parent session id</td>
+        <td>Runtime <code>Task</code> may carry these as <em>immutable routing / UI envelope copies</em> — not the
+          authoritative business facts.</td>
+      </tr>
+    </tbody>
+  </table></div>
+  <p style="margin-top:12px;color:var(--muted)">The executable owner matrix is the contract:
+    <span class="mono">opc/layer2_organization/metadata_ownership.py</span>. This page is the human summary.</p>
+</div></section>
+
+<section><div class="wrap">
+  <div class="sec-title"><span class="n">2</span><h2>Two rules that keep it honest</h2></div>
+  <div class="grid g2">
+    <div class="card">
+      <div class="k">⚖️</div><h3>Conflicts aren't silently repaired</h3>
+      <p><b>WorkItem wins</b>, and diagnostics report <code>metadata_ownership_conflict</code>. Invariants are
+        enforced by <span class="mono">work_item_runtime_invariants.py</span> and its tests.</p>
+    </div>
+    <div class="card">
+      <div class="k">🔗</div><h3>Linkage is not metadata</h3>
+      <p>The WorkItem↔Task relation lives in the <code>work_item_runtime_links</code> <b>table</b> — never in metadata.
+        UI payloads may expose it as <code>runtime_task_id</code> / <code>execution_turn_id</code>.</p>
+    </div>
+  </div>
+  <p style="margin-top:16px"><span class="callout"><b>For the implementer:</b> before adding a metadata key, check the matrix in
+    <code>metadata_ownership.py</code>. A field on the wrong record fails invariant tests — the migrator
+    <code>migrate_work_item_owned_metadata_from_linked_tasks</code> can dry-run or backfill WorkItem-owned values from
+    legacy Tasks.</span></p>
+</div></section>
+
+<div class="footer"><div class="wrap">
+  <span>Source: <a href="https://github.com/wjlgatech/physical-ai-native/blob/main/docs/company-metadata-ownership.md">docs/company-metadata-ownership.md</a> · <a href="index.html">All infographics</a></span>
+  <span class="pills"><span class="pill">Layer 2</span><span class="pill">invariant-tested</span></span>
+</div></div>
+</body>
+</html>

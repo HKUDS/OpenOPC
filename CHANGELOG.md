@@ -8,6 +8,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **Infographics for the essential docs.** `landing/infographics/` — one visual, self-contained,
+  theme-aware one-pager per essential doc (shared `ig.css`): How OpenOPC Works (the three loops +
+  work-item state machine), Physical AI Founding Roles (the robot-learning flywheel + 10
+  archetypes + RoboForce prototype), Company Metadata Ownership (the WorkItem/Task owner matrix),
+  Channels (provider matrix + deny-by-default + bridges), and CLI &amp; Slash Commands. Each honors
+  the two-reader standard (plain mental model mapped 1-to-1 to the exact file/type/command) and
+  cites its source doc. Linked from the landing page nav/CTA and the README; ships with the Vercel
+  deploy. Verified with a headless render of all six pages (CSS applied, zero console/network errors).
 - **Vercel landing page + 1-click deploy button.** `landing/index.html` is a self-contained,
   responsive, theme-aware marketing/get-started page (hero, the three loops, the Physical AI
   flywheel, quickstart). A "Deploy to Vercel" button at the top of the README one-click-deploys

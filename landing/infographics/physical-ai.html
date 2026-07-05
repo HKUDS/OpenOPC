@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Physical AI Founding Roles — infographic</title>
+<meta name="description" content="The robot-learning flywheel, the 10 role archetypes OpenOPC staffs, and the RoboForce Titan prototype that anchors them.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E%F0%9F%A4%96%3C/text%3E%3C/svg%3E">
+<link rel="stylesheet" href="ig.css">
+</head>
+<body>
+<div class="topbar"><div class="wrap">
+  <a class="brand" href="index.html"><span class="dot">🤖</span>OpenOPC</a>
+  <span class="sp"></span>
+  <a class="tl" href="index.html">← All infographics</a>
+</div></div>
+
+<header class="hero"><div class="wrap">
+  <span class="eyebrow">Built for Physical AI</span>
+  <h1>A robot that learns to work is one loop, turned fast</h1>
+  <p class="lead">People teach a robot, the robot learns a brain, the brain is tested against reality,
+    the robot goes to a real site, and what happens there becomes the next lesson. OpenOPC ships that
+    loop as a runnable org — the <span class="mono">physical-ai-robotics-company</span> preset.</p>
+</div></header>
+
+<section><div class="wrap">
+  <div class="sec-title"><span class="n">1</span><h2>The robot-learning flywheel</h2></div>
+  <div class="flow" style="justify-content:space-between">
+    <span class="step">👐 Teach<small>teleop data</small></span><span class="arr">→</span>
+    <span class="step">🧠 Learn<small>a VLA policy</small></span><span class="arr">→</span>
+    <span class="step">🧪 Test<small>sim2real + eval</small></span><span class="arr">→</span>
+    <span class="step">🚀 Deploy<small>field pilot</small></span><span class="arr">→</span>
+    <span class="step">📡 Observe<small>fleet telemetry</small></span><span class="arr">↺</span>
+  </div>
+  <div class="tr" style="margin-top:16px">
+    <div class="row"><div class="plain">Humans show the robot the task</div><div class="to">→</div>
+      <div class="tech">Teleoperation demos formatted as <code>(image, instruction, action)</code> tuples (RLDS). Coverage beats raw count.</div></div>
+    <hr>
+    <div class="row"><div class="plain">One model turns pixels into motion</div><div class="to">→</div>
+      <div class="tech">A Vision-Language-Action (VLA) policy — behavior cloning, then flow-matching / diffusion for contact-rich motion.</div></div>
+    <hr>
+    <div class="row"><div class="plain">Fail cheaply before spending hardware time</div><div class="to">→</div>
+      <div class="tech">A sim of <em>this</em> robot+task (Isaac Sim / MuJoCo) + domain randomization; gate on <b>held-out success rate on real hardware</b>.</div></div>
+    <hr>
+    <div class="row"><div class="plain">It isn't real until it works on the floor</div><div class="to">→</div>
+      <div class="tech">A field pilot with safety envelopes and operator handoff (Robot-as-a-Service); telemetry becomes the next batch of teaching data.</div></div>
+  </div>
+</div></section>
+
+<section><div class="wrap">
+  <div class="sec-title"><span class="n">2</span><h2>The 10 role archetypes — one per arc of the loop</h2></div>
+  <div class="grid g2">
+    <div class="card"><h3>👑 Founding AI Native Lead <span class="badge own">final decider</span></h3><p>Owns the capability thesis and the deployment go/no-go. Runs the company as an AI-native loop. <em>The anchor role this repo is built around.</em></p></div>
+    <div class="card"><h3>🧠 Robot Learning Lead</h3><p>Imitation-vs-RL, the data budget, the training curriculum, and the success-rate bar a policy must clear.</p></div>
+    <div class="card"><h3>🔬 Foundation Model Scientist</h3><p>Trains the VLA / policy — behavior cloning, flow-matching, RL fine-tune. Owns the obs→action mapping.</p></div>
+    <div class="card"><h3>📦 Data Engine Engineer</h3><p>The teleop→dataset pipeline: collection protocol, RLDS formatting, dedup, coverage, the data-quality gate.</p></div>
+    <div class="card"><h3>🧊 Sim2Real Engineer</h3><p>The simulator of the specific robot+task, domain randomization, and the transfer eval.</p></div>
+    <div class="card"><h3>👁️ Perception Engineer</h3><p>3D vision, SLAM, state estimation — the world state the policy and planners consume.</p></div>
+    <div class="card"><h3>🤚 Manipulation Engineer</h3><p>Grasping and contact-rich skills — pick, place, press, twist, connect — with force awareness.</p></div>
+    <div class="card"><h3>🛤️ Motion Planning Engineer</h3><p>Trajectories, collision-free paths, real-time control, motion safety envelopes and cycle time.</p></div>
+    <div class="card"><h3>🚀 Deployment &amp; Field Engineer</h3><p>Takes the robot to the site, runs the pilot, owns on-site reliability and the RaaS surface.</p></div>
+    <div class="card"><h3>🛡️ AI Infra &amp; Reliability Engineer</h3><p>Eval harness, fleet telemetry, safety gates, uptime. Reviewer on the sim2real and deployment gates.</p></div>
+  </div>
+</div></section>
+
+<section><div class="wrap">
+  <div class="sec-title"><span class="n">3</span><h2>Prototype: RoboForce — generalized to the industry</h2></div>
+  <div class="grid g2">
+    <div class="card">
+      <h3>The anchor is a real open job</h3>
+      <p>RoboForce (Titan — an industrial robot for “dull, dirty, dangerous” work; ~$67M raised) is hiring a
+        <b>Founding AI Native Lead</b>. OpenOPC ships that org as the <span class="mono">roboforce-titan</span> saved org.</p>
+    </div>
+    <div class="card">
+      <h3>Same loop, different robot bodies</h3>
+      <p>The preset generalizes across the field — Physical Intelligence (π), Figure (Helix), 1X, Tesla Optimus,
+        NVIDIA GR00T, Apptronik, Agility — each staffing the same flywheel.</p>
+    </div>
+  </div>
+  <p style="margin-top:16px"><span class="callout"><b>“Founding AI Engineer”, the common denominator:</b> end-to-end ownership of the whole loop — data → model
+    → sim/eval → integration → deployment → telemetry → back to data — not a single slice. That is exactly what the
+    <code>founding_ai_native_lead</code> final-decider role encodes.</span></p>
+</div></section>
+
+<div class="footer"><div class="wrap">
+  <span>Source: <a href="https://github.com/wjlgatech/physical-ai-native/blob/main/docs/physical-ai-founding-roles.md">docs/physical-ai-founding-roles.md</a> · <a href="index.html">All infographics</a></span>
+  <span class="pills"><span class="pill">VLA</span><span class="pill">sim2real</span><span class="pill">RaaS</span></span>
+</div></div>
+</body>
+</html>

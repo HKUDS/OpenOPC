@@ -6,6 +6,7 @@
   </a>
 </p>
 <p align="center"><sub><b>One-click deploys the <a href="landing/index.html">landing page</a></b> (in <code>landing/</code>) to Vercel. OpenOPC itself is a local-first daemon — WebSocket, subprocess-driven agents, a browser, and SQLite — so the <em>app</em> runs on your machine via <code>opc ui</code>, not on serverless.</sub></p>
+<p align="center"><sub>📊 <b>Visual infographics</b> of the essential docs — <a href="landing/infographics/how-it-works.html">how it works</a> · <a href="landing/infographics/physical-ai.html">Physical AI roles</a> · <a href="landing/infographics/metadata-ownership.html">metadata ownership</a> · <a href="landing/infographics/channels.html">channels</a> · <a href="landing/infographics/cli.html">CLI</a> — live in <a href="landing/infographics/"><code>landing/infographics/</code></a>. They render on the deployed site or open standalone in any browser.</sub></p>
 
 🏗️ **Self-Built** — Fully automated to recruit role-specific AI employees and build the org.
 
