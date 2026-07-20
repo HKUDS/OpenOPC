@@ -14,16 +14,19 @@ from opc.core.windows_ssl import sanitize_windows_sslkeylogfile
 
 sanitize_windows_sslkeylogfile()
 
-import litellm
+try:
+    import litellm
+    litellm.suppress_debug_info = True
+    litellm.drop_params = True
+except ImportError:
+    litellm = None
+
 from loguru import logger
 
 from opc.core.attachment_content import attachment_suffix
 from opc.core.attachment_store import AttachmentRef
 from opc.core.config import LLMConfig
 from opc.core.models import ModelCapabilitySet, RuntimeLLMEvent
-
-litellm.suppress_debug_info = True
-litellm.drop_params = True
 
 _MULTIMODAL_MODEL_HINTS = (
     "gpt-4.1",

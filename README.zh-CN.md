@@ -380,7 +380,7 @@ Workspace 页面是默认界面。
 
 ### 最新动态
 
-- **2026年7月21日 — 暗影模式与时光机性能追踪器:** 支持将下属角色无缝交接给人类承包商 (`HumanAgentAdapter`)，通过 Layer 0 响应式消息总线实现零轮询原生等待。同时提供 Streamlit 分析门户 (`streamlit run opc/presentation/human_portal.py`)，可视化追踪全组织、团队及个人三级性能与变更日志。
+- **2026年7月21日 — 暗影模式与时光机性能追踪器:** 支持将下属角色无缝交接给人类承包商 (`HumanAgentAdapter`)，通过 Layer 0 响应式消息总线实现零轮询原生等待。同时提供原生 Office UI (`python -m opc.cli.app ui --port 8765`) 或 Streamlit 分析门户，可视化追踪全组织、团队及个人三级性能与变更日志。
 - **2026年7月14日 — 更强韧的 Company 运行:** Company 模式会话恢复更顺畅，完整保留 Agent 身份、共享角色上下文、委派及审阅进度。
 
 ### UI 中的 Company 模式
