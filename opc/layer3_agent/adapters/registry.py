@@ -10,6 +10,7 @@ from opc.layer3_agent.adapters.claude_code import ClaudeCodeAdapter
 from opc.layer3_agent.adapters.cursor_adapter import CursorAdapter
 from opc.layer3_agent.adapters.codex_adapter import CodexAdapter
 from opc.layer3_agent.adapters.opencode_adapter import OpenCodeAdapter
+from opc.layer3_agent.adapters.human_adapter import HumanAgentAdapter
 
 
 ADAPTER_CLASSES: dict[str, type[ExternalAgentAdapter]] = {
@@ -17,6 +18,7 @@ ADAPTER_CLASSES: dict[str, type[ExternalAgentAdapter]] = {
     "cursor": CursorAdapter,
     "codex": CodexAdapter,
     "opencode": OpenCodeAdapter,
+    "human": HumanAgentAdapter,
 }
 
 

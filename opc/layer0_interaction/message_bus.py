@@ -23,7 +23,29 @@ class MessageBus:
         self._inbound_queue: asyncio.Queue[UserMessage] | None = None
         self._outbound_queue: asyncio.Queue[SystemMessage] | None = None
         self._inbound_handler: InboundHandler | None = None
+        self._subscribers: dict[str, list[asyncio.Future]] = {}
         self._running = False
+
+    def publish_event(self, topic: str, payload: Any = None) -> None:
+        """Publish a reactive event to all registered topic futures."""
+        futures = self._subscribers.pop(topic, [])
+        for fut in futures:
+            if not fut.done():
+                fut.set_result(payload)
+
+    async def subscribe_once(self, topic: str, timeout: float | None = None) -> Any:
+        """Reactive await for a single event on a given topic (no polling)."""
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future[Any] = loop.create_future()
+        self._subscribers.setdefault(topic, []).append(fut)
+        try:
+            if timeout is not None:
+                return await asyncio.wait_for(fut, timeout=timeout)
+            return await fut
+        except Exception:
+            if topic in self._subscribers and fut in self._subscribers[topic]:
+                self._subscribers[topic].remove(fut)
+            raise
 
     def _inbound(self) -> asyncio.Queue[UserMessage]:
         if self._inbound_queue is None:

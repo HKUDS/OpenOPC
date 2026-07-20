@@ -23,6 +23,7 @@
 
 ## News
 
+- **Jul 21, 2026 — Shadow Mode & Temporal Performance Tracker:** Seamlessly hand off subordinate roles to human contractors (`HumanAgentAdapter`) with zero-polling reactive events via Layer 0 MessageBus. Track organizational velocity and performance over time (Global, Team, Individual) via the Streamlit Time-Machine Analytics portal (`streamlit run opc/presentation/human_portal.py`).
 - **Jul 14, 2026 — More resilient company runs:** Company-mode sessions now recover and resume more seamlessly while preserving agent identity, shared role context, delegation, and review progress.
 - **Jul 13, 2026 — Smoother Office UI:** Faster live updates and chat scrolling improve long-running projects.
 - **Jul 8, 2026 — Smarter approvals:** Session grants persist, low-risk actions flow automatically, and deferred decisions stay available.

@@ -805,6 +805,10 @@ class EmployeeConfig(BaseModel):
     template_id: str = ""
     name: str
     role_id: str
+    username: str = ""
+    hashed_password: str = ""
+    is_human: bool = False
+    access_level: str = "worker"
     description: str = ""
     category: str = ""
     domains: list[str] = Field(default_factory=list)

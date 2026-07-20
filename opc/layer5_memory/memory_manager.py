@@ -1801,3 +1801,55 @@ class MemoryManager:
             "Write the updated memory as a structured markdown document. "
             "Merge new information with existing memory. Remove duplicates."
         )
+
+    # --- Step 1: Time-Aware Vector Metadata & Temporal Querying ---
+
+    def compute_temporal_metadata(self, dt: datetime | None = None) -> dict[str, Any]:
+        """Strictly compute temporal metadata: timestamp, year_month, epoch_week."""
+        if dt is None:
+            dt = datetime.now()
+        year_month = dt.strftime("%Y-%m")
+        iso_year, iso_week, _ = dt.isocalendar()
+        epoch_week = f"{iso_year}-W{iso_week:02d}"
+        return {
+            "timestamp": dt.isoformat(),
+            "year_month": year_month,
+            "epoch_week": epoch_week,
+            "epoch_time": dt.timestamp(),
+        }
+
+    async def embed_temporal_document(
+        self,
+        doc_id: str,
+        text: str,
+        metadata: dict[str, Any] | None = None,
+        created_at: datetime | None = None,
+    ) -> dict[str, Any]:
+        """Embed document/playbook/trajectory with temporal metadata."""
+        meta = dict(metadata or {})
+        temporal = self.compute_temporal_metadata(created_at)
+        meta.update(temporal)
+        meta["doc_id"] = doc_id
+        meta["text"] = text
+
+        if self.store and hasattr(self.store, "save_vector_document"):
+            await self.store.save_vector_document(doc_id, text, meta)
+
+        return meta
+
+    async def query_temporal_memory(
+        self,
+        query: str,
+        start_date: str | datetime | None = None,
+        end_date: str | datetime | None = None,
+        limit: int = 5,
+    ) -> list[dict[str, Any]]:
+        """Pull time-aware memory filtered within [start_date, end_date] date range."""
+        if self.store and hasattr(self.store, "query_temporal_vector_memory"):
+            return await self.store.query_temporal_vector_memory(
+                query=query,
+                start_date=start_date,
+                end_date=end_date,
+                limit=limit,
+            )
+        return []

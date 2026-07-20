@@ -282,6 +282,8 @@ stateDiagram-v2
 
     state RUNNING {
         [*] --> Executing
+        Executing --> AWAITING_HUMAN_DELIVERABLE : Human Contractor Role Hand-off (Shadow Mode)
+        AWAITING_HUMAN_DELIVERABLE --> Executing : Deliverable Completed via Layer 0 Event
         Executing --> WaitingApproval : Destructive Action / High-Risk Tool
         WaitingApproval --> Executing : Approval Granted
         Executing --> Blocked : Mid-run Blocker / Missing Information
@@ -298,10 +300,8 @@ stateDiagram-v2
     }
 
     IN_REVIEW --> COMPLETED : Accepted
-    IN_REVIEW --> REWORKED : Rejected (Feedback Attached)
-    REWORKED --> RUNNING : Re-dispatched to Worker Role
-
-    ESCALATED --> RUNNING : Resolved by Human Owner / Manager
+    IN_REVIEW --> RUNNING : Rejected (Revision Requested)
+    ESCALATED --> RUNNING : Re-routed or Re-assigned
     COMPLETED --> [*]
 ```
 

@@ -255,6 +255,49 @@ class EmployeeEvolutionManager:
 
         return recorded
 
+    def ingest_human_contractor_trajectory(
+        self,
+        organization_id: str,
+        employee_id: str,
+        role_id: str,
+        task_id: str,
+        deliverable_content: str,
+        artifacts: list[dict] | None = None,
+    ) -> dict[str, Any]:
+        """Distill human contractor deliverable into private role experience and shared playbook."""
+        org_id = validate_organization_id(organization_id)
+        event_id = f"human_traj_{task_id}_{int(datetime.now().timestamp())}"
+        
+        event = {
+            "event_id": event_id,
+            "employee_id": employee_id,
+            "role_id": role_id,
+            "task_id": task_id,
+            "event_kind": "human_deliverable_completed",
+            "content_summary": deliverable_content[:512],
+            "artifact_count": len(artifacts or []),
+            "timestamp": _utc_now(),
+        }
+
+        patch = {"patches": [event]}
+        recorded = self.apply_employee_evolution_patch(
+            organization_id=org_id,
+            patch=patch,
+            allowed_employee_ids={employee_id},
+        )
+
+        # Promote recurring human patterns to Shared Playbook in SkillLibrary
+        if deliverable_content:
+            skill_name = f"human-playbook-{role_id}"
+            self.skills.add_skill(
+                name=skill_name,
+                description=f"Shared playbook distilled from human contractor deliverables for role {role_id}.",
+                content=f"# Shared Playbook ({role_id})\n\n{deliverable_content}",
+                category="human_contractor_playbook",
+            )
+
+        return {"recorded": recorded, "event_id": event_id}
+
     def record_work_item_completion(
         self,
         task: Any,

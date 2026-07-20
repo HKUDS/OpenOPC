@@ -759,6 +759,44 @@ class OPCStore:
     async def _create_tables(self) -> None:
         assert self._db
         await self._db.executescript("""
+            CREATE TABLE IF NOT EXISTS employees (
+                employee_id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                role_id TEXT NOT NULL,
+                username TEXT UNIQUE,
+                hashed_password TEXT,
+                is_human INTEGER DEFAULT 0,
+                access_level TEXT DEFAULT 'worker',
+                template_id TEXT DEFAULT '',
+                description TEXT DEFAULT '',
+                category TEXT DEFAULT '',
+                seniority TEXT DEFAULT 'junior',
+                status TEXT DEFAULT 'active',
+                metadata TEXT DEFAULT '{}',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS org_changelogs (
+                id TEXT PRIMARY KEY,
+                timestamp TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                actor_id TEXT,
+                description TEXT NOT NULL,
+                impact_score REAL DEFAULT 1.0,
+                metadata TEXT DEFAULT '{}'
+            );
+
+            CREATE TABLE IF NOT EXISTS vector_documents (
+                doc_id TEXT PRIMARY KEY,
+                text TEXT NOT NULL,
+                timestamp TEXT NOT NULL,
+                year_month TEXT NOT NULL,
+                epoch_week TEXT NOT NULL,
+                epoch_time REAL NOT NULL,
+                metadata TEXT DEFAULT '{}'
+            );
+
             CREATE TABLE IF NOT EXISTS tasks (
                 id TEXT PRIMARY KEY,
                 session_id TEXT,
@@ -8334,8 +8372,135 @@ class OPCStore:
                 "tokens_in": row[0] or 0,
                 "tokens_out": row[1] or 0,
                 "cost_usd": row[2] or 0.0,
-                "calls": row[3] or 0,
+                "event_count": row[3] or 0,
             }
+
+    # --- Employee & Human Contractor Authentication ---
+
+    async def save_employee(self, employee: Any) -> None:
+        """Create or update an employee record (AI worker or Human contractor)."""
+        assert self._db
+        now_str = datetime.now().isoformat()
+        employee_id = str(getattr(employee, "employee_id", "") or "").strip()
+        name = str(getattr(employee, "name", "") or "").strip()
+        role_id = str(getattr(employee, "role_id", "") or "").strip()
+        username = str(getattr(employee, "username", "") or "").strip() or None
+        hashed_password = str(getattr(employee, "hashed_password", "") or "").strip() or None
+        is_human = 1 if getattr(employee, "is_human", False) else 0
+        access_level = str(getattr(employee, "access_level", "worker") or "worker").strip()
+        template_id = str(getattr(employee, "template_id", "") or "").strip()
+        description = str(getattr(employee, "description", "") or "").strip()
+        category = str(getattr(employee, "category", "") or "").strip()
+        seniority = str(getattr(employee, "seniority", "junior") or "junior").strip()
+        status = str(getattr(employee, "status", "active") or "active").strip()
+        metadata = getattr(employee, "metadata", {}) or {}
+
+        await self._db.execute(
+            """INSERT INTO employees
+            (employee_id, name, role_id, username, hashed_password, is_human, access_level, template_id, description, category, seniority, status, metadata, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(employee_id) DO UPDATE SET
+                name=excluded.name,
+                role_id=excluded.role_id,
+                username=excluded.username,
+                hashed_password=excluded.hashed_password,
+                is_human=excluded.is_human,
+                access_level=excluded.access_level,
+                template_id=excluded.template_id,
+                description=excluded.description,
+                category=excluded.category,
+                seniority=excluded.seniority,
+                status=excluded.status,
+                metadata=excluded.metadata,
+                updated_at=excluded.updated_at""",
+            (
+                employee_id,
+                name,
+                role_id,
+                username,
+                hashed_password,
+                is_human,
+                access_level,
+                template_id,
+                description,
+                category,
+                seniority,
+                status,
+                json.dumps(metadata),
+                now_str,
+                now_str,
+            ),
+        )
+        await self._db.commit()
+
+    async def get_employee_by_username(self, username: str) -> dict[str, Any] | None:
+        """Fetch employee record by contractor username."""
+        assert self._db
+        uname = str(username or "").strip()
+        if not uname:
+            return None
+        async with self._db.execute(
+            "SELECT employee_id, name, role_id, username, hashed_password, is_human, access_level, status, metadata FROM employees WHERE username = ? LIMIT 1",
+            (uname,),
+        ) as cursor:
+            row = await cursor.fetchone()
+            if not row:
+                return None
+            return {
+                "employee_id": row[0],
+                "name": row[1],
+                "role_id": row[2],
+                "username": row[3],
+                "hashed_password": row[4],
+                "is_human": bool(row[5]),
+                "access_level": row[6],
+                "status": row[7],
+                "metadata": json.loads(row[8]) if row[8] else {},
+            }
+
+    async def get_employee(self, employee_id: str) -> dict[str, Any] | None:
+        """Fetch employee record by employee_id."""
+        assert self._db
+        eid = str(employee_id or "").strip()
+        if not eid:
+            return None
+        async with self._db.execute(
+            "SELECT employee_id, name, role_id, username, hashed_password, is_human, access_level, status, metadata FROM employees WHERE employee_id = ? LIMIT 1",
+            (eid,),
+        ) as cursor:
+            row = await cursor.fetchone()
+            if not row:
+                return None
+            return {
+                "employee_id": row[0],
+                "name": row[1],
+                "role_id": row[2],
+                "username": row[3],
+                "hashed_password": row[4],
+                "is_human": bool(row[5]),
+                "access_level": row[6],
+                "status": row[7],
+                "metadata": json.loads(row[8]) if row[8] else {},
+            }
+
+    async def list_human_employees(self) -> list[dict[str, Any]]:
+        """List all human contractor accounts."""
+        assert self._db
+        async with self._db.execute(
+            "SELECT employee_id, name, role_id, username, access_level, status FROM employees WHERE is_human = 1"
+        ) as cursor:
+            rows = await cursor.fetchall()
+            return [
+                {
+                    "employee_id": row[0],
+                    "name": row[1],
+                    "role_id": row[2],
+                    "username": row[3],
+                    "access_level": row[4],
+                    "status": row[5],
+                }
+                for row in rows
+            ]
 
     async def get_org_spend(self, org_id: str) -> dict[str, Any]:
         assert self._db
@@ -8350,3 +8515,301 @@ class OPCStore:
                 "cost_usd": row[2] or 0.0,
                 "calls": row[3] or 0,
             }
+
+    # --- Task CRUD Operations for Shadow Mode ---
+
+    async def save_task(self, task: Task) -> None:
+        """Create or update a Task object in store."""
+        assert self._db
+        now_str = datetime.now().isoformat()
+        metadata_json = json.dumps(getattr(task, "metadata", {}) or {})
+        result_json = json.dumps(getattr(task, "result", {}) or {}) if getattr(task, "result", None) else None
+        
+        status_val = task.status.value if hasattr(task.status, "value") else str(task.status)
+
+        await self._db.execute(
+            """INSERT INTO tasks
+            (id, title, description, assigned_to, status, priority, metadata, result, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                title=excluded.title,
+                description=excluded.description,
+                assigned_to=excluded.assigned_to,
+                status=excluded.status,
+                priority=excluded.priority,
+                metadata=excluded.metadata,
+                result=excluded.result""",
+            (
+                task.id,
+                task.title,
+                task.description,
+                task.assigned_to,
+                status_val,
+                task.priority,
+                metadata_json,
+                result_json,
+                now_str,
+            ),
+        )
+        await self._db.commit()
+
+    async def get_task(self, task_id: str) -> Task | None:
+        """Fetch a Task object by ID."""
+        assert self._db
+        async with self._db.execute(
+            "SELECT id, title, description, assigned_to, status, priority, metadata, result FROM tasks WHERE id = ?",
+            (task_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+            if not row:
+                return None
+            metadata = json.loads(row[6]) if row[6] else {}
+            result = json.loads(row[7]) if row[7] else None
+            return Task(
+                id=row[0],
+                title=row[1],
+                description=row[2],
+                assigned_to=row[3],
+                status=TaskStatus(row[4]) if row[4] in [s.value for s in TaskStatus] else TaskStatus.PENDING,
+                priority=row[5],
+                metadata=metadata,
+                result=result,
+            )
+
+    async def list_tasks(self, status: str | None = None) -> list[Task]:
+        """List tasks with optional status filter."""
+        assert self._db
+        query = "SELECT id, title, description, assigned_to, status, priority, metadata, result FROM tasks"
+        params: list[Any] = []
+        if status:
+            query += " WHERE status = ?"
+            params.append(status)
+
+        async with self._db.execute(query, params) as cursor:
+            rows = await cursor.fetchall()
+            tasks = []
+            for row in rows:
+                metadata = json.loads(row[6]) if row[6] else {}
+                result = json.loads(row[7]) if row[7] else None
+                task_status = row[4]
+                try:
+                    ts = TaskStatus(task_status)
+                except Exception:
+                    ts = TaskStatus.PENDING
+                tasks.append(
+                    Task(
+                        id=row[0],
+                        title=row[1],
+                        description=row[2],
+                        assigned_to=row[3],
+                        status=ts,
+                        priority=row[5],
+                        metadata=metadata,
+                        result=result,
+                    )
+                )
+            return tasks
+
+    # --- Step 2 & 3: Temporal Performance Aggregation & Organizational Changelog ---
+
+    async def save_vector_document(self, doc_id: str, text: str, metadata: dict[str, Any]) -> None:
+        """Store vector document with temporal metadata."""
+        assert self._db
+        now_str = metadata.get("timestamp") or datetime.now().isoformat()
+        ym = metadata.get("year_month") or datetime.now().strftime("%Y-%m")
+        ew = metadata.get("epoch_week") or f"{datetime.now().isocalendar()[0]}-W{datetime.now().isocalendar()[1]:02d}"
+        etime = float(metadata.get("epoch_time") or datetime.now().timestamp())
+
+        await self._db.execute(
+            """INSERT INTO vector_documents
+            (doc_id, text, timestamp, year_month, epoch_week, epoch_time, metadata)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(doc_id) DO UPDATE SET
+                text=excluded.text,
+                timestamp=excluded.timestamp,
+                year_month=excluded.year_month,
+                epoch_week=excluded.epoch_week,
+                epoch_time=excluded.epoch_time,
+                metadata=excluded.metadata""",
+            (doc_id, text, now_str, ym, ew, etime, json.dumps(metadata)),
+        )
+        await self._db.commit()
+
+    async def query_temporal_vector_memory(
+        self,
+        query: str,
+        start_date: str | datetime | None = None,
+        end_date: str | datetime | None = None,
+        limit: int = 5,
+    ) -> list[dict[str, Any]]:
+        """Query vector documents filtered strictly by start_date and end_date."""
+        assert self._db
+        sql = "SELECT doc_id, text, timestamp, year_month, epoch_week, metadata FROM vector_documents"
+        conditions = []
+        params: list[Any] = []
+
+        if start_date:
+            s_epoch = start_date.timestamp() if isinstance(start_date, datetime) else datetime.fromisoformat(str(start_date)).timestamp()
+            conditions.append("epoch_time >= ?")
+            params.append(s_epoch)
+
+        if end_date:
+            e_epoch = end_date.timestamp() if isinstance(end_date, datetime) else datetime.fromisoformat(str(end_date)).timestamp()
+            conditions.append("epoch_time <= ?")
+            params.append(e_epoch)
+
+        if query:
+            conditions.append("text LIKE ?")
+            params.append(f"%{query}%")
+
+        if conditions:
+            sql += " WHERE " + " AND ".join(conditions)
+
+        sql += " ORDER BY epoch_time DESC LIMIT ?"
+        params.append(limit)
+
+        async with self._db.execute(sql, params) as cursor:
+            rows = await cursor.fetchall()
+            return [
+                {
+                    "doc_id": row[0],
+                    "text": row[1],
+                    "timestamp": row[2],
+                    "year_month": row[3],
+                    "epoch_week": row[4],
+                    "metadata": json.loads(row[5]) if row[5] else {},
+                }
+                for row in rows
+            ]
+
+    async def log_org_changelog(
+        self,
+        event_type: str,
+        actor_id: str,
+        description: str,
+        impact_score: float = 1.0,
+        metadata: dict[str, Any] | None = None,
+    ) -> str:
+        """Record a significant organizational event in ORG_CHANGELOGS."""
+        assert self._db
+        cid = f"changelog_{uuid.uuid4().hex[:12]}"
+        now_str = datetime.now().isoformat()
+        await self._db.execute(
+            """INSERT INTO org_changelogs (id, timestamp, event_type, actor_id, description, impact_score, metadata)
+            VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (cid, now_str, event_type, actor_id, description, impact_score, json.dumps(metadata or {})),
+        )
+        await self._db.commit()
+        return cid
+
+    async def get_org_changelogs(
+        self,
+        limit: int = 100,
+        search: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Fetch chronological feed of organizational changelogs."""
+        assert self._db
+        sql = "SELECT id, timestamp, event_type, actor_id, description, impact_score, metadata FROM org_changelogs"
+        params: list[Any] = []
+        if search and search.strip():
+            sql += " WHERE description LIKE ? OR event_type LIKE ? OR actor_id LIKE ?"
+            term = f"%{search.strip()}%"
+            params.extend([term, term, term])
+
+        sql += " ORDER BY timestamp DESC LIMIT ?"
+        params.append(limit)
+
+        async with self._db.execute(sql, params) as cursor:
+            rows = await cursor.fetchall()
+            return [
+                {
+                    "id": row[0],
+                    "timestamp": row[1],
+                    "event_type": row[2],
+                    "actor_id": row[3],
+                    "description": row[4],
+                    "impact_score": row[5],
+                    "metadata": json.loads(row[6]) if row[6] else {},
+                }
+                for row in rows
+            ]
+
+    async def get_temporal_performance(
+        self,
+        interval: str = "weekly",
+        start_date: str | None = None,
+        end_date: str | None = None,
+    ) -> dict[str, Any]:
+        """Aggregate performance metrics over time grouped by Individual, Team, and Global."""
+        assert self._db
+
+        time_format = "%Y-W%W" if interval == "weekly" else "%Y-%m-%d"
+
+        # 1. Global Aggregation
+        async with self._db.execute(
+            f"""SELECT strftime('{time_format}', created_at) as time_bucket,
+                       COUNT(CASE WHEN status IN ('done', 'completed') THEN 1 END) as completed_tasks,
+                       COUNT(*) as total_tasks,
+                       AVG(CASE WHEN status IN ('done', 'completed') THEN 1.0 ELSE 0.0 END) as completion_rate
+                FROM tasks
+                GROUP BY time_bucket
+                ORDER BY time_bucket ASC"""
+        ) as cursor:
+            global_rows = await cursor.fetchall()
+            global_metrics = [
+                {
+                    "time_bucket": row[0] or "current",
+                    "completed_tasks": row[1] or 0,
+                    "total_active_tasks": row[2] or 0,
+                    "avg_outcome_score": round(row[3] or 0.0, 2),
+                }
+                for row in global_rows
+            ]
+
+        # 2. Team Aggregation (by assigned_to / owner_role)
+        async with self._db.execute(
+            f"""SELECT assigned_to,
+                       strftime('{time_format}', created_at) as time_bucket,
+                       COUNT(CASE WHEN status IN ('done', 'completed') THEN 1 END) as completed_tasks,
+                       COUNT(*) as total_tasks
+                FROM tasks
+                WHERE assigned_to IS NOT NULL AND assigned_to != ''
+                GROUP BY assigned_to, time_bucket
+                ORDER BY time_bucket ASC"""
+        ) as cursor:
+            team_rows = await cursor.fetchall()
+            team_metrics: dict[str, list[dict[str, Any]]] = {}
+            for row in team_rows:
+                role = row[0]
+                team_metrics.setdefault(role, []).append({
+                    "time_bucket": row[1] or "current",
+                    "completed_tasks": row[2] or 0,
+                    "total_active_tasks": row[3] or 0,
+                })
+
+        # 3. Individual Aggregation (by employee / contractor)
+        async with self._db.execute(
+            f"""SELECT actor_id,
+                       strftime('{time_format}', timestamp) as time_bucket,
+                       COUNT(*) as event_count,
+                       SUM(impact_score) as total_impact
+                FROM org_changelogs
+                WHERE actor_id IS NOT NULL AND actor_id != ''
+                GROUP BY actor_id, time_bucket
+                ORDER BY time_bucket ASC"""
+        ) as cursor:
+            indiv_rows = await cursor.fetchall()
+            individual_metrics: dict[str, list[dict[str, Any]]] = {}
+            for row in indiv_rows:
+                actor = row[0]
+                individual_metrics.setdefault(actor, []).append({
+                    "time_bucket": row[1] or "current",
+                    "event_count": row[2] or 0,
+                    "impact_score": round(row[3] or 0.0, 2),
+                })
+
+        return {
+            "global": global_metrics,
+            "team": team_metrics,
+            "individual": individual_metrics,
+        }

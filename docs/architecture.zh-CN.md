@@ -282,6 +282,8 @@ stateDiagram-v2
 
     state RUNNING {
         [*] --> Executing : 执行中
+        Executing --> AWAITING_HUMAN_DELIVERABLE : 人类外包角色交接 (Shadow Mode)
+        AWAITING_HUMAN_DELIVERABLE --> Executing : 通过 Layer 0 事件完成交付
         Executing --> WaitingApproval : 触发破坏性/高风险操作
         WaitingApproval --> Executing : 审批通过
         Executing --> Blocked : 遇到运行阻碍/缺少信息
@@ -298,11 +300,60 @@ stateDiagram-v2
     }
 
     IN_REVIEW --> COMPLETED : 已接受 (Completed)
-    IN_REVIEW --> REWORKED : 已拒绝并附带反馈 (Reworked)
-    REWORKED --> RUNNING : 重新分发至执行角色
-
+    IN_REVIEW --> RUNNING : 重新分发至执行角色
     ESCALATED --> RUNNING : 由人类所有者/管理者解决
     COMPLETED --> [*]
+
+---
+
+## 5.1. 暗影模式与去中心化人类节点架构 (Shadow Mode & Human Nodes)
+
+OpenOPC 支持 **暗影模式 (Shadow Mode)**，允许将下属角色交由真实人类外包人员完成，作为 CompanyRuntime DAG 中的去中心化计算节点。
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Engine as CompanyRuntime (Layer 2)
+    participant Adapter as HumanAgentAdapter (Layer 3)
+    participant Bus as MessageBus (Layer 0)
+    participant Store as OPCStore / SQLite (Database)
+    participant Portal as Streamlit Web 门户 (Presentation)
+    participant Human as 人类承包商 (Human Node)
+
+    Engine->>Adapter: execute(task, context)
+    Adapter->>Store: save_task(status="RUNNING", sub_state="AWAITING_HUMAN_DELIVERABLE")
+    Adapter->>Bus: subscribe_once("deliverable_completed:{task_id}")
+    Note over Adapter: 适配器原生阻塞 (零轮询)
+
+    Human->>Portal: 身份验证 (JWT / PBKDF2)
+    Portal->>Human: 渲染分配的工作项
+    Human->>Portal: 上传交付文件 / 总结
+    Portal->>Store: save_trajectory() & log_org_changelog()
+    Portal->>Bus: publish_event("deliverable_completed:{task_id}", payload)
+    Bus-->>Adapter: 事件触发 (解除 subscribe_once 阻塞)
+    Adapter-->>Engine: 返回任务完成 Payload
+```
+
+---
+
+## 5.2. 时空组织知识与性能追踪器 (Temporal Knowledge & Performance Tracker)
+
+**时空组织知识与性能追踪器** 将 OpenOPC 升级为具有时间感知的组织变更日志与性能分析平台：
+
+1. **时间感知向量元数据 (`opc.layer5_memory.memory_manager`)**:
+   - 在向量文档嵌入中严格注入 `timestamp`, `year_month`, `epoch_week`, 与 `epoch_time`。
+   - 提供 `query_temporal_memory(query, start_date, end_date)` 用于时间跨度历史对比。
+
+2. **统一组织变更日志表 (`ORG_CHANGELOGS`)**:
+   - SQLite Schema: `org_changelogs(id, timestamp, event_type, actor_id, description, impact_score, metadata)`.
+   - 由 `OPCLogger` 在 DAG 关键节点静默自动写入。
+
+3. **三级关系性能聚合 (`opc.database.store`)**:
+   - 按可配置时间间隔 (`weekly` 或 `daily`) 执行 SQL `GROUP BY` 聚合。
+   - 在三个层级切片度量指标：`Global` (全组织), `Team` (团队/角色), `Individual` (个人/承包商/AI员工)。
+
+4. **时光机分析仪表盘 (`opc.presentation.human_portal`)**:
+   - Streamlit 分析门户，可视化渲染组织速率折线图、团队切片柱状图、个人绩效图表与可搜索变更日志流。
 ```
 
 ### 协作模式 (Collaboration Modes)
