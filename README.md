@@ -32,6 +32,7 @@
 - [When To Use OpenOPC](#when-to-use-openopc)
 - [Demos](#demos)
 - [How OpenOPC Works](#how-openopc-works)
+- [Architecture Specification](docs/architecture.md)
 - [Quick Start](#quick-start)
 - [Office UI Guide](#office-ui-guide)
 - [CLI Guide](#cli-guide)
@@ -170,6 +171,8 @@ Execution generates raw experience; Self-Grown turns it into lasting improvement
 📖 Distilling trajectories into knowledge. Execution traces are too noisy to learn from. OpenOPC therefore:
 - 💡 Distils each role's tasks into high-signal lessons, stored in its private experience profile.
 - 📚 Promotes recurring lessons into shared playbooks, which new hires inherit from the outset — compounding organisational knowledge over time.
+
+> 📐 **System Architecture Specification**: For complete technical details, 7-layer cognitive model breakdown, state machine diagrams, broker adapter specifications, and database entity models, see [`docs/architecture.md`](docs/architecture.md).
 
 <details>
 <summary><strong>How this maps to the UI</strong></summary>

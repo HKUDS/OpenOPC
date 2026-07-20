@@ -26,6 +26,7 @@
 - [何时使用 OpenOPC](#何时使用-openopc)
 - [演示](#演示)
 - [OpenOPC 如何工作](#openopc-如何工作)
+- [系统架构规范](docs/architecture.zh-CN.md)
 - [快速开始](#快速开始)
 - [Office UI 指南](#office-ui-指南)
 - [CLI 指南](#cli-指南)
@@ -164,6 +165,8 @@ OpenOPC 围绕复杂的真实任务组建一家 AI 公司 — 通过三个紧密
 📖 把执行轨迹提炼为知识。执行轨迹噪声太大，无法直接学习。因此 OpenOPC：
 - 💡 把每个角色的任务提炼为高信号的经验教训，存入其私有经验档案。
 - 📚 把反复出现的经验提升为共享的作业手册（playbook），新员工从入职起即可继承 — 让组织知识随时间复利增长。
+
+> 📐 **系统架构规范**: 欲查看完整的技术细节、7层认知模型拆解、状态机图解、Agent 适配器规范及数据库实体模型，请参见 [`docs/architecture.zh-CN.md`](docs/architecture.zh-CN.md)。
 
 <details>
 <summary><strong>这些机制如何对应到 UI</strong></summary>
