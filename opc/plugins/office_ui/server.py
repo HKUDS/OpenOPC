@@ -163,6 +163,14 @@ async def create_app(
     # ── Routes ────────────────────────────────────────────────────────
     app.router.add_get("/ws", ws_handler.handle_ws)
 
+    # ── Shadow Mode & Temporal Analytics REST API Handlers ────────────
+    sh_handlers = _make_shadow_mode_handlers(engine)
+    app.router.add_post("/api/auth/login", sh_handlers["login"])
+    app.router.add_get("/api/contractor/tasks", sh_handlers["tasks"])
+    app.router.add_post("/api/contractor/submit", sh_handlers["submit"])
+    app.router.add_get("/api/analytics/temporal_performance", sh_handlers["performance"])
+    app.router.add_get("/api/analytics/changelogs", sh_handlers["changelogs"])
+
     # Attachment download (must be registered before the SPA catch-all)
     app.router.add_get(
         "/api/attachments/{attachment_id}/{filename}",
@@ -213,6 +221,148 @@ async def _serve_spa_fallback(request: aiohttp.web.Request) -> aiohttp.web.Respo
         return aiohttp.web.FileResponse(file_path, headers=_FRONTEND_NO_STORE_HEADERS)
     # SPA fallback
     return aiohttp.web.FileResponse(_STATIC_DIR / "index.html", headers=_FRONTEND_NO_STORE_HEADERS)
+
+
+def _make_shadow_mode_handlers(engine: OPCEngine):
+    """Factory creating HTTP handlers for Shadow Mode authentication, contractor tasks, and analytics."""
+    from opc.core.auth import create_jwt_token, verify_jwt_token, verify_password
+    from opc.layer0_interaction.message_bus import MessageBus
+    from opc.layer6_observability.opc_logger import OPCLogger
+
+    async def handle_login(request: aiohttp.web.Request) -> aiohttp.web.Response:
+        data = await request.json()
+        username = str(data.get("username", "")).strip()
+        password = str(data.get("password", "")).strip()
+        if not username or not password:
+            return aiohttp.web.json_response({"error": "Username and password required"}, status=400)
+
+        employee = await engine.store.get_employee_by_username(username)
+        if not employee or not verify_password(password, employee.get("hashed_password", "")):
+            return aiohttp.web.json_response({"error": "Invalid credentials or contractor not registered"}, status=401)
+
+        payload = {
+            "sub": employee["employee_id"],
+            "username": employee["username"],
+            "name": employee["name"],
+            "role_id": employee["role_id"],
+            "access_level": employee.get("access_level", "worker"),
+        }
+        token = create_jwt_token(payload)
+        return aiohttp.web.json_response({"token": token, "user": payload})
+
+    async def handle_contractor_tasks(request: aiohttp.web.Request) -> aiohttp.web.Response:
+        auth_header = request.headers.get("Authorization", "")
+        token = auth_header.replace("Bearer ", "").strip() if "Bearer " in auth_header else request.query.get("token", "")
+        user = verify_jwt_token(token) if token else None
+        if not user:
+            return aiohttp.web.json_response({"error": "Unauthorized"}, status=401)
+
+        user_role = user.get("role_id", "")
+        all_tasks = await engine.store.list_tasks(status=None)
+        assigned_tasks = [
+            {
+                "id": t.id,
+                "title": t.title,
+                "description": t.description,
+                "status": t.status.value if hasattr(t.status, "value") else str(t.status),
+                "priority": t.priority,
+                "assigned_to": t.assigned_to,
+            }
+            for t in all_tasks
+            if str(t.assigned_to or t.metadata.get("owner_role") or "").strip() == user_role
+            and (t.status in ("running", "awaiting_human", "pending") or t.metadata.get("sub_state") == "AWAITING_HUMAN_DELIVERABLE")
+        ]
+        return aiohttp.web.json_response({"tasks": assigned_tasks, "user": user})
+
+    async def handle_contractor_submit(request: aiohttp.web.Request) -> aiohttp.web.Response:
+        auth_header = request.headers.get("Authorization", "")
+        token = auth_header.replace("Bearer ", "").strip() if "Bearer " in auth_header else ""
+        user = verify_jwt_token(token) if token else None
+        if not user:
+            return aiohttp.web.json_response({"error": "Unauthorized"}, status=401)
+
+        task_id = ""
+        summary_notes = ""
+        artifacts_list = []
+        file_content = ""
+
+        if request.content_type.startswith("multipart/form-data"):
+            reader = await request.multipart()
+            while True:
+                field = await reader.next()
+                if field is None:
+                    break
+                if field.name == "task_id":
+                    task_id = (await field.text()).strip()
+                elif field.name == "notes":
+                    summary_notes = (await field.text()).strip()
+                elif field.name == "file":
+                    filename = field.filename
+                    if filename:
+                        dest_dir = Path(".opc/workspace/deliverables") / (task_id or "general")
+                        dest_dir.mkdir(parents=True, exist_ok=True)
+                        dest_path = dest_dir / filename
+                        content_bytes = await field.read()
+                        with open(dest_path, "wb") as f:
+                            f.write(content_bytes)
+
+                        try:
+                            extracted = dest_path.read_text(encoding="utf-8", errors="ignore")
+                            file_content += f"\n\n--- Attached File ({filename}) ---\n{extracted}"
+                        except Exception:
+                            file_content += f"\n\nUploaded file: {dest_path} ({len(content_bytes)} bytes)"
+
+                        artifacts_list.append({"name": filename, "path": str(dest_path), "size": len(content_bytes)})
+        else:
+            data = await request.json()
+            task_id = str(data.get("task_id", "")).strip()
+            summary_notes = str(data.get("notes", "")).strip()
+
+        final_content = (summary_notes + "\n" + file_content).strip()
+        if not final_content or not task_id:
+            return aiohttp.web.json_response({"error": "Task ID and notes/file content required"}, status=400)
+
+        opc_log = OPCLogger(store=engine.store)
+        await opc_log.log_trajectory_step(
+            task_id=task_id,
+            role_id=user.get("role_id", ""),
+            employee_id=user.get("sub", "human_contractor"),
+            action="HUMAN_DELIVERABLE_SUBMISSION",
+            content=final_content,
+            artifacts=artifacts_list,
+        )
+
+        mbus = MessageBus()
+        mbus.publish_event(
+            f"deliverable_completed:{task_id}",
+            {
+                "task_id": task_id,
+                "summary": final_content,
+                "content": final_content,
+                "artifacts": artifacts_list,
+                "username": user.get("username", "human_contractor"),
+            },
+        )
+        return aiohttp.web.json_response({"success": True, "task_id": task_id})
+
+    async def handle_temporal_performance(request: aiohttp.web.Request) -> aiohttp.web.Response:
+        interval = request.query.get("interval", "weekly")
+        data = await engine.store.get_temporal_performance(interval=interval)
+        return aiohttp.web.json_response(data)
+
+    async def handle_changelogs(request: aiohttp.web.Request) -> aiohttp.web.Response:
+        limit = int(request.query.get("limit", "100"))
+        search = request.query.get("search", None)
+        changelogs = await engine.store.get_org_changelogs(limit=limit, search=search)
+        return aiohttp.web.json_response({"changelogs": changelogs})
+
+    return {
+        "login": handle_login,
+        "tasks": handle_contractor_tasks,
+        "submit": handle_contractor_submit,
+        "performance": handle_temporal_performance,
+        "changelogs": handle_changelogs,
+    }
 
 
 def _make_attachment_handler(engine: OPCEngine):
