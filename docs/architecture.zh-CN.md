@@ -96,73 +96,66 @@ flowchart TB
 
 ```mermaid
 stateDiagram-v2
-    [*] --> UNINITIALIZED : 系统启动 / 加载工作区
+    [*] --> IDLE : 会话创建 / 工作区初始化
 
-    UNINITIALIZED --> CONFIGURING : opc init / 选择预设
-    CONFIGURING --> STAFFING : 提交目标 (自建阶段)
+    IDLE --> STAFFING : 提交目标 / 触发招聘器
 
     state STAFFING {
-        [*] --> DerivingOrgChart : 推导组织架构图
+        [*] --> DerivingOrgChart : 招聘器分析目标
         DerivingOrgChart --> QueryingTalentMarket : 评估预设与历史雇员
-        QueryingTalentMarket --> HiringEmployees : 角色与员工匹配招聘
-        HiringEmployees --> OrgStaffed : 团队花名册组建完成
+        QueryingTalentMarket --> AssigningSeats : 角色绑定员工/承包商
+        AssigningSeats --> RosterReady : 席位状态已同步
     }
 
-    STAFFING --> ORCHESTRATING : 组织花名册就位
+    STAFFING --> RUNNING : 组织架构与工作项 DAG 就绪
 
-    state ORCHESTRATING {
-        [*] --> DecomposingGoal : 组织引擎生成工作项 DAG
-        DecomposingGoal --> SchedulingDAG : 解析工作项前置依赖
-        SchedulingDAG --> DispatchingWorkItem : 抽取可运行工作项
-    }
-
-    ORCHESTRATING --> EXECUTING_ITEM : 工作项分发至执行角色
-
-    state EXECUTING_ITEM {
-        [*] --> AssemblingContext : Layer 1 上下文组装
-        AssemblingContext --> AgentLoop : NativeAgent / ExternalBroker 迭代
+    state RUNNING {
+        [*] --> SelectingRunnableItem : 阶段转换 (QUEUED -> READY)
+        SelectingRunnableItem --> DispatchedToRole : 获取席位执行锁
         
-        state AgentLoop {
-            [*] --> LLMInference : LLM 推理
-            LLMInference --> EvaluatingToolCall : 校验工具调用
-            EvaluatingToolCall --> ExecutingTool : 治理审批通过并执行工具
-            ExecutingTool --> LLMInference : 附加工具执行结果
+        state DispatchedToRole {
+            [*] --> ContextAssembly : Layer 1 Prompt & 历史上下文组装
+            ContextAssembly --> AgentExecutionLoop : NativeRuntimeV2 / ExternalBroker
+            
+            state AgentExecutionLoop {
+                [*] --> LLMInference : LLM 推理
+                LLMInference --> EvaluatingToolCall : 评估工具调用
+                EvaluatingToolCall --> ToolExecution : ApprovalEngine 批准执行
+                ToolExecution --> LLMInference : 返回工具结果
+            }
+
+            AgentExecutionLoop --> OutputSubmitted : 提交产出 (Phase -> AWAITING_MANAGER_REVIEW)
         }
 
-        AgentLoop --> AWAITING_HUMAN_APPROVAL : 高风险操作 / 运行阻碍
-        AWAITING_HUMAN_APPROVAL --> AgentLoop : 人类授权决策 / 输入指导
-        AgentLoop --> SubmittingOutput : 生成工作项产出
-    }
-
-    EXECUTING_ITEM --> IN_MANAGER_REVIEW : 执行角色提交工作项
-
-    state IN_MANAGER_REVIEW {
-        [*] --> ReviewingDeliverable : 审阅交付物
-        ReviewingDeliverable --> Accepted : 满足输出契约要求
-        ReviewingDeliverable --> Rejected : 未达验收标准
-    }
-
-    IN_MANAGER_REVIEW --> REWORKING : 已拒绝并附带修改建议 (Reworking)
-    REWORKING --> EXECUTING_ITEM : 重新分发至执行角色
-
-    IN_MANAGER_REVIEW --> ORCHESTRATING : 已接受 (DAG 中仍有待执行工作项)
-    IN_MANAGER_REVIEW --> PROJECT_COMPLETE : 已接受 (DAG 中所有工作项均已完成)
-
-    state PROJECT_COMPLETE {
-        [*] --> GeneratingFinalReport : 生成最终报告
-        GeneratingFinalReport --> DistillingTrajectories : 自成长阶段
+        DispatchedToRole --> ManagerReview : 管理者审阅评估
         
-        state DistillingTrajectories {
-            [*] --> RatingOutcomes : 解析用户评价反馈
-            RatingOutcomes --> AttributingCredit : 角色归因评级
-            AttributingCredit --> UpdatingPrivateExperience : 更新角色私有经验
-            UpdatingPrivateExperience --> SynthesizingPlaybooks : 提升高频经验模式
+        state ManagerReview {
+            [*] --> EvaluatingOutputContract : 校验交付物契约
+            EvaluatingOutputContract --> ApprovedVerdict : 满足产出契约
+            EvaluatingOutputContract --> RejectedVerdict : 未达质量/Lint标准
         }
 
-        DistillingTrajectories --> MemoryEvolved : 共享公司剧本库已更新
+        ManagerReview --> ReworkLoop : 拒绝并返工 (Phase -> READY_FOR_REWORK)
+        ReworkLoop --> DispatchedToRole : 重新分发至执行角色
     }
 
-    PROJECT_COMPLETE --> [*] : 项目归档 / 空闲
+    RUNNING --> PAUSED_GOVERNANCE : ApprovalEngine 触发升格/需要人类输入
+    PAUSED_GOVERNANCE --> RUNNING : 所有者批准授权
+
+    RUNNING --> AWAITING_HUMAN : 指派给人类承包商 (Shadow Mode)
+    AWAITING_HUMAN --> RUNNING : 通过 MessageBus / SQLite 提交交付物
+
+    RUNNING --> COMPLETED : 所有工作项 DAG 节点均已批准/关闭
+    RUNNING --> FAILED : 发生不可恢复异常 / 超过最大重试次数
+
+    state COMPLETED {
+        [*] --> DistillingExperience : Layer 5 轨迹经验蒸馏
+        DistillingExperience --> SynthesizingPlaybooks : 沉淀高频模式至 SkillLibrary
+        SynthesizingPlaybooks --> MemoryEvolved : 保存已进化的员工档案与剧本
+    }
+
+    COMPLETED --> [*] : 会话关闭
+    FAILED --> [*] : 异常已记录
 ```
 
 ---
@@ -442,37 +435,92 @@ classDiagram
 Layer 4 (`opc/layer4_tools/`) 提供实际的可执行能力。每一次工具调用在进入处理函数之前，必须通过多重安全治理管道。
 
 ```mermaid
-flowchart LR
-    subgraph ToolCallEmitter ["Agent 执行层"]
-        AgentCall["Agent 发起工具调用请求"]
-    end
+erDiagram
+    delegation_work_items ||--o{ tasks : projects_to_runtime
+    delegation_work_items ||--o{ artifact_records : produces
+    seat_states ||--o{ delegation_work_items : executes
+    employees ||--o{ seat_states : fills_seat
+    tasks ||--o{ cost_events : incurs_cost
+    sessions ||--o{ runtime_permission_grants : scopes_permission
+    delegation_work_items ||--o{ org_changelogs : records_event
 
-    subgraph SafetyGovernance ["安全治理管道"]
-        PermMgr["权限管理器 (permissions.py)"]
-        Allowlist["审批允许列表 (approval_allowlist.py)"]
-        ShellCheck["Shell 安全检查器 (shell_safety.py)"]
-        GateHarness["Gate 检查管道 (gate_harness.py)"]
-    end
+    delegation_work_items {
+        string work_item_id PK
+        string run_id
+        string project_id
+        string title
+        string phase
+        string owner_role_id
+        string parent_work_item_id FK
+        json dependencies
+    }
 
-    subgraph ToolHandlers ["Layer 4 工具处理函数"]
-        Browser["Playwright 浏览器 (browser.py)"]
-        ShellExec["Shell / Python 执行 (shell.py, python_exec.py)"]
-        FileOps["文件与 Git 操作 (file_ops.py, git_ops.py)"]
-        CollabRPC["协作 RPC (collaboration_rpc.py)"]
-        SearchTodo["网络搜索与待办事项 (web_search.py, todo.py)"]
-    end
+    tasks {
+        string id PK
+        string session_id
+        string project_id
+        string title
+        string status
+        string assigned_to
+        string assigned_external_agent
+        json metadata
+        json result
+    }
 
-    subgraph Sanitization ["输出预算与结果截断"]
-        OutputBudget["输出预算管控 (output_budget.py)"]
-    end
+    seat_states {
+        string seat_state_id PK
+        string team_instance_id
+        string role_id
+        string seat_id
+        string employee_id FK
+        string status
+        string current_work_item_id FK
+    }
 
-    AgentCall --> PermMgr
-    PermMgr --> Allowlist
-    Allowlist -->|匹配已授权 Grant| ToolHandlers
-    Allowlist -->|未匹配/高风险| ShellCheck
-    ShellCheck -->|安全命令| GateHarness
-    ShellCheck -->|不安全/被拦截| Escalation["升级至人类 / 拒绝执行"]
-    GateHarness --> ToolHandlers
+    employees {
+        string employee_id PK
+        string name
+        string role_id
+        string username
+        string is_human
+        string access_level
+    }
+
+    artifact_records {
+        string artifact_id PK
+        string task_id FK
+        string work_item_id FK
+        string path
+        string category
+    }
+
+    runtime_permission_grants {
+        string grant_id PK
+        string session_id FK
+        string tool_name
+        string scope
+        string status
+    }
+
+    org_changelogs {
+        string log_id PK
+        string org_id
+        string event_type
+        string actor_id
+        string description
+        string timestamp
+    }
+
+    vector_documents {
+        string doc_id PK
+        string text
+        string timestamp
+        string year_month
+        string epoch_week
+        float epoch_time
+        json metadata
+    }
+```
 
     ToolHandlers --> Browser
     ToolHandlers --> ShellExec
@@ -588,74 +636,89 @@ OpenOPC 使用异步 SQLite (`aiosqlite`) 存储关系型数据，并结合 Chro
 
 ```mermaid
 erDiagram
-    PROJECTS ||--o{ WORK_ITEMS : contains
-    PROJECTS ||--o{ ROLES : defines
-    ROLES ||--o{ EMPLOYEES : assigned_to
-    WORK_ITEMS ||--o{ ARTIFACTS : produces
-    WORK_ITEMS ||--o{ TRAJECTORIES : records
-    EMPLOYEES ||--o{ TRAJECTORIES : generates
-    SESSIONS ||--o{ GRANTS : scoped_by
+    delegation_work_items ||--o{ tasks : projects_to_runtime
+    delegation_work_items ||--o{ artifact_records : produces
+    seat_states ||--o{ delegation_work_items : executes
+    employees ||--o{ seat_states : fills_seat
+    tasks ||--o{ cost_events : incurs_cost
+    sessions ||--o{ runtime_permission_grants : scopes_permission
+    delegation_work_items ||--o{ org_changelogs : records_event
 
-    PROJECTS {
+    delegation_work_items {
+        string work_item_id PK
+        string run_id
+        string project_id
+        string title
+        string phase
+        string owner_role_id
+        string parent_work_item_id FK
+        json dependencies
+    }
+
+    tasks {
         string id PK
-        string name
-        string goal
+        string session_id
+        string project_id
+        string title
         string status
-        datetime created_at
+        string assigned_to
+        string assigned_external_agent
+        json metadata
+        json result
     }
 
-    WORK_ITEMS {
-        string id PK
-        string project_id FK
-        string title
-        string state
-        string owner_role FK
-        string parent_id FK
-        json dependency_ids
-    }
-
-    ROLES {
-        string id PK
-        string project_id FK
-        string title
-        string responsibility
-        json capabilities
-    }
-
-    EMPLOYEES {
-        string id PK
-        string name
-        string role_id FK
-        string profile_avatar
-        json private_experience
-    }
-
-    TRAJECTORIES {
-        string id PK
-        string work_item_id FK
+    seat_states {
+        string seat_state_id PK
+        string team_instance_id
+        string role_id
+        string seat_id
         string employee_id FK
-        json step_history
-        float outcome_score
+        string status
+        string current_work_item_id FK
     }
 
-    ARTIFACTS {
-        string id PK
+    employees {
+        string employee_id PK
+        string name
+        string role_id
+        string username
+        string is_human
+        string access_level
+    }
+
+    artifact_records {
+        string artifact_id PK
+        string task_id FK
         string work_item_id FK
-        string file_path
-        string mime_type
+        string path
+        string category
     }
 
-    SESSIONS {
-        string id PK
-        string mode
-        string project_id FK
-    }
-
-    GRANTS {
-        string id PK
+    runtime_permission_grants {
+        string grant_id PK
         string session_id FK
         string tool_name
         string scope
+        string status
+    }
+
+    org_changelogs {
+        string log_id PK
+        string org_id
+        string event_type
+        string actor_id
+        string description
+        string timestamp
+    }
+
+    vector_documents {
+        string doc_id PK
+        string text
+        string timestamp
+        string year_month
+        string epoch_week
+        float epoch_time
+        json metadata
     }
 ```
 

@@ -96,73 +96,66 @@ The global system lifecycle governs the macro-level state transitions of an Open
 
 ```mermaid
 stateDiagram-v2
-    [*] --> UNINITIALIZED : System Start / Workspace Load
+    [*] --> IDLE : Session Created / Workspace Initialized
 
-    UNINITIALIZED --> CONFIGURING : opc init / Profile Selected
-    CONFIGURING --> STAFFING : Goal Submitted (Self-Built Phase)
+    IDLE --> STAFFING : Goal Submitted / Staffing Recruiter Triggered
 
     state STAFFING {
-        [*] --> DerivingOrgChart
+        [*] --> DerivingOrgChart : Recruiter Analyzes Goal
         DerivingOrgChart --> QueryingTalentMarket : Evaluate Presets & Past Hires
-        QueryingTalentMarket --> HiringEmployees : Match Roles to Employees
-        HiringEmployees --> OrgStaffed : Roster Completed
+        QueryingTalentMarket --> AssigningSeats : Bind Roles to Employees / Contractors
+        AssigningSeats --> RosterReady : Seat State Synchronized
     }
 
-    STAFFING --> ORCHESTRATING : Org Roster Ready
+    STAFFING --> RUNNING : Org Roster & Work-Item DAG Ready
 
-    state ORCHESTRATING {
-        [*] --> DecomposingGoal : Org Engine Generates Work-Item DAG
-        DecomposingGoal --> SchedulingDAG : Resolve Item Dependencies
-        SchedulingDAG --> DispatchingWorkItem : Pick Runnable Item
-    }
-
-    ORCHESTRATING --> EXECUTING_ITEM : Item Dispatched to Worker Role
-
-    state EXECUTING_ITEM {
-        [*] --> AssemblingContext : Layer 1 Prompt Assembly
-        AssemblingContext --> AgentLoop : NativeAgent / ExternalBroker Iteration
+    state RUNNING {
+        [*] --> SelectingRunnableItem : Phase Transition (QUEUED -> READY)
+        SelectingRunnableItem --> DispatchedToRole : Seat Execution Lock Acquired
         
-        state AgentLoop {
-            [*] --> LLMInference
-            LLMInference --> EvaluatingToolCall
-            EvaluatingToolCall --> ExecutingTool : Governance Approval Granted
-            ExecutingTool --> LLMInference : Tool Result Attached
+        state DispatchedToRole {
+            [*] --> ContextAssembly : Layer 1 Prompt & History Assembly
+            ContextAssembly --> AgentExecutionLoop : NativeRuntimeV2 / ExternalBroker
+            
+            state AgentExecutionLoop {
+                [*] --> LLMInference
+                LLMInference --> EvaluatingToolCall
+                EvaluatingToolCall --> ToolExecution : ApprovalEngine Grants Permission
+                ToolExecution --> LLMInference : Result Returned
+            }
+
+            AgentExecutionLoop --> OutputSubmitted : Work Item Submitted (Phase -> AWAITING_MANAGER_REVIEW)
         }
 
-        AgentLoop --> AWAITING_HUMAN_APPROVAL : High-Risk Tool / Mid-run Blocker
-        AWAITING_HUMAN_APPROVAL --> AgentLoop : Human Grants Permission / Answer
-        AgentLoop --> SubmittingOutput : Task Output Produced
-    }
-
-    EXECUTING_ITEM --> IN_MANAGER_REVIEW : Worker Submits Work Item
-
-    state IN_MANAGER_REVIEW {
-        [*] --> ReviewingDeliverable
-        ReviewingDeliverable --> Accepted : Meets Output Contract
-        ReviewingDeliverable --> Rejected : Output Fails Acceptance Criteria
-    }
-
-    IN_MANAGER_REVIEW --> REWORKING : Rejected (Feedback Attached)
-    REWORKING --> EXECUTING_ITEM : Re-dispatched to Worker Role
-
-    IN_MANAGER_REVIEW --> ORCHESTRATING : Accepted (More Runnable DAG Items Exist)
-    IN_MANAGER_REVIEW --> PROJECT_COMPLETE : Accepted (All DAG Items Finished)
-
-    state PROJECT_COMPLETE {
-        [*] --> GeneratingFinalReport
-        GeneratingFinalReport --> DistillingTrajectories : Self-Grown Phase
+        DispatchedToRole --> ManagerReview : Manager Evaluation
         
-        state DistillingTrajectories {
-            [*] --> RatingOutcomes : Resolve User Evaluation
-            RatingOutcomes --> AttributingCredit : Credit/Blame per Role Owner
-            AttributingCredit --> UpdatingPrivateExperience : Save Role Lessons
-            UpdatingPrivateExperience --> SynthesizingPlaybooks : Promote Recurring Lessons
+        state ManagerReview {
+            [*] --> EvaluatingOutputContract
+            EvaluatingOutputContract --> ApprovedVerdict : Meets Artifact Contract
+            EvaluatingOutputContract --> RejectedVerdict : Fails Quality / Lint Checks
         }
 
-        DistillingTrajectories --> MemoryEvolved : Shared Company Playbooks Updated
+        ManagerReview --> ReworkLoop : Rejected (Phase -> READY_FOR_REWORK)
+        ReworkLoop --> DispatchedToRole : Re-dispatched to Worker Role
     }
 
-    PROJECT_COMPLETE --> [*] : Project Archived / Idle
+    RUNNING --> PAUSED_GOVERNANCE : ApprovalEngine Requires Escalation / User Input
+    PAUSED_GOVERNANCE --> RUNNING : Approval Granted by Owner
+
+    RUNNING --> AWAITING_HUMAN : Assigned to Human Contractor (Shadow Mode)
+    AWAITING_HUMAN --> RUNNING : Deliverable Submitted via MessageBus / SQLite
+
+    RUNNING --> COMPLETED : All Work-Item DAG Nodes Approved / Closed
+    RUNNING --> FAILED : Unrecoverable Exception / Max Retries Exceeded
+
+    state COMPLETED {
+        [*] --> DistillingExperience : Layer 5 Trajectory Learning
+        DistillingExperience --> SynthesizingPlaybooks : Promote Recurring Lessons to SkillLibrary
+        SynthesizingPlaybooks --> MemoryEvolved : Evolved Employee Profiles & Playbooks Saved
+    }
+
+    COMPLETED --> [*] : Session Closed
+    FAILED --> [*] : Error Logged
 ```
 
 ---
@@ -275,34 +268,36 @@ The Organization Engine (`opc/layer2_organization/`) manages dynamic work-item o
 
 ```mermaid
 stateDiagram-v2
-    [*] --> PENDING : Work Item Created
+    [*] --> QUEUED : Work Item Created (Manager Holding)
 
-    PENDING --> READY : Prerequisites Met (DAG Dependencies Resolved)
-    READY --> RUNNING : Assigned to Role & Dispatched
+    QUEUED --> READY : Released / Dependencies Resolved
+    READY --> IN_PROGRESS : Dispatched & Execution Lock Acquired
 
-    state RUNNING {
-        [*] --> Executing
-        Executing --> AWAITING_HUMAN_DELIVERABLE : Human Contractor Role Hand-off (Shadow Mode)
-        AWAITING_HUMAN_DELIVERABLE --> Executing : Deliverable Completed via Layer 0 Event
-        Executing --> WaitingApproval : Destructive Action / High-Risk Tool
-        WaitingApproval --> Executing : Approval Granted
-        Executing --> Blocked : Mid-run Blocker / Missing Information
-        Blocked --> Executing : Blocker Resolved / Unblocked
+    state IN_PROGRESS {
+        [*] --> ExecutingWorkItem
+        ExecutingWorkItem --> BLOCKED : Missing Dependency / Resource
+        BLOCKED --> ExecutingWorkItem : Blocker Resolved
+        ExecutingWorkItem --> AWAITING_HUMAN_DELIVERABLE : Assigned to Human (Shadow Mode)
+        AWAITING_HUMAN_DELIVERABLE --> ExecutingWorkItem : Deliverable Submitted
     }
 
-    RUNNING --> IN_REVIEW : Task Submitted by Worker Role
-    RUNNING --> ESCALATED : Critical Failure / Authority Exceeded
+    IN_PROGRESS --> AWAITING_PEER_REVIEW : Worker Submits for Peer Review
+    AWAITING_PEER_REVIEW --> AWAITING_MANAGER_REVIEW : Peer Approval Granted
+    IN_PROGRESS --> AWAITING_MANAGER_REVIEW : Worker Submits directly to Manager
 
-    state IN_REVIEW {
-        [*] --> Reviewing
-        Reviewing --> Accepted : Manager Approves Deliverable
-        Reviewing --> Rejected : Deliverable Fails Output Contract
+    state AWAITING_MANAGER_REVIEW {
+        [*] --> ManagerEvaluating
+        ManagerEvaluating --> APPROVED : Output Meets Contract
+        ManagerEvaluating --> READY_FOR_REWORK : Output Fails Review (Rework)
+        ManagerEvaluating --> REJECTED : Terminal Rejection
     }
 
-    IN_REVIEW --> COMPLETED : Accepted
-    IN_REVIEW --> RUNNING : Rejected (Revision Requested)
-    ESCALATED --> RUNNING : Re-routed or Re-assigned
-    COMPLETED --> [*]
+    READY_FOR_REWORK --> IN_PROGRESS : Re-dispatched to Worker Role
+    APPROVED --> CLOSED : Deliverable Merged & Closed
+    SUPERSEDED --> [*] : Replaced by Reorg
+    CANCELLED --> [*] : Cancelled by User
+    FAILED --> [*] : Timeout / Unrecoverable Error
+    CLOSED --> [*] : Complete
 ```
 
 ### Collaboration Modes
@@ -396,11 +391,11 @@ flowchart LR
         AgentCall["Agent Emits Tool Call Request"]
     end
 
-    subgraph SafetyGovernance ["Governance & Security Pipeline"]
-        PermMgr["Permission Manager (permissions.py)"]
-        Allowlist["Approval Allowlist (approval_allowlist.py)"]
-        ShellCheck["Shell Safety Guard (shell_safety.py)"]
-        GateHarness["Gate Harness (gate_harness.py)"]
+    subgraph GovernanceEngine ["Governance & Approval Engine"]
+        ApprovalEngine["Approval Engine (opc.layer0_interaction.approval_engine)"]
+        PermMgr["Permission Manager (opc.layer3_agent.runtime_v2.permissions)"]
+        Allowlist["Approval Allowlist (opc.layer5_memory.approval_allowlist)"]
+        ShellSafety["Shell Safety Guard (opc.layer2_organization.shell_safety)"]
     end
 
     subgraph ToolHandlers ["Layer 4 Execution Handlers"]
@@ -415,13 +410,15 @@ flowchart LR
         OutputBudget["Output Budget (output_budget.py)"]
     end
 
-    AgentCall --> PermMgr
-    PermMgr --> Allowlist
-    Allowlist -->|Match Active Grant| ToolHandlers
-    Allowlist -->|Unmatched / High-Risk| ShellCheck
-    ShellCheck -->|Safe Command| GateHarness
-    ShellCheck -->|Unsafe / Blocked| Escalation["Escalate to Human / Reject"]
-    GateHarness --> ToolHandlers
+    AgentCall --> ApprovalEngine
+    ApprovalEngine --> PermMgr
+    ApprovalEngine --> Allowlist
+    ApprovalEngine --> ShellSafety
+    
+    Allowlist -->|Match Active Session Grant| ToolHandlers
+    ShellSafety -->|Safe Shell Command| ToolHandlers
+    ShellSafety -->|Unsafe / Destructive| Escalation["Escalate to Owner / Reject"]
+    ApprovalEngine -->|Approved| ToolHandlers
 
     ToolHandlers --> Browser
     ToolHandlers --> ShellExec
@@ -537,74 +534,89 @@ OpenOPC utilizes asynchronous SQLite (`aiosqlite`) for structured entity storage
 
 ```mermaid
 erDiagram
-    PROJECTS ||--o{ WORK_ITEMS : contains
-    PROJECTS ||--o{ ROLES : defines
-    ROLES ||--o{ EMPLOYEES : assigned_to
-    WORK_ITEMS ||--o{ ARTIFACTS : produces
-    WORK_ITEMS ||--o{ TRAJECTORIES : records
-    EMPLOYEES ||--o{ TRAJECTORIES : generates
-    SESSIONS ||--o{ GRANTS : scoped_by
+    delegation_work_items ||--o{ tasks : projects_to_runtime
+    delegation_work_items ||--o{ artifact_records : produces
+    seat_states ||--o{ delegation_work_items : executes
+    employees ||--o{ seat_states : fills_seat
+    tasks ||--o{ cost_events : incurs_cost
+    sessions ||--o{ runtime_permission_grants : scopes_permission
+    delegation_work_items ||--o{ org_changelogs : records_event
 
-    PROJECTS {
+    delegation_work_items {
+        string work_item_id PK
+        string run_id
+        string project_id
+        string title
+        string phase
+        string owner_role_id
+        string parent_work_item_id FK
+        json dependencies
+    }
+
+    tasks {
         string id PK
-        string name
-        string goal
+        string session_id
+        string project_id
+        string title
         string status
-        datetime created_at
+        string assigned_to
+        string assigned_external_agent
+        json metadata
+        json result
     }
 
-    WORK_ITEMS {
-        string id PK
-        string project_id FK
-        string title
-        string state
-        string owner_role FK
-        string parent_id FK
-        json dependency_ids
-    }
-
-    ROLES {
-        string id PK
-        string project_id FK
-        string title
-        string responsibility
-        json capabilities
-    }
-
-    EMPLOYEES {
-        string id PK
-        string name
-        string role_id FK
-        string profile_avatar
-        json private_experience
-    }
-
-    TRAJECTORIES {
-        string id PK
-        string work_item_id FK
+    seat_states {
+        string seat_state_id PK
+        string team_instance_id
+        string role_id
+        string seat_id
         string employee_id FK
-        json step_history
-        float outcome_score
+        string status
+        string current_work_item_id FK
     }
 
-    ARTIFACTS {
-        string id PK
+    employees {
+        string employee_id PK
+        string name
+        string role_id
+        string username
+        string is_human
+        string access_level
+    }
+
+    artifact_records {
+        string artifact_id PK
+        string task_id FK
         string work_item_id FK
-        string file_path
-        string mime_type
+        string path
+        string category
     }
 
-    SESSIONS {
-        string id PK
-        string mode
-        string project_id FK
-    }
-
-    GRANTS {
-        string id PK
+    runtime_permission_grants {
+        string grant_id PK
         string session_id FK
         string tool_name
         string scope
+        string status
+    }
+
+    org_changelogs {
+        string log_id PK
+        string org_id
+        string event_type
+        string actor_id
+        string description
+        string timestamp
+    }
+
+    vector_documents {
+        string doc_id PK
+        string text
+        string timestamp
+        string year_month
+        string epoch_week
+        float epoch_time
+        json metadata
     }
 ```
 
