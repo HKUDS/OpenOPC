@@ -72,6 +72,11 @@ class ExternalAgentBroker:
 
     _STREAM_READ_SIZE = 8192
     _MAX_PATH_HINT_TOKEN_LENGTH = 512
+    # Result statuses that prove the provider attempt terminally failed, so
+    # its session token must not stay pinned. Parks (awaiting_human /
+    # awaiting_peer / awaiting_manager_review) and cancels keep the token:
+    # those runs resume the same provider thread once the gate clears.
+    _SESSION_INVALIDATING_RESULT_STATUSES = frozenset({TaskStatus.FAILED})
     _STREAM_SESSION_UPDATE_MIN_SECONDS = 2.0
     _STREAM_PROGRESS_MIN_SECONDS = 2.0
     _STREAM_TRANSCRIPT_HEAD_LINES = 40
@@ -92,11 +97,13 @@ class ExternalAgentBroker:
         approval_engine: ApprovalEngine,
         task_preparer: Callable[[Task], Coroutine[Any, Any, Task]] | None = None,
         communication: CommunicationManager | None = None,
+        org_engine: Any | None = None,
     ) -> None:
         self.store = store
         self.approval_engine = approval_engine
         self.task_preparer = task_preparer
         self.communication = communication
+        self.org_engine = org_engine
 
     @staticmethod
     def _normalize_external_agent_choice(value: Any) -> str:
@@ -137,19 +144,27 @@ class ExternalAgentBroker:
         )
         return selected
 
-    async def _provider_stream_token_allows_resume(
+    async def _stored_provider_token_allows_resume(
         self,
         *,
         adapter: ExternalAgentAdapter,
         task: Task,
         role_session_id: str,
         token: str,
-    ) -> bool:
-        """Cross-check an early stream token against its latest run status."""
+        strict: bool = False,
+    ) -> bool | None:
+        """Return the latest durable resumability verdict for one provider token.
+
+        ``True`` means the newest row for the token finalized resumable,
+        ``False`` means the token is dead and must be cleared, ``None`` means
+        there is no durable verdict either way (caller keeps the token).
+        ``strict`` treats an unfinalized newest row as ``False`` — required
+        for provider_stream tokens whose run may have crashed mid-stream.
+        """
 
         list_sessions = getattr(self.store, "list_external_sessions", None)
         if not callable(list_sessions):
-            return False
+            return None
         project_id = str(task.project_id or "default").strip() or "default"
         kwargs: dict[str, Any] = {"project_id": project_id, "limit": 100}
         if role_session_id:
@@ -160,19 +175,38 @@ class ExternalAgentBroker:
             sessions = await list_sessions(**kwargs)
         except Exception:
             logger.opt(exception=True).debug(
-                "External resume restore: provider-stream status lookup failed"
+                "External resume restore: provider-token status lookup failed"
             )
+            return None
+        matching = [
+            session
+            for session in sessions
+            if str(getattr(session, "agent_type", "") or "").strip()
+            == adapter.agent_type
+            and external_session_matches_provider_token(session, token)
+        ]
+        if not matching:
+            return None
+        selected, selected_token = select_best_external_resume_session(
+            matching,
+            agent_type=adapter.agent_type,
+            project_id=project_id,
+        )
+        if (
+            selected is None
+            or selected_token != token
+            or not external_session_allows_resume(selected)
+        ):
+            # The newest row for this token is terminally non-resumable.
             return False
-        for session in sessions:
-            if str(getattr(session, "agent_type", "") or "").strip() != adapter.agent_type:
-                continue
-            if external_session_matches_provider_token(session, token):
-                return (
-                    external_session_allows_resume(session)
-                    and str(getattr(session, "status", "") or "").strip().lower()
-                    in {"done", "suspended"}
-                )
-        return False
+        status = str(getattr(selected, "status", "") or "").strip().lower()
+        if status in {"done", "suspended"}:
+            return True
+        # The newest row is alive but not finalized (running / awaiting_human /
+        # awaiting_peer). An approval or peer park is not evidence the thread
+        # is dead, so a canonical token keeps its pin; a provider_stream token
+        # must not resume an attempt that never finalized.
+        return False if strict else None
 
     @classmethod
     def _task_explicitly_selected_external_agent(cls, task: Task, agent_type: str) -> bool:
@@ -474,9 +508,12 @@ class ExternalAgentBroker:
             return
         if str(getattr(config, "session_mode", "") or "").strip().lower() == "new":
             return
-        # Respect already-configured resume state.
-        if str(getattr(config, "session_mode", "") or "").strip().lower() == "resume" and getattr(config, "session_id", ""):
-            return
+        configured_session_token = (
+            str(getattr(config, "session_id", "") or "").strip()
+            if str(getattr(config, "session_mode", "") or "").strip().lower()
+            == "resume"
+            else ""
+        )
 
         store = getattr(self, "store", None)
         if store is None or not hasattr(store, "get_external_session"):
@@ -494,7 +531,7 @@ class ExternalAgentBroker:
         # Fix 5 PR6: canonical source is ``role_runtime_session.adapter_session_state[agent_type]``.
         # Check it first; the ExternalSession table is a compatibility
         # fallback for legacy rows written before PR6 landed.
-        session_token = ""
+        session_token = configured_session_token
         if role_session_id and hasattr(store, "get_role_session_adapter_state"):
             try:
                 entry = await store.get_role_session_adapter_state(
@@ -507,28 +544,31 @@ class ExternalAgentBroker:
                 )
                 entry = None
             if isinstance(entry, dict):
-                session_token = str(
+                role_session_token = str(
                     entry.get("resume_session_id")
                     or entry.get("provider_session_id")
                     or ""
                 ).strip()
                 if not is_provider_session_token(
-                    session_token,
+                    role_session_token,
                     agent_type=adapter.agent_type,
                     project_id=project_id,
                 ):
-                    session_token = ""
-                if (
-                    session_token
-                    and str(entry.get("source", "") or "").strip()
-                    == "provider_stream"
-                    and not await self._provider_stream_token_allows_resume(
+                    role_session_token = ""
+                session_token = session_token or role_session_token
+                token_allows_resume = (
+                    await self._stored_provider_token_allows_resume(
                         adapter=adapter,
                         task=task,
                         role_session_id=role_session_id,
                         token=session_token,
+                        strict=str(entry.get("source", "") or "").strip()
+                        == "provider_stream",
                     )
-                ):
+                    if session_token
+                    else None
+                )
+                if session_token and token_allows_resume is False:
                     session_token = ""
                     clear_role_state = getattr(
                         store,
@@ -544,8 +584,23 @@ class ExternalAgentBroker:
                             )
                         except Exception:
                             logger.opt(exception=True).debug(
-                                "External resume restore: stale provider-stream token clear failed"
+                                "External resume restore: stale provider token clear failed"
                             )
+                    if hasattr(config, "session_mode"):
+                        config.session_mode = "new"
+                    if hasattr(config, "session_id"):
+                        config.session_id = ""
+                    task.metadata = dict(task.metadata or {})
+                    task.metadata.pop("external_resume_session_id", None)
+                    task.metadata.pop("external_resume_session_scope_id", None)
+                    task.metadata.pop("external_resume_agent_type", None)
+                    task.metadata["external_resume_fallback"] = (
+                        "provider_terminal_failure"
+                    )
+                    if on_progress:
+                        await on_progress(
+                            f"[External resume] {adapter.agent_type} skipped prior failed session"
+                        )
                     # Do not immediately rediscover the same unfinalized or
                     # failed stream row through the compatibility fallback.
                     return
@@ -2548,24 +2603,40 @@ class ExternalAgentBroker:
                     )
         elif (
             role_session_id
-            and result.status != TaskStatus.DONE
+            and result.status in self._SESSION_INVALIDATING_RESULT_STATUSES
             and hasattr(self.store, "get_role_session_adapter_state")
             and hasattr(self.store, "update_role_session_adapter_state")
         ):
-            # A stream token is durable early so Stop can retain it.  A normal
-            # terminal failure, however, must not leave that attempt's token
-            # pinned for a later unrelated turn.
+            # A stream token is durable early so Stop can retain it, and a
+            # park (awaiting_human / awaiting_peer) keeps it so the run can
+            # resume the same thread once the gate clears. A terminal failure
+            # must clear both a token discovered by this task and an older
+            # role token that this failed attempt resumed.
             try:
                 current = await self.store.get_role_session_adapter_state(
                     role_session_id,
                     adapter.agent_type,
                 )
+                current_token = ""
+                if isinstance(current, dict):
+                    current_token = str(
+                        current.get("resume_session_id")
+                        or current.get("provider_session_id")
+                        or ""
+                    ).strip()
+                failed_token = str(
+                    resume_session_id
+                    or provider_session_id
+                    or getattr(adapter.config, "session_id", "")
+                    or ""
+                ).strip()
                 if (
                     isinstance(current, dict)
-                    and str(current.get("last_task_id", "") or "").strip()
-                    == str(task.id or "").strip()
-                    and str(current.get("source", "") or "").strip()
-                    == "provider_stream"
+                    and (
+                        str(current.get("last_task_id", "") or "").strip()
+                        == str(task.id or "").strip()
+                        or bool(failed_token and current_token == failed_token)
+                    )
                 ):
                     await self.store.update_role_session_adapter_state(
                         role_session_id,
@@ -2576,3 +2647,19 @@ class ExternalAgentBroker:
                 logger.opt(exception=True).debug(
                     "Failed to clear provider-stream role state after terminal failure"
                 )
+        if result.status in self._SESSION_INVALIDATING_RESULT_STATUSES:
+            failed_token = str(
+                resume_session_id
+                or provider_session_id
+                or getattr(adapter.config, "session_id", "")
+                or ""
+            ).strip()
+            task_token = str(
+                (task.metadata or {}).get("external_resume_session_id", "") or ""
+            ).strip()
+            if failed_token and task_token == failed_token:
+                task.metadata = dict(task.metadata or {})
+                task.metadata.pop("external_resume_session_id", None)
+                task.metadata.pop("external_resume_session_scope_id", None)
+                task.metadata.pop("external_resume_agent_type", None)
+                task.metadata["external_resume_fallback"] = "provider_terminal_failure"

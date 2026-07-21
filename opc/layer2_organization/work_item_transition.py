@@ -34,6 +34,7 @@ from opc.layer2_organization.phase import (
     DONE_PHASES,
     InvalidPhaseTransition,
     coerce_phase,
+    has_open_attempt,
     phase_for_task_status,
     task_status_for_phase,
     validate_transition,
@@ -41,6 +42,54 @@ from opc.layer2_organization.phase import (
 from opc.layer2_organization.work_item_links import linked_work_item_id_for_task
 from opc.layer2_organization.work_item_identity import work_item_identity_payload
 from opc.layer2_organization.work_item_runtime import is_work_item_runtime_metadata
+
+
+def build_attempt_settlement_updates(
+    current_metadata: dict[str, Any] | None,
+    *,
+    outcome: str,
+) -> dict[str, Any]:
+    """Compute the metadata delta that settles the currently-open attempt.
+
+    ``outcome`` semantics:
+      * ``"crashed"`` — the attempt died on an exception/timeout; increments
+        ``attempt_crash_streak`` (consecutive crashes).
+      * ``"interrupted"`` — the owning process/coroutine went away without a
+        verdict (kill, cancel-before-harvest); increments
+        ``attempt_interrupted_streak``.
+      * anything else — a clean turn boundary (approved/failed-by-review/
+        waiting/park/...); resets both streaks.
+
+    Returns ``{}`` when there is no open attempt to settle, so callers can
+    merge unconditionally.
+    """
+    metadata = dict(current_metadata or {})
+    if not has_open_attempt(metadata):
+        return {}
+
+    def _streak(key: str) -> int:
+        try:
+            return int(metadata.get(key, 0) or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    outcome_clean = str(outcome or "").strip() or "settled"
+    if outcome_clean == "crashed":
+        crash_streak = _streak("attempt_crash_streak") + 1
+        interrupted_streak = _streak("attempt_interrupted_streak")
+    elif outcome_clean == "interrupted":
+        crash_streak = _streak("attempt_crash_streak")
+        interrupted_streak = _streak("attempt_interrupted_streak") + 1
+    else:
+        crash_streak = 0
+        interrupted_streak = 0
+    return {
+        "attempt_settled": True,
+        "attempt_outcome": outcome_clean,
+        "attempt_settled_at": datetime.now().isoformat(),
+        "attempt_crash_streak": crash_streak,
+        "attempt_interrupted_streak": interrupted_streak,
+    }
 
 
 async def transition_work_item(
@@ -52,6 +101,7 @@ async def transition_work_item(
     summary: str | None = None,
     metadata_updates: dict[str, Any] | None = None,
     release_claim: bool = False,
+    attempt_outcome: str | None = None,
 ) -> DelegationWorkItem | None:
     """Transition a work item to ``target_phase``.
 
@@ -89,39 +139,102 @@ async def transition_work_item(
     reason_clean = str(reason or "").strip()
     if reason_clean:
         merged["last_transition_reason"] = reason_clean
+    # Attempt settlement: any transition to a non-RUNNING phase is a turn
+    # boundary for the claim that opened the current attempt (the claim CAS
+    # stamped attempt_settled=false). Fold the settlement delta into the SAME
+    # write as the phase change so an attempt can never end without its
+    # ledger entry — the structural guarantee behind the dispatcher's
+    # crash/interrupted streak brake (see phase.attempt_ledger_dispatch_
+    # block_reason).
+    settlement: dict[str, Any] = {}
+    current_item = None
+    if phase != Phase.RUNNING and hasattr(store, "get_delegation_work_item"):
+        try:
+            current_item = await store.get_delegation_work_item(work_item_id)
+        except Exception:
+            current_item = None
+        if current_item is not None:
+            settlement = build_attempt_settlement_updates(
+                dict(getattr(current_item, "metadata", {}) or {}),
+                outcome=attempt_outcome or phase.value,
+            )
+            if settlement:
+                merged = {**settlement, **merged}
     kwargs: dict[str, Any] = {
         "phase": phase,
         "metadata_updates": merged,
     }
     if summary is not None:
         kwargs["summary"] = summary
-    # Phase transition first, claim release second (when requested). The
-    # old rationale for this ordering was "sync_member_session_hook reads
-    # item.claimed_by_role_runtime_session_id"; Phase B removed that hook
-    # and moved the unpark to the dispatcher's per-tick rehydrate pass,
-    # but the two-step ordering is kept so downstream listeners that
-    # still inspect the claim (audit logs, kanban projections) see a
-    # consistent before/after.
+    if release_claim:
+        # Fold claim release into the same write as the phase change: the
+        # legacy two-call sequence could commit the phase and then fail the
+        # release, stranding a dead claim. Terminal phases additionally drop
+        # the metadata claim mirror keys so the row can never satisfy a
+        # future claim-CAS predicate by accident.
+        kwargs["claimed_by_role_runtime_session_id"] = ""
+        kwargs["claimed_by_seat_id"] = ""
+        if phase in DONE_PHASES:
+            merged.setdefault("claimed_by_role_session_id", "")
+            merged.setdefault("claimed_task_id", "")
     try:
         result = await store.update_delegation_work_item(work_item_id, **kwargs)
+    except InvalidPhaseTransition:
+        # The phase write lost a race (or the caller is out of date). The
+        # attempt settlement must still land — losing it is exactly the
+        # "crash without accounting" gap that produced endless re-dispatch.
+        if settlement:
+            try:
+                await store.update_delegation_work_item(
+                    work_item_id,
+                    metadata_updates=settlement,
+                )
+            except Exception:
+                logger.opt(exception=True).warning(
+                    f"transition_work_item: settlement fallback failed wid={work_item_id}"
+                )
+        raise
     except Exception:
         logger.opt(exception=True).warning(
             f"transition_work_item failed wid={work_item_id} "
             f"target={phase.value} reason={reason_clean}"
         )
         raise
-    if release_claim and result is not None:
-        try:
-            result = await store.update_delegation_work_item(
-                work_item_id,
-                claimed_by_role_runtime_session_id="",
-                claimed_by_seat_id="",
-            )
-        except Exception:
-            logger.opt(exception=True).warning(
-                f"transition_work_item: claim release failed wid={work_item_id}"
-            )
     return result
+
+
+async def settle_open_attempt_as_interrupted(
+    store: Any,
+    work_item: DelegationWorkItem,
+) -> bool:
+    """Back-fill the ledger for an attempt whose owner died without settling.
+
+    Metadata-only write (no phase change): the card keeps whatever phase the
+    crash left it in — recovery semantics stay untouched — but the attempt
+    stops being invisible. Called by the dispatcher's per-tick reconcile pass
+    for cards with an open attempt and no live in-process owner. Returns True
+    when a settlement write was issued.
+    """
+    if store is None or not hasattr(store, "update_delegation_work_item"):
+        return False
+    metadata = dict(getattr(work_item, "metadata", {}) or {})
+    settlement = build_attempt_settlement_updates(metadata, outcome="interrupted")
+    if not settlement:
+        return False
+    try:
+        updated = await store.update_delegation_work_item(
+            work_item.work_item_id,
+            metadata_updates=settlement,
+        )
+    except Exception:
+        logger.opt(exception=True).warning(
+            "settle_open_attempt_as_interrupted failed "
+            f"wid={getattr(work_item, 'work_item_id', '')}"
+        )
+        return False
+    if updated is not None:
+        work_item.metadata = dict(updated.metadata or {})
+    return True
 
 
 def _fallback_status_for(
@@ -162,6 +275,7 @@ async def transition_work_item_from_task(
     metadata_updates: dict[str, Any] | None = None,
     release_claim: bool = False,
     require_work_item: bool = False,
+    attempt_outcome: str | None = None,
 ) -> bool:
     """Task bridge helper: transition a work item when the caller holds a Task.
 
@@ -306,6 +420,7 @@ async def transition_work_item_from_task(
             summary=summary,
             metadata_updates=back_ref,
             release_claim=release_claim,
+            attempt_outcome=attempt_outcome,
         )
     except InvalidPhaseTransition:
         # Defensive: state-machine validation at the store layer can also

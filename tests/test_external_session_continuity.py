@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+from datetime import datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -37,6 +38,7 @@ from opc.core.models import (
 from opc.database.store import OPCStore
 from opc.layer3_agent.adapters.base import ExternalAgentAdapter
 from opc.layer3_agent.external_broker import ExternalAgentBroker
+from opc.layer3_agent.external_session_identity import select_best_external_resume_session
 
 
 # ── Store helper unit tests ──────────────────────────────────────────────
@@ -97,9 +99,28 @@ class AdapterSessionStateHelperTests(unittest.IsolatedAsyncioTestCase):
         await self.store.update_role_session_adapter_state(
             self.sid, "codex", {"resume_session_id": "thread-abc"},
         )
+        role_session = await self.store.get_delegation_role_session(self.sid)
+        role_session.adapter_session_state.update({
+            "selected_execution_agent": "codex",
+            "external_resume_session_id": "thread-abc",
+            "external_resume_session_scope_id": "sess-a",
+            "external_resume_agent_type": "codex",
+            "resume_source_session": "thread-abc",
+        })
+        await self.store.save_delegation_role_session(role_session)
         await self.store.update_role_session_adapter_state(self.sid, "codex", None)
         entry = await self.store.get_role_session_adapter_state(self.sid, "codex")
+        refreshed = await self.store.get_delegation_role_session(self.sid)
         self.assertIsNone(entry)
+        self.assertEqual(
+            refreshed.adapter_session_state.get("selected_execution_agent"),
+            "codex",
+        )
+        self.assertNotIn(
+            "external_resume_session_id",
+            refreshed.adapter_session_state,
+        )
+        self.assertNotIn("resume_source_session", refreshed.adapter_session_state)
 
     async def test_missing_session_returns_false(self) -> None:
         ok = await self.store.update_role_session_adapter_state(
@@ -245,6 +266,97 @@ class BrokerPersistWritesRoleStateTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIsNone(entry)
 
+    async def test_failed_resume_clears_matching_older_role_token_and_task_metadata(self) -> None:
+        await self._persist_run(
+            task_id="task-old",
+            agent_type="codex",
+            resume_session_id="thread-full",
+        )
+        adapter = _MiniAdapter(agent_type="codex")
+        adapter.config.session_mode = "resume"
+        adapter.config.session_id = "thread-full"
+        task = self._task(task_id="task-retry")
+        task.metadata.update({
+            "external_resume_session_id": "thread-full",
+            "external_resume_session_scope_id": "sess-a",
+            "external_resume_agent_type": "codex",
+        })
+        await self.broker._persist_session(
+            adapter=adapter,
+            task=task,
+            workspace_path="/tmp/ws",
+            metadata={
+                "command": "codex exec resume",
+                "model": "(cli default)",
+                "resume_session_id": "thread-full",
+            },
+            result=TaskResult(
+                status=TaskStatus.FAILED,
+                content="context window full",
+                artifacts={"resume_session_id": "thread-full"},
+            ),
+        )
+
+        self.assertIsNone(
+            await self.store.get_role_session_adapter_state(
+                self.role_session_id,
+                "codex",
+            )
+        )
+        self.assertNotIn("external_resume_session_id", task.metadata)
+        self.assertEqual(
+            task.metadata.get("external_resume_fallback"),
+            "provider_terminal_failure",
+        )
+
+    async def test_awaiting_human_park_keeps_role_token_and_task_metadata(self) -> None:
+        # An approval park is not a terminal failure: the run resumes the
+        # same provider thread once the human approves, so neither the role
+        # token nor the task's resume pin may be cleared.
+        await self._persist_run(
+            task_id="task-old",
+            agent_type="codex",
+            resume_session_id="thread-live",
+        )
+        adapter = _MiniAdapter(agent_type="codex")
+        adapter.config.session_mode = "resume"
+        adapter.config.session_id = "thread-live"
+        task = self._task(task_id="task-parked")
+        task.metadata.update({
+            "external_resume_session_id": "thread-live",
+            "external_resume_session_scope_id": "sess-a",
+            "external_resume_agent_type": "codex",
+        })
+        await self.broker._persist_session(
+            adapter=adapter,
+            task=task,
+            workspace_path="/tmp/ws",
+            metadata={
+                "command": "codex exec resume",
+                "model": "(cli default)",
+                "resume_session_id": "thread-live",
+            },
+            result=TaskResult(
+                status=TaskStatus.AWAITING_HUMAN,
+                content="External action blocked by autonomy policy",
+                artifacts={
+                    "resume_session_id": "thread-live",
+                    "requires_user_input": True,
+                },
+            ),
+        )
+
+        entry = await self.store.get_role_session_adapter_state(
+            self.role_session_id,
+            "codex",
+        )
+        self.assertIsNotNone(entry)
+        self.assertEqual(entry["resume_session_id"], "thread-live")
+        self.assertEqual(
+            task.metadata.get("external_resume_session_id"), "thread-live"
+        )
+        self.assertNotIn("external_resume_fallback", task.metadata)
+
     async def test_consecutive_tasks_overwrite_with_latest_token(self) -> None:
         await self._persist_run(
             task_id="task-1", agent_type="codex", resume_session_id="thread-1",
@@ -257,6 +369,34 @@ class BrokerPersistWritesRoleStateTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(entry["resume_session_id"], "thread-2")
         self.assertEqual(entry["last_task_id"], "task-2")
+
+    def test_newer_failed_row_vetoes_older_done_row_for_same_token(self) -> None:
+        now = datetime.now()
+        older = ExternalSession(
+            agent_type="codex",
+            project_id="proj1",
+            session_id="thread-full",
+            status="done",
+            metadata={"resume_session_id": "thread-full"},
+            updated_at=now - timedelta(minutes=1),
+        )
+        newer = ExternalSession(
+            agent_type="codex",
+            project_id="proj1",
+            session_id="thread-full",
+            status="failed",
+            metadata={"resume_session_id": "thread-full"},
+            updated_at=now,
+        )
+
+        selected, token = select_best_external_resume_session(
+            [older, newer],
+            agent_type="codex",
+            project_id="proj1",
+        )
+
+        self.assertIsNone(selected)
+        self.assertEqual(token, "")
 
     async def test_per_agent_isolation_codex_claude_opencode(self) -> None:
         # All three external adapters land in the same broker path. Each
@@ -429,6 +569,133 @@ class BrokerRestorePrefersRoleStateTests(unittest.IsolatedAsyncioTestCase):
             self.role_session_id,
             "codex",
         ))
+
+    async def test_restore_rejects_terminal_normal_role_token_even_when_preconfigured(self) -> None:
+        token = "thread-terminal"
+        await self.store.update_role_session_adapter_state(
+            self.role_session_id,
+            "codex",
+            {
+                "resume_session_id": token,
+                "provider_session_id": token,
+                "last_task_id": "task-old",
+            },
+        )
+        await self.store.save_external_session(ExternalSession(
+            agent_type="codex",
+            project_id="proj1",
+            session_id=token,
+            opc_session_id=self.role_session_id,
+            task_id="task-failed",
+            workspace_path="/tmp/ws",
+            run_mode="exec",
+            status="failed",
+            metadata={
+                "resume_session_id": token,
+                "provider_session_id": token,
+            },
+        ))
+        adapter = _MiniAdapter(agent_type="codex", can_resume_blank=False)
+        adapter.config.session_mode = "resume"
+        adapter.config.session_id = token
+        task = self._task()
+        task.metadata.update({
+            "external_resume_session_id": token,
+            "external_resume_session_scope_id": "sess-a",
+            "external_resume_agent_type": "codex",
+        })
+
+        await self.broker._restore_session_resume_from_store(adapter, task)
+
+        self.assertEqual(adapter.config.session_mode, "new")
+        self.assertEqual(adapter.config.session_id, "")
+        self.assertIsNone(await self.store.get_role_session_adapter_state(
+            self.role_session_id,
+            "codex",
+        ))
+        self.assertNotIn("external_resume_session_id", task.metadata)
+        self.assertEqual(
+            task.metadata.get("external_resume_fallback"),
+            "provider_terminal_failure",
+        )
+
+    async def test_restore_keeps_role_token_when_newest_row_is_parked_awaiting_human(self) -> None:
+        # A canonical role token whose newest run parked on approval must
+        # keep its pin: awaiting_human is not evidence the thread is dead,
+        # and resume-after-approval depends on this token surviving.
+        token = "thread-parked"
+        await self.store.update_role_session_adapter_state(
+            self.role_session_id,
+            "codex",
+            {
+                "resume_session_id": token,
+                "provider_session_id": token,
+                "last_task_id": "task-old",
+            },
+        )
+        await self.store.save_external_session(ExternalSession(
+            agent_type="codex",
+            project_id="proj1",
+            session_id=token,
+            opc_session_id=self.role_session_id,
+            task_id="task-parked",
+            workspace_path="/tmp/ws",
+            run_mode="exec",
+            status="awaiting_human",
+            metadata={
+                "resume_session_id": token,
+                "provider_session_id": token,
+            },
+        ))
+        adapter = _MiniAdapter(agent_type="codex", can_resume_blank=False)
+        task = self._task()
+
+        await self.broker._restore_session_resume_from_store(adapter, task)
+
+        self.assertEqual(adapter.config.session_mode, "resume")
+        self.assertEqual(adapter.config.session_id, token)
+        self.assertIsNotNone(await self.store.get_role_session_adapter_state(
+            self.role_session_id,
+            "codex",
+        ))
+
+    async def test_restore_still_rejects_unfinalized_provider_stream_token(self) -> None:
+        # provider_stream tokens keep the strict pre-existing rule: a row
+        # that never finalized (still "working") may belong to a crashed
+        # attempt and must not be resumed.
+        token = "thread-unfinalized"
+        await self.store.update_role_session_adapter_state(
+            self.role_session_id,
+            "codex",
+            {
+                "resume_session_id": token,
+                "provider_session_id": token,
+                "last_task_id": "task-new",
+                "source": "provider_stream",
+                "status": "working",
+            },
+        )
+        await self.store.save_external_session(ExternalSession(
+            agent_type="codex",
+            project_id="proj1",
+            session_id=token,
+            opc_session_id=self.role_session_id,
+            task_id="task-new",
+            workspace_path="/tmp/ws",
+            run_mode="exec",
+            status="working",
+            metadata={
+                "resume_session_id": token,
+                "provider_session_id": token,
+            },
+        ))
+        adapter = _MiniAdapter(agent_type="codex", can_resume_blank=False)
+        task = self._task()
+
+        await self.broker._restore_session_resume_from_store(adapter, task)
+
+        self.assertNotEqual(adapter.config.session_mode, "resume")
+        self.assertEqual(adapter.config.session_id, "")
 
 
 if __name__ == "__main__":

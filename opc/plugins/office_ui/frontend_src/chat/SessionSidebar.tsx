@@ -4,6 +4,7 @@ import type { Session } from '../types/kanban'
 import { IconPlus, IconSearch, IconActivity, IconShield, IconTrash, IconWorkItem } from './SvgIcons'
 import { getSessionRuntimeStatus } from '../lib/sessionRuntime'
 import { deriveCompanyRuntimeDisplayStatus } from '../lib/workItemSessions'
+import { useI18n } from '../i18n'
 
 interface SessionSidebarProps {
   sessions: Session[]
@@ -35,12 +36,14 @@ function sessionDotClass(session: Session): string {
   return STATUS_DOT[displayStatus] ?? 'status-pending'
 }
 
-function relativeTime(ts: number): string {
+type TFunction = ReturnType<typeof useI18n>['t']
+
+function relativeTime(ts: number, t: TFunction): string {
   const diff = Date.now() - ts
-  if (diff < 60_000) return 'just now'
-  if (diff < 3_600_000) return `${Math.floor(diff / 60_000)}m`
-  if (diff < 86_400_000) return `${Math.floor(diff / 3_600_000)}h`
-  return `${Math.floor(diff / 86_400_000)}d`
+  if (diff < 60_000) return t('session.justNow')
+  if (diff < 3_600_000) return t('session.minutes', { count: Math.floor(diff / 60_000) })
+  if (diff < 86_400_000) return t('session.hours', { count: Math.floor(diff / 3_600_000) })
+  return t('session.days', { count: Math.floor(diff / 86_400_000) })
 }
 
 function dateGroup(ts: number): string {
@@ -51,6 +54,15 @@ function dateGroup(ts: number): string {
   if (d >= today) return 'Today'
   if (d >= yesterday) return 'Yesterday'
   return 'Earlier'
+}
+
+function groupLabel(group: 'Today' | 'Yesterday' | 'Earlier', hasRuntimeSessions: boolean, t: TFunction): string {
+  const label = group === 'Today'
+    ? t('session.today')
+    : group === 'Yesterday'
+      ? t('session.yesterday')
+      : t('session.earlier')
+  return hasRuntimeSessions ? `${label} ${t('session.runtimeSuffix')}` : label
 }
 
 interface SessionTree {
@@ -104,6 +116,7 @@ function SessionItem({
   onSelect: () => void
   onDelete: () => void
 }) {
+  const { t, translateMaybe } = useI18n()
   const [showDelete, setShowDelete] = useState(false)
   const [confirming, setConfirming] = useState(false)
   const agentLabel = session.assigneeIds.length > 0
@@ -134,12 +147,12 @@ function SessionItem({
             <span className="session-agent-tag">{agentLabel}</span>
           )}
           {!isChild && session.isCompanyRuntime && (
-            <span className="session-runtime-badge" title="Company runtime"><IconWorkItem /></span>
+            <span className="session-runtime-badge" title={t('session.companyRuntime')}><IconWorkItem /></span>
           )}
           {session.title}
         </span>
         <span className="session-item-meta">
-          {displayStatus} · {relativeTime(session.updatedAt)}
+          {translateMaybe('kanban.status', displayStatus) || displayStatus} · {relativeTime(session.updatedAt, t)}
         </span>
       </div>
       {!!unreadCount && unreadCount > 0 && (
@@ -149,15 +162,15 @@ function SessionItem({
         <button
           className="session-delete-btn"
           onClick={e => { e.stopPropagation(); setConfirming(true) }}
-          title="Delete"
+          title={t('common.delete')}
         >
           <IconTrash />
         </button>
       )}
       {confirming && (
         <span className="session-confirm-delete" onClick={e => e.stopPropagation()}>
-          <button className="session-confirm-yes" onClick={() => { setConfirming(false); onDelete() }}>Delete</button>
-          <button className="session-confirm-no" onClick={() => setConfirming(false)}>Cancel</button>
+          <button className="session-confirm-yes" onClick={() => { setConfirming(false); onDelete() }}>{t('common.delete')}</button>
+          <button className="session-confirm-no" onClick={() => setConfirming(false)}>{t('common.cancel')}</button>
         </span>
       )}
     </button>
@@ -165,6 +178,7 @@ function SessionItem({
 }
 
 export function SessionSidebar({ sessions, activeSessionId, activeChannel, secretaryChannelId, unreadCounts, onSelect, onCreateSession, onDeleteSession, onSelectSecretary }: SessionSidebarProps) {
+  const { t } = useI18n()
   const [search, setSearch] = useState('')
   const [collapsed, setCollapsed] = useState<Set<string>>(new Set())
   const hasRuntimeSessions = sessions.some(session =>
@@ -256,7 +270,7 @@ export function SessionSidebar({ sessions, activeSessionId, activeChannel, secre
                 e.stopPropagation()
                 toggleCollapse(node.session.taskId)
               }}
-              aria-label={isCollapsed ? 'Expand' : 'Collapse'}
+              aria-label={isCollapsed ? t('session.expand') : t('session.collapse')}
             />
           )}
           <SessionItem
@@ -269,13 +283,13 @@ export function SessionSidebar({ sessions, activeSessionId, activeChannel, secre
         </div>
       </div>
     )
-  }, [activeSessionId, collapsed, onDeleteSession, onSelect, toggleCollapse, unreadCounts])
+  }, [activeSessionId, collapsed, onDeleteSession, onSelect, toggleCollapse, unreadCounts, t])
 
   const renderVirtualRow = useCallback((row: SidebarRow) => {
     if (row.kind === 'group') {
       return (
         <div className="session-group-label">
-          {hasRuntimeSessions ? `${row.group} Runtime Sessions` : row.group}
+          {groupLabel(row.group, hasRuntimeSessions, t)}
         </div>
       )
     }
@@ -288,7 +302,7 @@ export function SessionSidebar({ sessions, activeSessionId, activeChannel, secre
           className="session-child-count"
           onClick={() => toggleCollapse(row.node.session.taskId)}
         >
-          {row.node.children.length} sub-task{row.node.children.length > 1 ? 's' : ''}
+          {t(row.node.children.length > 1 ? 'session.subTasks' : 'session.subTask', { count: row.node.children.length })}
         </button>
       )
     }
@@ -305,13 +319,13 @@ export function SessionSidebar({ sessions, activeSessionId, activeChannel, secre
         />
       </div>
     )
-  }, [activeSessionId, hasRuntimeSessions, onDeleteSession, onSelect, renderPrimaryRow, toggleCollapse, unreadCounts])
+  }, [activeSessionId, hasRuntimeSessions, onDeleteSession, onSelect, renderPrimaryRow, toggleCollapse, unreadCounts, t])
 
   return (
     <div className="session-sidebar">
       <button className="session-new-btn" onClick={onCreateSession}>
         <IconPlus />
-        <span>New Chat</span>
+        <span>{t('session.newChat')}</span>
       </button>
 
       {onSelectSecretary && (
@@ -320,7 +334,7 @@ export function SessionSidebar({ sessions, activeSessionId, activeChannel, secre
           onClick={onSelectSecretary}
         >
           <IconShield />
-          <span>Secretary</span>
+          <span>{t('session.secretary')}</span>
           {!!(secretaryChannelId && unreadCounts?.[secretaryChannelId]) && unreadCounts![secretaryChannelId!] > 0 && (
             <span className="session-unread-badge">{unreadCounts![secretaryChannelId!] > 99 ? '99+' : unreadCounts![secretaryChannelId!]}</span>
           )}
@@ -331,7 +345,7 @@ export function SessionSidebar({ sessions, activeSessionId, activeChannel, secre
         <IconSearch />
         <input
           className="session-search"
-          placeholder="Search..."
+          placeholder={t('session.search')}
           value={search}
           onChange={e => setSearch(e.target.value)}
         />
@@ -368,7 +382,7 @@ export function SessionSidebar({ sessions, activeSessionId, activeChannel, secre
           if (!items || items.length === 0) return null
           return (
           <div key={group} className="session-group">
-              <div className="session-group-label">{hasRuntimeSessions ? `${group} Runtime Sessions` : group}</div>
+              <div className="session-group-label">{groupLabel(group, hasRuntimeSessions, t)}</div>
               {items.map(node => {
                 const hasChildren = node.children.length > 0
                 const isCollapsed = collapsed.has(node.session.taskId)
@@ -382,7 +396,7 @@ export function SessionSidebar({ sessions, activeSessionId, activeChannel, secre
                             e.stopPropagation()
                             toggleCollapse(node.session.taskId)
                           }}
-                          aria-label={isCollapsed ? 'Expand' : 'Collapse'}
+                          aria-label={isCollapsed ? t('session.expand') : t('session.collapse')}
                         />
                       )}
                       <SessionItem
@@ -416,7 +430,7 @@ export function SessionSidebar({ sessions, activeSessionId, activeChannel, secre
                         className="session-child-count"
                         onClick={() => toggleCollapse(node.session.taskId)}
                       >
-                        {node.children.length} sub-task{node.children.length > 1 ? 's' : ''}
+                        {t(node.children.length > 1 ? 'session.subTasks' : 'session.subTask', { count: node.children.length })}
                       </button>
                     )}
                   </div>
@@ -427,7 +441,7 @@ export function SessionSidebar({ sessions, activeSessionId, activeChannel, secre
         })}
 
         {filtered.length === 0 && (
-          <div className="session-empty">No sessions yet</div>
+          <div className="session-empty">{t('session.noSessions')}</div>
         )}
       </div>
 
@@ -436,7 +450,7 @@ export function SessionSidebar({ sessions, activeSessionId, activeChannel, secre
         onClick={() => onSelect(null)}
       >
         <IconActivity />
-        <span>Activity</span>
+        <span>{t('session.activity')}</span>
       </button>
     </div>
   )

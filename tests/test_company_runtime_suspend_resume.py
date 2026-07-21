@@ -276,6 +276,154 @@ class CompanyRuntimeSuspendResumeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(refreshed_item.metadata.get("dispatch_hold"), "")
         self.assertEqual(refreshed_item.claimed_by_role_runtime_session_id, "")
 
+    async def test_continue_merges_task_suspended_after_checkpoint_creation(self) -> None:
+        store = await self._store()
+        plan, task = await self._seed_runtime(store)
+        engine = self._engine(store)
+        await engine.suspend_company_runtime(
+            origin_task_id=task.id,
+            session_id="sess-parent",
+            reason="startup_interrupted",
+        )
+
+        review_item = DelegationWorkItem(
+            work_item_id="review-item-v3",
+            run_id="run-1",
+            role_id="executor",
+            seat_id="seat-1",
+            title="Review v3",
+            summary="Review the completed report.",
+            kind="review",
+            projection_id="review-v3",
+            phase=Phase.RUNNING,
+            metadata={
+                "work_item_projection_id": "review-v3",
+                "dispatch_hold": "company_runtime_suspended",
+                "suspend_checkpoint_type": "company_runtime_interrupted",
+                "suspended_phase": Phase.RUNNING.value,
+            },
+        )
+        await store.save_delegation_work_item(review_item)
+        review_task = Task(
+            id="review-task-v3",
+            title="Review v3",
+            session_id="sess-review-v3",
+            parent_session_id="sess-parent",
+            status=TaskStatus.RUNNING,
+            project_id="proj1",
+            assigned_to="executor",
+            assigned_external_agent="codex",
+            metadata={
+                "company_profile": "corporate",
+                "execution_model": "multi_team_org",
+                "runtime_model": "multi_team_org",
+                "work_item_runtime": True,
+                "work_item_projection_id": "review-v3",
+                "delegation_run_id": "run-1",
+                "delegation_role_session_id": "role-runtime-1",
+                "company_work_item_plan": serialize_company_work_item_runtime_plan(plan),
+                "company_runtime_stop_state": "suspended",
+                "company_runtime_suspend_checkpoint_type": "company_runtime_interrupted",
+                "company_runtime_suspended_at": datetime.now().isoformat(),
+                "dispatch_hold": "company_runtime_suspended",
+                "suspended_task_status": TaskStatus.RUNNING.value,
+            },
+        )
+        set_linked_work_item_id(review_task, review_item.work_item_id)
+        await store.save_task(review_task)
+        await store.link_work_item_runtime_task(review_item.work_item_id, review_task.id)
+
+        captured: dict[str, Any] = {}
+
+        class DummyCompanyExecutor:
+            async def execute(
+                self,
+                resumed_plan: CompanyWorkItemRuntimePlan,
+                tasks: list[Task],
+            ) -> str:
+                captured["plan"] = resumed_plan
+                captured["tasks"] = tasks
+                return "runtime resumed"
+
+        engine.company_executor = DummyCompanyExecutor()
+        await engine._maybe_resume_checkpoint(
+            "continue",
+            "sess-parent",
+            reply_metadata={"ui_force_resume": True},
+        )
+
+        resumed_ids = {item.id for item in captured["tasks"]}
+        refreshed_review_item = await store.get_delegation_work_item(
+            review_item.work_item_id
+        )
+        resolved = await store.get_execution_checkpoints(
+            project_id="proj1",
+            session_id="sess-parent",
+            checkpoint_types=["company_runtime_suspended"],
+            statuses=["resolved"],
+        )
+
+        self.assertEqual(resumed_ids, {task.id, review_task.id})
+        assert refreshed_review_item is not None
+        self.assertEqual(refreshed_review_item.metadata.get("dispatch_hold"), "")
+        self.assertEqual(len(resolved), 1)
+        self.assertEqual(
+            set(resolved[0].payload.get("task_ids", [])),
+            {task.id, review_task.id},
+        )
+        self.assertEqual(
+            {
+                snapshot.get("task_id")
+                for snapshot in resolved[0].payload.get("task_snapshots", [])
+            },
+            {task.id, review_task.id},
+        )
+
+    async def test_runtime_refreshes_canonical_adapter_state_before_persisting(self) -> None:
+        store = await self._store()
+        _, task = await self._seed_runtime(store)
+        role_session_id = "role-runtime-1"
+        stale_state = {
+            "selected_execution_agent": "codex",
+            "external_resume_session_id": "thread-terminal",
+            "external_resume_agent_type": "codex",
+            "codex": {
+                "resume_session_id": "thread-terminal",
+                "provider_session_id": "thread-terminal",
+            },
+        }
+        role_session = await store.get_delegation_role_session(role_session_id)
+        assert role_session is not None
+        role_session.adapter_session_state = dict(stale_state)
+        await store.save_delegation_role_session(role_session)
+
+        runtime = CompanyRuntime(org_engine=None, communication=None, store=store)
+        runtime.role_sessions[role_session_id] = role_session
+        member = CompanyMemberSession(
+            member_session_id="member-operations",
+            role_session_id=role_session_id,
+            role_id="executor",
+            employee_id="employee-1",
+            adapter_session_state=dict(stale_state),
+        )
+        await store.update_role_session_adapter_state(
+            role_session_id,
+            "codex",
+            None,
+        )
+
+        await runtime._refresh_adapter_session_state_from_store(member)
+
+        self.assertNotIn("codex", member.adapter_session_state)
+        self.assertNotIn(
+            "external_resume_session_id",
+            member.adapter_session_state,
+        )
+        self.assertEqual(
+            runtime.role_sessions[role_session_id].adapter_session_state,
+            member.adapter_session_state,
+        )
+
     async def test_second_stop_during_resumed_execution_restores_pending_checkpoint(self) -> None:
         store = await self._store()
         _, task = await self._seed_runtime(store)

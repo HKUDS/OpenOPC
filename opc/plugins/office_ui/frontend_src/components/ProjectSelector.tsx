@@ -1,5 +1,6 @@
 import { useState, useCallback } from 'react'
 import type { Project } from '../types/kanban'
+import { useI18n } from '../i18n'
 
 interface ProjectSelectorProps {
   projects: Project[]
@@ -10,6 +11,7 @@ interface ProjectSelectorProps {
 }
 
 export function ProjectSelector({ projects, activeId, onSelect, onCreate, onDelete }: ProjectSelectorProps) {
+  const { t } = useI18n()
   const [creating, setCreating] = useState(false)
   const [newName, setNewName] = useState('')
   const [confirmDelete, setConfirmDelete] = useState<string | null>(null)
@@ -34,7 +36,8 @@ export function ProjectSelector({ projects, activeId, onSelect, onCreate, onDele
         className="theme-select"
         value={activeId}
         onChange={e => onSelect(e.target.value)}
-        title="Switch project"
+        title={t('project.switch')}
+        aria-label={t('project.switch')}
       >
         {projects.map(p => (
           <option key={p.id} value={p.id}>{p.name}</option>
@@ -49,7 +52,7 @@ export function ProjectSelector({ projects, activeId, onSelect, onCreate, onDele
             autoFocus
             className="theme-select"
             value={newName}
-            placeholder="project-name"
+            placeholder={t('project.placeholder')}
             onChange={e => setNewName(e.target.value)}
             onKeyDown={e => { if (e.key === 'Escape') setCreating(false) }}
             style={{ width: 120 }}
@@ -60,7 +63,7 @@ export function ProjectSelector({ projects, activeId, onSelect, onCreate, onDele
         <button
           className="pill-btn"
           onClick={() => setCreating(true)}
-          title="New project"
+          title={t('project.new')}
           style={{ fontSize: 11, padding: '2px 8px' }}
         >
           +
@@ -70,10 +73,10 @@ export function ProjectSelector({ projects, activeId, onSelect, onCreate, onDele
         <button
           className="pill-btn"
           onClick={() => setConfirmDelete(activeId)}
-          title="Delete project"
+          title={t('project.delete')}
           style={{ fontSize: 11, padding: '2px 8px', color: '#ef4444' }}
         >
-          Del
+          {t('project.deleteButton')}
         </button>
       )}
 
@@ -88,10 +91,10 @@ export function ProjectSelector({ projects, activeId, onSelect, onCreate, onDele
             maxWidth: 400, boxShadow: '0 8px 32px rgba(0,0,0,0.4)', textAlign: 'center',
           }}>
             <p style={{ margin: '0 0 8px', fontWeight: 600, fontSize: 15 }}>
-              Delete project "{confirmDelete}"?
+              {t('project.confirmTitle', { name: confirmDelete })}
             </p>
             <p style={{ margin: '0 0 20px', fontSize: 13, opacity: 0.7 }}>
-              All sessions, messages, tasks, and agent data in this project will be permanently deleted. This action cannot be undone.
+              {t('project.confirmBody')}
             </p>
             <div style={{ display: 'flex', gap: 8, justifyContent: 'center' }}>
               <button
@@ -99,14 +102,14 @@ export function ProjectSelector({ projects, activeId, onSelect, onCreate, onDele
                 onClick={() => setConfirmDelete(null)}
                 style={{ padding: '6px 18px', fontSize: 13 }}
               >
-                Cancel
+                {t('common.cancel')}
               </button>
               <button
                 className="pill-btn"
                 onClick={handleDelete}
                 style={{ padding: '6px 18px', fontSize: 13, background: '#ef4444', color: '#fff' }}
               >
-                Delete
+                {t('common.delete')}
               </button>
             </div>
           </div>

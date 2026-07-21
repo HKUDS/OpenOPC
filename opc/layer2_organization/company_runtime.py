@@ -1710,6 +1710,7 @@ class CompanyRuntime:
                 **dict(session.resume_state),
                 **runtime_state,
             }
+        await self._refresh_adapter_session_state_from_store(session)
         adapter_state_updates = self._adapter_state_from_result(task, result)
         if adapter_state_updates:
             session.adapter_session_state = {
@@ -1898,6 +1899,31 @@ class CompanyRuntime:
             if candidate.role_id == session.role_id and candidate.seat_id == session.seat_id:
                 return candidate
         return None
+
+    async def _refresh_adapter_session_state_from_store(
+        self,
+        session: CompanyMemberSession,
+    ) -> None:
+        role_session_id = str(session.role_session_id or "").strip()
+        getter = getattr(self.store, "get_delegation_role_session", None)
+        if not role_session_id or not callable(getter):
+            return
+        try:
+            persisted = await getter(role_session_id)
+        except Exception:
+            logger.opt(exception=True).debug(
+                "company runtime adapter-state refresh failed"
+            )
+            return
+        if persisted is None:
+            return
+        adapter_state = dict(
+            getattr(persisted, "adapter_session_state", {}) or {}
+        )
+        session.adapter_session_state = adapter_state
+        role_session = self.role_sessions.get(role_session_id)
+        if role_session is not None:
+            role_session.adapter_session_state = dict(adapter_state)
 
     def _ensure_role_session(self, task: Task) -> DelegationRoleSession | None:
         role_id = self._role_id(task)

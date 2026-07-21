@@ -920,6 +920,53 @@ class CompanyCollaborationTests(unittest.IsolatedAsyncioTestCase):
                 any(item.startswith("[Workspace] Prepared workspace roots:") for item in task.metadata.get("progress_log", []))
             )
 
+    async def test_failed_work_item_transitions_out_of_running_phase(self) -> None:
+        execute_task = AsyncMock(
+            return_value=TaskResult(status=TaskStatus.FAILED, content="provider limit")
+        )
+        save_task = AsyncMock()
+        executor = CompanyWorkItemExecutor(
+            org_engine=DummyOrgEngine(),
+            communication=SimpleNamespace(),
+            approval_engine=SimpleNamespace(),
+            memory=None,
+            execute_task=execute_task,
+            save_task=save_task,
+        )
+        task = Task(
+            id="failed-work-item-task",
+            title="Failed Work Item",
+            assigned_to="executor",
+            status=TaskStatus.PENDING,
+            metadata={
+                "work_item_projection_id": "failed_execution",
+                "work_item_role_id": "executor",
+                "work_item_turn_type": "execute",
+                "work_item_execution_strategy": "native",
+                "progress_log": [],
+            },
+        )
+
+        with patch(
+            "opc.layer2_organization.company_mode.transition_work_item_from_task",
+            new_callable=AsyncMock,
+        ) as transition:
+            result = await executor._run_work_item(task, {task.id: task, "failed_execution": task})
+
+        self.assertEqual(result.status, TaskStatus.FAILED)
+        self.assertTrue(
+            any(
+                call.kwargs.get("target_status_or_phase") == TaskStatus.FAILED
+                and call.kwargs.get("reason") == "work_item_failed"
+                for call in transition.await_args_list
+            )
+        )
+        self.assertIn(
+            "Work item ended with status failed.",
+            task.metadata.get("progress_log", []),
+        )
+        save_task.assert_awaited()
+
     async def test_workspace_bootstrap_work_item_records_manifest_and_reserved_layout(self) -> None:
         with _workspace_tempdir() as tmpdir:
             workspace = tmpdir / "runtime-root"

@@ -2513,7 +2513,8 @@ class ExternalAgentMonitoringTests(unittest.IsolatedAsyncioTestCase):
     def test_codex_adapter_resolves_launch_binary_before_spawn(self) -> None:
         metadata: dict[str, object] = {}
 
-        with patch("opc.layer3_agent.adapters.base.shutil.which", return_value=r"C:\Tools\codex.cmd"):
+        with patch("opc.layer3_agent.adapters.base.os.name", "posix"), \
+            patch("opc.layer3_agent.adapters.base.shutil.which", return_value=r"C:\Tools\codex.cmd"):
             cmd = CodexAdapter._resolve_launch_command(
                 ["codex", "exec", "--json", "-"],
                 launch_metadata=metadata,
@@ -2523,6 +2524,39 @@ class ExternalAgentMonitoringTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(metadata["configured_binary"], "codex")
         self.assertEqual(metadata["resolved_binary"], r"C:\Tools\codex.cmd")
 
+    def test_codex_adapter_wraps_windows_cmd_shim_before_spawn(self) -> None:
+        metadata: dict[str, object] = {}
+        which_results = {
+            "codex": r"D:\nodejs\codex",
+            "cmd.exe": r"C:\Windows\System32\cmd.exe",
+        }
+
+        with patch("opc.layer3_agent.adapters.base.os.name", "nt"), \
+            patch("opc.layer3_agent.adapters.base.os.path.isfile", side_effect=lambda path: path == r"D:\nodejs\codex.cmd"), \
+            patch("opc.layer3_agent.adapters.base.shutil.which", side_effect=lambda name, path=None: which_results.get(name)), \
+            patch.dict(os.environ, {"COMSPEC": r"C:\Windows\System32\cmd.exe"}, clear=False):
+            cmd = CodexAdapter._resolve_launch_command(
+                ["codex", "exec", "--json", "-"],
+                launch_metadata=metadata,
+            )
+
+        self.assertEqual(
+            cmd,
+            [
+                r"C:\Windows\System32\cmd.exe",
+                "/d",
+                "/s",
+                "/c",
+                r"D:\nodejs\codex.cmd",
+                "exec",
+                "--json",
+                "-",
+            ],
+        )
+        self.assertEqual(metadata["configured_binary"], "codex")
+        self.assertEqual(metadata["resolved_binary"], r"D:\nodejs\codex.cmd")
+        self.assertEqual(metadata["launch_wrapper"], r"C:\Windows\System32\cmd.exe")
+
     def test_codex_adapter_resolves_launch_binary_with_extra_env_path(self) -> None:
         with patch("opc.layer3_agent.adapters.base.shutil.which", return_value=r"D:\bin\codex.cmd") as which_mock:
             CodexAdapter._resolve_launch_command(
@@ -2531,6 +2565,40 @@ class ExternalAgentMonitoringTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(which_mock.call_args.kwargs["path"], r"D:\bin")
+
+    def test_codex_adapter_forwards_only_openopc_runtime_env_to_shell_policy(self) -> None:
+        metadata: dict[str, object] = {}
+
+        cmd = CodexAdapter._inject_runtime_shell_environment(
+            ["codex", "exec", "--json", "-"],
+            {
+                "OPC_ALLOWED_COLLAB_TOOLS": json.dumps(["delegate_work", "inbox"]),
+                "OPC_COLLAB_RPC_TOKEN": "rpc-token",
+                "PYTHONPATH": r"D:\OpenOPC",
+                "UNRELATED_SECRET": "do-not-forward",
+            },
+            launch_metadata=metadata,
+        )
+
+        self.assertEqual(cmd[:2], ["codex", "exec"])
+        config_values = [cmd[index + 1] for index, value in enumerate(cmd[:-1]) if value == "-c"]
+        self.assertIn(
+            "shell_environment_policy.set.OPC_ALLOWED_COLLAB_TOOLS='''delegate_work,inbox'''",
+            config_values,
+        )
+        self.assertIn(
+            "shell_environment_policy.set.OPC_COLLAB_RPC_TOKEN='''rpc-token'''",
+            config_values,
+        )
+        self.assertIn(
+            "shell_environment_policy.set.PYTHONPATH='''D:\\OpenOPC'''",
+            config_values,
+        )
+        self.assertFalse(any("UNRELATED_SECRET" in value for value in config_values))
+        self.assertEqual(
+            metadata["runtime_shell_environment_keys"],
+            ["OPC_ALLOWED_COLLAB_TOOLS", "OPC_COLLAB_RPC_TOKEN", "PYTHONPATH"],
+        )
 
     def test_codex_adapter_full_auto_uses_dangerous_bypass_flag(self) -> None:
         adapter = CodexAdapter(
@@ -5242,10 +5310,11 @@ class ExternalAgentMonitoringTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             store = _SessionStoreStub()
             adapter = _CollabSurfaceScriptAdapter("print('company-mode external run')\n")
-            broker = ExternalAgentBroker(store, _ApprovalStub())
             from opc.layer2_organization.org_engine import OrgEngine
             from opc.core.config import OPCConfig
-            broker.org_engine = OrgEngine(OPCConfig(), Path(tmpdir))
+            org_engine = OrgEngine(OPCConfig(), Path(tmpdir))
+            broker = ExternalAgentBroker(store, _ApprovalStub(), org_engine=org_engine)
+            self.assertIs(broker.org_engine, org_engine)
             task = Task(
                 id="collab-env-ceo",
                 title="collab env ceo",

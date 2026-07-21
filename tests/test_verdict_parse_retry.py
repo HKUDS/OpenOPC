@@ -164,6 +164,32 @@ def _make_review_task(
 
 
 class VerdictParseRetryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_terminal_failed_review_card_can_record_parse_failure_outcome(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            store = OPCStore(root / "tasks.db")
+            await store.initialize()
+            try:
+                executor = _build_executor(store, _make_org_engine(root))
+                review = _make_review_card(review_card_id="review-failed")
+                review.phase = Phase.FAILED
+                await store.save_delegation_work_item(review)
+
+                persisted = await executor._persist_terminal_review_card(
+                    "review-failed",
+                    phase=Phase.CANCELLED,
+                    outcome="verdict_parse_failed",
+                )
+
+                self.assertIsNotNone(persisted)
+                self.assertEqual(persisted.phase, Phase.FAILED)
+                self.assertEqual(
+                    persisted.metadata.get("review_work_item_outcome"),
+                    "verdict_parse_failed",
+                )
+            finally:
+                await store.close()
+
     async def test_unparseable_verdict_spawns_retry_with_hint(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)

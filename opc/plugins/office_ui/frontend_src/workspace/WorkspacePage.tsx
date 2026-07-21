@@ -22,6 +22,7 @@ import { getRuntimeOrgView } from '../lib/runtimeOrg'
 import { getLinkedRuntimeTaskId } from '../lib/workItemRuntimeIds'
 import { ContextPanel } from './ContextPanel'
 import { useResizePanel } from './useResizePanel'
+import { useI18n } from '../i18n'
 
 type ActiveView =
   | { kind: 'session'; taskId: string }
@@ -42,11 +43,25 @@ function makeOptimisticUserMessageId(): string {
 
 /* ── Org mode pre-run readiness check ─────────────────────────────────── */
 
+type TFunction = ReturnType<typeof useI18n>['t']
+
 function checkOrgModeReadiness(
   mode: string,
   orgInfoData: OrgInfoPayload | null | undefined,
   onNavigateToOrg?: () => void,
+  t?: TFunction,
 ): boolean {
+  const tr = t ?? ((key: string, params?: Record<string, string | number>) => {
+    const fallbacks: Record<string, string> = {
+      'workspace.confirmNoRoles': 'Your org has no roles defined.\n\nSet up at least one role before running a task.\n\nGo to Org tab now?',
+      'workspace.confirmNoDecider': 'Your organization has multiple top-level roles but no final decider selected.\n\nChoose one final decider in the Org tab before running a task.\n\nGo to Org tab now?',
+      'workspace.warningNoTeams': 'No runtime teams defined — the system will auto-generate from your roles',
+      'workspace.warningVacantRoles': '{count} role(s) have no employees: {names}',
+      'workspace.confirmWarnings': 'Before running this task:\n\n{warnings}\n\nRun anyway?',
+    }
+    const template = fallbacks[key] ?? key
+    return template.replace(/\{(\w+)\}/g, (_, name) => String(params?.[name] ?? `{${name}}`))
+  }) as TFunction
   if (mode !== 'org' && mode !== 'custom') return true
   if (!orgInfoData) return true
 
@@ -57,21 +72,13 @@ function checkOrgModeReadiness(
 
   // Block: no roles defined
   if (roles.length === 0) {
-    const goToOrg = confirm(
-      'Your org has no roles defined.\n\n' +
-      'Set up at least one role before running a task.\n\n' +
-      'Go to Org tab now?'
-    )
+    const goToOrg = confirm(tr('workspace.confirmNoRoles'))
     if (goToOrg) onNavigateToOrg?.()
     return false
   }
 
   if (topLevelRoleIds.length > 1 && !finalDeciderRoleId) {
-    const goToOrg = confirm(
-      'Your organization has multiple top-level roles but no final decider selected.\n\n' +
-      'Choose one final decider in the Org tab before running a task.\n\n' +
-      'Go to Org tab now?'
-    )
+    const goToOrg = confirm(tr('workspace.confirmNoDecider'))
     if (goToOrg) onNavigateToOrg?.()
     return false
   }
@@ -84,7 +91,7 @@ function checkOrgModeReadiness(
     || (team.manager_role_id && roleIds.has(team.manager_role_id))
   ))
   if (relevantTeams.length === 0) {
-    warnings.push('No runtime teams defined \u2014 the system will auto-generate from your roles')
+    warnings.push(tr('workspace.warningNoTeams'))
   }
 
   // Warn: roles without employees
@@ -92,15 +99,11 @@ function checkOrgModeReadiness(
   const vacantRoles = roles.filter(r => !employeeRoleIds.has(r.role_id))
   if (vacantRoles.length > 0) {
     const names = vacantRoles.map(r => r.name).join(', ')
-    warnings.push(`${vacantRoles.length} role(s) have no employees: ${names}`)
+    warnings.push(tr('workspace.warningVacantRoles', { count: vacantRoles.length, names }))
   }
 
   if (warnings.length > 0) {
-    return confirm(
-      'Before running this task:\n\n' +
-      warnings.map(w => '\u2022 ' + w).join('\n') +
-      '\n\nRun anyway?'
-    )
+    return confirm(tr('workspace.confirmWarnings', { warnings: warnings.map(w => '\u2022 ' + w).join('\n') }))
   }
 
   return true
@@ -158,6 +161,7 @@ function BoardTitleEditor({
   title: string
   onCommit: (next: string) => void
 }) {
+  const { t } = useI18n()
   const [editing, setEditing] = useState(false)
   const [draft, setDraft] = useState(title)
   const inputRef = useRef<HTMLInputElement>(null)
@@ -206,7 +210,7 @@ function BoardTitleEditor({
             <span
               className="board-tab-title"
               onClick={startEditing}
-              title="Click to edit session title"
+              title={t('workspace.clickEditTitle')}
             >
               {title}
             </span>
@@ -310,6 +314,7 @@ export function WorkspacePage({
   onSavedOrgsList,
   onSavedOrgLoad,
 }: WorkspacePageProps) {
+  const { t } = useI18n()
   const { sessions, activeSessionId, activeSession } = sessionStore
   const { markRead } = chatStore
 
@@ -933,7 +938,7 @@ export function WorkspacePage({
         : undefined
 
     // Pre-run readiness check for org mode
-    if (!checkOrgModeReadiness(sessionExecMode, orgInfoData, onNavigateToOrg)) {
+    if (!checkOrgModeReadiness(sessionExecMode, orgInfoData, onNavigateToOrg, t)) {
       return
     }
 
@@ -948,7 +953,7 @@ export function WorkspacePage({
     if (inProgressCol) {
       boardStore.moveTask(taskId, inProgressCol.id, 0)
     }
-  }, [boardStore, onRunTask, sessions, execMode, companyProfile, orgInfoData, onNavigateToOrg])
+  }, [boardStore, onRunTask, sessions, execMode, companyProfile, orgInfoData, onNavigateToOrg, t])
 
   const handleSessionConfigChange = useCallback((taskId: string, sessionMode: string, sessionCompanyProfile?: string, orgId?: string) => {
     onSessionConfigChange?.(taskId, sessionMode, sessionCompanyProfile, orgId)
@@ -1094,7 +1099,7 @@ export function WorkspacePage({
   }, [handleOpenWorkItemSession, onOpenExecutionPanel])
 
   const isSecretary = effectiveView.kind === 'secretary'
-  const channelName = isSecretary ? 'Secretary' : activeSession ? activeSession.title : 'Activity'
+  const channelName = isSecretary ? t('workspace.channel.secretary') : activeSession ? activeSession.title : t('workspace.channel.activity')
 
   return (
     <div className={`workspace-page${panelState === 'maximized' ? ' panel-maximized' : ''}`}>
@@ -1137,7 +1142,7 @@ export function WorkspacePage({
           )}
           {isCompanyMode && !boardStore.activeBoard ? (
             <div className="kanban-empty-state">
-              <p>Select a Runtime Session on the left to view its Work Item board.</p>
+              <p>{t('workspace.selectRuntimeSession')}</p>
             </div>
           ) : (
             <>
@@ -1156,7 +1161,7 @@ export function WorkspacePage({
               />
               {isCompanyMode && boardStore.activeBoard && boardStore.tasks.filter(t => t.boardId === boardStore.activeBoardId).length === 0 && (
                 <div className="kanban-empty-state kanban-empty-state-inline">
-                  <p>No work items yet — start delegation to populate this board.</p>
+                  <p>{t('workspace.noWorkItems')}</p>
                 </div>
               )}
             </>

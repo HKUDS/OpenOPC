@@ -3996,6 +3996,23 @@ class OPCStore:
                 current = {}
             if token_record is None:
                 current.pop(agent, None)
+                legacy_agent = str(
+                    current.get("external_resume_agent_type")
+                    or (
+                        current.get("selected_execution_agent")
+                        if current.get("external_resume_session_id")
+                        else ""
+                    )
+                    or ""
+                ).strip()
+                if legacy_agent == agent:
+                    for key in (
+                        "external_resume_session_id",
+                        "external_resume_session_scope_id",
+                        "external_resume_agent_type",
+                        "resume_source_session",
+                    ):
+                        current.pop(key, None)
             else:
                 current[agent] = {
                     str(k): v for k, v in dict(token_record).items()
@@ -5541,7 +5558,14 @@ class OPCStore:
                        COALESCE(NULLIF(metadata, ''), '{}'),
                        '$.claimed_by_role_session_id', ?,
                        '$.claimed_task_id', ?,
-                       '$.claimed_work_item_revision', ?
+                       '$.claimed_work_item_revision', ?,
+                       '$.attempt_seq', COALESCE(
+                           CAST(json_extract(metadata, '$.attempt_seq') AS INTEGER),
+                           0
+                       ) + 1,
+                       '$.attempt_settled', json('false'),
+                       '$.attempt_outcome', '',
+                       '$.attempt_started_at', ?
                    ),
                    updated_at = ?
                WHERE work_item_id = ?
@@ -5564,6 +5588,7 @@ class OPCStore:
                 role_session_id,
                 claimed_task_id,
                 int(work_item_revision or 0),
+                updated_at.isoformat(),
                 updated_at.isoformat(),
                 str(work_item_id or "").strip(),
                 phase.value,

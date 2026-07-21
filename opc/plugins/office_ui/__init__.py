@@ -91,6 +91,19 @@ def _ensure_aiohttp() -> None:
         _pip_install(*missing)
 
 
+def _run_npm(npm: str, *args: str) -> None:
+    """Run npm in a way that also works when Windows resolves npm.cmd."""
+    cmd = [npm, *args]
+    if sys.platform == "win32":
+        npm_path = Path(npm)
+        npm_cmd = npm_path.with_suffix(".cmd")
+        if npm_path.suffix.lower() in {".cmd", ".bat"}:
+            cmd = [os.environ.get("COMSPEC", "cmd.exe"), "/c", npm, *args]
+        elif npm_cmd.exists():
+            cmd = [os.environ.get("COMSPEC", "cmd.exe"), "/c", str(npm_cmd), *args]
+    subprocess.check_call(cmd, cwd=_FRONTEND_SRC)
+
+
 def _ensure_frontend() -> None:
     """Build frontend if frontend_dist is missing, empty, or stale."""
     if not _frontend_needs_rebuild():
@@ -114,11 +127,11 @@ def _ensure_frontend() -> None:
     node_modules = _FRONTEND_SRC / "node_modules"
     if not node_modules.is_dir():
         terminal_status("Installing npm dependencies")
-        subprocess.check_call([npm, "install"], cwd=_FRONTEND_SRC)
+        _run_npm(npm, "install")
 
     # npm run build → outputs to ../frontend_dist via vite config
     terminal_status("Building frontend bundle")
-    subprocess.check_call([npm, "run", "build"], cwd=_FRONTEND_SRC)
+    _run_npm(npm, "run", "build")
 
     if _FRONTEND_DIST.is_dir() and any(_FRONTEND_DIST.iterdir()):
         terminal_status("Frontend built successfully", kind="success")

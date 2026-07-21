@@ -207,6 +207,8 @@ class EventAdapter:
             results.append(_ve(agent_id, runtime_type, dict(p)))
             if runtime_type in {
                 "turn_started",
+                "turn_completed",
+                "turn_failed",
                 "tool_started",
                 "tool_progress",
                 "tool_completed",
@@ -233,6 +235,11 @@ class EventAdapter:
                 elif runtime_type in {"turn_started", "permission_requested", "permission_resolved", "subagent_started", "subagent_updated", "verification_started"}:
                     tracker.state = AgentAnimState.REFLECTING
                 elif runtime_type in {"tool_completed", "subagent_completed", "verification_completed"}:
+                    # The turn is still running between tools — the agent is
+                    # back to reasoning, not idle. IDLE is owned by turn end.
+                    tracker.current_tool = None
+                    tracker.state = AgentAnimState.REFLECTING
+                elif runtime_type in {"turn_completed", "turn_failed"}:
                     tracker.current_tool = None
                     tracker.state = AgentAnimState.IDLE
                 extras: dict[str, Any] = {}

@@ -426,6 +426,41 @@ html, body, #root {
   gap: 6px;
 }
 
+.language-toggle {
+  display: inline-flex;
+  align-items: center;
+  flex: 0 0 auto;
+  height: 30px;
+  padding: 2px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+}
+
+.language-toggle-btn {
+  flex: 0 0 auto;
+  min-width: 34px;
+  height: 24px;
+  padding: 0 8px;
+  border: 0;
+  border-radius: calc(var(--radius-sm) - 2px);
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: 11px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.language-toggle-btn:hover {
+  color: var(--text);
+  background: var(--surface-hover);
+}
+
+.language-toggle-btn.active {
+  color: var(--accent);
+  background: var(--accent-soft);
+}
+
 .theme-select {
   font-size: 11px;
   padding: 4px 8px;

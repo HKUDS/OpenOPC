@@ -1,0 +1,413 @@
+schema_version: 2
+kind: opc_org_architecture
+organization_id: cross-border-ecommerce
+organization_name: Cross-Border Ecommerce Team
+company:
+  name: Cross-Border Ecommerce Team
+  topology: Ecommerce Growth Hub
+  company_profile: custom
+  execution_model: actor_runtime
+  final_decider_role_id: ecommerce_director
+  company_profiles:
+  - corporate
+  - custom
+roles:
+- id: ecommerce_director
+  name: Ecommerce Director
+  responsibility: Owns market choice, commercial goals, portfolio priorities, budget
+    allocation, operating cadence, risk decisions, and final delivery.
+  reports_to: owner
+  icon: leader
+  can_spawn:
+  - market_researcher
+  - listing_localization_specialist
+  - paid_media_specialist
+  - social_content_specialist
+  - operations_manager
+  - finance_analyst
+  tools: []
+  preferred_external_agent: codex
+  prompt_refs:
+  - Clarify target platform, country, category, customer, margin target, budget, inventory
+    constraints, and time horizon before delegating.
+  - Require every recommendation to separate verified facts, assumptions, experiments,
+    owners, metrics, and stop conditions.
+  skill_refs:
+  - ecommerce-operating-system
+  - market-product-research
+  - compliance-freshness
+  - cross-border-guide
+  handoff_template_ref: null
+  memory_policy_ref: null
+  artifact_contract_ref: null
+  runtime_policy:
+    execution_strategy: native
+    allowed_downstream_roles:
+    - market_researcher
+    - listing_localization_specialist
+    - paid_media_specialist
+    - social_content_specialist
+    - operations_manager
+    - finance_analyst
+    review_role: null
+    default_turn_type: work
+    shell_timeout_override: null
+    setup_env_type: null
+    coordination_hints: {}
+    signal_capabilities: []
+    parallelism_constraints: []
+    gate_preferences: {}
+  capabilities: []
+  role_type: coordinator
+  coordinator_policy: null
+- id: market_researcher
+  name: Market and Product Researcher
+  responsibility: Researches demand, competition, pricing, reviews, trends, product
+    opportunities, and market-entry evidence.
+  reports_to: ecommerce_director
+  icon: search
+  can_spawn: []
+  tools: []
+  preferred_external_agent: codex
+  prompt_refs:
+  - Use current sources, record URLs and access dates, compare multiple competitors,
+    and quantify confidence and data gaps.
+  skill_refs:
+  - market-product-research
+  - compliance-freshness
+  handoff_template_ref: null
+  memory_policy_ref: null
+  artifact_contract_ref: null
+  runtime_policy:
+    execution_strategy: auto
+    allowed_downstream_roles: []
+    review_role: null
+    default_turn_type: research
+    shell_timeout_override: null
+    setup_env_type: null
+    coordination_hints: {}
+    signal_capabilities: []
+    parallelism_constraints: []
+    gate_preferences: {}
+  capabilities: []
+  role_type: worker
+  coordinator_policy: null
+- id: listing_localization_specialist
+  name: Listing and Localization Specialist
+  responsibility: Produces localized product positioning, titles, bullets, descriptions,
+    keyword maps, image briefs, and storefront copy.
+  reports_to: ecommerce_director
+  icon: writing
+  can_spawn: []
+  tools: []
+  preferred_external_agent: codex
+  prompt_refs:
+  - Adapt claims and terminology to the target market and platform. Never invent certifications,
+    performance claims, or product facts.
+  skill_refs:
+  - listing-localization
+  - market-product-research
+  - compliance-freshness
+  handoff_template_ref: null
+  memory_policy_ref: null
+  artifact_contract_ref: null
+  runtime_policy:
+    execution_strategy: auto
+    allowed_downstream_roles: []
+    review_role: null
+    default_turn_type: work
+    shell_timeout_override: null
+    setup_env_type: null
+    coordination_hints: {}
+    signal_capabilities: []
+    parallelism_constraints: []
+    gate_preferences: {}
+  capabilities: []
+  role_type: worker
+  coordinator_policy: null
+- id: paid_media_specialist
+  name: Paid Media Specialist
+  responsibility: Designs and optimizes PPC and paid-social campaigns, budgets, tracking,
+    experiments, and profitability controls.
+  reports_to: ecommerce_director
+  icon: target
+  can_spawn: []
+  tools: []
+  preferred_external_agent: codex
+  prompt_refs:
+  - Define funnel stage, audience, creative hypothesis, budget, attribution limits,
+    success metric, guardrails, and stop-loss rule for every campaign.
+  skill_refs:
+  - paid-media-optimization
+  - ecommerce-operating-system
+  handoff_template_ref: null
+  memory_policy_ref: null
+  artifact_contract_ref: null
+  runtime_policy:
+    execution_strategy: auto
+    allowed_downstream_roles: []
+    review_role: null
+    default_turn_type: work
+    shell_timeout_override: null
+    setup_env_type: null
+    coordination_hints: {}
+    signal_capabilities: []
+    parallelism_constraints: []
+    gate_preferences: {}
+  capabilities: []
+  role_type: worker
+  coordinator_policy: null
+- id: social_content_specialist
+  name: Social Content Specialist
+  responsibility: Plans platform-native organic content, creator briefs, short-video
+    concepts, publishing cadence, and community feedback loops.
+  reports_to: ecommerce_director
+  icon: marketing
+  can_spawn: []
+  tools: []
+  preferred_external_agent: codex
+  prompt_refs:
+  - Build content around verified product value, target-customer situations, platform-native
+    formats, and measurable calls to action.
+  skill_refs:
+  - listing-localization
+  - paid-media-optimization
+  handoff_template_ref: null
+  memory_policy_ref: null
+  artifact_contract_ref: null
+  runtime_policy:
+    execution_strategy: auto
+    allowed_downstream_roles: []
+    review_role: null
+    default_turn_type: work
+    shell_timeout_override: null
+    setup_env_type: null
+    coordination_hints: {}
+    signal_capabilities: []
+    parallelism_constraints: []
+    gate_preferences: {}
+  capabilities: []
+  role_type: worker
+  coordinator_policy: null
+- id: operations_manager
+  name: Ecommerce Operations Manager
+  responsibility: Owns catalog operations, order flow, inventory, fulfillment, customer
+    service coordination, SOPs, and operational incident handling.
+  reports_to: ecommerce_director
+  icon: settings
+  can_spawn:
+  - supply_chain_specialist
+  - customer_service_specialist
+  tools: []
+  preferred_external_agent: codex
+  prompt_refs:
+  - Convert recommendations into repeatable SOPs with owner, trigger, input, output,
+    SLA, exception path, and audit evidence.
+  skill_refs:
+  - ecommerce-operating-system
+  - inventory-fulfillment
+  - cross-border-guide
+  handoff_template_ref: null
+  memory_policy_ref: null
+  artifact_contract_ref: null
+  runtime_policy:
+    execution_strategy: native
+    allowed_downstream_roles:
+    - supply_chain_specialist
+    - customer_service_specialist
+    review_role: null
+    default_turn_type: work
+    shell_timeout_override: null
+    setup_env_type: null
+    coordination_hints: {}
+    signal_capabilities: []
+    parallelism_constraints: []
+    gate_preferences: {}
+  capabilities: []
+  role_type: coordinator
+  coordinator_policy: null
+- id: supply_chain_specialist
+  name: Supply Chain Specialist
+  responsibility: Plans sourcing, lead times, replenishment, safety stock, logistics
+    options, landed cost, and inventory risk.
+  reports_to: operations_manager
+  icon: database
+  can_spawn: []
+  tools: []
+  preferred_external_agent: codex
+  prompt_refs:
+  - State assumptions for demand, lead time, MOQ, defect rate, freight, duties, and
+    service level; provide sensitivity ranges instead of false precision.
+  skill_refs:
+  - inventory-fulfillment
+  - ecommerce-operating-system
+  - cross-border-guide
+  handoff_template_ref: null
+  memory_policy_ref: null
+  artifact_contract_ref: null
+  runtime_policy:
+    execution_strategy: auto
+    allowed_downstream_roles: []
+    review_role: null
+    default_turn_type: work
+    shell_timeout_override: null
+    setup_env_type: null
+    coordination_hints: {}
+    signal_capabilities: []
+    parallelism_constraints: []
+    gate_preferences: {}
+  capabilities: []
+  role_type: worker
+  coordinator_policy: null
+- id: customer_service_specialist
+  name: Customer Service Specialist
+  responsibility: Designs support macros, escalation paths, return handling, review
+    response, complaint analysis, and voice-of-customer feedback.
+  reports_to: operations_manager
+  icon: message
+  can_spawn: []
+  tools: []
+  preferred_external_agent: codex
+  prompt_refs:
+  - Keep responses factual, empathetic, policy-compliant, and explicit about what
+    requires human approval or account access.
+  skill_refs:
+  - customer-service-voice
+  - compliance-freshness
+  handoff_template_ref: null
+  memory_policy_ref: null
+  artifact_contract_ref: null
+  runtime_policy:
+    execution_strategy: auto
+    allowed_downstream_roles: []
+    review_role: null
+    default_turn_type: work
+    shell_timeout_override: null
+    setup_env_type: null
+    coordination_hints: {}
+    signal_capabilities: []
+    parallelism_constraints: []
+    gate_preferences: {}
+  capabilities: []
+  role_type: worker
+  coordinator_policy: null
+- id: finance_analyst
+  name: Ecommerce Finance Analyst
+  responsibility: Models unit economics, pricing, contribution margin, CAC, ROAS,
+    cash conversion, scenario risk, and KPI reporting.
+  reports_to: ecommerce_director
+  icon: chart
+  can_spawn: []
+  tools: []
+  preferred_external_agent: codex
+  prompt_refs:
+  - Show formulas, currencies, tax and fee assumptions, data sources, and sensitivity
+    ranges. Flag missing inputs rather than guessing silently.
+  skill_refs:
+  - ecommerce-unit-economics
+  - paid-media-optimization
+  handoff_template_ref: null
+  memory_policy_ref: null
+  artifact_contract_ref: null
+  runtime_policy:
+    execution_strategy: auto
+    allowed_downstream_roles: []
+    review_role: null
+    default_turn_type: analysis
+    shell_timeout_override: null
+    setup_env_type: null
+    coordination_hints: {}
+    signal_capabilities: []
+    parallelism_constraints: []
+    gate_preferences: {}
+  capabilities: []
+  role_type: worker
+  coordinator_policy: null
+employees: []
+escalation_rules: []
+runtime_policies:
+  custom:
+    communication:
+      default_mode: dm
+      blocking_default: true
+      meeting_required_for:
+      - budget_change
+      - compliance_risk
+      - inventory_risk
+      allow_broadcast: true
+    memory:
+      include_role_memory: true
+      include_project_memory: true
+      include_decision_log: true
+      include_artifact_index: true
+      recent_history_lines: 16
+    handoff:
+      require_structured_handoff: true
+      require_ack: true
+      include_risks: true
+      include_open_questions: true
+    artifact:
+      enforce_contract: false
+      require_artifact_index: true
+      required_kinds: []
+    review:
+      enable_work_item_gates: true
+      strict_gate_inference: true
+      require_reviewer_role: true
+      allow_human_override: true
+    gate_harness:
+      enabled: true
+      decision_mode: agent_first
+      default_degrade_policy: allow
+      auto_infer_turn_kind: true
+      auto_infer_gate_profile: true
+      max_rework_rounds_per_issue: 2
+      stagnation_threshold: 2
+      allow_pass_with_constraints: true
+      enable_delivery_constraints_propagation: true
+      agent_model: ''
+      agent_confidence_threshold: 0.55
+      fallback_to_rules_on_parse_error: true
+      builtin_blocker_map:
+        workspace_mismatch: rework_same_work_item
+        missing_required_artifact: rework_same_work_item
+        verification_missing: rework_same_work_item
+        dependency_not_ready: rework_same_work_item
+        cross_work_item_conflict: replan
+        external_secret_missing: await_user_decision
+        permission_missing: escalate
+        environment_capability_gap: pass_with_constraints
+        quality_gap: rework_same_work_item
+        goal_env_mismatch: replan
+        unresolved_user_visible_risk: pass_with_constraints
+      turn_kind_overrides: {}
+      gate_profile_overrides: {}
+    parallel:
+      auto_dispatch: true
+      review_gate_enabled: true
+      max_workers: 7
+    coordination:
+      inference_mode: llm_primary
+      fallback_mode: conservative
+      strict_gate_turn_kinds:
+      - verify
+      - deliver
+      mixed_gate_turn_kinds:
+      - synthesize
+      - review
+      - integration
+      allow_manager_release_for_mixed_only: true
+      allow_custom_signals: true
+talent_templates: []
+teams: []
+team_runtime:
+  default_team_id: ''
+  shared_role_session_scope: team
+  allow_shared_role_sessions: true
+  seat_refresh_interval_seconds: 30
+  metadata: {}
+installed_packages: []
+role_serial_queue_enabled: true
+metadata:
+  source: org_mode
+  organization_config_file: company_orgs/org_cross-border-ecommerce_config.yaml

@@ -29,6 +29,7 @@ interface SocketHandlers {
   onCrossOfficeCollab?: (payload: { agent_ids: string[]; task_id: string; action: string }) => void
   onCollabMessage?: (type: string, payload: Record<string, unknown>) => void
   onAgentRuntimeUpdate?: (payload: AgentRuntimePayload) => void
+  onRuntimeStatusSync?: (payload: RuntimeStatusSyncPayload) => void
   onWorkerNotification?: (payload: WorkerNotificationPayload) => void
   onKanbanViewData?: (payload: KanbanViewDataPayload) => void
   onSessionCreated?: (payload: { project_id: string; task_id: string; channel_id: string; session_id?: string; parent_session_id?: string; origin_task_id?: string; title: string; status: string; created_at: number; assignee_ids?: string[]; exec_mode?: string; company_profile?: string; org_id?: string; organization_id?: string; preferred_agent?: TaskPreferredAgent; selected_execution_agent?: TaskPreferredAgent }) => void
@@ -58,6 +59,16 @@ interface SocketHandlers {
   onOrgSavedDelete?: (payload: { ok: boolean; name: string; error?: string }) => void
   onCommsState?: (payload: CommsStatePayload) => void
   onCommsMessage?: (payload: CommsMessagePayload) => void
+}
+
+export interface RuntimeStatusSyncPayload {
+  project_id: string
+  sessions: Array<{
+    task_id: string
+    status: string
+    agent_status?: string
+    current_tool?: string | null
+  }>
 }
 
 export interface CommsMessageItem {
@@ -751,6 +762,9 @@ export class VisualSocketClient {
         break
       case 'agent_runtime_update':
         this.handlers.onAgentRuntimeUpdate?.(parsed.payload)
+        break
+      case 'runtime_status_sync':
+        this.handlers.onRuntimeStatusSync?.(parsed.payload)
         break
       case 'worker_notification':
         this.handlers.onWorkerNotification?.(parsed.payload as WorkerNotificationPayload)

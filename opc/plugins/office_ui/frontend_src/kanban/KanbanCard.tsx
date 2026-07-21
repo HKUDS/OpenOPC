@@ -3,6 +3,7 @@ import type { AgentInfo } from '../types/visual'
 import { PRIORITY_META, AGENT_STATUS_LABEL, type KanbanTask } from '../types/kanban'
 import { getWorkItemRoleLabel, humanizeWorkItemRoleId } from '../lib/workItemIdentity'
 import { getLinkedRuntimeTaskId } from '../lib/workItemRuntimeIds'
+import { useI18n } from '../i18n'
 
 const STATUS_BADGE: Record<string, { label: string; color: string }> = {
   todo: { label: 'To do', color: '#9ca3af' },
@@ -32,6 +33,7 @@ interface KanbanCardProps {
 }
 
 export function KanbanCard({ task, index, agents, officeMap, companyMode, isSelected, onClick, onStart }: KanbanCardProps) {
+  const { t, translateMaybe } = useI18n()
   const assignees = task.assigneeIds
     .map(id => agents.find(a => a.agent_id === id))
     .filter(Boolean) as AgentInfo[]
@@ -54,6 +56,9 @@ export function KanbanCard({ task, index, agents, officeMap, companyMode, isSele
   const blockerLabel = (task.blockedReason ?? '').trim()
   const reworkLabel = (task.reworkFeedback ?? '').trim()
   const linkedRuntimeTaskId = getLinkedRuntimeTaskId(task)
+  const runtimeStatusLabel = task.agentStatus
+    ? (translateMaybe('agent.status', task.agentStatus) || AGENT_STATUS_LABEL[task.agentStatus] || task.agentStatus)
+    : ''
 
   return (
     <Draggable draggableId={task.id} index={index} isDragDisabled={!!companyMode}>
@@ -71,17 +76,17 @@ export function KanbanCard({ task, index, agents, officeMap, companyMode, isSele
             {statusBadge && (
               <span className="kanban-status-badge" style={{ color: statusBadge.color }}>
                 <span style={{ display: 'inline-block', width: 6, height: 6, borderRadius: '50%', background: statusBadge.color, marginRight: 3 }} />
-                {statusBadge.label}
+                {translateMaybe('kanban.status', phaseBadge) || statusBadge.label}
               </span>
             )}
             {depCount > 0 && (
-              <span className="kanban-dep-badge" title={`${depCount} upstream dep(s)`}>{depCount} dep</span>
+              <span className="kanban-dep-badge" title={t('kanban.upstreamDeps', { count: depCount })}>{t('kanban.dep', { count: depCount })}</span>
             )}
-            {crossOffice && <span className="kanban-cross-badge" title="Cross-office">&#x21C4;</span>}
+            {crossOffice && <span className="kanban-cross-badge" title={t('kanban.crossOffice')}>&#x21C4;</span>}
             {onStart && (
               <button
                 className="kanban-start-btn"
-                title={companyMode ? 'Start Work Item' : 'Start task'}
+                title={companyMode ? t('kanban.startWorkItem') : t('kanban.startTask')}
                 onClick={e => { e.stopPropagation(); onStart(task.id) }}
               >
                 &#x25B6;
@@ -94,34 +99,34 @@ export function KanbanCard({ task, index, agents, officeMap, companyMode, isSele
           {(roleLabel || employee?.name || gate?.type || task.originChannel || task.workItemProjectionId) && (
             <div className="kanban-card-meta-row">
               {roleLabel && (
-                <span className="kanban-meta-badge kanban-role-badge" title={`Role: ${roleLabel}`}>
+                <span className="kanban-meta-badge kanban-role-badge" title={`${t('common.role')}: ${roleLabel}`}>
                   {roleLabel}
                 </span>
               )}
               {employee?.name && (
-                <span className="kanban-meta-badge kanban-employee-badge" title={`Employee: ${employee.name}${employee.category ? ` (${employee.category})` : ''}`}>
+                <span className="kanban-meta-badge kanban-employee-badge" title={`${t('common.employee')}: ${employee.name}${employee.category ? ` (${employee.category})` : ''}`}>
                   <span className="kanban-meta-icon">&#x1F464;</span>
                   {employee.name}
                 </span>
               )}
               {task.workItemProjectionId && (
-                <span className="kanban-meta-badge kanban-projection-badge" title={`Projection: ${task.workItemProjectionId}`}>
+                <span className="kanban-meta-badge kanban-projection-badge" title={`${t('common.projection')}: ${task.workItemProjectionId}`}>
                   {task.workItemProjectionId}
                 </span>
               )}
               {gate?.type && (
-                <span className={`kanban-meta-badge kanban-gate-badge kanban-gate-${gate.type}`} title={`Gate: ${gate.type}${gate.reviewerRole ? ` by ${gate.reviewerRole}` : ''}`}>
+                <span className={`kanban-meta-badge kanban-gate-badge kanban-gate-${gate.type}`} title={`${t('common.gate')}: ${gate.type}${gate.reviewerRole ? ` by ${gate.reviewerRole}` : ''}`}>
                   {gate.type === 'review' ? '\u2709' : gate.type === 'approval' ? '\u2713' : '\u270B'}
                   {gate.type}
                 </span>
               )}
               {task.originChannel && (
-                <span className="kanban-meta-badge kanban-origin-badge" title={`Origin: ${task.originChannel}`}>
+                <span className="kanban-meta-badge kanban-origin-badge" title={`${t('common.origin')}: ${task.originChannel}`}>
                   #{task.originChannel}
                 </span>
               )}
               {managerLabel && (
-                <span className="kanban-meta-badge" title={`Manager: ${managerLabel}`}>
+                <span className="kanban-meta-badge" title={`${t('common.manager')}: ${managerLabel}`}>
                   {managerLabel}
                 </span>
               )}
@@ -133,8 +138,8 @@ export function KanbanCard({ task, index, agents, officeMap, companyMode, isSele
               {blockerLabel && <span className="kanban-tag">{blockerLabel}</span>}
               {reworkLabel && <span className="kanban-tag">{reworkLabel}</span>}
               {linkedRuntimeTaskId && (
-                <span className="kanban-tag" title={`Execution Turn: ${linkedRuntimeTaskId}`}>
-                  Runtime
+                <span className="kanban-tag" title={t('kanban.executionTurn', { id: linkedRuntimeTaskId })}>
+                  {t('common.runtime')}
                 </span>
               )}
             </div>
@@ -146,7 +151,7 @@ export function KanbanCard({ task, index, agents, officeMap, companyMode, isSele
               <span className="kanban-runtime-label">
                 {task.agentStatus === 'tool_active' && task.currentTool
                   ? task.currentTool
-                  : AGENT_STATUS_LABEL[task.agentStatus!] ?? task.agentStatus}
+                  : runtimeStatusLabel}
               </span>
             </div>
           )}

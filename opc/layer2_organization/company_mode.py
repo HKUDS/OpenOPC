@@ -51,6 +51,9 @@ from opc.layer2_organization.phase import (
     IN_PROGRESS_PHASES,
     IN_REVIEW_PHASES,
     TODO_PHASES,
+    InvalidPhaseTransition,
+    attempt_ledger_dispatch_block_reason,
+    has_open_attempt,
     is_dispatchable,
     is_orphaned,
     is_report_execution_work_item_metadata,
@@ -111,7 +114,9 @@ from opc.layer2_organization.work_item_transition import (
     has_pending_settlement_release,
     normalize_dependency_work_item_ids,
     refresh_dependents_for_run,
+    settle_open_attempt_as_interrupted,
     settled_failure_dependency_ids,
+    transition_work_item,
     transition_work_item_from_task,
 )
 from opc.layer2_organization.work_item_identity import (
@@ -2671,6 +2676,13 @@ class CompanyWorkItemExecutor:
         report_execution_work_item = is_report_execution_work_item_metadata(metadata)
         if str(metadata.get("dispatch_hold", "") or "").strip():
             return False
+        # Attempt-ledger brake: cards whose recent attempts keep crashing or
+        # keep getting interrupted must not be re-enqueued — this check also
+        # covers the review/report `or phase == RUNNING` arms below that
+        # bypass is_dispatchable. The per-tick ledger reconcile pass
+        # terminalizes such cards with a visible blocked_reason.
+        if attempt_ledger_dispatch_block_reason(metadata):
+            return False
         # Hidden auxiliary cards (review / report) are still runnable —
         # they are the kanban-push primitives the dispatcher schedules.
         # Worker work items marked hidden for any other reason stay
@@ -2827,6 +2839,124 @@ class CompanyWorkItemExecutor:
         if turn_kind in mixed_gate_turn_kinds:
             return True
         return True
+
+    async def _reconcile_attempt_ledger(
+        self,
+        work_items: list[DelegationWorkItem],
+        active_work_item_tasks: dict[
+            "asyncio.Task[TaskResult | None]",
+            tuple["CompanyMemberSession", Task],
+        ],
+    ) -> list[DelegationWorkItem]:
+        """Per-tick attempt-ledger reconcile: the structural anti-loop pass.
+
+        Two responsibilities, both driven by durable state instead of any
+        code path "remembering" to behave:
+
+        1. **Back-fill dead attempts.** A card whose claim opened an attempt
+           (``attempt_settled == False``) but has no live owner in THIS
+           dispatcher (not in ``active_work_item_tasks`` / claimed sets) had
+           its coroutine or process die without a verdict — kill -9, cancel
+           before harvest, or a settlement write that never landed. Settle it
+           as ``interrupted`` so the ledger sees it.
+        2. **Terminalize over-limit cards.** When the ledger shows a run of
+           consecutive crashed/interrupted attempts over the limit, transition
+           the card to FAILED with a visible ``blocked_reason`` (quarantine
+           via ``dispatch_hold`` if even that write fails). Eligibility checks
+           (``is_dispatchable`` / ``_work_item_is_runnable``) independently
+           refuse such cards, so either write path converges the loop.
+        """
+        if not work_items or self.store is None:
+            return work_items
+        in_flight_ids: set[str] = {
+            linked_work_item_id_for_task(claimed_task)
+            for _member, claimed_task in active_work_item_tasks.values()
+        }
+        in_flight_ids.discard("")
+        in_flight_ids.update(
+            str(item) for item in getattr(self.runtime, "_claimed_work_item_ids", set()) or set()
+        )
+        reconciled: list[DelegationWorkItem] = []
+        for work_item in work_items:
+            phase = getattr(work_item, "phase", None)
+            work_item_id = str(getattr(work_item, "work_item_id", "") or "").strip()
+            if not work_item_id or phase in DONE_PHASES:
+                reconciled.append(work_item)
+                continue
+            metadata = dict(getattr(work_item, "metadata", {}) or {})
+            if has_open_attempt(metadata) and work_item_id not in in_flight_ids:
+                if await settle_open_attempt_as_interrupted(self.store, work_item):
+                    metadata = dict(getattr(work_item, "metadata", {}) or {})
+                    logger.info(
+                        "[attempt_ledger] settled dead attempt as interrupted "
+                        "work_item={} phase={} interrupted_streak={}",
+                        work_item_id,
+                        getattr(phase, "value", phase),
+                        metadata.get("attempt_interrupted_streak"),
+                    )
+            block_reason = attempt_ledger_dispatch_block_reason(metadata)
+            if not block_reason:
+                reconciled.append(work_item)
+                continue
+            summary_text = (
+                f"Work item quarantined by the attempt ledger: {block_reason}. "
+                "Its recent execution attempts kept dying without a durable verdict; "
+                "manual triage (rework or new card) is required."
+            )
+            try:
+                updated = await transition_work_item(
+                    self.store,
+                    work_item_id,
+                    target_phase=Phase.FAILED,
+                    reason="attempt_ledger_limit",
+                    summary=summary_text,
+                    metadata_updates={"attempt_ledger_block_reason": block_reason},
+                    release_claim=True,
+                )
+                if updated is not None:
+                    work_item = updated
+                try:
+                    await self.store.update_delegation_work_item(
+                        work_item_id,
+                        blocked_reason=block_reason,
+                    )
+                except Exception:
+                    logger.opt(exception=True).debug(
+                        "[attempt_ledger] blocked_reason write failed for {}", work_item_id
+                    )
+                await self._emit_progress(
+                    f"[Company:{projection_id_for_work_item(work_item)}] {summary_text}"
+                )
+            except InvalidPhaseTransition:
+                # A concurrent writer moved the card; re-read and keep going —
+                # eligibility checks still refuse it while the ledger is over
+                # the limit.
+                logger.opt(exception=True).debug(
+                    "[attempt_ledger] FAILED terminalize lost a phase race for {}",
+                    work_item_id,
+                )
+            except Exception:
+                logger.opt(exception=True).warning(
+                    "[attempt_ledger] FAILED terminalize did not land for {}; "
+                    "quarantining via dispatch_hold",
+                    work_item_id,
+                )
+                try:
+                    await self.store.update_delegation_work_item(
+                        work_item_id,
+                        blocked_reason=block_reason,
+                        metadata_updates={
+                            "dispatch_hold": "attempt_ledger_quarantine",
+                            "attempt_ledger_block_reason": block_reason,
+                        },
+                    )
+                except Exception:
+                    logger.opt(exception=True).error(
+                        "[attempt_ledger] quarantine hold write also failed for {}",
+                        work_item_id,
+                    )
+            reconciled.append(work_item)
+        return reconciled
 
     def _task_effective_projection_spec(self, task: Task) -> WorkItemProjectionSpec:
         projection = self._projection_spec_for_task(task)
@@ -4528,6 +4658,10 @@ class CompanyWorkItemExecutor:
                         await self._try_unpark_blocking_comms(parked)
                 await self.runtime.refresh_inbox_state(tasks)
                 work_items = await self._load_delegation_work_items(tasks)
+                work_items = await self._reconcile_attempt_ledger(
+                    work_items,
+                    active_work_item_tasks,
+                )
                 work_items = await self._refresh_ready_work_items(work_items, tasks=tasks)
                 tasks = await self._materialize_work_item_tasks(tasks, work_items)
                 self._active_tasks = tasks
@@ -4690,6 +4824,42 @@ class CompanyWorkItemExecutor:
                 self._schedule_kanban_notification()
         except asyncio.CancelledError:
             claimed_pairs = list(active_work_item_tasks.values())
+            # Coroutines that already died on a real exception must settle
+            # their attempt BEFORE this turn unwinds. The old gather(...,
+            # return_exceptions=True) below silently discarded them, leaving
+            # the card RUNNING with an open attempt — the exact gap that let
+            # a deterministic crash replay forever across suspend/resume
+            # cycles (issue #10). Cancellation of live coroutines is still a
+            # legitimate suspend; only genuine crashes are harvested here.
+            crashed_pairs: list[tuple[CompanyMemberSession, Task, BaseException]] = []
+            for work_item_task, session_task in list(active_work_item_tasks.items()):
+                if not work_item_task.done() or work_item_task.cancelled():
+                    continue
+                crash_exc = work_item_task.exception()
+                if crash_exc is None or isinstance(crash_exc, asyncio.CancelledError):
+                    continue
+                crashed_member_session, crashed_task = session_task
+                crashed_pairs.append((crashed_member_session, crashed_task, crash_exc))
+            for crashed_member_session, crashed_task, crash_exc in crashed_pairs:
+                try:
+                    await asyncio.shield(
+                        self._handle_claimed_work_item_exception(
+                            crashed_member_session,
+                            crashed_task,
+                            crash_exc,
+                        )
+                    )
+                except asyncio.CancelledError:
+                    logger.warning(
+                        "company runtime cancellation: crashed work item settlement "
+                        "for task={} continues shielded in background",
+                        crashed_task.id,
+                    )
+                except Exception:
+                    logger.opt(exception=True).error(
+                        "company runtime cancellation: failed to settle crashed work item task={}",
+                        crashed_task.id,
+                    )
             for work_item_task in list(active_work_item_tasks.keys()):
                 if not work_item_task.done():
                     work_item_task.cancel()
@@ -4957,13 +5127,42 @@ class CompanyWorkItemExecutor:
                 "artifacts": dict(failure_result.artifacts or {}),
             }
             # Phase A: phase write first → hook projects task.status=FAILED
-            # onto the DB row and syncs our local task.status too.
-            await transition_work_item_from_task(
-                self.store, task,
-                target_status_or_phase=Phase.FAILED,
-                reason="claimed_work_item_exception",
-                summary=summary or None,
-            )
+            # onto the DB row and syncs our local task.status too. The
+            # attempt_outcome="crashed" settlement rides the same write so
+            # the dispatcher's crash-streak brake has durable accounting.
+            # If even this write fails, quarantine the card via a plain
+            # metadata hold — dispatch_hold blocks is_dispatchable without
+            # needing phase-machine legality — so a store hiccup can never
+            # convert a crash into an endless re-dispatch loop.
+            try:
+                await transition_work_item_from_task(
+                    self.store, task,
+                    target_status_or_phase=Phase.FAILED,
+                    reason="claimed_work_item_exception",
+                    summary=summary or None,
+                    release_claim=True,
+                    attempt_outcome="crashed",
+                )
+            except Exception as transition_exc:
+                logger.opt(exception=transition_exc).error(
+                    f"[Company:{projection_id}] FAILED transition for crashed work item "
+                    "did not land; quarantining via dispatch_hold"
+                )
+                if work_item_id and self.store is not None and hasattr(self.store, "update_delegation_work_item"):
+                    try:
+                        await self.store.update_delegation_work_item(
+                            work_item_id,
+                            blocked_reason=summary,
+                            metadata_updates={
+                                "dispatch_hold": "crash_quarantine",
+                                "crash_quarantine_at": datetime.now().isoformat(),
+                                "crash_quarantine_error": str(exc),
+                            },
+                        )
+                    except Exception:
+                        logger.opt(exception=True).error(
+                            f"[Company:{projection_id}] crash quarantine write also failed"
+                        )
             try:
                 await self.runtime.complete_claim(member_session, task, result=failure_result)
             except Exception as cleanup_exc:
@@ -5428,6 +5627,7 @@ class CompanyWorkItemExecutor:
                     self.store, task,
                     target_status_or_phase=Phase.FAILED,
                     reason="work_item_timeout",
+                    attempt_outcome="crashed",
                 )
                 await self.save_task(task)
                 return TaskResult(status=TaskStatus.FAILED, content=f"Work item timed out after {self.work_item_timeout}s.")
@@ -5461,7 +5661,18 @@ class CompanyWorkItemExecutor:
                     await self._emit_progress(f"[Company:{projection_id}] awaiting peer", task_id=task.id)
                     await self.save_task(task)
                 else:
+                    await transition_work_item_from_task(
+                        self.store,
+                        task,
+                        target_status_or_phase=result.status,
+                        reason=f"work_item_{result.status.value}",
+                    )
+                    await self._append_progress(
+                        task,
+                        f"Work item ended with status {result.status.value}.",
+                    )
                     await self._emit_progress(f"[Company:{projection_id}] failed", task_id=task.id)
+                    await self.save_task(task)
                 return result
 
             # Comms park check: if the agent sent any blocking messages
@@ -7332,12 +7543,19 @@ class CompanyWorkItemExecutor:
             metadata_updates["review_resolution"] = copy.deepcopy(resolution)
             metadata_updates["review_resolution_state"] = "pending"
         try:
+            current = None
+            if hasattr(self.store, "get_delegation_work_item"):
+                current = await self.store.get_delegation_work_item(review_work_item_id)
+            update_kwargs: dict[str, Any] = {
+                "claimed_by_role_runtime_session_id": "",
+                "claimed_by_seat_id": "",
+                "metadata_updates": metadata_updates,
+            }
+            if current is None or current.phase not in DONE_PHASES or current.phase == phase:
+                update_kwargs["phase"] = phase
             persisted = await self.store.update_delegation_work_item(
                 review_work_item_id,
-                phase=phase,
-                claimed_by_role_runtime_session_id="",
-                claimed_by_seat_id="",
-                metadata_updates=metadata_updates,
+                **update_kwargs,
             )
         except Exception:
             logger.opt(exception=True).warning(

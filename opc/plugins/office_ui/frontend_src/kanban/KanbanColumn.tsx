@@ -3,6 +3,7 @@ import { Droppable } from '@hello-pangea/dnd'
 import type { AgentInfo } from '../types/visual'
 import type { KanbanColumn as KanbanColumnType, KanbanTask } from '../types/kanban'
 import { KanbanCard } from './KanbanCard'
+import { useI18n } from '../i18n'
 
 interface KanbanColumnProps {
   column: KanbanColumnType
@@ -17,6 +18,7 @@ interface KanbanColumnProps {
 }
 
 export function KanbanColumn({ column, tasks, agents, officeMap, companyMode, selectedTaskId, onCardClick, onStartTask, onQuickCreate }: KanbanColumnProps) {
+  const { t, translateMaybe } = useI18n()
   const [adding, setAdding] = useState(false)
   const [draft, setDraft] = useState('')
   const committedRef = useRef(false)
@@ -36,10 +38,10 @@ export function KanbanColumn({ column, tasks, agents, officeMap, companyMode, se
     <div className="kanban-column">
       <div className="kanban-column-header">
         <span className="kanban-col-dot" style={{ background: column.color }} />
-        <span className="kanban-col-label">{column.name}</span>
+        <span className="kanban-col-label">{translateMaybe('kanban.column', column.name) || column.name}</span>
         <span className="kanban-col-count">{tasks.length}</span>
         {onQuickCreate && (
-          <button className="kanban-col-add" title="Add task" onClick={() => { committedRef.current = false; setAdding(true) }}>+</button>
+          <button className="kanban-col-add" title={t('kanban.addTask')} onClick={() => { committedRef.current = false; setAdding(true) }}>+</button>
         )}
       </div>
 
@@ -54,7 +56,7 @@ export function KanbanColumn({ column, tasks, agents, officeMap, companyMode, se
               if (e.key === 'Escape') { committedRef.current = true; setDraft(''); setAdding(false) }
             }}
             onBlur={commitAdd}
-            placeholder="Task title..."
+            placeholder={t('kanban.taskTitle')}
             autoFocus
           />
         </div>

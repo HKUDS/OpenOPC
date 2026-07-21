@@ -1,4 +1,5 @@
 import type { KanbanBoard } from '../types/kanban'
+import { useI18n } from '../i18n'
 
 interface BoardSelectorProps {
   boards: KanbanBoard[]
@@ -7,6 +8,7 @@ interface BoardSelectorProps {
 }
 
 export function BoardSelector({ boards, activeBoardId, onSelect }: BoardSelectorProps) {
+  const { translateMaybe } = useI18n()
   return (
     <div className="board-selector">
       <div className="board-tabs">
@@ -18,7 +20,7 @@ export function BoardSelector({ boards, activeBoardId, onSelect }: BoardSelector
             onClick={() => onSelect(b.id)}
           >
             <span className="board-tab-dot" style={{ background: b.color }} />
-            {b.name}
+            {translateMaybe('kanban.column', b.name) || b.name}
           </button>
         ))}
       </div>

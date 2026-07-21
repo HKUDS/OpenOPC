@@ -29,6 +29,7 @@ import { extractSessionRecruitmentByRole, sessionChannelId } from './lib/session
 import { resolveCanonicalTurnId, terminalAssistantTurnId } from './lib/turnIdentity'
 import { unassignAgent } from './game/map/OfficeStore'
 import type { AgentAnimStatus, EmployeeAssignment, KanbanPhase, KanbanTask, RoleAggregatedStatus, RoleWorkItemSummary, Session, TaskPreferredAgent } from './types/kanban'
+import { useI18n } from './i18n'
 
 function readOutdoorOverrideUi(): 'auto' | 'day' | 'night' {
   try {
@@ -446,6 +447,7 @@ function MaybeExecutionPanel({ taskId, sessions, agents, onClose }: {
 }
 
 export default function App() {
+  const { locale, setLocale, t, translateMaybe } = useI18n()
   const bridgeRef = useRef(new GameBridge())
   useMemo(() => registerTestRunner(bridgeRef.current), [])
   const clientRef = useRef<VisualSocketClient | null>(null)
@@ -1451,6 +1453,56 @@ export default function App() {
           scheduleSessionDetailRefresh(payload.task_id)
         }
       },
+      onRuntimeStatusSync: (payload) => {
+        if (!payloadMatchesActiveProject(payload as unknown as Record<string, unknown>, false)) return
+        const ss = sessionStoreRef.current
+        const bs = boardStoreRef.current
+        if (!ss) return
+        // Periodic reconciliation against the backend's authoritative status.
+        // Diff before dispatching: a tick where nothing drifted must not
+        // trigger a single store update (and therefore no re-render).
+        for (const entry of payload.sessions ?? []) {
+          const taskId = String(entry.task_id ?? '').trim()
+          if (!taskId) continue
+          const session = ss.sessions.find((s) => s.taskId === taskId)
+          if (!session) continue
+          const status = String(entry.status ?? '').trim()
+          const patch: Partial<import('./types/kanban').Session> = {}
+          if (status && status !== session.status) patch.status = status
+          const rawAgentStatus = typeof entry.agent_status === 'string' ? entry.agent_status.trim() : ''
+          if (rawAgentStatus === 'idle' || rawAgentStatus === 'reflecting' || rawAgentStatus === 'tool_active') {
+            if (rawAgentStatus !== session.agentStatus) patch.agentStatus = rawAgentStatus
+            const tool = typeof entry.current_tool === 'string' && entry.current_tool.trim()
+              ? entry.current_tool
+              : undefined
+            if (tool !== session.currentTool) patch.currentTool = tool
+            if (runtimeStatusClearsDisplayTool(rawAgentStatus) && session.displayTool !== undefined) {
+              patch.displayTool = undefined
+            }
+          } else {
+            // No live tracker for this task: only clear stale indicators when
+            // the backend says the task is no longer running (mirrors the
+            // mergeLiveRuntimeField semantics used by collab_sync).
+            const controlActive = session.runtimeControlState === 'running'
+              || session.runtimeControlState === 'suspending'
+              || session.runtimeControlState === 'resuming'
+            if (status && status !== 'running' && !controlActive) {
+              if (session.agentStatus !== undefined) patch.agentStatus = undefined
+              if (session.currentTool !== undefined) patch.currentTool = undefined
+              if (session.displayTool !== undefined) patch.displayTool = undefined
+            }
+          }
+          if (Object.keys(patch).length === 0) continue
+          ss.updateSession(taskId, patch)
+          if (bs && ('agentStatus' in patch || 'currentTool' in patch || 'displayTool' in patch)) {
+            const boardPatch: Partial<KanbanTask> = {}
+            if ('agentStatus' in patch) boardPatch.agentStatus = patch.agentStatus as KanbanTask['agentStatus']
+            if ('currentTool' in patch) boardPatch.currentTool = patch.currentTool
+            if ('displayTool' in patch) boardPatch.displayTool = patch.displayTool
+            bs.updateTask(taskId, boardPatch)
+          }
+        }
+      },
       onWorkerNotification: (payload) => {
         if (!payloadMatchesActiveProject(payload as unknown as Record<string, unknown>, false)) return
         const data = payload as Record<string, unknown>
@@ -2349,26 +2401,47 @@ export default function App() {
         <div className="topbar-center">
           <div className="page-nav">
             <button className={`page-nav-btn${activePage === 'workspace' ? ' active' : ''}`} onClick={() => setActivePage('workspace')}>
-              Workspace
+              {t('app.page.workspace')}
               {(() => {
                 const total = chatStore.channels.reduce((sum, ch) => sum + chatStore.getUnreadCount(ch.id), 0)
                 return total > 0 ? <span className="nav-unread-badge">{total > 99 ? '99+' : total}</span> : null
               })()}
             </button>
-            <button className={`page-nav-btn${activePage === 'office' ? ' active' : ''}`} onClick={() => setActivePage('office')}>Office</button>
-            <button className={`page-nav-btn${activePage === 'org' ? ' active' : ''}`} onClick={() => setActivePage('org')}>Org</button>
+            <button className={`page-nav-btn${activePage === 'office' ? ' active' : ''}`} onClick={() => setActivePage('office')}>{t('app.page.office')}</button>
+            <button className={`page-nav-btn${activePage === 'org' ? ' active' : ''}`} onClick={() => setActivePage('org')}>{t('app.page.org')}</button>
           </div>
           <div className="stat-chips">
-            <span className="stat-chip"><b>{metrics.totalAgents}</b> agents</span>
-            <span className="stat-chip"><b>{metrics.totalSkills}</b> skills</span>
-            <span className="stat-chip"><b>{boardStore.getOpenTaskCount()}</b> tasks</span>
+            <span className="stat-chip"><b>{metrics.totalAgents}</b> {t('app.metric.agents')}</span>
+            <span className="stat-chip"><b>{metrics.totalSkills}</b> {t('app.metric.skills')}</span>
+            <span className="stat-chip"><b>{boardStore.getOpenTaskCount()}</b> {t('app.metric.tasks')}</span>
           </div>
         </div>
         <div className="topbar-right">
+          <div className="language-toggle" role="group" aria-label={t('language.label')} title={t('language.label')}>
+            <button
+              type="button"
+              data-locale="en"
+              aria-pressed={locale === 'en'}
+              className={`language-toggle-btn${locale === 'en' ? ' active' : ''}`}
+              onClick={() => setLocale('en')}
+            >
+              {t('language.english')}
+            </button>
+            <button
+              type="button"
+              data-locale="zh-CN"
+              aria-pressed={locale === 'zh-CN'}
+              className={`language-toggle-btn${locale === 'zh-CN' ? ' active' : ''}`}
+              onClick={() => setLocale('zh-CN')}
+            >
+              {t('language.chinese')}
+            </button>
+          </div>
           <select
             className="theme-select"
             value={outdoorOverride}
-            title="Outdoor lighting override"
+            title={t('outdoor.title')}
+            aria-label={t('outdoor.title')}
             onChange={(e) => {
               const v = e.target.value as 'auto' | 'day' | 'night'
               setOutdoorOverride(v)
@@ -2386,20 +2459,20 @@ export default function App() {
               bridgeRef.current.syncOutdoorLighting()
             }}
           >
-            <option value="auto">Outdoor auto</option>
-            <option value="day">Outdoor day</option>
-            <option value="night">Outdoor night</option>
+            <option value="auto">{t('outdoor.auto')}</option>
+            <option value="day">{t('outdoor.day')}</option>
+            <option value="night">{t('outdoor.night')}</option>
           </select>
           <select className="theme-select" value={theme} onChange={(e) => setTheme(e.target.value as ThemeName)}>
-            <option value="midnight">Midnight</option>
-            <option value="neon">Neon</option>
-            <option value="paper">Paper</option>
-            <option value="retro">Retro</option>
-            <option value="terminal">Terminal</option>
-            <option value="cozy">Cozy</option>
-            <option value="openopc">OpenOPC</option>
+            <option value="midnight">{t('theme.midnight')}</option>
+            <option value="neon">{t('theme.neon')}</option>
+            <option value="paper">{t('theme.paper')}</option>
+            <option value="retro">{t('theme.retro')}</option>
+            <option value="terminal">{t('theme.terminal')}</option>
+            <option value="cozy">{t('theme.cozy')}</option>
+            <option value="openopc">{t('theme.openopc')}</option>
           </select>
-          <button className={`icon-btn ${showDevTools ? 'active' : ''}`} onClick={() => setShowDevTools((v) => !v)} title="Developer Tools">
+          <button className={`icon-btn ${showDevTools ? 'active' : ''}`} onClick={() => setShowDevTools((v) => !v)} title={t('dev.tools')} aria-label={t('dev.tools')}>
             <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M5.5 2L2 5.5 5.5 9" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/><path d="M10.5 7L14 10.5 10.5 14" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/></svg>
           </button>
         </div>
@@ -2554,14 +2627,14 @@ export default function App() {
         {/* Phaser Game Canvas */}
         <section className="canvas-wrap">
           <PhaserGame bridge={bridgeRef.current} active={activePage === 'office'} />
-          <button className="canvas-float-btn" onClick={() => setShowSubagents((v) => !v)} title={showSubagents ? 'Hide sub-agents' : 'Show sub-agents'}>
+          <button className="canvas-float-btn" onClick={() => setShowSubagents((v) => !v)} title={showSubagents ? t('office.hideSubagents') : t('office.showSubagents')}>
             {showSubagents ? '👥' : '👤'}
           </button>
           <button
             className="sidebar-collapse-btn"
             onClick={toggleSidebar}
-            title={sidebarCollapsed ? 'Show side panel' : 'Hide side panel'}
-            aria-label={sidebarCollapsed ? 'Show side panel' : 'Hide side panel'}
+            title={sidebarCollapsed ? t('office.showSidePanel') : t('office.hideSidePanel')}
+            aria-label={sidebarCollapsed ? t('office.showSidePanel') : t('office.hideSidePanel')}
           >
             <span className="collapse-glyph">{sidebarCollapsed ? '❮' : '❯'}</span>
           </button>
@@ -2576,13 +2649,13 @@ export default function App() {
                 <div className="mode-info-bar">
                   <span className="mode-badge">{globalExecMode === 'company' ? `${globalExecMode}/${globalCompanyProfile}` : globalModeLabel}</span>
                   {isOrgMode ? (
-                    <span className="mode-hint">Manage your team in the <b>Org</b> tab</span>
+                    <span className="mode-hint">{t('office.modeHint.org')}</span>
                   ) : (
-                    <span className="mode-hint">Switch to <b>Org</b> mode to create or manage agents</span>
+                    <span className="mode-hint">{t('office.modeHint.switch')}</span>
                   )}
                 </div>
 
-                <div className="section-label">Offices <span className="count-badge">{offices.length}</span></div>
+                <div className="section-label">{t('office.offices')} <span className="count-badge">{offices.length}</span></div>
                 <div className="office-cards">
                   {offices.map((office) => {
                     const deskCount = getOfficeDeskSeats(office.id).length
@@ -2604,14 +2677,14 @@ export default function App() {
                           ) : (
                             <>
                               <span className="office-name">{office.name}</span>
-                              <button className="office-edit-btn" title="Rename" onClick={(e) => { e.stopPropagation(); setEditingOfficeName(office.id); setOfficeNameDraft(office.name) }}>✎</button>
+                              <button className="office-edit-btn" title={t('office.rename')} onClick={(e) => { e.stopPropagation(); setEditingOfficeName(office.id); setOfficeNameDraft(office.name) }}>✎</button>
                             </>
                           )}
                           <span className="office-capacity">{assignedCards.length}/{deskCount}</span>
                         </div>
                         <div className="office-agents">
                           {assignedCards.map(c => (
-                            <span key={c.id} className="office-agent-chip" title={`${c.displayName} — ${c.seatId ?? 'no seat'}`} onClick={(e) => { e.stopPropagation(); selectAgent(c.id) }}>
+                            <span key={c.id} className="office-agent-chip" title={`${c.displayName} — ${c.seatId ?? t('office.noSeat')}`} onClick={(e) => { e.stopPropagation(); selectAgent(c.id) }}>
                               {c.displayName.slice(0, 8)}
                             </span>
                           ))}
@@ -2622,7 +2695,7 @@ export default function App() {
                               onClick={e => e.stopPropagation()}
                               onChange={e => { if (e.target.value) handleAssignAgent(office.id, e.target.value) }}
                             >
-                              <option value="">+ Move here</option>
+                              <option value="">{t('office.moveHere')}</option>
                               {otherAgents.map(a => (
                                 <option key={a.id} value={a.id}>{a.displayName} ({offices.find(o => o.id === (cards.find(cc => cc.id === a.id)?.officeId))?.name ?? '?'})</option>
                               ))}
@@ -2634,7 +2707,7 @@ export default function App() {
                   })}
                 </div>
 
-                <div className="section-label">Active Agents <span className="count-badge">{swarmAgents.length}</span></div>
+                <div className="section-label">{t('office.activeAgents')} <span className="count-badge">{swarmAgents.length}</span></div>
                 <div className="agent-list">
                   {swarmAgents.map((agent) => (
                     <div key={agent.agent_id} className={`agent-row ${selectedAgentId === agent.agent_id ? 'selected' : ''}`}>
@@ -2642,7 +2715,7 @@ export default function App() {
                         <span className={`dot ${agent.status}`} />
                         <div className="agent-info">
                           <span className="agent-name">{agent.name}</span>
-                          <span className="agent-spec">{agent.specialties.slice(0, 2).join(' · ') || 'general'}</span>
+                          <span className="agent-spec">{agent.specialties.slice(0, 2).join(' · ') || t('common.general')}</span>
                         </div>
                       </button>
                       {isOrgMode && (
@@ -2650,27 +2723,27 @@ export default function App() {
                           ? <span className="agent-del" style={{ pointerEvents: 'none' }}><span className="spinner-inline" /></span>
                           : confirmDeleteId === agent.agent_id
                             ? <span className="del-confirm">
-                                <span className="del-confirm-label">Delete?</span>
-                                <button className="del-confirm-yes" onClick={() => { setDeletingAgentId(agent.agent_id); setConfirmDeleteId(null); clientRef.current?.deleteAgent(agent.agent_id) }}>Yes</button>
-                                <button className="del-confirm-no" onClick={() => setConfirmDeleteId(null)}>No</button>
+                                <span className="del-confirm-label">{t('office.deleteQuestion')}</span>
+                                <button className="del-confirm-yes" onClick={() => { setDeletingAgentId(agent.agent_id); setConfirmDeleteId(null); clientRef.current?.deleteAgent(agent.agent_id) }}>{t('common.yes')}</button>
+                                <button className="del-confirm-no" onClick={() => setConfirmDeleteId(null)}>{t('common.no')}</button>
                               </span>
-                            : <button className="agent-del" title={`Remove ${agent.name}`} onClick={() => setConfirmDeleteId(agent.agent_id)}>×</button>
+                            : <button className="agent-del" title={t('office.removeAgent', { name: agent.name })} onClick={() => setConfirmDeleteId(agent.agent_id)}>×</button>
                       )}
                     </div>
                   ))}
                   {swarmAgents.length === 0 && (
-                    <div className="empty-state">No agents yet — click a template above to spawn one.</div>
+                    <div className="empty-state">{t('office.emptyAgents')}</div>
                   )}
                 </div>
 
                 {selectedCard && (
-                  <div className="agent-detail">
-                    <div className="agent-detail-name">{selectedCard.displayName}</div>
-                    <div className="agent-detail-row"><span className="detail-label">State</span><span className="detail-value">{selectedCard.state}</span></div>
-                    <div className="agent-detail-row"><span className="detail-label">Tool</span><span className="detail-value">{selectedCard.currentTool ?? '—'}</span></div>
-                    <div className="agent-detail-row"><span className="detail-label">Task</span><span className="detail-value">{selectedCard.taskSummary ?? '—'}</span></div>
+                    <div className="agent-detail">
+                      <div className="agent-detail-name">{selectedCard.displayName}</div>
+                    <div className="agent-detail-row"><span className="detail-label">{t('common.state')}</span><span className="detail-value">{translateMaybe('agent.status', selectedCard.state) || selectedCard.state}</span></div>
+                    <div className="agent-detail-row"><span className="detail-label">{t('common.tool')}</span><span className="detail-value">{selectedCard.currentTool ?? '—'}</span></div>
+                    <div className="agent-detail-row"><span className="detail-label">{t('common.task')}</span><span className="detail-value">{selectedCard.taskSummary ?? '—'}</span></div>
                     <div className="agent-detail-row">
-                      <span className="detail-label">Office</span>
+                      <span className="detail-label">{t('app.page.office')}</span>
                       <select
                         className="detail-select"
                         value={selectedCard.officeId}
@@ -2681,7 +2754,7 @@ export default function App() {
                       </select>
                     </div>
                     <div className="agent-detail-row">
-                      <span className="detail-label">Seat</span>
+                      <span className="detail-label">{t('common.seat')}</span>
                       <select
                         className="detail-select"
                         value={selectedCard.seatId ?? ''}
@@ -2706,8 +2779,8 @@ export default function App() {
                 {cards.length > swarmAgents.length && (
                   <>
                     <div className="section-label">
-                      Characters
-                      <button className="inline-btn" onClick={() => setShowSubagents((v) => !v)}>{showSubagents ? 'hide sub' : 'show sub'}</button>
+                      {t('office.characters')}
+                      <button className="inline-btn" onClick={() => setShowSubagents((v) => !v)}>{showSubagents ? t('office.hideSub') : t('office.showSub')}</button>
                     </div>
                     <div className="agent-list">
                       {cards.filter((c) => !swarmAgents.some((a) => a.agent_id === c.id)).map((card) => (
@@ -2729,28 +2802,29 @@ export default function App() {
       {showDevTools && (
         <div className="dev-overlay">
           <div className="dev-header">
-            <span className="dev-title">Developer Tools</span>
+            <span className="dev-title">{t('dev.tools')}</span>
             <button className="icon-btn" onClick={() => setShowDevTools(false)}>✕</button>
           </div>
           <div className="dev-group">
-            <div className="dev-label">Connection</div>
+            <div className="dev-label">{t('dev.connection')}</div>
             <div className="input-row">
               <input value={wsUrlInput} onChange={(e) => setWsUrlInput(e.target.value)} placeholder="ws://..." />
               <button className="send-btn" onClick={applyWsUrl}>↩</button>
             </div>
           </div>
           <div className="dev-group">
-            <div className="dev-label">Evolution Pipeline</div>
+            <div className="dev-label">{t('dev.evolution')}</div>
             <div className="evo-pipeline">
               {(['Trace', 'Reflect', 'Synthesize', 'Practice', 'Lifecycle'] as const).map((phase, i) => {
                 const key = phase.toLowerCase() as keyof typeof evolutionPhases
                 const active = key in evolutionPhases ? evolutionPhases[key as 'trace' | 'reflect' | 'synthesize'] : false
+                const phaseLabelKey = `dev.phase.${key}` as Parameters<typeof t>[0]
                 return (
                   <div key={phase} className="evo-phase-group">
                     {i > 0 && <div className="evo-connector" />}
                     <div className={`evo-node ${active ? 'active' : ''}`}>
                       <div className="evo-dot" />
-                      <span className="evo-label">{phase}</span>
+                      <span className="evo-label">{t(phaseLabelKey)}</span>
                     </div>
                   </div>
                 )
@@ -2767,7 +2841,7 @@ export default function App() {
           </div>
           <div className="dev-group">
             <div className="dev-label">
-              Events
+              {t('dev.events')}
               <select className="inline-select" value={eventTypeFilter} onChange={(e) => setEventTypeFilter(e.target.value)}>
                 {eventTypes.map((type) => <option key={type} value={type}>{type}</option>)}
               </select>
@@ -2785,7 +2859,7 @@ export default function App() {
           </div>
           {Object.keys(snapshot?.channels ?? {}).length > 0 && (
             <div className="dev-group">
-              <div className="dev-label">Channels</div>
+              <div className="dev-label">{t('dev.channels')}</div>
               {Object.entries(snapshot?.channels ?? {}).map(([name, info]) => (
                 <div className="list-row" key={name}>
                   <span>{name}</span>
