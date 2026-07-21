@@ -31,11 +31,6 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# Optional Streamlit contractor portal
-portal = [
-    "streamlit>=1.30.0",
-    "pandas>=2.0.0",
-]
 # Backwards-compatible alias: browser tools are now native and the dependency
 # is installed with the base package.
 browser = []

@@ -274,6 +274,26 @@ def _make_shadow_mode_handlers(engine: OPCEngine):
             if str(t.assigned_to or t.metadata.get("owner_role") or "").strip() == user_role
             and (t.status in ("running", "awaiting_human", "pending") or t.metadata.get("sub_state") == "AWAITING_HUMAN_DELIVERABLE")
         ]
+
+        if engine.store._db is not None and await engine.store._table_exists("delegation_work_items"):
+            async with engine.store._db.execute(
+                "SELECT work_item_id, title, phase, owner_role_id FROM delegation_work_items WHERE owner_role_id = ? OR phase = 'AWAITING_HUMAN_DELIVERABLE'",
+                (user_role,),
+            ) as cursor:
+                rows = await cursor.fetchall()
+                existing_ids = {t["id"] for t in assigned_tasks}
+                for r in rows:
+                    w_id, title, phase, owner_role = r[0], r[1], r[2], r[3]
+                    if w_id not in existing_ids:
+                        assigned_tasks.append({
+                            "id": w_id,
+                            "title": title or f"Work Item {w_id}",
+                            "description": f"Phase: {phase}",
+                            "status": str(phase).lower(),
+                            "priority": 1,
+                            "assigned_to": owner_role,
+                        })
+
         return aiohttp.web.json_response({"tasks": assigned_tasks, "user": user})
 
     async def handle_contractor_submit(request: aiohttp.web.Request) -> aiohttp.web.Response:

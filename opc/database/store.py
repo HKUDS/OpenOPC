@@ -8403,6 +8403,7 @@ class OPCStore:
                 "tokens_in": row[0] or 0,
                 "tokens_out": row[1] or 0,
                 "cost_usd": row[2] or 0.0,
+                "calls": row[3] or 0,
                 "event_count": row[3] or 0,
             }
 
