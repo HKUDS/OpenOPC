@@ -10,6 +10,7 @@ from datetime import datetime, timedelta
 from enum import Enum
 from pathlib import Path
 import sqlite3
+import aiosqlite
 from typing import Any
 
 from loguru import logger

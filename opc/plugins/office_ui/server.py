@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +21,7 @@ import aiosqlite
 from loguru import logger
 
 from opc.core.config import OPCConfig, get_opc_home
+from opc.core.models import TaskStatus
 from opc.engine import OPCEngine
 from opc.plugins.office_ui.agent_store import AgentStore
 from opc.plugins.office_ui.chat_store import ChatStore

@@ -14,6 +14,7 @@ from typing import Any
 import streamlit as st
 
 from opc.core.auth import create_jwt_token, hash_password, verify_jwt_token, verify_password
+from opc.core.models import TaskStatus
 from opc.database.store import OPCStore
 from opc.layer0_interaction.message_bus import MessageBus
 from opc.layer6_observability.opc_logger import OPCLogger
