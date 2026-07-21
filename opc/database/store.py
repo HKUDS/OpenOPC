@@ -2835,6 +2835,11 @@ class OPCStore:
         await self.hydrate_task_work_item_links(tasks)
         return tasks
 
+    async def list_tasks(self, status: str | None = None) -> list[Task]:
+        """List tasks with optional status filter."""
+        st = TaskStatus(status) if status and status in [s.value for s in TaskStatus] else None
+        return await self.get_tasks(status=st)
+
     async def get_tasks_by_session_id(
         self,
         session_id: str,
@@ -8515,100 +8520,6 @@ class OPCStore:
                 "cost_usd": row[2] or 0.0,
                 "calls": row[3] or 0,
             }
-
-    # --- Task CRUD Operations for Shadow Mode ---
-
-    async def save_task(self, task: Task) -> None:
-        """Create or update a Task object in store."""
-        assert self._db
-        now_str = datetime.now().isoformat()
-        metadata_json = json.dumps(getattr(task, "metadata", {}) or {})
-        result_json = json.dumps(getattr(task, "result", {}) or {}) if getattr(task, "result", None) else None
-        
-        status_val = task.status.value if hasattr(task.status, "value") else str(task.status)
-
-        await self._db.execute(
-            """INSERT INTO tasks
-            (id, title, description, assigned_to, status, priority, metadata, result, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(id) DO UPDATE SET
-                title=excluded.title,
-                description=excluded.description,
-                assigned_to=excluded.assigned_to,
-                status=excluded.status,
-                priority=excluded.priority,
-                metadata=excluded.metadata,
-                result=excluded.result""",
-            (
-                task.id,
-                task.title,
-                task.description,
-                task.assigned_to,
-                status_val,
-                task.priority,
-                metadata_json,
-                result_json,
-                now_str,
-            ),
-        )
-        await self._db.commit()
-
-    async def get_task(self, task_id: str) -> Task | None:
-        """Fetch a Task object by ID."""
-        assert self._db
-        async with self._db.execute(
-            "SELECT id, title, description, assigned_to, status, priority, metadata, result FROM tasks WHERE id = ?",
-            (task_id,),
-        ) as cursor:
-            row = await cursor.fetchone()
-            if not row:
-                return None
-            metadata = json.loads(row[6]) if row[6] else {}
-            result = json.loads(row[7]) if row[7] else None
-            return Task(
-                id=row[0],
-                title=row[1],
-                description=row[2],
-                assigned_to=row[3],
-                status=TaskStatus(row[4]) if row[4] in [s.value for s in TaskStatus] else TaskStatus.PENDING,
-                priority=row[5],
-                metadata=metadata,
-                result=result,
-            )
-
-    async def list_tasks(self, status: str | None = None) -> list[Task]:
-        """List tasks with optional status filter."""
-        assert self._db
-        query = "SELECT id, title, description, assigned_to, status, priority, metadata, result FROM tasks"
-        params: list[Any] = []
-        if status:
-            query += " WHERE status = ?"
-            params.append(status)
-
-        async with self._db.execute(query, params) as cursor:
-            rows = await cursor.fetchall()
-            tasks = []
-            for row in rows:
-                metadata = json.loads(row[6]) if row[6] else {}
-                result = json.loads(row[7]) if row[7] else None
-                task_status = row[4]
-                try:
-                    ts = TaskStatus(task_status)
-                except Exception:
-                    ts = TaskStatus.PENDING
-                tasks.append(
-                    Task(
-                        id=row[0],
-                        title=row[1],
-                        description=row[2],
-                        assigned_to=row[3],
-                        status=ts,
-                        priority=row[5],
-                        metadata=metadata,
-                        result=result,
-                    )
-                )
-            return tasks
 
     # --- Step 2 & 3: Temporal Performance Aggregation & Organizational Changelog ---
 

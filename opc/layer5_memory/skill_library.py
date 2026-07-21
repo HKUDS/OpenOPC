@@ -71,6 +71,36 @@ class SkillLibrary:
             if skill:
                 self._skills[skill.name] = skill
 
+    def save_learned_skill(
+        self,
+        name: str,
+        description: str,
+        content: str,
+        level: str = "system",
+        project_id: str | None = None,
+        category: str | None = None,
+    ) -> Path:
+        """Persist a learned skill into SKILL.md format."""
+        if level == "project" and project_id:
+            target_dir = self.projects_dir / project_id / "skills" / name
+        else:
+            target_dir = self.system_skills_dir / name
+        target_dir.mkdir(parents=True, exist_ok=True)
+        file_path = target_dir / "SKILL.md"
+        frontmatter = f"---\nname: {name}\ndescription: {description}\n---\n\n{content}\n"
+        file_path.write_text(frontmatter, encoding="utf-8")
+        skill = Skill(
+            name=name,
+            description=description,
+            content=content,
+            source_path=str(file_path),
+            level=level,
+        )
+        self._skills[name] = skill
+        return file_path
+
+    add_skill = save_learned_skill
+
     # ------------------------------------------------------------------
     # Accessors
     # ------------------------------------------------------------------

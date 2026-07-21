@@ -10,8 +10,11 @@ import os
 import time
 from typing import Any
 
-# Default secret key for JWT signing; in production, set OPC_JWT_SECRET environment variable
-JWT_SECRET_KEY = os.getenv("OPC_JWT_SECRET", "opc-shadow-mode-secret-key-change-in-production")
+import secrets
+
+# JWT secret key configuration; uses OPC_JWT_SECRET environment variable or generates secure runtime key
+_env_secret = os.getenv("OPC_JWT_SECRET")
+JWT_SECRET_KEY = _env_secret if _env_secret else secrets.token_hex(32)
 JWT_ALGORITHM = "HS256"
 JWT_EXPIRATION_SECONDS = 86400 * 7  # 7 days expiration for human contractors
 

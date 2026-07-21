@@ -299,20 +299,28 @@ def _make_shadow_mode_handlers(engine: OPCEngine):
                 elif field.name == "file":
                     filename = field.filename
                     if filename:
-                        dest_dir = Path(".opc/workspace/deliverables") / (task_id or "general")
+                        safe_filename = Path(filename).name if filename else ""
+                        safe_task_id = re.sub(r'[^a-zA-Z0-9_\-]', '', task_id) or "general"
+                        dest_dir = (Path(".opc/workspace/deliverables") / safe_task_id).resolve()
+                        base_deliverables_dir = Path(".opc/workspace/deliverables").resolve()
+                        base_deliverables_dir.mkdir(parents=True, exist_ok=True)
                         dest_dir.mkdir(parents=True, exist_ok=True)
-                        dest_path = dest_dir / filename
+
+                        if not _is_under_path(dest_dir, base_deliverables_dir) or not safe_filename:
+                            return aiohttp.web.json_response({"error": "Invalid upload path"}, status=400)
+
+                        dest_path = dest_dir / safe_filename
                         content_bytes = await field.read()
                         with open(dest_path, "wb") as f:
                             f.write(content_bytes)
 
                         try:
                             extracted = dest_path.read_text(encoding="utf-8", errors="ignore")
-                            file_content += f"\n\n--- Attached File ({filename}) ---\n{extracted}"
+                            file_content += f"\n\n--- Attached File ({safe_filename}) ---\n{extracted}"
                         except Exception:
                             file_content += f"\n\nUploaded file: {dest_path} ({len(content_bytes)} bytes)"
 
-                        artifacts_list.append({"name": filename, "path": str(dest_path), "size": len(content_bytes)})
+                        artifacts_list.append({"name": safe_filename, "path": str(dest_path), "size": len(content_bytes)})
         else:
             data = await request.json()
             task_id = str(data.get("task_id", "")).strip()
@@ -321,6 +329,18 @@ def _make_shadow_mode_handlers(engine: OPCEngine):
         final_content = (summary_notes + "\n" + file_content).strip()
         if not final_content or not task_id:
             return aiohttp.web.json_response({"error": "Task ID and notes/file content required"}, status=400)
+
+        # Update persistent task status and result in store directly
+        task_obj = await engine.store.get_task(task_id)
+        if task_obj:
+            task_obj.status = TaskStatus.DONE
+            task_obj.result = {
+                "summary": final_content,
+                "artifacts": artifacts_list,
+                "submitted_by_human": True,
+                "contractor_username": user.get("username", "human_contractor"),
+            }
+            await engine.store.save_task(task_obj)
 
         opc_log = OPCLogger(store=engine.store)
         await opc_log.log_trajectory_step(
@@ -346,11 +366,23 @@ def _make_shadow_mode_handlers(engine: OPCEngine):
         return aiohttp.web.json_response({"success": True, "task_id": task_id})
 
     async def handle_temporal_performance(request: aiohttp.web.Request) -> aiohttp.web.Response:
+        auth_header = request.headers.get("Authorization", "")
+        token = auth_header.replace("Bearer ", "").strip() if "Bearer " in auth_header else ""
+        user = verify_jwt_token(token) if token else None
+        if not user:
+            return aiohttp.web.json_response({"error": "Unauthorized"}, status=401)
+
         interval = request.query.get("interval", "weekly")
         data = await engine.store.get_temporal_performance(interval=interval)
         return aiohttp.web.json_response(data)
 
     async def handle_changelogs(request: aiohttp.web.Request) -> aiohttp.web.Response:
+        auth_header = request.headers.get("Authorization", "")
+        token = auth_header.replace("Bearer ", "").strip() if "Bearer " in auth_header else ""
+        user = verify_jwt_token(token) if token else None
+        if not user:
+            return aiohttp.web.json_response({"error": "Unauthorized"}, status=401)
+
         limit = int(request.query.get("limit", "100"))
         search = request.query.get("search", None)
         changelogs = await engine.store.get_org_changelogs(limit=limit, search=search)

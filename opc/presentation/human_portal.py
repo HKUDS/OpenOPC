@@ -56,7 +56,6 @@ def render_login_page(store: OPCStore) -> None:
             token = create_jwt_token(payload)
             st.session_state["jwt_token"] = token
             st.session_state["user"] = payload
-            st.query_params["token"] = token
             st.success(f"Welcome back, {employee['name']}!")
             st.rerun()
 
@@ -68,7 +67,6 @@ def render_contractor_dashboard(store: OPCStore, user: dict[str, Any]) -> None:
     
     if st.sidebar.button("Log Out"):
         st.session_state.clear()
-        st.query_params.clear()
         st.rerun()
 
     tab1, tab2 = st.tabs(["Task Queue", "Organizational Velocity & Changelog"])
@@ -119,21 +117,32 @@ def render_contractor_dashboard(store: OPCStore, user: dict[str, Any]) -> None:
                             if uploaded_file is not None:
                                 dest_dir = Path(".opc/workspace/deliverables") / task_id
                                 dest_dir.mkdir(parents=True, exist_ok=True)
-                                dest_path = dest_dir / uploaded_file.name
+                                safe_filename = Path(uploaded_file.name).name
+                                dest_path = dest_dir / safe_filename
                                 with open(dest_path, "wb") as f:
                                     f.write(uploaded_file.getbuffer())
 
                                 try:
                                     extracted_text = dest_path.read_text(encoding="utf-8", errors="ignore")
-                                    file_content += f"\n\n--- Attached File Content ({uploaded_file.name}) ---\n{extracted_text}"
+                                    file_content += f"\n\n--- Attached File Content ({safe_filename}) ---\n{extracted_text}"
                                 except Exception:
                                     file_content += f"\n\nUploaded file: {dest_path} (Raw size: {len(uploaded_file.getbuffer())} bytes)"
 
                                 artifacts_list.append({
-                                    "name": uploaded_file.name,
+                                    "name": safe_filename,
                                     "path": str(dest_path),
                                     "size": len(uploaded_file.getbuffer())
                                 })
+
+                            # Mark task status as DONE in store
+                            task.status = TaskStatus.DONE
+                            task.result = {
+                                "summary": file_content,
+                                "artifacts": artifacts_list,
+                                "submitted_by_human": True,
+                                "contractor_username": user.get("username", "human_contractor"),
+                            }
+                            asyncio.run(store.save_task(task))
 
                             logger = OPCLogger(store=store)
                             asyncio.run(logger.log_trajectory_step(

@@ -14,14 +14,11 @@ from opc.core.windows_ssl import sanitize_windows_sslkeylogfile
 
 sanitize_windows_sslkeylogfile()
 
-try:
-    import litellm
-    litellm.suppress_debug_info = True
-    litellm.drop_params = True
-except ImportError:
-    litellm = None
-
+import litellm
 from loguru import logger
+
+litellm.suppress_debug_info = True
+litellm.drop_params = True
 
 from opc.core.attachment_content import attachment_suffix
 from opc.core.attachment_store import AttachmentRef
