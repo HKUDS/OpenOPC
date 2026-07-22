@@ -38,9 +38,9 @@ class AdapterRegistry:
             agent_config = self.config.agents.get(agent_type)
             adapter = adapter_cls(config=agent_config)
             self._adapters[agent_type] = adapter
-            if agent_config and not agent_config.enabled:
+            if agent_config is None or not agent_config.enabled:
                 self._available[agent_type] = False
-                logger.info(f"External agent {agent_type}: disabled in config")
+                logger.info(f"External agent {agent_type}: disabled or unconfigured")
                 continue
 
             available = await adapter.is_available()

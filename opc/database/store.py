@@ -8683,6 +8683,17 @@ class OPCStore:
 
         time_format = "%Y-W%W" if interval == "weekly" else "%Y-%m-%d"
 
+        where_clauses: list[str] = []
+        params: list[Any] = []
+        if start_date:
+            where_clauses.append("created_at >= ?")
+            params.append(start_date)
+        if end_date:
+            where_clauses.append("created_at <= ?")
+            params.append(end_date)
+
+        where_str = (" WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
+
         # 1. Global Aggregation
         async with self._db.execute(
             f"""SELECT strftime('{time_format}', created_at) as time_bucket,
@@ -8690,8 +8701,10 @@ class OPCStore:
                        COUNT(*) as total_tasks,
                        AVG(CASE WHEN status IN ('done', 'completed') THEN 1.0 ELSE 0.0 END) as completion_rate
                 FROM tasks
+                {where_str}
                 GROUP BY time_bucket
-                ORDER BY time_bucket ASC"""
+                ORDER BY time_bucket ASC""",
+            params,
         ) as cursor:
             global_rows = await cursor.fetchall()
             global_metrics = [
@@ -8705,15 +8718,21 @@ class OPCStore:
             ]
 
         # 2. Team Aggregation (by assigned_to / owner_role)
+        team_where = list(where_clauses)
+        team_params = list(params)
+        team_where.append("assigned_to IS NOT NULL AND assigned_to != ''")
+        team_where_str = " WHERE " + " AND ".join(team_where)
+
         async with self._db.execute(
             f"""SELECT assigned_to,
                        strftime('{time_format}', created_at) as time_bucket,
                        COUNT(CASE WHEN status IN ('done', 'completed') THEN 1 END) as completed_tasks,
                        COUNT(*) as total_tasks
                 FROM tasks
-                WHERE assigned_to IS NOT NULL AND assigned_to != ''
+                {team_where_str}
                 GROUP BY assigned_to, time_bucket
-                ORDER BY time_bucket ASC"""
+                ORDER BY time_bucket ASC""",
+            team_params,
         ) as cursor:
             team_rows = await cursor.fetchall()
             team_metrics: dict[str, list[dict[str, Any]]] = {}
@@ -8726,15 +8745,26 @@ class OPCStore:
                 })
 
         # 3. Individual Aggregation (by employee / contractor)
+        indiv_where: list[str] = ["actor_id IS NOT NULL AND actor_id != ''"]
+        indiv_params: list[Any] = []
+        if start_date:
+            indiv_where.append("timestamp >= ?")
+            indiv_params.append(start_date)
+        if end_date:
+            indiv_where.append("timestamp <= ?")
+            indiv_params.append(end_date)
+        indiv_where_str = " WHERE " + " AND ".join(indiv_where)
+
         async with self._db.execute(
             f"""SELECT actor_id,
                        strftime('{time_format}', timestamp) as time_bucket,
                        COUNT(*) as event_count,
                        SUM(impact_score) as total_impact
                 FROM org_changelogs
-                WHERE actor_id IS NOT NULL AND actor_id != ''
+                {indiv_where_str}
                 GROUP BY actor_id, time_bucket
-                ORDER BY time_bucket ASC"""
+                ORDER BY time_bucket ASC""",
+            indiv_params,
         ) as cursor:
             indiv_rows = await cursor.fetchall()
             individual_metrics: dict[str, list[dict[str, Any]]] = {}

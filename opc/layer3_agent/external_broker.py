@@ -383,6 +383,13 @@ class ExternalAgentBroker:
         on_progress: Callable[[str], Coroutine[Any, Any, None]] | None = None,
         prepared_task: Task | None = None,
     ) -> TaskResult:
+        if getattr(adapter, "agent_type", "") == "human":
+            if hasattr(adapter, "store"):
+                adapter.store = self.store
+            if hasattr(adapter, "message_bus"):
+                adapter.message_bus = getattr(self, "message_bus", None) or MessageBus()
+            return await adapter.execute(task, workspace_path)
+
         await self._restore_session_resume_from_store(adapter, task, on_progress=on_progress)
         agent_task = prepared_task or await self._prepare_task_for_agent(task)
         await self._clear_broker_pending_inbox(task)

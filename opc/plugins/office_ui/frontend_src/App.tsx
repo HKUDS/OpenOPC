@@ -70,7 +70,7 @@ const SESSION_DETAIL_REFRESH_LOW_VALUE_RUNTIME_EVENTS = new Set([
 ])
 
 type ThemeName = 'midnight' | 'neon' | 'paper' | 'retro' | 'terminal' | 'cozy' | 'openopc'
-type AppPage = 'office' | 'workspace' | 'org' | 'mapEditor'
+type AppPage = 'office' | 'workspace' | 'org' | 'shadowPortal' | 'temporalAnalytics' | 'mapEditor'
 type AppExecMode = 'task' | 'company' | 'org'
 
 function defaultWsUrl(): string {
@@ -2409,6 +2409,8 @@ export default function App() {
             </button>
             <button className={`page-nav-btn${activePage === 'office' ? ' active' : ''}`} onClick={() => setActivePage('office')}>{t('app.page.office')}</button>
             <button className={`page-nav-btn${activePage === 'org' ? ' active' : ''}`} onClick={() => setActivePage('org')}>{t('app.page.org')}</button>
+            <button className={`page-nav-btn${activePage === 'shadowPortal' ? ' active' : ''}`} onClick={() => setActivePage('shadowPortal')}>Shadow Mode</button>
+            <button className={`page-nav-btn${activePage === 'temporalAnalytics' ? ' active' : ''}`} onClick={() => setActivePage('temporalAnalytics')}>Analytics</button>
           </div>
           <div className="stat-chips">
             <span className="stat-chip"><b>{metrics.totalAgents}</b> {t('app.metric.agents')}</span>
@@ -2613,6 +2615,18 @@ export default function App() {
             orgCreateResult={orgCreateResult}
             onSelectCorporate={handleSelectCorporateOrg}
           />
+        </div>
+      )}
+
+      {activePage === 'shadowPortal' && (
+        <div className="shadow-portal-page" style={{ padding: '20px', overflowY: 'auto' }}>
+          <ShadowModePortal />
+        </div>
+      )}
+
+      {activePage === 'temporalAnalytics' && (
+        <div className="analytics-page" style={{ padding: '20px', overflowY: 'auto' }}>
+          <TemporalAnalyticsDashboard />
         </div>
       )}
 

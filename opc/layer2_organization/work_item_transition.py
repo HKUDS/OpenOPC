@@ -102,6 +102,7 @@ async def transition_work_item(
     metadata_updates: dict[str, Any] | None = None,
     release_claim: bool = False,
     attempt_outcome: str | None = None,
+    deliverable_summary: str | None = None,
 ) -> DelegationWorkItem | None:
     """Transition a work item to ``target_phase``.
 
@@ -166,6 +167,8 @@ async def transition_work_item(
     }
     if summary is not None:
         kwargs["summary"] = summary
+    if deliverable_summary is not None:
+        kwargs["deliverable_summary"] = deliverable_summary
     if release_claim:
         # Fold claim release into the same write as the phase change: the
         # legacy two-call sequence could commit the phase and then fail the

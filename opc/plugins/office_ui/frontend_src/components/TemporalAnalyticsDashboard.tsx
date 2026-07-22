@@ -34,9 +34,16 @@ export const TemporalAnalyticsDashboard: React.FC = () => {
     fetchChangelogs();
   }, [searchQuery]);
 
+  const getAuthHeaders = (): Record<string, string> => {
+    const token = localStorage.getItem('opc_token') || sessionStorage.getItem('opc_token') || '';
+    return token ? { 'Authorization': `Bearer ${token}` } : {};
+  };
+
   const fetchAnalytics = async () => {
     try {
-      const res = await fetch(`/api/analytics/temporal_performance?interval=${interval}`);
+      const res = await fetch(`/api/analytics/temporal_performance?interval=${interval}`, {
+        headers: getAuthHeaders(),
+      });
       const data = await res.json();
       if (res.ok) {
         setGlobalMetrics(data.global || []);
@@ -56,7 +63,9 @@ export const TemporalAnalyticsDashboard: React.FC = () => {
 
   const fetchChangelogs = async () => {
     try {
-      const res = await fetch(`/api/analytics/changelogs?limit=50&search=${encodeURIComponent(searchQuery)}`);
+      const res = await fetch(`/api/analytics/changelogs?limit=50&search=${encodeURIComponent(searchQuery)}`, {
+        headers: getAuthHeaders(),
+      });
       const data = await res.json();
       if (res.ok) {
         setChangelogs(data.changelogs || []);

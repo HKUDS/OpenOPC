@@ -34,8 +34,10 @@ class HumanAgentAdapter(ExternalAgentAdapter):
         self.store = store
 
     async def is_available(self) -> bool:
-        """Human contractor seats are always available when configured."""
-        return True
+        """Human contractor seats are available only when explicitly configured and enabled."""
+        if self.config is None:
+            return False
+        return bool(self.config.enabled)
 
     async def get_status(self) -> AgentStatus:
         """Return status for human adapter."""

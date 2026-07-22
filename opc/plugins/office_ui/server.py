@@ -272,18 +272,18 @@ def _make_shadow_mode_handlers(engine: OPCEngine):
             }
             for t in all_tasks
             if str(t.assigned_to or t.metadata.get("owner_role") or "").strip() == user_role
-            and (t.status in ("running", "awaiting_human", "pending") or t.metadata.get("sub_state") == "AWAITING_HUMAN_DELIVERABLE")
+            and (str(t.status.value if hasattr(t.status, "value") else t.status).lower() in ("running", "awaiting_human", "pending") or t.metadata.get("sub_state") == "AWAITING_HUMAN_DELIVERABLE")
         ]
 
         if engine.store._db is not None and await engine.store._table_exists("delegation_work_items"):
             async with engine.store._db.execute(
-                "SELECT work_item_id, title, phase, owner_role_id FROM delegation_work_items WHERE owner_role_id = ? OR phase = 'AWAITING_HUMAN_DELIVERABLE'",
+                "SELECT work_item_id, title, phase, role_id FROM delegation_work_items WHERE (role_id = ? OR phase = 'awaiting_human') AND phase != 'closed'",
                 (user_role,),
             ) as cursor:
                 rows = await cursor.fetchall()
                 existing_ids = {t["id"] for t in assigned_tasks}
                 for r in rows:
-                    w_id, title, phase, owner_role = r[0], r[1], r[2], r[3]
+                    w_id, title, phase, role_id_val = r[0], r[1], r[2], r[3]
                     if w_id not in existing_ids:
                         assigned_tasks.append({
                             "id": w_id,
@@ -291,7 +291,7 @@ def _make_shadow_mode_handlers(engine: OPCEngine):
                             "description": f"Phase: {phase}",
                             "status": str(phase).lower(),
                             "priority": 1,
-                            "assigned_to": owner_role,
+                            "assigned_to": role_id_val,
                         })
 
         return aiohttp.web.json_response({"tasks": assigned_tasks, "user": user})
@@ -302,6 +302,13 @@ def _make_shadow_mode_handlers(engine: OPCEngine):
         user = verify_jwt_token(token) if token else None
         if not user:
             return aiohttp.web.json_response({"error": "Unauthorized"}, status=401)
+
+        username = user.get("username", "")
+        employee = await engine.store.get_employee_by_username(username) if username and hasattr(engine.store, "get_employee_by_username") else None
+        if not employee and hasattr(engine.store, "get_employee"):
+            employee = await engine.store.get_employee(user.get("sub", ""))
+        if not employee:
+            return aiohttp.web.json_response({"error": "Forbidden: active contractor account required"}, status=403)
 
         task_id = ""
         summary_notes = ""
@@ -352,29 +359,68 @@ def _make_shadow_mode_handlers(engine: OPCEngine):
         if not final_content or not task_id:
             return aiohttp.web.json_response({"error": "Task ID and notes/file content required"}, status=400)
 
-        # Update persistent task status and result in store directly
         task_obj = await engine.store.get_task(task_id)
+        work_item_obj = await engine.store.get_delegation_work_item(task_id) if hasattr(engine.store, "get_delegation_work_item") else None
+        if not task_obj and not work_item_obj:
+            return aiohttp.web.json_response({"error": "Task or WorkItem not found"}, status=404)
+
+        user_role = user.get("role_id", "")
+        item_role = ""
+        if work_item_obj:
+            item_role = getattr(work_item_obj, "role_id", "") or ""
+        elif task_obj:
+            item_role = getattr(task_obj, "assigned_to", "") or task_obj.metadata.get("owner_role", "")
+
+        if item_role and user_role and item_role != user_role:
+            return aiohttp.web.json_response({"error": "Forbidden: task belongs to a different role"}, status=403)
+
+        is_awaiting_human = False
+        if work_item_obj:
+            is_awaiting_human = str(getattr(work_item_obj.phase, "value", work_item_obj.phase)).lower() in ("awaiting_human", "in_progress", "ready")
+        if task_obj:
+            is_awaiting_human = is_awaiting_human or str(task_obj.status.value if hasattr(task_obj.status, "value") else task_obj.status).lower() in ("awaiting_human", "running", "pending") or task_obj.metadata.get("sub_state") == "AWAITING_HUMAN_DELIVERABLE"
+
+        if not is_awaiting_human:
+            return aiohttp.web.json_response({"error": "Task is not awaiting a human deliverable"}, status=400)
+
+        if work_item_obj:
+            from opc.core.models import Phase
+            from opc.layer2_organization.work_item_transition import transition_work_item
+            work_item_obj.deliverable_summary = final_content
+            work_item_obj.metadata["deliverable_artifacts"] = artifacts_list
+            work_item_obj.metadata["submitted_by_human"] = True
+            work_item_obj.metadata["contractor_username"] = username
+            await transition_work_item(
+                store=engine.store,
+                work_item_id=work_item_obj.work_item_id,
+                target_phase=Phase.AWAITING_MANAGER_REVIEW,
+                reason="Contractor deliverable submission",
+                summary=final_content,
+                deliverable_summary=final_content,
+                metadata_updates=work_item_obj.metadata,
+            )
+
         if task_obj:
             task_obj.status = TaskStatus.DONE
             task_obj.result = {
                 "summary": final_content,
                 "artifacts": artifacts_list,
                 "submitted_by_human": True,
-                "contractor_username": user.get("username", "human_contractor"),
+                "contractor_username": username,
             }
             await engine.store.save_task(task_obj)
 
         opc_log = OPCLogger(store=engine.store)
         await opc_log.log_trajectory_step(
             task_id=task_id,
-            role_id=user.get("role_id", ""),
+            role_id=user_role,
             employee_id=user.get("sub", "human_contractor"),
             action="HUMAN_DELIVERABLE_SUBMISSION",
             content=final_content,
             artifacts=artifacts_list,
         )
 
-        mbus = MessageBus()
+        mbus = getattr(engine, "message_bus", None) or MessageBus()
         mbus.publish_event(
             f"deliverable_completed:{task_id}",
             {
@@ -382,7 +428,7 @@ def _make_shadow_mode_handlers(engine: OPCEngine):
                 "summary": final_content,
                 "content": final_content,
                 "artifacts": artifacts_list,
-                "username": user.get("username", "human_contractor"),
+                "username": username,
             },
         )
         return aiohttp.web.json_response({"success": True, "task_id": task_id})

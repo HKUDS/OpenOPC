@@ -290,6 +290,7 @@ ALLOWED_TRANSITIONS: dict[Phase, frozenset[Phase]] = {
     }) | _UNIVERSAL_EXITS | _RECOVERY_EXITS,
     Phase.AWAITING_HUMAN: frozenset({
         Phase.APPROVED,
+        Phase.AWAITING_MANAGER_REVIEW,
         Phase.READY_FOR_REWORK,
     }) | _UNIVERSAL_EXITS | _RECOVERY_EXITS,
 
