@@ -6454,7 +6454,22 @@ class CompanyWorkItemExecutor:
                 session.focused_work_item_id = ""
                 session.updated_at = now
                 continue
-            if is_dispatchable(work_item):
+            # If focused work item is in a terminal phase (approved, done, etc.),
+            # clear the focus so the session can pick up new work.
+            if work_item.phase in DONE_PHASES:
+                session.status = "idle"
+                session.resident_status = "idle"
+                session.focused_work_item_id = ""
+                session.updated_at = now
+                continue
+            # Unpark only when the focused card is genuinely dispatchable.
+            # is_dispatchable already covers READY / READY_FOR_REWORK and
+            # orphaned in-flight cards, while still respecting dispatch_hold /
+            # queued_behind_session / attempt-ledger brakes. A bare
+            # is_runnable(phase) check would override those holds and unpark a
+            # session whose card must stay parked.
+            dispatchable = is_dispatchable(work_item)
+            if dispatchable:
                 session.status = "idle"
                 session.resident_status = "idle"
                 session.focused_work_item_id = ""
