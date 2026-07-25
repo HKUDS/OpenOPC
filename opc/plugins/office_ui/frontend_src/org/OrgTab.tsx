@@ -18,6 +18,7 @@ import { EmployeesMarketplace } from './EmployeesMarketplace'
 import { ConfigImportExportPanel } from './ConfigImportExportPanel'
 import { OrgCreateModal } from './OrgCreateModal'
 import { getRuntimeOrgView } from '../lib/runtimeOrg'
+import { useI18n } from '../i18n'
 import './org.css'
 import './team.css'
 import './marketplace.css'
@@ -122,6 +123,7 @@ export function OrgTab({
   onSavedOrgsList, onSavedOrgSaveAs, onSavedOrgCreate, onSavedOrgLoad, onSavedOrgDelete, savedOrgsList,
   activeSavedOrg, activeSavedOrgVersionAtLoad, orgCreatePending, orgCreateResult, onSelectCorporate,
 }: OrgTabProps) {
+  const { t } = useI18n()
   const [activeTab, setActiveTab] = useState<SubTab>('team')
   const [createOpen, setCreateOpen] = useState(false)
 
@@ -166,8 +168,8 @@ export function OrgTab({
     if (!orgCreateResult || !orgCreateResult.ok) return
     setCreateOpen(false)
     setActiveTab('team')
-    showToast(`Created ${orgCreateResult.organization_name || orgCreateResult.name} and saved automatically`)
-  }, [orgCreateResult, showToast])
+    showToast(t('org.createdToast', { name: orgCreateResult.organization_name || orgCreateResult.name }))
+  }, [orgCreateResult, showToast, t])
 
   // In org mode: show only user-owned roles. In company mode: show all roles read-only.
   const allRoles = data?.roles ?? []
@@ -176,13 +178,13 @@ export function OrgTab({
   const runtimeView = useMemo(() => getRuntimeOrgView(data), [data])
   const activeAgents = useMemo(() => displayEmployees.filter(e => e.linked_agent_id), [displayEmployees])
   const configuredOrgName = data?.organization_name?.trim()
-  const activeOrgLabel = configuredOrgName || humanizeOrgName(activeSavedOrg) || (isCustomMode ? 'Custom org' : 'Corporate company')
+  const activeOrgLabel = configuredOrgName || humanizeOrgName(activeSavedOrg) || (isCustomMode ? t('org.customOrg') : t('org.corporateCompany'))
   const activeOrgId = (isCustomMode ? (data?.organization_id || activeSavedOrg) : 'corporate') || ''
-  const architectureKindLabel = isCustomMode ? 'Saved org' : 'Corporate'
+  const architectureKindLabel = isCustomMode ? t('org.kind.saved') : t('org.kind.corporate')
   const architectureStateLabel = isCustomMode
-    ? activeSavedOrg ? 'Editable saved architecture' : 'Editable draft architecture'
-    : 'Built-in read-only architecture'
-  const runtimeStateLabel = runtimeView.frontier.status || runtimeView.projectRun?.status || runtimeView.projectRun?.lifecycle_status || 'ready'
+    ? activeSavedOrg ? t('org.state.editableSaved') : t('org.state.editableDraft')
+    : t('org.state.readOnly')
+  const runtimeStateLabel = runtimeView.frontier.status || runtimeView.projectRun?.status || runtimeView.projectRun?.lifecycle_status || t('common.ready')
 
   // Roles that already have at least one non-placeholder employee.
   const filledRoleIds = useMemo(
@@ -210,9 +212,9 @@ export function OrgTab({
       setApplyingPresetId(null)
       versionAtApply.current = -1
       setActiveTab('team')
-      showToast('Architecture applied successfully')
+      showToast(t('org.architectureApplied'))
     }
-  }, [orgVersion, applyingPresetId, showToast])
+  }, [orgVersion, applyingPresetId, showToast, t])
 
   const handleApplyPreset = (presetId: string, strategy: string) => {
     versionAtApply.current = orgVersion // snapshot current version
@@ -232,7 +234,7 @@ export function OrgTab({
   }
 
   if (!data) {
-    return <div className="org-tab"><div className="org-loading">Loading organization data...</div></div>
+    return <div className="org-tab"><div className="org-loading">{t('org.loading')}</div></div>
   }
 
   const installedPackages = data.installed_packages ?? []
@@ -244,7 +246,7 @@ export function OrgTab({
       <div className={`org-header${isCustomMode ? ' org-header--custom' : ' org-header--corporate'}`}>
         <div className="org-header-main">
           <div className="org-eyebrow">
-            <span>Company</span>
+            <span>{t('org.company')}</span>
             <span className="org-eyebrow-separator">/</span>
             <span>{architectureKindLabel}</span>
           </div>
@@ -259,13 +261,13 @@ export function OrgTab({
             <span className="org-meta-pill">{data.company_profile || (isCustomMode ? 'custom' : 'corporate')}</span>
             {activeOrgId && <code className="org-meta-code">{activeOrgId}</code>}
             <span className="org-meta-pill org-meta-pill--runtime">{runtimeStateLabel}</span>
-            <span className="org-meta-pill org-meta-pill--saved">Auto-saved</span>
+            <span className="org-meta-pill org-meta-pill--saved">{t('common.autoSaved')}</span>
           </div>
         </div>
 
         <div className="org-control-panel">
           <label className="org-switcher">
-            <span className="org-switcher-label">Organization</span>
+            <span className="org-switcher-label">{t('org.organization')}</span>
             <span className="org-switcher-select-wrap">
               <select
                 className="org-switcher-select"
@@ -273,9 +275,9 @@ export function OrgTab({
                 onChange={e => handleOrgSelection(e.target.value)}
                 onFocus={() => onSavedOrgsList?.()}
                 onPointerDown={() => onSavedOrgsList?.()}
-                aria-label="Organization"
+                aria-label={t('org.organization')}
               >
-                <option value="corporate">Corporate</option>
+                <option value="corporate">{t('org.corporate')}</option>
                 {savedOrgOptions.map(org => (
                   <option key={org.name} value={`org:${org.name}`}>
                     {(org.organization_name || org.name).trim() || org.name}
@@ -286,36 +288,36 @@ export function OrgTab({
           </label>
           <button type="button" className="org-create-trigger" onClick={() => setCreateOpen(true)}>
             <span className="org-create-trigger-icon" aria-hidden>+</span>
-            New organization
+            {t('org.newOrganization')}
           </button>
         </div>
 
         <div className="org-stats-strip">
           <span className="org-stat">
             <img src={STAT_ICON.agents} alt="" className="org-stat-icon" />
-            <b>{displayRoles.length}</b> roles
+            <b>{displayRoles.length}</b> {t('org.roles')}
           </span>
           <span className="org-stat">
             <img src={TAB_ICON.employees} alt="" className="org-stat-icon" />
-            <b>{displayEmployees.length}</b> employees
+            <b>{displayEmployees.length}</b> {t('org.employees')}
           </span>
           <span className="org-stat">
             <img src={TAB_ICON.runtime} alt="" className="org-stat-icon" />
-            <b>{runtimeView.runtimeTeams.length}</b> runtime teams
+            <b>{runtimeView.runtimeTeams.length}</b> {t('org.runtimeTeams')}
           </span>
           <span className="org-stat">
             <img src={STAT_ICON.active} alt="" className="org-stat-icon" />
-            <b>{activeAgents.length}</b> active
+            <b>{activeAgents.length}</b> {t('common.active')}
           </span>
         </div>
       </div>
 
       <div className="org-subtabs">
         {([
-          { id: 'team' as SubTab, icon: TAB_ICON.team, label: 'Team', count: displayRoles.length },
-          { id: 'runtime' as SubTab, icon: TAB_ICON.runtime, label: 'Runtime', count: runtimeView.runtimeTeams.length },
-          { id: 'architecture' as SubTab, icon: TAB_ICON.architecture, label: 'Architecture', count: marketPresets?.length ?? 0 },
-          { id: 'employees' as SubTab, icon: TAB_ICON.employees, label: 'Employees', count: talents.length },
+          { id: 'team' as SubTab, icon: TAB_ICON.team, label: t('org.tab.team'), count: displayRoles.length },
+          { id: 'runtime' as SubTab, icon: TAB_ICON.runtime, label: t('org.tab.runtime'), count: runtimeView.runtimeTeams.length },
+          { id: 'architecture' as SubTab, icon: TAB_ICON.architecture, label: t('org.tab.architecture'), count: marketPresets?.length ?? 0 },
+          { id: 'employees' as SubTab, icon: TAB_ICON.employees, label: t('org.tab.employees'), count: talents.length },
         ]).map(tab => (
           <button key={tab.id}
             className={`org-subtab${activeTab === tab.id ? ' org-subtab--active' : ''}`}

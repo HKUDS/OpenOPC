@@ -61,6 +61,23 @@ def provider_token_from_external_session(
 ) -> str:
     if not external_session_allows_resume(session):
         return ""
+    return _provider_token_from_session_identity(
+        session,
+        agent_type=agent_type,
+        project_id=project_id,
+    )
+
+
+def _provider_token_from_session_identity(
+    session: Any | None,
+    *,
+    agent_type: str,
+    project_id: str,
+) -> str:
+    """Extract a provider token without treating its row as resumable."""
+
+    if session is None:
+        return ""
     metadata = dict(getattr(session, "metadata", {}) or {})
     for candidate in (
         metadata.get("resume_session_id"),
@@ -108,7 +125,7 @@ def select_best_external_resume_session(
 ) -> tuple[Any | None, str]:
     """Select the newest valid provider capability, ignoring placeholders."""
 
-    valid: list[tuple[Any, str]] = []
+    latest_by_token: dict[str, Any] = {}
     normalized_agent = str(agent_type or "").strip()
     for session in list(sessions or []):
         if (
@@ -116,23 +133,35 @@ def select_best_external_resume_session(
             != normalized_agent
         ):
             continue
-        token = provider_token_from_external_session(
+        token = _provider_token_from_session_identity(
             session,
             agent_type=normalized_agent,
             project_id=project_id,
         )
-        if token:
-            valid.append((session, token))
+        if not token:
+            continue
+        current = latest_by_token.get(token)
+        if current is None or _session_timestamp(session) > _session_timestamp(current):
+            latest_by_token[token] = session
+
+    valid = [
+        (session, token)
+        for token, session in latest_by_token.items()
+        if external_session_allows_resume(session)
+    ]
     if not valid:
         return None, ""
 
     def _sort_key(item: tuple[Any, str]) -> tuple[float, str]:
         session, token = item
-        updated_at = getattr(session, "updated_at", None)
-        try:
-            timestamp = float(updated_at.timestamp())
-        except Exception:
-            timestamp = 0.0
-        return timestamp, token
+        return _session_timestamp(session), token
 
     return max(valid, key=_sort_key)
+
+
+def _session_timestamp(session: Any) -> float:
+    updated_at = getattr(session, "updated_at", None)
+    try:
+        return float(updated_at.timestamp())
+    except Exception:
+        return 0.0

@@ -32,6 +32,8 @@ class CodexAdapter(ExternalAgentAdapter):
         "CODEX_SANDBOX_NETWORK_DISABLED",
         "CODEX_THREAD_ID",
     }
+    _RUNTIME_SHELL_ENV_KEYS = {"PYTHONPATH"}
+    _RUNTIME_SHELL_ENV_PREFIXES = ("OPC_",)
     _PROMPT_SENTINEL = "-"
     _TTY_EOF = b"\x04"
     _INTERACTIVE_ARGV_PROMPT_MAX_BYTES = 16 * 1024
@@ -117,6 +119,64 @@ class CodexAdapter(ExternalAgentAdapter):
     def _is_parent_codex_runtime_env(cls, key: str) -> bool:
         normalized = key.upper()
         return normalized in cls._PARENT_CODEX_RUNTIME_ENV_VARS
+
+    @classmethod
+    def _runtime_shell_environment_config_args(
+        cls,
+        extra_env: dict[str, str] | None,
+    ) -> tuple[list[str], list[str]]:
+        """Forward only OpenOPC's runtime contract into Codex shell tools.
+
+        Codex can intentionally run with ``shell_environment_policy.inherit=core``.
+        The broker process still receives ``OPC_*`` variables, but commands launched
+        by Codex do not unless they are added to the policy's ``set`` table.
+        """
+        forwarded: dict[str, str] = {}
+        for raw_key, raw_value in dict(extra_env or {}).items():
+            key = str(raw_key).strip()
+            if not key:
+                continue
+            if key not in cls._RUNTIME_SHELL_ENV_KEYS and not key.startswith(
+                cls._RUNTIME_SHELL_ENV_PREFIXES
+            ):
+                continue
+            value = str(raw_value)
+            if key == "OPC_ALLOWED_COLLAB_TOOLS":
+                try:
+                    parsed = json.loads(value)
+                except json.JSONDecodeError:
+                    parsed = None
+                if isinstance(parsed, list):
+                    value = ",".join(
+                        str(item).strip() for item in parsed if str(item).strip()
+                    )
+            forwarded[key] = value
+
+        args: list[str] = []
+        for key in sorted(forwarded):
+            value = forwarded[key]
+            if "'''" in value:
+                encoded = json.dumps(value, ensure_ascii=False)
+            else:
+                encoded = f"'''{value}'''"
+            args.extend(["-c", f"shell_environment_policy.set.{key}={encoded}"])
+        return args, sorted(forwarded)
+
+    @classmethod
+    def _inject_runtime_shell_environment(
+        cls,
+        cmd: list[str],
+        extra_env: dict[str, str] | None,
+        launch_metadata: dict[str, Any] | None = None,
+    ) -> list[str]:
+        config_args, forwarded_keys = cls._runtime_shell_environment_config_args(extra_env)
+        if not config_args or not cmd:
+            return list(cmd)
+        insert_at = 2 if len(cmd) > 1 and str(cmd[1]).strip() == "exec" else 1
+        launch_cmd = [*cmd[:insert_at], *config_args, *cmd[insert_at:]]
+        if isinstance(launch_metadata, dict):
+            launch_metadata["runtime_shell_environment_keys"] = forwarded_keys
+        return launch_cmd
 
     def build_workspace_args(self, workspace_path: str | None = None) -> list[str]:
         args: list[str] = []
@@ -564,8 +624,13 @@ class CodexAdapter(ExternalAgentAdapter):
         prompt_transport = str((launch_metadata or {}).get("prompt_transport") or "").strip().lower()
         prompt = self._prompt_text_from_task(task) if prompt_transport == "stdin" else ""
         env = self.build_process_env(extra_env)
-        launch_cmd = self._resolve_launch_command(
+        runtime_cmd = self._inject_runtime_shell_environment(
             cmd,
+            extra_env,
+            launch_metadata=launch_metadata,
+        )
+        launch_cmd = self._resolve_launch_command(
+            runtime_cmd,
             extra_env=extra_env,
             launch_metadata=launch_metadata,
         )

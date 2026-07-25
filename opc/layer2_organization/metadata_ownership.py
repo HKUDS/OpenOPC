@@ -187,6 +187,17 @@ _WORK_ITEM_FIELDS: tuple[MetadataFieldSpec, ...] = (
     _spec("self_evolution_patch", MetadataOwner.WORK_ITEM, allowed_locations=("work_item",), migration_policy="work_item_wins"),
     _spec("self_evolution_completed_at", MetadataOwner.WORK_ITEM, allowed_locations=("work_item",), migration_policy="work_item_wins"),
     _spec("self_evolution_error", MetadataOwner.WORK_ITEM, allowed_locations=("work_item",), migration_policy="work_item_wins"),
+    # Attempt ledger (dispatch-attempt accounting; see phase.py). Opened by the
+    # claim CAS, settled by transition_work_item — the dispatcher's structural
+    # brake against crash/interrupted re-dispatch loops.
+    _spec("attempt_seq", MetadataOwner.WORK_ITEM, allowed_locations=("work_item",), migration_policy="work_item_wins"),
+    _spec("attempt_settled", MetadataOwner.WORK_ITEM, allowed_locations=("work_item",), migration_policy="work_item_wins"),
+    _spec("attempt_outcome", MetadataOwner.WORK_ITEM, allowed_locations=("work_item",), migration_policy="work_item_wins"),
+    _spec("attempt_started_at", MetadataOwner.WORK_ITEM, allowed_locations=("work_item",), migration_policy="work_item_wins"),
+    _spec("attempt_settled_at", MetadataOwner.WORK_ITEM, allowed_locations=("work_item",), migration_policy="work_item_wins"),
+    _spec("attempt_crash_streak", MetadataOwner.WORK_ITEM, allowed_locations=("work_item",), migration_policy="work_item_wins"),
+    _spec("attempt_interrupted_streak", MetadataOwner.WORK_ITEM, allowed_locations=("work_item",), migration_policy="work_item_wins"),
+    _spec("attempt_ledger_block_reason", MetadataOwner.WORK_ITEM, allowed_locations=("work_item",), migration_policy="work_item_wins"),
 )
 
 _RUNTIME_TASK_FIELDS: tuple[MetadataFieldSpec, ...] = (

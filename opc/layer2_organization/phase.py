@@ -385,6 +385,57 @@ def is_orphaned(item: Any) -> bool:
     return not claim
 
 
+# ── Attempt ledger ───────────────────────────────────────────────────────
+#
+# Every durable claim opens an "attempt" on the work item (stamped by the
+# claim CAS in store.claim_delegation_work_item_if_dispatchable) and every
+# turn-boundary transition through work_item_transition.transition_work_item
+# settles it with an outcome. The dispatcher refuses to start attempt N+1
+# for cards whose ledger shows a run of consecutive crashed / interrupted
+# attempts — this is the structural brake that makes "a crash path forgot
+# (or failed) to write FAILED" converge instead of re-dispatching forever
+# (issue #10: restart → resume → deterministic crash → re-dispatch loop).
+
+ATTEMPT_CRASH_STREAK_LIMIT = 3
+ATTEMPT_INTERRUPTED_STREAK_LIMIT = 5
+
+
+def _attempt_ledger_int(metadata: Mapping[str, Any], key: str) -> int:
+    try:
+        return int(metadata.get(key, 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def attempt_ledger_dispatch_block_reason(metadata: Mapping[str, Any] | None) -> str:
+    """Non-empty human-readable reason when the attempt ledger forbids
+    dispatching this card again; empty string when dispatch is allowed."""
+    if not isinstance(metadata, Mapping):
+        return ""
+    crash_streak = _attempt_ledger_int(metadata, "attempt_crash_streak")
+    if crash_streak >= ATTEMPT_CRASH_STREAK_LIMIT:
+        return (
+            f"attempt ledger: {crash_streak} consecutive crashed attempts "
+            f"(limit {ATTEMPT_CRASH_STREAK_LIMIT})"
+        )
+    interrupted_streak = _attempt_ledger_int(metadata, "attempt_interrupted_streak")
+    if interrupted_streak >= ATTEMPT_INTERRUPTED_STREAK_LIMIT:
+        return (
+            f"attempt ledger: {interrupted_streak} consecutive interrupted attempts "
+            f"(limit {ATTEMPT_INTERRUPTED_STREAK_LIMIT})"
+        )
+    return ""
+
+
+def has_open_attempt(metadata: Mapping[str, Any] | None) -> bool:
+    """True when a claim opened an attempt that was never settled."""
+    if not isinstance(metadata, Mapping):
+        return False
+    if _attempt_ledger_int(metadata, "attempt_seq") <= 0:
+        return False
+    return not bool(metadata.get("attempt_settled", True))
+
+
 def is_dispatchable(item: Any) -> bool:
     """Combined check used by the dispatcher: pick this card on next tick?
 
@@ -404,6 +455,8 @@ def is_dispatchable(item: Any) -> bool:
     if isinstance(metadata, dict) and str(metadata.get("queued_behind_session", "") or "").strip():
         return False
     if isinstance(metadata, dict) and str(metadata.get("dispatch_hold", "") or "").strip():
+        return False
+    if attempt_ledger_dispatch_block_reason(metadata):
         return False
     return is_runnable(item.phase) or is_orphaned(item)
 

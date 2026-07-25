@@ -665,6 +665,7 @@ class OPCEngine:
             self.approval_engine,
             task_preparer=self._build_external_agent_task,
             communication=self.communication,
+            org_engine=self.org_engine,
         )
         self.secretary = SecretaryService(
             llm=self.llm,
@@ -6363,6 +6364,81 @@ class OPCEngine:
                     f"company runtime resume checkpoint has no task identity snapshot for {task.id}"
                 )
             identity = self._checkpoint_task_execution_identity(task_snapshot)
+            # Resume availability gate: the checkpoint pins one exact
+            # execution backend, so a pinned external agent that is disabled
+            # (or whose binary vanished) makes this work item deterministically
+            # un-runnable — every dispatch would claim, transition to RUNNING,
+            # and crash on the selector's availability check. Fail the item
+            # closed HERE, before any pin/claim, with a visible diagnostic;
+            # the rest of the organization resumes normally and the failed-
+            # child settlement machinery hands the card to manager triage.
+            pinned_agent = str(
+                identity.get("selected_execution_agent", "") or "native"
+            ).strip() or "native"
+            work_item_already_terminal = bool(
+                work_item is not None
+                and getattr(work_item, "phase", None) in DONE_PHASES
+            )
+            # A missing adapter registry means availability is UNKNOWN (engine
+            # not fully initialized / delegate context) — fail open and let the
+            # dispatch-time selector guard decide; only a registry that exists
+            # and excludes the pinned agent is proof of unavailability.
+            if (
+                pinned_agent != "native"
+                and not work_item_already_terminal
+                and self.adapter_registry is not None
+                and pinned_agent not in self._available_external_agents()
+            ):
+                diagnostic = (
+                    f"Cannot resume work item: its execution is pinned to external agent "
+                    f"'{pinned_agent}', which is currently disabled or unavailable. "
+                    f"Re-enable '{pinned_agent}' in the config and restart to run it, "
+                    "or re-issue the work as a new request."
+                )
+                task.metadata = dict(task.metadata or {})
+                for key in _COMPANY_RUNTIME_CONTROL_METADATA_KEYS:
+                    task.metadata.pop(key, None)
+                progress = list(task.metadata.get("progress_log", []) or [])
+                progress.append(diagnostic)
+                task.metadata["progress_log"] = progress[-20:]
+                task.metadata["resume_unavailable_external_agent"] = pinned_agent
+                existing_result = dict(task.result or {})
+                existing_result["content"] = diagnostic
+                task.result = existing_result
+                await self._fail_task_via_phase(
+                    task,
+                    reason="resume_external_agent_unavailable",
+                )
+                if work_item_id and callable(update_work_item):
+                    try:
+                        await update_work_item(
+                            work_item_id,
+                            blocked_reason=diagnostic,
+                            metadata_updates={"dispatch_hold": ""},
+                        )
+                    except Exception:
+                        logger.opt(exception=True).debug(
+                            "company runtime resume: blocked_reason write failed for {}",
+                            work_item_id,
+                        )
+                if self.on_progress:
+                    try:
+                        await self.on_progress(
+                            f"[Company:{projection_id_for_task(task) or task.title}] {diagnostic}"
+                        )
+                    except Exception:
+                        logger.opt(exception=True).debug(
+                            "company runtime resume: unavailable-agent progress emit failed"
+                        )
+                logger.warning(
+                    "company runtime resume: failed work item {} closed — pinned external "
+                    "agent {!r} unavailable",
+                    work_item_id or task.id,
+                    pinned_agent,
+                )
+                fresh = await self.store.get_task(task.id)
+                refreshed.append(fresh or task)
+                continue
             expected_role_session_id = str(
                 identity.get("role_runtime_session_id", "") or ""
             ).strip()
@@ -7394,12 +7470,6 @@ class OPCEngine:
         )
         for task in tasks:
             task_metadata = dict(getattr(task, "metadata", {}) or {})
-            if (
-                str(task_metadata.get("dispatch_hold", "") or "").strip() == "company_runtime_suspended"
-                or str(task_metadata.get("company_runtime_stop_state", "") or "").strip() in {"suspending", "suspended"}
-            ):
-                interrupted_tasks.append(task)
-                continue
             work_item_id = linked_work_item_id_for_task(task)
             work_item = (
                 await get_work_item(work_item_id)
@@ -7407,6 +7477,38 @@ class OPCEngine:
                 else None
             )
             work_item_phase = getattr(work_item, "phase", None)
+            task_held = (
+                str(task_metadata.get("dispatch_hold", "") or "").strip() == "company_runtime_suspended"
+                or str(task_metadata.get("company_runtime_stop_state", "") or "").strip() in {"suspending", "suspended"}
+            )
+            terminal_card = (
+                work_item_phase in DONE_PHASES
+                if work_item is not None
+                else task.status in {TaskStatus.DONE, TaskStatus.FAILED, TaskStatus.CANCELLED}
+            )
+            if terminal_card:
+                # Terminal cards are done — a leftover suspend hold on them is
+                # residue (stale-snapshot save, suspend racing a FAILED write),
+                # not an interruption. Classifying it as interrupted here
+                # rebuilt a pending company_runtime_interrupted checkpoint on
+                # EVERY boot for a run that had already converged. Scrub the
+                # residue instead so startup is idempotent.
+                if task_held:
+                    task.metadata = dict(task_metadata)
+                    for key in _COMPANY_RUNTIME_CONTROL_METADATA_KEYS:
+                        task.metadata.pop(key, None)
+                    try:
+                        await self.store.save_task(task)
+                        updated += 1
+                    except Exception:
+                        logger.opt(exception=True).debug(
+                            "startup reconcile: terminal-card hold scrub failed for {}",
+                            task.id,
+                        )
+                continue
+            if task_held:
+                interrupted_tasks.append(task)
+                continue
             # A linked WorkItem is the company workflow state.  Task.status is
             # only its UI/execution projection and may lag on either side of a
             # crash.  Fall back to Task status only for legacy envelopes that
@@ -7853,6 +7955,17 @@ class OPCEngine:
         plan: CompanyWorkItemRuntimePlan,
         tasks: list[Task],
     ) -> Task | None:
+        # FAILED/CANCELLED cards are terminal in the phase machine — there is
+        # no legal reopen edge, so routing a follow-up onto one can only crash
+        # the resume turn (`InvalidPhaseTransition: failed -> ready`) after
+        # having already clobbered the Task projection to PENDING. DONE stays
+        # eligible: the approved→rework reopen has a dedicated legal store op
+        # (`reopen_approved_delegation_work_item_for_rework`).
+        tasks = [
+            task
+            for task in tasks
+            if task.status not in {TaskStatus.FAILED, TaskStatus.CANCELLED}
+        ]
         final_delivery_candidates = [
             task for task in tasks
             if self._is_open_final_delivery_review_task(task)
@@ -7933,6 +8046,18 @@ class OPCEngine:
         metadata_updates: dict[str, Any] | None = None,
     ) -> None:
         assert self.store
+        # Terminal guard (belt to the selection-level filter): FAILED and
+        # CANCELLED have no legal reopen edge. Mutating the Task projection
+        # first and letting the store reject the phase write afterwards is
+        # exactly the ordering that left task=PENDING vs work_item=FAILED
+        # divergence — refuse up front instead.
+        if task.status in {TaskStatus.FAILED, TaskStatus.CANCELLED}:
+            logger.warning(
+                "_prepare_company_followup_target: refusing terminal target task {} (status={})",
+                task.id,
+                task.status.value,
+            )
+            return
         reply = str(user_reply or "").strip()
         task.context_snapshot = dict(task.context_snapshot or {})
         task.context_snapshot["user_supplied_input"] = reply
@@ -8120,6 +8245,7 @@ class OPCEngine:
         resume_source: str = "primary_session_followup",
         context_updates: dict[str, Any] | None = None,
         metadata_updates: dict[str, Any] | None = None,
+        degrade_to_plain_resume_on_missing_target: bool = False,
     ) -> str | None:
         assert self.company_executor
         reply = str(user_reply or "").strip()
@@ -8127,6 +8253,20 @@ class OPCEngine:
             return None
         target_task = self._company_followup_target_task(plan, tasks)
         if target_task is None:
+            # No live final-decider card remains (e.g. it failed terminally
+            # during resume preparation). For the suspend-checkpoint caller,
+            # degrade to a plain runtime resume so the run converges and the
+            # checkpoint drains, instead of parking the checkpoint pending
+            # forever and dead-ending every follow-up.
+            if degrade_to_plain_resume_on_missing_target:
+                result = await self.company_executor.execute(plan, tasks)
+                note = (
+                    "The final-decider work item for this run is no longer active "
+                    "(failed or cancelled), so the follow-up could not be routed to it. "
+                    "Resumed the remaining runtime instead; re-issue the request as a "
+                    "new task if further work is needed."
+                )
+                return f"{note}\n\n{str(result or '').strip()}".strip()
             return None
         projection_label = projection_id_for_task(target_task) or str(target_task.title or target_task.id).strip()
         projection_title = str(target_task.title or projection_label).strip() or projection_label
@@ -11191,6 +11331,53 @@ class OPCEngine:
         if callable(reset):
             await reset(tasks, payload=payload)
 
+    def _merge_company_runtime_checkpoint_payload(
+        self,
+        payload: dict[str, Any],
+        supplement: dict[str, Any],
+    ) -> dict[str, Any]:
+        merged = copy.deepcopy(payload)
+
+        merged["task_ids"] = list(dict.fromkeys([
+            *list(merged.get("task_ids", []) or []),
+            *list(supplement.get("task_ids", []) or []),
+        ]))
+        for key, identity_key in (
+            ("task_snapshots", "task_id"),
+            ("active_work_items", "work_item_id"),
+        ):
+            indexed = {
+                str(item.get(identity_key, "") or "").strip(): copy.deepcopy(item)
+                for item in list(merged.get(key, []) or [])
+                if isinstance(item, dict)
+                and str(item.get(identity_key, "") or "").strip()
+            }
+            for item in list(supplement.get(key, []) or []):
+                if not isinstance(item, dict):
+                    continue
+                identity = str(item.get(identity_key, "") or "").strip()
+                if identity:
+                    indexed[identity] = copy.deepcopy(item)
+            merged[key] = list(indexed.values())
+
+        for key in ("role_runtime_session_ids", "seat_state_ids"):
+            merged[key] = list(dict.fromkeys([
+                *list(merged.get(key, []) or []),
+                *list(supplement.get(key, []) or []),
+            ]))
+        for key in (
+            "native_runtime_resume",
+            "adapter_session_state",
+            "external_sessions",
+            "progress_tail",
+        ):
+            merged[key] = {
+                **dict(merged.get(key, {}) or {}),
+                **copy.deepcopy(dict(supplement.get(key, {}) or {})),
+            }
+        merged["basis_hash"] = self._checkpoint_basis_hash(merged)
+        return merged
+
     async def _load_company_suspend_checkpoint_runtime(
         self,
         checkpoint: ExecutionCheckpoint,
@@ -11213,16 +11400,56 @@ class OPCEngine:
             task = await self.store.get_task(task_id)
             if task:
                 tasks.append(task)
-        if not tasks and parent_session_id:
+
+        plan_data = payload.get("company_work_item_plan") or payload.get("plan") or {}
+        plan = deserialize_company_work_item_runtime_plan(plan_data if isinstance(plan_data, dict) else {})
+        if parent_session_id:
             snapshot = await self._load_company_runtime_snapshot(parent_session_id)
             if snapshot:
-                _plan, tasks = snapshot
+                snapshot_plan, current_tasks = snapshot
+                if not tasks:
+                    tasks = current_tasks
+                    if not plan.projections:
+                        plan = snapshot_plan
+                else:
+                    known_task_ids = {task.id for task in tasks}
+                    held_task_ids = await self._company_suspend_resume_candidate_task_ids(
+                        current_tasks
+                    )
+                    supplemental_tasks = [
+                        task
+                        for task in current_tasks
+                        if task.id not in known_task_ids and task.id in held_task_ids
+                    ]
+                    if supplemental_tasks:
+                        supplement = await self._company_runtime_checkpoint_payload(
+                            checkpoint_type=str(
+                                checkpoint.checkpoint_type
+                                or payload.get("checkpoint_type")
+                                or "company_runtime_interrupted"
+                            ),
+                            reason=str(payload.get("reason", "") or "runtime_resume_reconciliation"),
+                            parent_session_id=parent_session_id,
+                            origin_task_id=str(
+                                checkpoint.task_id
+                                or payload.get("origin_task_id")
+                                or ""
+                            ).strip()
+                            or None,
+                            plan=plan,
+                            tasks=supplemental_tasks,
+                            stop_intent_id=str(payload.get("stop_intent_id", "") or "").strip()
+                            or None,
+                        )
+                        payload = self._merge_company_runtime_checkpoint_payload(
+                            payload,
+                            supplement,
+                        )
+                        tasks.extend(supplemental_tasks)
         if not tasks:
             await self.store.resolve_execution_checkpoint(checkpoint.checkpoint_id, status="invalid")
             return None
 
-        plan_data = payload.get("company_work_item_plan") or payload.get("plan") or {}
-        plan = deserialize_company_work_item_runtime_plan(plan_data if isinstance(plan_data, dict) else {})
         payload["checkpoint_id"] = checkpoint.checkpoint_id
         payload["checkpoint_type"] = checkpoint.checkpoint_type
         return payload, parent_session_id, plan, tasks
@@ -11694,7 +11921,16 @@ class OPCEngine:
         payload, parent_session_id, plan, tasks = loaded
         target_task = self._company_followup_target_task(plan, tasks)
         if target_task is None:
-            return "Could not route the suspended company runtime because no CEO/final-decider work item was available."
+            # Every routable final-decider card is terminal — a follow-up can
+            # no longer be routed, but the run itself must still drain instead
+            # of bouncing this checkpoint back to pending on every message.
+            plain = await self._resume_company_suspend_checkpoint(checkpoint, user_reply)
+            return (
+                "The final-decider work item for this run is no longer active "
+                "(failed or cancelled), so the message could not be routed to it. "
+                "Resumed the remaining runtime instead; re-issue the request as a "
+                f"new task if further work is needed.\n\n{plain}"
+            ).strip()
 
         handoff = await self._handoff_company_suspend_checkpoint(
             checkpoint,
@@ -11715,6 +11951,7 @@ class OPCEngine:
                     tasks=tasks,
                     user_reply=user_reply,
                     session_id=parent_session_id,
+                    degrade_to_plain_resume_on_missing_target=True,
                 )
                 if followup_result is None:
                     await self._restore_company_suspend_checkpoint_pending(

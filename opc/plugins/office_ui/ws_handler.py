@@ -382,6 +382,7 @@ _PROJECT_SCOPED_ENVELOPE_TYPES = frozenset({
     "comms_state",
     "comms_message",
     "comms_state_dirty",
+    "runtime_status_sync",
 })
 
 
@@ -463,6 +464,8 @@ class WSHandler:
         self._pending_escalation_order: list[str] = []
         self._progress_buffer: dict[str, list[dict[str, Any]]] = {}
         self._progress_project_ids: dict[str, str] = {}
+        self._runtime_status_sync_task: asyncio.Task[Any] | None = None
+        self._runtime_status_sync_prev: dict[str, str] = {}
         self._assistant_delta_buffers: dict[tuple[str, str, str], dict[str, Any]] = {}
         self._assistant_delta_flush_tasks: dict[tuple[str, str, str], asyncio.Task[None]] = {}
         self._assistant_delta_seq: int = 0
@@ -482,6 +485,7 @@ class WSHandler:
         # in RAM before they're persisted and visible on page refresh.
         self._PROGRESS_FLUSH_THRESHOLD = 2
         self._PROGRESS_FLUSH_INTERVAL_SEC = 3.0
+        self._RUNTIME_STATUS_SYNC_INTERVAL_SEC = 12.0
         self._progress_flush_task: asyncio.Task[None] | None = None
         self._shutting_down: bool = False
         self._active_message_tasks: set[asyncio.Task[Any]] = set()
@@ -1081,6 +1085,7 @@ class WSHandler:
             return ws
         self._clients.add(ws)
         self._ensure_progress_flush_loop()
+        self._ensure_runtime_status_sync_loop()
         logger.info(f"WS client connected ({len(self._clients)} total)")
 
         try:
@@ -2327,6 +2332,109 @@ class WSHandler:
                     logger.debug(
                         "Periodic progress flush error for task %s", tid,
                     )
+
+    def _ensure_runtime_status_sync_loop(self) -> None:
+        """Start the runtime-status reconciliation coroutine if not running.
+
+        Live status deltas are one-shot, best-effort broadcasts: a delta lost
+        to a disconnect window, a project-scope drop, or a not-ready store
+        leaves the UI stuck on a stale status until a full refresh. This loop
+        periodically re-broadcasts the authoritative status of every task with
+        a live runtime (plus one final tick for tasks that just ended) so any
+        missed delta converges within one interval.
+        """
+        if self._runtime_status_sync_task and not self._runtime_status_sync_task.done():
+            return
+        self._runtime_status_sync_task = asyncio.create_task(self._runtime_status_sync_loop())
+
+    async def _runtime_status_sync_loop(self) -> None:
+        while not self._shutting_down:
+            try:
+                await asyncio.sleep(self._RUNTIME_STATUS_SYNC_INTERVAL_SEC)
+            except asyncio.CancelledError:
+                break
+            if self._shutting_down:
+                break
+            try:
+                await self._runtime_status_sync_tick()
+            except Exception:
+                logger.opt(exception=True).debug("runtime status sync tick failed")
+
+    def _collect_runtime_status_candidates(self) -> dict[str, str]:
+        """Map task_id → project_id for every task with a live runtime.
+
+        Sources are purely in-memory (no store scans): the background-task
+        context registry covers every session run across modes; the company
+        runtime-children map adds work-item child tasks of a live tree.
+        """
+        candidates: dict[str, str] = {}
+        for bg, ctx in list(self._task_bg_context.items()):
+            if bg.done():
+                continue
+            t_id = str(ctx.get("task_id") or "").strip()
+            if t_id:
+                candidates[t_id] = self._normalize_project_id(str(ctx.get("project_id") or ""))
+        for child_id, root_id in list(self._active_runtime_children.items()):
+            if child_id in candidates:
+                continue
+            pid = (
+                candidates.get(root_id)
+                or self._progress_project_ids.get(child_id)
+                or self._progress_project_ids.get(root_id)
+            )
+            if pid:
+                candidates[child_id] = self._normalize_project_id(pid)
+        return candidates
+
+    async def _runtime_status_sync_tick(self) -> None:
+        current = self._collect_runtime_status_candidates()
+        if not self._clients:
+            # Nobody to correct; a connecting client gets a full snapshot.
+            self._runtime_status_sync_prev = current
+            return
+        departed = {
+            tid: pid for tid, pid in self._runtime_status_sync_prev.items()
+            if tid not in current
+        }
+        self._runtime_status_sync_prev = current
+        to_sync = {**departed, **current}
+        if not to_sync:
+            return
+        tracker_by_task: dict[str, tuple[str, str | None]] = {}
+        for tracker in getattr(self.event_adapter, "_trackers", {}).values():
+            t_id = str(getattr(tracker, "task_id", "") or "").strip()
+            if t_id:
+                tracker_by_task[t_id] = (tracker.state.value, tracker.current_tool)
+        by_project: dict[str, list[str]] = {}
+        for tid, pid in to_sync.items():
+            by_project.setdefault(pid, []).append(tid)
+        for pid, task_ids in by_project.items():
+            try:
+                engine = await self._engine_for_project(pid)
+            except Exception:
+                continue
+            store = getattr(engine, "store", None)
+            if store is None or not self._store_is_ready(store):
+                continue
+            sessions: list[dict[str, Any]] = []
+            for task_id in sorted(task_ids):
+                try:
+                    t = await store.get_task(task_id)
+                except Exception:
+                    continue
+                if t is None:
+                    continue
+                status_val = t.status.value if hasattr(t.status, "value") else str(t.status)
+                entry: dict[str, Any] = {"task_id": task_id, "status": status_val}
+                tracked = tracker_by_task.get(task_id)
+                if tracked is not None:
+                    entry["agent_status"], entry["current_tool"] = tracked
+                sessions.append(entry)
+            if sessions:
+                await self.broadcast({
+                    "type": "runtime_status_sync",
+                    "payload": {"project_id": pid, "sessions": sessions},
+                })
 
     @staticmethod
     def _parse_progress_entry(text: str) -> dict[str, Any] | None:
@@ -4585,6 +4693,16 @@ class WSHandler:
             except (asyncio.CancelledError, Exception):
                 pass
             self._progress_flush_task = None
+
+        if self._runtime_status_sync_task:
+            # Cancel rather than await: the sync interval is long enough that
+            # waiting for a natural wake-up would stall shutdown.
+            self._runtime_status_sync_task.cancel()
+            try:
+                await self._runtime_status_sync_task
+            except (asyncio.CancelledError, Exception):
+                pass
+            self._runtime_status_sync_task = None
 
         clients = list(self._clients)
         for ws in clients:
@@ -8474,6 +8592,7 @@ class WSHandler:
             await self.broadcast({"type": "board_task_status_changed", "payload": {
                 "project_id": pid, "task_id": task_id, "column_id": "in-progress", "status": "running",
             }})
+            terminal_board_broadcast_sent = False
             # Register company runtime origin so child-task progress can dual-route
             company_runtime_target: dict[str, Any] | None = None
             if session_exec_mode in ("company", "org", "custom"):
@@ -8563,6 +8682,7 @@ class WSHandler:
                 await self.broadcast({"type": "board_task_status_changed", "payload": {
                     "project_id": pid, "task_id": task_id, "column_id": final_column_id, "status": final_status,
                 }})
+                terminal_board_broadcast_sent = True
                 if session_exec_mode in ("company", "org", "custom"):
                     try:
                         idle_target = await self._resolve_company_runtime_target(task_id, engine=engine)
@@ -8593,6 +8713,7 @@ class WSHandler:
                 await self.broadcast({"type": "board_task_status_changed", "payload": {
                     "project_id": pid, "task_id": task_id, "column_id": "in-progress", "status": "failed",
                 }})
+                terminal_board_broadcast_sent = True
                 if session_exec_mode in ("company", "org", "custom"):
                     try:
                         failed_target = await self._resolve_company_runtime_target(task_id, engine=engine)
@@ -8615,6 +8736,25 @@ class WSHandler:
                 self._stop_requested_task_ids.discard(task_id)
                 if session_id:
                     self._session_to_task.pop(session_id, None)
+                if not terminal_board_broadcast_sent:
+                    # A cancelled run (or a failure inside the failure handler)
+                    # never reaches the terminal broadcasts above, leaving the
+                    # board stuck on "running" until a full refresh. Mirror the
+                    # persisted status best-effort; never write engine state here.
+                    try:
+                        store = engine.store
+                        if self._store_is_ready(store):
+                            t = await store.get_task(task_id)
+                            if t is not None:
+                                status_val = t.status.value if hasattr(t.status, "value") else str(t.status)
+                                await self.broadcast({"type": "board_task_status_changed", "payload": {
+                                    "project_id": pid,
+                                    "task_id": task_id,
+                                    "column_id": "done" if status_val in ("done", "cancelled") else "in-progress",
+                                    "status": status_val,
+                                }})
+                    except Exception:
+                        logger.opt(exception=True).debug("failed to mirror terminal board status")
                 # Clear agent runtime indicator — include agent_id so the
                 # frontend can also clear the swarm agent's reflecting/tool_active state.
                 idle_payload: dict[str, Any] = {

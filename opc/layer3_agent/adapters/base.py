@@ -517,7 +517,28 @@ class ExternalAgentAdapter(abc.ABC):
             merged = {**os.environ, **{str(k): str(v) for k, v in extra_env.items()}}
             path_value = merged.get("PATH") or merged.get("Path") or merged.get("path") or ""
         resolved = shutil.which(executable, path=path_value or None)
-        if not resolved or resolved == executable:
+        if not resolved:
+            return cmd
+
+        if os.name == "nt":
+            resolved = ExternalAgentAdapter._resolve_windows_command_shim(
+                executable,
+                resolved,
+                path_value=path_value,
+            )
+
+        if os.name == "nt" and os.path.splitext(resolved)[1].lower() in {".cmd", ".bat"}:
+            comspec = str(os.environ.get("COMSPEC") or "").strip()
+            if not comspec:
+                comspec = shutil.which("cmd.exe") or "cmd.exe"
+            wrapped_cmd = [comspec, "/d", "/s", "/c", resolved, *cmd[1:]]
+            if isinstance(launch_metadata, dict):
+                launch_metadata.setdefault("configured_binary", executable)
+                launch_metadata["resolved_binary"] = resolved
+                launch_metadata["launch_wrapper"] = comspec
+            return wrapped_cmd
+
+        if resolved == executable:
             return cmd
         resolved_cmd = list(cmd)
         resolved_cmd[0] = resolved
@@ -525,6 +546,31 @@ class ExternalAgentAdapter(abc.ABC):
             launch_metadata.setdefault("configured_binary", executable)
             launch_metadata["resolved_binary"] = resolved
         return resolved_cmd
+
+    @staticmethod
+    def _resolve_windows_command_shim(
+        executable: str,
+        resolved: str,
+        *,
+        path_value: str = "",
+    ) -> str:
+        """Prefer a Windows-launchable sibling over an extensionless POSIX shim."""
+        if os.path.splitext(resolved)[1]:
+            return resolved
+
+        for extension in (".exe", ".com", ".cmd", ".bat"):
+            sibling = f"{resolved}{extension}"
+            if os.path.isfile(sibling):
+                return sibling
+
+        if os.path.dirname(executable):
+            return resolved
+
+        for extension in (".exe", ".com", ".cmd", ".bat"):
+            candidate = shutil.which(f"{executable}{extension}", path=path_value or None)
+            if candidate:
+                return candidate
+        return resolved
 
     async def send_process_input(
         self,

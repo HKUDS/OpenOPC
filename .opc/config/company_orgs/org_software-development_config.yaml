@@ -1,0 +1,380 @@
+schema_version: 2
+kind: opc_org_architecture
+organization_id: software-development
+organization_name: Software Development Team
+company:
+  name: Software Development Team
+  topology: Product Engineering Hub
+  company_profile: custom
+  execution_model: actor_runtime
+  final_decider_role_id: engineering_manager
+  company_profiles:
+  - corporate
+  - custom
+roles:
+- id: engineering_manager
+  name: Engineering Manager
+  responsibility: Owns scope, delivery, staffing, cross-role coordination, risk decisions,
+    and final acceptance for software projects.
+  reports_to: owner
+  icon: leader
+  can_spawn:
+  - product_manager
+  - software_architect
+  - qa_engineer
+  - security_reviewer
+  tools: []
+  preferred_external_agent: codex
+  prompt_refs:
+  - Clarify the user goal, repository boundaries, constraints, acceptance criteria,
+    and delivery order before delegating.
+  - Require implementation evidence, focused tests, review findings, deployment notes,
+    and explicit residual risks before final delivery.
+  skill_refs:
+  - repo-onboarding
+  - software-delivery
+  - release-readiness
+  handoff_template_ref: null
+  memory_policy_ref: null
+  artifact_contract_ref: null
+  runtime_policy:
+    execution_strategy: native
+    allowed_downstream_roles:
+    - product_manager
+    - software_architect
+    - qa_engineer
+    - security_reviewer
+    review_role: null
+    default_turn_type: work
+    shell_timeout_override: null
+    setup_env_type: null
+    coordination_hints: {}
+    signal_capabilities: []
+    parallelism_constraints: []
+    gate_preferences: {}
+  capabilities: []
+  role_type: coordinator
+  coordinator_policy: null
+- id: product_manager
+  name: Product Manager
+  responsibility: Converts business goals into prioritized requirements, user flows,
+    acceptance criteria, and release scope.
+  reports_to: engineering_manager
+  icon: clipboard
+  can_spawn: []
+  tools: []
+  preferred_external_agent: codex
+  prompt_refs:
+  - Produce testable requirements and identify assumptions, exclusions, dependencies,
+    and user-visible behavior.
+  skill_refs:
+  - software-delivery
+  handoff_template_ref: null
+  memory_policy_ref: null
+  artifact_contract_ref: null
+  runtime_policy:
+    execution_strategy: auto
+    allowed_downstream_roles: []
+    review_role: null
+    default_turn_type: work
+    shell_timeout_override: null
+    setup_env_type: null
+    coordination_hints: {}
+    signal_capabilities: []
+    parallelism_constraints: []
+    gate_preferences: {}
+  capabilities: []
+  role_type: worker
+  coordinator_policy: null
+- id: software_architect
+  name: Software Architect
+  responsibility: Owns repository analysis, architecture, technical decomposition,
+    interfaces, data design, and engineering integration.
+  reports_to: engineering_manager
+  icon: code
+  can_spawn:
+  - frontend_engineer
+  - backend_engineer
+  - devops_engineer
+  tools: []
+  preferred_external_agent: codex
+  prompt_refs:
+  - Inspect the existing repository before proposing architecture. Prefer existing
+    patterns and define contracts between work items.
+  - Review implementation integration and reject changes that violate repository boundaries
+    or lack verification.
+  skill_refs:
+  - repo-onboarding
+  - software-delivery
+  - code-review-gate
+  - code-review
+  handoff_template_ref: null
+  memory_policy_ref: null
+  artifact_contract_ref: null
+  runtime_policy:
+    execution_strategy: native
+    allowed_downstream_roles:
+    - frontend_engineer
+    - backend_engineer
+    - devops_engineer
+    review_role: null
+    default_turn_type: work
+    shell_timeout_override: null
+    setup_env_type: null
+    coordination_hints: {}
+    signal_capabilities: []
+    parallelism_constraints: []
+    gate_preferences: {}
+  capabilities: []
+  role_type: coordinator
+  coordinator_policy: null
+- id: frontend_engineer
+  name: Frontend Engineer
+  responsibility: Implements accessible, responsive, tested frontend behavior using
+    the existing design system and framework conventions.
+  reports_to: software_architect
+  icon: design
+  can_spawn: []
+  tools: []
+  preferred_external_agent: codex
+  prompt_refs:
+  - Implement complete UI states and verify desktop and mobile behavior with focused
+    tests or browser evidence.
+  skill_refs:
+  - software-delivery
+  - testing-quality-gate
+  handoff_template_ref: null
+  memory_policy_ref: null
+  artifact_contract_ref: null
+  runtime_policy:
+    execution_strategy: external
+    allowed_downstream_roles: []
+    review_role: null
+    default_turn_type: work
+    shell_timeout_override: null
+    setup_env_type: null
+    coordination_hints: {}
+    signal_capabilities: []
+    parallelism_constraints: []
+    gate_preferences: {}
+  capabilities: []
+  role_type: worker
+  coordinator_policy: null
+- id: backend_engineer
+  name: Backend Engineer
+  responsibility: Implements APIs, domain logic, persistence, integrations, migrations,
+    and backend tests.
+  reports_to: software_architect
+  icon: terminal
+  can_spawn: []
+  tools: []
+  preferred_external_agent: codex
+  prompt_refs:
+  - Preserve data and API compatibility, validate inputs, handle failure paths, and
+    add focused tests for changed behavior.
+  skill_refs:
+  - software-delivery
+  - testing-quality-gate
+  handoff_template_ref: null
+  memory_policy_ref: null
+  artifact_contract_ref: null
+  runtime_policy:
+    execution_strategy: external
+    allowed_downstream_roles: []
+    review_role: null
+    default_turn_type: work
+    shell_timeout_override: null
+    setup_env_type: null
+    coordination_hints: {}
+    signal_capabilities: []
+    parallelism_constraints: []
+    gate_preferences: {}
+  capabilities: []
+  role_type: worker
+  coordinator_policy: null
+- id: qa_engineer
+  name: QA Engineer
+  responsibility: Independently validates requirements, regressions, edge cases, test
+    evidence, and release readiness.
+  reports_to: engineering_manager
+  icon: bug
+  can_spawn: []
+  tools: []
+  preferred_external_agent: codex
+  prompt_refs:
+  - Build a risk-based test matrix, run focused and integration checks, and report
+    reproducible defects with evidence.
+  skill_refs:
+  - testing-quality-gate
+  - code-review-gate
+  - code-review
+  - release-readiness
+  handoff_template_ref: null
+  memory_policy_ref: null
+  artifact_contract_ref: null
+  runtime_policy:
+    execution_strategy: auto
+    allowed_downstream_roles: []
+    review_role: null
+    default_turn_type: verify
+    shell_timeout_override: null
+    setup_env_type: null
+    coordination_hints: {}
+    signal_capabilities: []
+    parallelism_constraints: []
+    gate_preferences: {}
+  capabilities: []
+  role_type: worker
+  coordinator_policy: null
+- id: devops_engineer
+  name: DevOps Engineer
+  responsibility: Owns environment setup, CI/CD, deployment, observability, rollback
+    planning, and operational verification.
+  reports_to: software_architect
+  icon: settings
+  can_spawn: []
+  tools: []
+  preferred_external_agent: codex
+  prompt_refs:
+  - Probe the environment first, keep changes reversible, document commands, and include
+    health checks and rollback steps.
+  skill_refs:
+  - repo-onboarding
+  - release-readiness
+  handoff_template_ref: null
+  memory_policy_ref: null
+  artifact_contract_ref: null
+  runtime_policy:
+    execution_strategy: auto
+    allowed_downstream_roles: []
+    review_role: null
+    default_turn_type: setup
+    shell_timeout_override: 1800
+    setup_env_type: null
+    coordination_hints: {}
+    signal_capabilities: []
+    parallelism_constraints: []
+    gate_preferences: {}
+  capabilities: []
+  role_type: worker
+  coordinator_policy: null
+- id: security_reviewer
+  name: Security Reviewer
+  responsibility: Reviews authentication, authorization, secrets, dependencies, input
+    handling, privacy, and abuse risks.
+  reports_to: engineering_manager
+  icon: shield
+  can_spawn: []
+  tools: []
+  preferred_external_agent: codex
+  prompt_refs:
+  - Review only the relevant attack surface, rank findings by severity, and distinguish
+    blockers from hardening opportunities.
+  skill_refs:
+  - code-review-gate
+  - code-review
+  - release-readiness
+  handoff_template_ref: null
+  memory_policy_ref: null
+  artifact_contract_ref: null
+  runtime_policy:
+    execution_strategy: auto
+    allowed_downstream_roles: []
+    review_role: null
+    default_turn_type: review
+    shell_timeout_override: null
+    setup_env_type: null
+    coordination_hints: {}
+    signal_capabilities: []
+    parallelism_constraints: []
+    gate_preferences: {}
+  capabilities: []
+  role_type: worker
+  coordinator_policy: null
+employees: []
+escalation_rules: []
+runtime_policies:
+  custom:
+    communication:
+      default_mode: dm
+      blocking_default: true
+      meeting_required_for:
+      - architecture
+      - cross_team_conflict
+      allow_broadcast: true
+    memory:
+      include_role_memory: true
+      include_project_memory: true
+      include_decision_log: true
+      include_artifact_index: true
+      recent_history_lines: 16
+    handoff:
+      require_structured_handoff: true
+      require_ack: true
+      include_risks: true
+      include_open_questions: true
+    artifact:
+      enforce_contract: false
+      require_artifact_index: true
+      required_kinds: []
+    review:
+      enable_work_item_gates: true
+      strict_gate_inference: true
+      require_reviewer_role: true
+      allow_human_override: true
+    gate_harness:
+      enabled: true
+      decision_mode: agent_first
+      default_degrade_policy: allow
+      auto_infer_turn_kind: true
+      auto_infer_gate_profile: true
+      max_rework_rounds_per_issue: 2
+      stagnation_threshold: 2
+      allow_pass_with_constraints: true
+      enable_delivery_constraints_propagation: true
+      agent_model: ''
+      agent_confidence_threshold: 0.55
+      fallback_to_rules_on_parse_error: true
+      builtin_blocker_map:
+        workspace_mismatch: rework_same_work_item
+        missing_required_artifact: rework_same_work_item
+        verification_missing: rework_same_work_item
+        dependency_not_ready: rework_same_work_item
+        cross_work_item_conflict: replan
+        external_secret_missing: await_user_decision
+        permission_missing: escalate
+        environment_capability_gap: pass_with_constraints
+        quality_gap: rework_same_work_item
+        goal_env_mismatch: replan
+        unresolved_user_visible_risk: pass_with_constraints
+      turn_kind_overrides: {}
+      gate_profile_overrides: {}
+    parallel:
+      auto_dispatch: true
+      review_gate_enabled: true
+      max_workers: 6
+    coordination:
+      inference_mode: llm_primary
+      fallback_mode: conservative
+      strict_gate_turn_kinds:
+      - verify
+      - deliver
+      mixed_gate_turn_kinds:
+      - synthesize
+      - review
+      - integration
+      allow_manager_release_for_mixed_only: true
+      allow_custom_signals: true
+talent_templates: []
+teams: []
+team_runtime:
+  default_team_id: ''
+  shared_role_session_scope: team
+  allow_shared_role_sessions: true
+  seat_refresh_interval_seconds: 30
+  metadata: {}
+installed_packages: []
+role_serial_queue_enabled: true
+metadata:
+  source: org_mode
+  organization_config_file: company_orgs/org_software-development_config.yaml

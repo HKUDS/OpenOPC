@@ -2,6 +2,7 @@ import { useMemo } from 'react'
 import type { AgentInfo } from '../types/visual'
 import type { AgentAnimStatus, KanbanTask } from '../types/kanban'
 import { AGENT_STATUS_LABEL } from '../types/kanban'
+import { useI18n } from '../i18n'
 
 interface AgentStatusBarProps {
   agents: AgentInfo[]
@@ -16,6 +17,7 @@ interface AgentState {
 }
 
 export function AgentStatusBar({ agents, tasks }: AgentStatusBarProps) {
+  const { t, translateMaybe } = useI18n()
   const agentStates = useMemo<AgentState[]>(() => {
     const tasksById = new Map(tasks.map((task) => [task.id, task]))
     return agents.map(agent => {
@@ -42,31 +44,36 @@ export function AgentStatusBar({ agents, tasks }: AgentStatusBarProps) {
     <div className="agent-status-bar">
       <span className="agent-status-summary">
         {activeCount > 0
-          ? `${activeCount}/${agents.length} active`
-          : `${agents.length} agent${agents.length !== 1 ? 's' : ''}`}
+          ? t('agent.summary.active', { active: activeCount, total: agents.length })
+          : t(agents.length !== 1 ? 'agent.summary.countPlural' : 'agent.summary.count', { count: agents.length })}
       </span>
       <div className="agent-status-chips">
-        {agentStates.map(({ agent, status, currentTool, taskDisplayId }) => (
-          <div
-            key={agent.agent_id}
-            className={`agent-status-chip status-${status}`}
-            title={`${agent.name}: ${status === 'tool_active' && currentTool ? currentTool : AGENT_STATUS_LABEL[status]}${taskDisplayId ? ` (${taskDisplayId})` : ''}`}
-          >
-            <span className="agent-status-avatar">{agent.name.charAt(0).toUpperCase()}</span>
-            <span className="agent-status-name">{agent.name}</span>
-            {status !== 'idle' && (
-              <>
-                <span className="kanban-runtime-dot" />
-                <span className="agent-status-detail">
-                  {status === 'tool_active' && currentTool ? currentTool : AGENT_STATUS_LABEL[status]}
-                </span>
-              </>
-            )}
-            {taskDisplayId && (
-              <span className="agent-status-task">{taskDisplayId}</span>
-            )}
-          </div>
-        ))}
+        {agentStates.map(({ agent, status, currentTool, taskDisplayId }) => {
+          const statusLabel = status === 'tool_active' && currentTool
+            ? currentTool
+            : translateMaybe('agent.status', status) || AGENT_STATUS_LABEL[status]
+          return (
+            <div
+              key={agent.agent_id}
+              className={`agent-status-chip status-${status}`}
+              title={`${agent.name}: ${statusLabel}${taskDisplayId ? ` (${taskDisplayId})` : ''}`}
+            >
+              <span className="agent-status-avatar">{agent.name.charAt(0).toUpperCase()}</span>
+              <span className="agent-status-name">{agent.name}</span>
+              {status !== 'idle' && (
+                <>
+                  <span className="kanban-runtime-dot" />
+                  <span className="agent-status-detail">
+                    {statusLabel}
+                  </span>
+                </>
+              )}
+              {taskDisplayId && (
+                <span className="agent-status-task">{taskDisplayId}</span>
+              )}
+            </div>
+          )
+        })}
       </div>
     </div>
   )
