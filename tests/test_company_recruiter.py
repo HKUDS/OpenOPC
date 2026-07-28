@@ -13,6 +13,8 @@ from opc.core.config import EmployeeConfig, OPCConfig, RoleConfig, TalentTemplat
 from opc.core.events import EventBus
 from opc.core.models import (
     ExecutionMode,
+    RecruitmentPlan,
+    RecruitmentProposal,
     RouterDecision,
     Task,
     WorkItemExecutionStrategy,
@@ -24,7 +26,11 @@ from opc.layer2_organization.org_engine import (
     OrgEngine,
     TASK_MODE_GENERAL_ROLE_ID,
 )
-from opc.layer2_organization.recruiter import CompanyRecruiter, build_recruitment_plan_from_payload
+from opc.layer2_organization.recruiter import (
+    CompanyRecruiter,
+    build_recruitment_plan_from_payload,
+    recruitment_plan_requires_confirmation,
+)
 from opc.layer2_organization.task_graph import TaskGraphScheduler
 from opc.layer2_organization.talent_market import TalentMarket
 from opc.layer5_memory.memory_manager import MemoryManager
@@ -491,6 +497,144 @@ class CompanyRecruiterFlowTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertEqual(senior_role["selected_agent"], "codex")
             await store.close()
+
+    async def test_fully_staffed_team_skips_recruitment_and_confirmation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            config = OPCConfig()
+            config.org.company_profile = "custom"
+            config.org.roles = [
+                RoleConfig(
+                    id="api_owner",
+                    name="API Owner",
+                    responsibility="Own API design and delivery.",
+                )
+            ]
+            config.org.employees = [
+                EmployeeConfig(
+                    employee_id="api-owner-existing",
+                    template_id="api-owner-existing",
+                    name="Existing API Owner",
+                    role_id="api_owner",
+                    description="An active employee already assigned to the API owner role.",
+                    category="engineering",
+                    domains=["api"],
+                    prompt_refs=[],
+                )
+            ]
+            llm = DummyRecruiterLLM()
+            engine, store = await self._build_engine(root, config, llm)
+            decision = RouterDecision(
+                mode=ExecutionMode.COMPANY_MODE,
+                company_profile="custom",
+                domains=[],
+            )
+            runtime_spec = engine.company_runtime_spec_builder.build_spec(
+                decision,
+                original_message="Improve the API documentation",
+            )
+
+            plan = await engine.company_recruiter.build_recruitment_plan(
+                runtime_spec,
+                domains=[],
+                project_id="proj1",
+            )
+
+            self.assertTrue(plan.metadata["fully_staffed_fast_path"])
+            self.assertEqual(llm.calls, [])
+            self.assertEqual(len(plan.proposals), 1)
+            proposal = plan.proposals[0]
+            self.assertEqual(proposal.status, "existing_staff")
+            self.assertEqual(proposal.existing_employee.employee_id, "api-owner-existing")
+            self.assertEqual(proposal.existing_employee_ids, ["api-owner-existing"])
+            self.assertFalse(recruitment_plan_requires_confirmation(plan))
+
+            self.assertIsNone(
+                engine._build_manual_staffing_checkpoint_payload(
+                    decision,
+                    "Improve the API documentation",
+                    runtime_spec,
+                    session_id="sess-fully-staffed",
+                    origin_channel="cli",
+                    origin_chat_id="",
+                    origin_thread_id="",
+                )
+            )
+            self.assertIsNotNone(
+                engine._build_manual_staffing_checkpoint_payload(
+                    decision,
+                    "Improve the API documentation",
+                    runtime_spec,
+                    session_id="sess-fully-staffed",
+                    origin_channel="cli",
+                    origin_chat_id="",
+                    origin_thread_id="",
+                    force_manual_preflight=True,
+                )
+            )
+            await store.close()
+
+    async def test_placeholder_only_role_keeps_staffing_preflight(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            config = OPCConfig()
+            config.org.company_profile = "custom"
+            config.org.roles = [
+                RoleConfig(
+                    id="api_owner",
+                    name="API Owner",
+                    responsibility="Own API design and delivery.",
+                )
+            ]
+            config.org.employees = [
+                EmployeeConfig(
+                    employee_id="api-owner-placeholder",
+                    template_id="fallback-empty-employee",
+                    name="Fallback API Owner",
+                    role_id="api_owner",
+                    description="A placeholder employee, not staffed capacity.",
+                    category="engineering",
+                    domains=["api"],
+                    prompt_refs=[],
+                    metadata={"is_fallback_employee": True},
+                )
+            ]
+            engine, store = await self._build_engine(root, config, DummyRecruiterLLM())
+            decision = RouterDecision(
+                mode=ExecutionMode.COMPANY_MODE,
+                company_profile="custom",
+                domains=[],
+            )
+            runtime_spec = engine.company_runtime_spec_builder.build_spec(
+                decision,
+                original_message="Improve the API documentation",
+            )
+
+            payload = engine._build_manual_staffing_checkpoint_payload(
+                decision,
+                "Improve the API documentation",
+                runtime_spec,
+                session_id="sess-placeholder-only",
+                origin_channel="cli",
+                origin_chat_id="",
+                origin_thread_id="",
+            )
+
+            self.assertIsNotNone(payload)
+            await store.close()
+
+    def test_existing_staff_without_same_role_employee_still_requires_confirmation(self) -> None:
+        plan = RecruitmentPlan(
+            proposals=[
+                RecruitmentProposal(
+                    role_id="api_owner",
+                    status="existing_staff",
+                    existing_employee_ids=[],
+                )
+            ]
+        )
+
+        self.assertTrue(recruitment_plan_requires_confirmation(plan))
 
     async def test_org_hire_existing_canonical_employee_staffs_requested_role(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

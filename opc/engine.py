@@ -1371,6 +1371,20 @@ class OPCEngine:
             )
         if not roles:
             return None
+        # Fully-staffed team: every role already has at least one assigned
+        # (non-placeholder) employee, so there is no hiring/staffing decision to
+        # make. Skip the staffing preflight entirely and let execution proceed
+        # with those employees. We key off the actual same-role employees rather
+        # than ``default_selection`` because a saved project default may pin a
+        # template for a role that is nonetheless already staffed. The prompt is
+        # still shown for not-fully-staffed teams, new teams, or when the user
+        # explicitly reopens it via ``/staffing`` (``force_manual_preflight``).
+        fully_staffed = all(
+            list(role.get("same_role_employee_ids") or [])
+            for role in roles
+        )
+        if fully_staffed and not force_manual_preflight:
+            return None
         role_agent_overrides = {
             str(role.get("role_id", "") or "").strip(): str(role.get("selected_agent", "") or "").strip()
             for role in roles

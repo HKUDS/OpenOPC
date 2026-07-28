@@ -250,7 +250,22 @@ def build_fallback_role_ids(plan: RecruitmentPlan) -> set[str]:
 
 
 def recruitment_plan_requires_confirmation(plan: RecruitmentPlan) -> bool:
-    return any(proposal.status in {"existing_staff", "proposed_hire"} for proposal in plan.proposals)
+    """Prompt for staffing confirmation only when the plan actually changes staffing.
+
+    A team that is already fully staffed (every role has an assigned employee
+    that the plan simply reuses) needs no confirmation. Confirmation is required
+    only when there is a genuine staffing decision:
+    - a new hire is proposed (``proposed_hire``), or
+    - an existing pool employee is assigned to a role that currently has no
+      employee of its own (``existing_staff`` with no same-role employees), i.e.
+      a not-fully-staffed or new team.
+    """
+    for proposal in plan.proposals:
+        if proposal.status == "proposed_hire":
+            return True
+        if proposal.status == "existing_staff" and not list(proposal.existing_employee_ids or []):
+            return True
+    return False
 
 
 def serialize_recruitment_plan(plan: RecruitmentPlan) -> dict[str, Any]:
@@ -429,6 +444,30 @@ class CompanyRecruiter:
             default="native",
         ) or "native"
         needs = self._collect_needs(runtime_spec)
+        # Fast path for a fully-staffed team: every role already has an active,
+        # non-placeholder same-role employee, so there is no staffing decision
+        # to make. Skip the (LLM) triage + global recruit entirely and reuse
+        # existing staff. This avoids slow recruiter calls and hiring prompts on
+        # every run when nothing about staffing needs to change.
+        fully_staffed_proposals = self._fully_staffed_proposals(needs, project_id=project_id)
+        if fully_staffed_proposals is not None:
+            plan_metadata = {
+                "project_id": project_id,
+                "execution_mode": str(getattr(runtime_spec, "metadata", {}).get("execution_mode", "company_mode") or "company_mode"),
+                "request_label": str(getattr(runtime_spec, "metadata", {}).get("request_label", "runtime") or "runtime"),
+                "recruitment_agent": selected_recruitment_agent,
+                "fully_staffed_fast_path": True,
+            }
+            plan = ensure_recruitment_plan_default_agents(
+                RecruitmentPlan(
+                    company_profile=str(getattr(runtime_spec, "profile", "corporate") or "corporate"),
+                    proposals=fully_staffed_proposals,
+                    recruiter_feedback=feedback,
+                    metadata=plan_metadata,
+                )
+            )
+            plan.summary = self.render_recruitment_summary(plan)
+            return plan
         triage_by_role = await self._triage_staffing_for_needs(
             needs,
             recruiter_feedback=feedback,
@@ -503,6 +542,70 @@ class CompanyRecruiter:
             summary=summary,
             metadata=plan_metadata,
         ))
+
+    @staticmethod
+    def _is_placeholder_employee(employee: Any) -> bool:
+        metadata = dict(getattr(employee, "metadata", {}) or {})
+        return bool(metadata.get("is_default_employee") or metadata.get("is_fallback_employee"))
+
+    def _fully_staffed_proposals(
+        self,
+        needs: list[RecruitmentNeed],
+        *,
+        project_id: str,
+    ) -> list[RecruitmentProposal] | None:
+        """Return reuse-existing-staff proposals when every role is already staffed.
+
+        Returns ``None`` (no fast path) if any role lacks an active,
+        non-placeholder same-role employee, so not-fully-staffed and new teams
+        still go through normal recruitment.
+        """
+        if not needs:
+            return None
+        proposals: list[RecruitmentProposal] = []
+        for need in needs:
+            same_role = [
+                employee
+                for employee in self.org_engine.list_employees(role_id=need.role_id)
+                if not self._is_placeholder_employee(employee)
+            ]
+            if not same_role:
+                return None
+            summaries = [
+                (
+                    employee,
+                    self._build_existing_employee_summary(
+                        employee,
+                        role_id=need.role_id,
+                        domains=[],
+                        project_id=project_id,
+                    ),
+                )
+                for employee in same_role
+            ]
+            employee, _ = max(
+                summaries,
+                key=lambda pair: float(pair[1].get("experience_score", 0.0) or 0.0),
+            )
+            recommendation = self._make_existing_employee_recommendation(
+                employee,
+                role_id=need.role_id,
+                domains=[],
+                project_id=project_id,
+                rationale="Reusing the employee already staffed for this role; no staffing change is needed.",
+            )
+            proposals.append(
+                RecruitmentProposal(
+                    role_id=need.role_id,
+                    status="existing_staff",
+                    rationale=recommendation.rationale,
+                    role_labels=[need.role_name] if need.role_name else [],
+                    existing_employee=recommendation,
+                    existing_employee_ids=[item.employee_id for item in same_role],
+                    metadata={"selection_source": "fully_staffed_fast_path"},
+                )
+            )
+        return proposals
 
     def render_recruitment_summary(self, plan: RecruitmentPlan) -> str:
         execution_mode = str(plan.metadata.get("execution_mode", "company_mode") or "company_mode")
