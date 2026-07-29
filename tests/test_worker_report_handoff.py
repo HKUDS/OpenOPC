@@ -1433,5 +1433,107 @@ class ReportCardRunnableFilterTests(unittest.TestCase):
         )
 
 
+class ReportFailureStormBrakeTests(unittest.IsolatedAsyncioTestCase):
+    """FAILED report cards must not mint Report #N forever on reconcile."""
+
+    async def asyncSetUp(self) -> None:
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmpdir.name)
+        self.store = OPCStore(self.root / "tasks.db")
+        await self.store.initialize()
+        self.executor = _build_executor(self.store, _make_org_engine(self.root))
+
+    async def asyncTearDown(self) -> None:
+        await self.store.close()
+        self._tmpdir.cleanup()
+
+    def _failed_report(self, attempt: int) -> DelegationWorkItem:
+        report_id = report_work_item_id_for_attempt("wi-child", attempt)
+        return DelegationWorkItem(
+            work_item_id=report_id,
+            run_id="run-1",
+            cell_id="team::cto",
+            team_id="team::cto",
+            role_id="engineer",
+            seat_id="seat::team::cto::engineer",
+            parent_work_item_id="wi-child",
+            kind="report",
+            projection_id=report_id,
+            phase=Phase.FAILED,
+            batch_index=attempt,
+            metadata={
+                "runtime_model": "multi_team_org",
+                "report_execution_work_item": True,
+                "report_attempt": attempt,
+                "report_target_work_item_id": "wi-child",
+                "hidden_from_company_kanban": True,
+            },
+        )
+
+    async def test_reconcile_stops_after_consecutive_report_failures(self) -> None:
+        parent = _build_child_work_item()
+        parent.phase = Phase.AWAITING_MANAGER_REVIEW
+        parent.metadata = {
+            **dict(parent.metadata or {}),
+            "review_owner_role_id": "cto",
+            "review_owner_seat_id": "seat::team::cto::cto",
+            "max_consecutive_report_failures": 3,
+        }
+        await self.store.save_delegation_work_item(parent)
+        for attempt in (1, 2, 3):
+            await self.store.save_delegation_work_item(self._failed_report(attempt))
+
+        before = [
+            item.work_item_id
+            for item in await self.store.list_delegation_work_items("run-1")
+            if item.kind == "report"
+        ]
+        await self.executor._reconcile_missing_review_chain(
+            await self.store.list_delegation_work_items("run-1")
+        )
+        after = [
+            item.work_item_id
+            for item in await self.store.list_delegation_work_items("run-1")
+            if item.kind == "report"
+        ]
+        self.assertEqual(before, after)
+        self.assertIsNone(
+            await self.store.get_delegation_work_item(
+                report_work_item_id_for_attempt("wi-child", 4)
+            )
+        )
+        refreshed = await self.store.get_delegation_work_item("wi-child")
+        self.assertEqual(
+            refreshed.metadata.get("report_chain_hold"),
+            "consecutive_report_failures",
+        )
+
+    async def test_reconcile_allows_retry_below_failure_limit(self) -> None:
+        parent = _build_child_work_item()
+        parent.phase = Phase.AWAITING_MANAGER_REVIEW
+        parent.metadata = {
+            **dict(parent.metadata or {}),
+            "review_owner_role_id": "cto",
+            "review_owner_seat_id": "seat::team::cto::cto",
+            "max_consecutive_report_failures": 3,
+        }
+        await self.store.save_delegation_work_item(parent)
+        await self.store.save_delegation_work_item(self._failed_report(1))
+        await self.store.save_delegation_work_item(self._failed_report(2))
+
+        await self.executor._reconcile_missing_review_chain(
+            await self.store.list_delegation_work_items("run-1")
+        )
+        next_report = await self.store.get_delegation_work_item(
+            report_work_item_id_for_attempt("wi-child", 3)
+        )
+        self.assertIsNotNone(next_report)
+        self.assertEqual(next_report.phase, Phase.READY)
+        refreshed = await self.store.get_delegation_work_item("wi-child")
+        self.assertFalse(
+            str((refreshed.metadata or {}).get("report_chain_hold", "") or "").strip()
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

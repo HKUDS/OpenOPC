@@ -233,6 +233,12 @@ DEFAULT_MAX_PRE_DELIVERY_REWORKS = 3
 # honest-but-rejected work.
 MAX_VERDICT_PARSE_RETRIES = 2
 
+# Cap consecutive FAILED report cards for one parent while it stays in
+# AWAITING_MANAGER_REVIEW. Reconcile treats FAILED as "no active report" and
+# would otherwise mint Report #N forever (seen when cursor-agent spawn dies
+# with ARG_MAX before the process starts).
+DEFAULT_MAX_CONSECUTIVE_REPORT_FAILURES = 3
+
 _REVIEW_VERDICT_PARSE_RETRY_HINT = (
     "\n\n[REVIEW RETRY — Your previous verdict could not be parsed. The "
     "runtime needs an explicit approve/reject decision to drive the next "
@@ -3864,6 +3870,13 @@ class CompanyWorkItemExecutor:
                 else:
                     # No unconsumed durable report exists. This is either the
                     # first handoff for the phase or a later rework cycle.
+                    # Brake: consecutive FAILED report cards must not mint a
+                    # new Report #N on every reconcile tick.
+                    if await self._should_hold_report_chain(
+                        parent,
+                        work_items=work_items,
+                    ):
+                        continue
                     spawned = await self._ensure_report_work_item_for_work_item(
                         target_id,
                         run_items=work_items,
@@ -6091,6 +6104,37 @@ class CompanyWorkItemExecutor:
                 review_evidence["manager_dispatch"] = dict(manager_turn_context)
             if review_evidence:
                 metadata_updates["review_evidence"] = review_evidence
+            if target_phase == Phase.AWAITING_MANAGER_REVIEW:
+                # A fresh execute→review handoff must clear any prior report
+                # storm hold so rework cycles can spawn Report #1 again.
+                # Baseline the failure streak on already-minted report attempts
+                # so historical FAILED cards from a previous cycle do not
+                # immediately re-trigger the hold.
+                prior_attempts = 0
+                if linked_work_item is not None:
+                    try:
+                        prior_items = await self._run_items_for_parent(linked_work_item)
+                        prior_attempts = max(
+                            (
+                                self._auxiliary_attempt_number(item, kind="report")
+                                for item in self._targeting_auxiliary_items(
+                                    prior_items,
+                                    work_item_id,
+                                    kind="report",
+                                )
+                            ),
+                            default=0,
+                        )
+                    except Exception:
+                        prior_attempts = int(
+                            (linked_work_item_metadata or {}).get("report_attempt_count", 0)
+                            or 0
+                        )
+                metadata_updates["report_chain_hold"] = ""
+                metadata_updates["report_chain_hold_reason"] = ""
+                metadata_updates["report_chain_hold_at"] = ""
+                metadata_updates["report_chain_failed_attempts"] = 0
+                metadata_updates["report_failure_baseline_attempt"] = prior_attempts
 
         # Phase write + local status sync via the canonical helper. Returns
         # False only if wid disappeared between our lookup and the call —
@@ -6604,6 +6648,111 @@ class CompanyWorkItemExecutor:
             if getattr(item, "phase", None) not in DONE_PHASES
         ]
         return active[-1] if active else None
+
+    @classmethod
+    def _consecutive_failed_auxiliary_attempts(
+        cls,
+        run_items: list[DelegationWorkItem],
+        target_work_item_id: str,
+        *,
+        kind: str,
+        baseline_attempt: int = 0,
+    ) -> int:
+        """Count trailing FAILED auxiliary cards since the last non-failed one.
+
+        Why this exists: each crashed report card settles as Phase.FAILED
+        (a DONE_PHASE), so ``_active_auxiliary_item`` returns None and
+        reconcile mints a fresh attempt. Counting the trailing failure
+        streak lets the runtime stop before Report #295.
+
+        ``baseline_attempt`` ignores older cards from a previous execute→
+        review cycle so a rework handoff can spawn again after the hold
+        was cleared.
+        """
+        floor = max(0, int(baseline_attempt or 0))
+        streak = 0
+        for item in reversed(
+            cls._targeting_auxiliary_items(
+                run_items,
+                target_work_item_id,
+                kind=kind,
+            )
+        ):
+            attempt_no = cls._auxiliary_attempt_number(item, kind=kind)
+            if attempt_no <= floor:
+                break
+            if getattr(item, "phase", None) == Phase.FAILED:
+                streak += 1
+                continue
+            break
+        return streak
+
+    @classmethod
+    def _report_failure_limit(cls, parent_item: DelegationWorkItem) -> int:
+        metadata = dict(getattr(parent_item, "metadata", {}) or {})
+        raw = metadata.get("max_consecutive_report_failures")
+        try:
+            value = int(raw) if raw is not None else DEFAULT_MAX_CONSECUTIVE_REPORT_FAILURES
+        except (TypeError, ValueError):
+            value = DEFAULT_MAX_CONSECUTIVE_REPORT_FAILURES
+        return max(1, value)
+
+    async def _should_hold_report_chain(
+        self,
+        parent_item: DelegationWorkItem,
+        *,
+        work_items: list[DelegationWorkItem] | None = None,
+    ) -> bool:
+        """True when reconcile must stop minting new report cards for parent."""
+        parent_metadata = dict(getattr(parent_item, "metadata", {}) or {})
+        if str(parent_metadata.get("report_chain_hold", "") or "").strip():
+            return True
+        all_run_items = await self._run_items_for_parent(parent_item, work_items)
+        try:
+            baseline = int(parent_metadata.get("report_failure_baseline_attempt", 0) or 0)
+        except (TypeError, ValueError):
+            baseline = 0
+        consecutive_failures = self._consecutive_failed_auxiliary_attempts(
+            all_run_items,
+            parent_item.work_item_id,
+            kind="report",
+            baseline_attempt=baseline,
+        )
+        limit = self._report_failure_limit(parent_item)
+        if consecutive_failures < limit:
+            return False
+        hold_reason = (
+            f"{consecutive_failures} consecutive report cards failed "
+            f"(limit {limit}); refusing to spawn another Report #N until "
+            "the parent leaves AWAITING_MANAGER_REVIEW or the hold is cleared"
+        )
+        try:
+            await self.store.update_delegation_work_item(
+                parent_item.work_item_id,
+                metadata_updates={
+                    "report_chain_hold": "consecutive_report_failures",
+                    "report_chain_hold_reason": hold_reason,
+                    "report_chain_hold_at": datetime.now().isoformat(),
+                    "report_chain_failed_attempts": consecutive_failures,
+                },
+            )
+        except Exception:
+            logger.opt(exception=True).warning(
+                "Failed to stamp report_chain_hold on "
+                f"work_item_id={parent_item.work_item_id}"
+            )
+        await self._record_work_item_runtime_diagnostic(
+            code="report_chain_held_after_failures",
+            severity="error",
+            work_item=parent_item,
+            message=hold_reason,
+            details={
+                "consecutive_failures": consecutive_failures,
+                "limit": limit,
+                "baseline_attempt": baseline,
+            },
+        )
+        return True
 
     @classmethod
     def _next_auxiliary_attempt(
@@ -7323,6 +7472,13 @@ class CompanyWorkItemExecutor:
             target_work_item_id,
             kind="review",
         ) is not None:
+            return None
+        # Defense in depth: even callers outside reconcile (e.g. DONE
+        # transition) must not mint Report #N after a failure storm.
+        if await self._should_hold_report_chain(
+            worker_item,
+            work_items=all_run_items,
+        ):
             return None
         existing_card = self._active_auxiliary_item(
             all_run_items,

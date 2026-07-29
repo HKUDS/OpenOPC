@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import re
 import shutil
+from pathlib import Path
 from typing import Any
 
 from loguru import logger
@@ -18,6 +20,12 @@ class CursorAdapter(ExternalAgentAdapter):
 
     agent_type = "cursor"
     default_command = "cursor-agent"
+    # cursor-agent takes the prompt as a positional argv token (not stdin in
+    # --print mode). Large company/report prompts routinely exceed OS ARG_MAX
+    # and crash spawn with ``OSError: [Errno 7] Argument list too long``. Keep
+    # small prompts on argv; spill larger ones to a workspace file and pass a
+    # short pointer prompt instead.
+    _ARGV_PROMPT_MAX_BYTES = 16 * 1024
 
     def __init__(self, config=None) -> None:
         super().__init__(config=config)
@@ -90,13 +98,71 @@ class CursorAdapter(ExternalAgentAdapter):
     def agent_isolation_home_slug(self) -> str:
         return "cursor"
 
+    def _prompt_arg_for_invocation(
+        self,
+        prompt: str,
+        *,
+        workspace_path: str | None = None,
+        task: Task | None = None,
+    ) -> tuple[str, dict[str, object]]:
+        """Return argv-safe prompt text plus transport metadata.
+
+        Why file spill exists: ``cursor-agent -p`` consumes the prompt as a
+        positional CLI argument. Putting a 100k+ company handoff prompt on
+        argv trips Linux/macOS ``Argument list too long`` before the process
+        starts, which previously crashed report cards and triggered an
+        infinite Report #N reconcile storm.
+        """
+        prompt_text = str(prompt or "")
+        prompt_bytes = len(prompt_text.encode("utf-8"))
+        if prompt_bytes <= self._ARGV_PROMPT_MAX_BYTES:
+            return prompt_text, {
+                "prompt_transport": "argv",
+                "prompt_bytes": prompt_bytes,
+            }
+
+        root = Path(str(workspace_path or "").strip() or ".").expanduser()
+        try:
+            root = root.resolve()
+        except OSError:
+            root = Path(".").resolve()
+        prompt_dir = root / ".opc" / "external_prompts"
+        prompt_dir.mkdir(parents=True, exist_ok=True)
+        task_id = str(getattr(task, "id", "") or "").strip() or "task"
+        digest = hashlib.sha256(prompt_text.encode("utf-8")).hexdigest()[:16]
+        prompt_path = prompt_dir / f"cursor_{task_id}_{digest}.md"
+        prompt_path.write_text(prompt_text, encoding="utf-8")
+        pointer = (
+            "Open and follow the complete task instructions in this file exactly:\n"
+            f"{prompt_path}\n\n"
+            "Treat the file contents as your full prompt. Do not ask for confirmation "
+            "before starting; do not recreate the file."
+        )
+        return pointer, {
+            "prompt_transport": "file",
+            "prompt_bytes": prompt_bytes,
+            "prompt_file": str(prompt_path),
+            "prompt_transport_reason": "prompt_too_large_for_argv",
+        }
+
+    @staticmethod
+    def _redact_prompt_arg(cmd: list[str], prompt: str) -> list[str]:
+        redacted = list(cmd)
+        if redacted:
+            redacted[-1] = f"<prompt:{len(prompt.encode('utf-8'))}-bytes>"
+        return redacted
+
     def build_invocation(
         self,
         task: Task,
         workspace_path: str | None = None,
     ) -> tuple[list[str], dict[str, object]]:
-        _ = workspace_path
-        prompt = self.build_task_prompt(task)
+        full_prompt = self.build_task_prompt(task)
+        prompt_arg, transport_meta = self._prompt_arg_for_invocation(
+            full_prompt,
+            workspace_path=workspace_path,
+            task=task,
+        )
         command = self._runtime_command() or self.configured_command()
         cmd = [
             command,
@@ -108,10 +174,18 @@ class CursorAdapter(ExternalAgentAdapter):
             *self._build_model_args(),
             *self._build_session_args(),
             *list(self.config.extra_args),
-            prompt,
+            prompt_arg,
         ]
-        metadata = self.build_invocation_metadata(cmd)
+        # Redact large/file-backed prompts from audit command strings so logs
+        # stay small and never re-inflate ARG_MAX-sized text into metadata.
+        display_cmd = (
+            self._redact_prompt_arg(cmd, full_prompt)
+            if transport_meta.get("prompt_transport") == "file" or len(full_prompt) > 160
+            else cmd
+        )
+        metadata = self.build_invocation_metadata(display_cmd)
         metadata["binary"] = command
+        metadata.update(transport_meta)
         return cmd, metadata
 
     def build_interactive_invocation(
@@ -119,8 +193,12 @@ class CursorAdapter(ExternalAgentAdapter):
         task: Task,
         workspace_path: str | None = None,
     ) -> tuple[list[str], dict[str, object]]:
-        _ = workspace_path
-        prompt = self.build_task_prompt(task)
+        full_prompt = self.build_task_prompt(task)
+        prompt_arg, transport_meta = self._prompt_arg_for_invocation(
+            full_prompt,
+            workspace_path=workspace_path,
+            task=task,
+        )
         command = self._runtime_command() or self.configured_command()
         cmd = [
             command,
@@ -132,10 +210,16 @@ class CursorAdapter(ExternalAgentAdapter):
             *self._build_model_args(),
             *self._build_session_args(),
             *list(self.config.extra_args),
-            prompt,
+            prompt_arg,
         ]
-        metadata = self.build_invocation_metadata(cmd)
+        display_cmd = (
+            self._redact_prompt_arg(cmd, full_prompt)
+            if transport_meta.get("prompt_transport") == "file" or len(full_prompt) > 160
+            else cmd
+        )
+        metadata = self.build_invocation_metadata(display_cmd)
         metadata["binary"] = command
+        metadata.update(transport_meta)
         return cmd, metadata
 
     def extract_resume_session_id(self, output: str) -> str:

@@ -3498,6 +3498,38 @@ class ExternalAgentMonitoringTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.status, TaskStatus.DONE)
         self.assertEqual(spawn_mock.await_args.kwargs["stdin"], asyncio.subprocess.DEVNULL)
 
+    def test_cursor_adapter_large_prompt_spills_to_workspace_file(self) -> None:
+        adapter = CursorAdapter(config=ExternalAgentConfig(command="cursor-agent"))
+        prompt = "x" * (CursorAdapter._ARGV_PROMPT_MAX_BYTES + 1)
+        task = Task(id="task-large", title="large", description=prompt)
+        full_prompt = adapter.build_task_prompt(task)
+        tmpdir = _make_test_dir("cursor-large-prompt-file")
+        try:
+            cmd, metadata = adapter.build_interactive_invocation(
+                task, workspace_path=tmpdir
+            )
+            self.assertEqual(metadata["prompt_transport"], "file")
+            self.assertEqual(
+                metadata["prompt_transport_reason"],
+                "prompt_too_large_for_argv",
+            )
+            prompt_file = Path(str(metadata["prompt_file"]))
+            self.assertTrue(prompt_file.is_file())
+            self.assertEqual(prompt_file.read_text(encoding="utf-8"), full_prompt)
+            self.assertNotIn(full_prompt, cmd)
+            self.assertIn(str(prompt_file), str(cmd[-1]))
+            self.assertNotIn(prompt[:64], metadata["command"])
+            self.assertLess(len(cmd[-1].encode("utf-8")), CursorAdapter._ARGV_PROMPT_MAX_BYTES)
+        finally:
+            _cleanup_test_dir(tmpdir)
+
+    def test_cursor_adapter_small_prompt_stays_on_argv(self) -> None:
+        adapter = CursorAdapter(config=ExternalAgentConfig(command="cursor-agent"))
+        task = Task(title="demo", description="short body")
+        cmd, metadata = adapter.build_invocation(task, workspace_path="/tmp/opc-ws")
+        self.assertEqual(metadata["prompt_transport"], "argv")
+        self.assertEqual(cmd[-1], adapter.build_task_prompt(task))
+
     def test_codex_adapter_mirrors_user_auth_and_config_with_copy_fallback(self) -> None:
         adapter = CodexAdapter()
         tmpdir = _make_test_dir("codex-mirror-user-config")
