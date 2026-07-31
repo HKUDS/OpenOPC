@@ -3137,7 +3137,8 @@ class ExternalAgentMonitoringTests(unittest.IsolatedAsyncioTestCase):
         task = Task(title="demo", description="body")
         prompt = adapter.build_task_prompt(task)
 
-        cmd, metadata = adapter.build_interactive_invocation(task, workspace_path="/repo")
+        with patch.object(ClaudeCodeAdapter, "_windows_multiline_argv_is_unsafe", return_value=False):
+            cmd, metadata = adapter.build_interactive_invocation(task, workspace_path="/repo")
 
         self.assertEqual(cmd[-2:], ["--", prompt])
         self.assertEqual(metadata["prompt_transport"], "argv")
@@ -3150,7 +3151,8 @@ class ExternalAgentMonitoringTests(unittest.IsolatedAsyncioTestCase):
             config=ExternalAgentConfig(command="claude", approval_mode="full-auto")
         )
         task = Task(title="demo", description="body")
-        cmd, metadata = adapter.build_interactive_invocation(task, workspace_path="/repo")
+        with patch.object(ClaudeCodeAdapter, "_windows_multiline_argv_is_unsafe", return_value=False):
+            cmd, metadata = adapter.build_interactive_invocation(task, workspace_path="/repo")
         proc = type("Proc", (), {"pid": 321, "stdin": None, "stdout": object(), "stderr": object()})()
 
         tmpdir = _make_test_dir("claude-full-auto-devnull")
@@ -3179,7 +3181,8 @@ class ExternalAgentMonitoringTests(unittest.IsolatedAsyncioTestCase):
             config=ExternalAgentConfig(command="claude", approval_mode="auto")
         )
         task = Task(title="demo", description="body")
-        cmd, metadata = adapter.build_interactive_invocation(task, workspace_path="/repo")
+        with patch.object(ClaudeCodeAdapter, "_windows_multiline_argv_is_unsafe", return_value=False):
+            cmd, metadata = adapter.build_interactive_invocation(task, workspace_path="/repo")
         proc = type("Proc", (), {"pid": 321, "stdin": None, "stdout": object(), "stderr": object()})()
 
         tmpdir = _make_test_dir("claude-auto-approval-stdin")
@@ -3202,6 +3205,90 @@ class ExternalAgentMonitoringTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(adapter.supports_approval_prompt_handling(cmd, metadata))
         self.assertEqual(spawn_mock.await_args.kwargs["stdin"], asyncio.subprocess.PIPE)
         self.assertEqual(metadata["stdin_policy"], "pipe_open")
+
+    def test_claude_adapter_windows_multiline_prompt_uses_stdin_transport(self) -> None:
+        adapter = ClaudeCodeAdapter()
+        task = Task(
+            title="demo",
+            description="## Task Brief\n在工作区里创建一个 hello.py\n\n## OpenOPC Context\nctx",
+            metadata={"external_prompt_contract": "description_is_full_prompt"},
+        )
+        prompt = adapter.build_task_prompt(task)
+
+        with patch("opc.layer3_agent.adapters.claude_code.os.name", "nt"), \
+            patch(
+                "opc.layer3_agent.adapters.claude_code.shutil.which",
+                return_value=r"C:\Users\me\AppData\Roaming\npm\claude.CMD",
+            ):
+            cmd, metadata = adapter.build_interactive_invocation(task, workspace_path="/repo")
+
+        self.assertNotIn("--", cmd)
+        self.assertNotIn(prompt, cmd)
+        self.assertIn("--input-format", cmd)
+        self.assertEqual(cmd[cmd.index("--input-format") + 1], "text")
+        self.assertEqual(metadata["prompt_transport"], "stdin")
+        self.assertEqual(metadata["stdin_prompt_channel"], "pipe")
+        self.assertEqual(metadata["prompt_transport_reason"], "windows_multiline_argv_unsafe")
+        self.assertEqual(
+            adapter.stdin_policy_for_process(cmd, metadata),
+            "pipe_prompt_then_close",
+        )
+
+    def test_claude_adapter_windows_single_line_prompt_stays_on_argv(self) -> None:
+        adapter = ClaudeCodeAdapter()
+        task = Task(
+            title="demo",
+            description="创建一个 hello.py",
+            metadata={"external_prompt_contract": "description_is_full_prompt"},
+        )
+        prompt = adapter.build_task_prompt(task)
+
+        with patch("opc.layer3_agent.adapters.claude_code.os.name", "nt"), \
+            patch(
+                "opc.layer3_agent.adapters.claude_code.shutil.which",
+                return_value=r"C:\Users\me\AppData\Roaming\npm\claude.CMD",
+            ):
+            cmd, metadata = adapter.build_interactive_invocation(task, workspace_path="/repo")
+
+        self.assertEqual(cmd[-2:], ["--", prompt])
+        self.assertEqual(metadata["prompt_transport"], "argv")
+
+    def test_claude_adapter_windows_multiline_batch_prompt_uses_stdin_transport(self) -> None:
+        adapter = ClaudeCodeAdapter()
+        task = Task(
+            title="demo",
+            description="## Task Brief\n在工作区里创建一个 hello.py",
+            metadata={"external_prompt_contract": "description_is_full_prompt"},
+        )
+        prompt = adapter.build_task_prompt(task)
+
+        with patch("opc.layer3_agent.adapters.claude_code.os.name", "nt"), \
+            patch(
+                "opc.layer3_agent.adapters.claude_code.shutil.which",
+                return_value=r"C:\Users\me\AppData\Roaming\npm\claude.CMD",
+            ):
+            cmd, metadata = adapter.build_invocation(task, workspace_path="/repo")
+
+        self.assertNotIn("--", cmd)
+        self.assertNotIn(prompt, cmd)
+        self.assertIn("--input-format", cmd)
+        self.assertEqual(metadata["prompt_transport"], "stdin")
+        self.assertEqual(metadata["prompt_transport_reason"], "windows_multiline_argv_unsafe")
+
+    def test_claude_adapter_posix_multiline_prompt_stays_on_argv(self) -> None:
+        adapter = ClaudeCodeAdapter()
+        task = Task(
+            title="demo",
+            description="## Task Brief\nline two",
+            metadata={"external_prompt_contract": "description_is_full_prompt"},
+        )
+        prompt = adapter.build_task_prompt(task)
+
+        with patch("opc.layer3_agent.adapters.claude_code.os.name", "posix"):
+            cmd, metadata = adapter.build_interactive_invocation(task, workspace_path="/repo")
+
+        self.assertEqual(cmd[-2:], ["--", prompt])
+        self.assertEqual(metadata["prompt_transport"], "argv")
 
     def test_claude_adapter_large_interactive_prompt_uses_stdin(self) -> None:
         adapter = ClaudeCodeAdapter()
