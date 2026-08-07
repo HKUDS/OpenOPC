@@ -553,28 +553,27 @@ opc session create "Research sprint" -p demo --mode org --org hku_research_lab
 | `.opc/config/company_orgs/org_<id>_config.yaml` | Company 模式使用的自定义公司架构。 |
 | `.opc/config/org_index.yaml` | 当前生效的已保存公司架构选择器。 |
 
-### LLM 密钥
+### LLM 密钥与本地模型支持
 
-运行 `opc init` 后，编辑仓库本地 OPC home 中的 `.opc/config/llm_config.yaml`。如果设置了 `OPC_HOME`，则改为编辑 `$OPC_HOME/config/llm_config.yaml`。
-
-模板中的密钥留空。直接把 key 写入文件：
+运行 `opc init` 后，编辑仓库本地 OPC home 中的 `.opc/config/llm_config.yaml`（或 `$OPC_HOME/config/llm_config.yaml`）。OpenOPC 同时支持云端 LLM（OpenAI、Anthropic、OpenRouter）与无 API Key 的**本地模型**（Ollama、vLLM、LM Studio、LocalAI、Llama.cpp、TGI）：
 
 ```yaml
 llm:
-  default_model: "openai/gpt-5.4"
-  api_base: "https://openrouter.ai/api/v1"
-  api_key: "sk-or-v1-..."   # 你的 OpenRouter（或其他提供方）API key
+  default_model: "ollama/llama3.3"         # 或 "vllm/meta-llama-3.1-8b-instruct"、"openai/gpt-4o"
+  api_base: "http://localhost:11434"        # 本地模型前缀将自动解析默认 Base URL
+  api_key: ""                               # 本地节点免 API Key 运行！
 
-  max_tokens: 32768         # 每次请求的最大输出 token；如果你的模型
-                            # 输出上限更小，请调低
-  # context_window: 128000  # 总输入窗口。通常由 litellm 自动检测；
-                            # 未收录的模型回退为 128000。仅当回退值
-                            # 不适合你的模型时才取消注释并设置。
+  max_tokens: 32768         # 每次请求的最大输出 token
+  is_local: true            # 可选的显式本地运行标志
 ```
+
+你也可以直接在浏览器 Office UI 顶栏点击 **LLM & 本地模型设置弹窗（`🤖` 按钮）** 进行可视配置。
+
+详细配置指南请参见 [`docs/LOCAL_MODELS.md`](docs/LOCAL_MODELS.md)。
 
 然后用 `opc status` 验证。
 
-如果不想把密钥存在文件里，可以将 `api_key` 留空，并把 `api_key_env` 设置为持有密钥的环境变量名（例如 `api_key_env: "OPENROUTER_API_KEY"`）。
+如果不想把云端密钥存在文件里，可以将 `api_key` 留空，并把 `api_key_env` 设置为持有密钥的环境变量名（例如 `api_key_env: "OPENROUTER_API_KEY"`）。
 
 ### 审批与 Agent 权限
 
