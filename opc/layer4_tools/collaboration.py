@@ -14,7 +14,10 @@ from typing import Any
 
 from loguru import logger
 
-from opc.core.company_tools import COMPANY_COLLABORATION_TOOL_NAMES
+from opc.core.company_tools import (
+    COMPANY_COLLABORATION_TOOL_NAMES,
+    is_self_evolution_work_item,
+)
 from opc.core.models import (
     AgentMessage,
     CommsSemanticType,
@@ -45,6 +48,7 @@ from opc.layer2_organization.work_item_transition import (
     is_prunable_dependency_work_item,
     normalize_dependency_work_item_ids,
     refresh_dependents_for_run,
+    transition_work_item,
 )
 from opc.layer4_tools.output_budget import clip_text
 from opc.layer4_tools.registry import ToolDefinition
@@ -860,6 +864,16 @@ _EXTERNAL_BRIDGE_ARGUMENT_EXAMPLES: dict[str, dict[str, Any]] = {
         "summary": "The user accepted this delivery and no further internal work is required.",
         "user_message": "Acknowledged. I am closing the human review for this delivery.",
     },
+    "submit_self_evolution_patches": {
+        "patches": [
+            {
+                "summary": "One-paragraph lesson from the delivered work cycle.",
+                "strengths": ["Concrete behavior worth repeating"],
+                "adjustments": ["Concrete behavior to change next time"],
+                "confidence": 0.8,
+            }
+        ],
+    },
     "send_dm": {
         "to_agent": "reviewer",
         "subject": "Need review",
@@ -912,6 +926,10 @@ _EXTERNAL_BRIDGE_ARGUMENT_NOTES: dict[str, tuple[str, ...]] = {
         "Use only when you decide the owner-facing delivery review is complete and should be closed.",
         "Do not call this for requested changes; revise the board, delegate work, or respond instead.",
     ),
+    "submit_self_evolution_patches": (
+        "Available only on self-evolution work items; the recorded patches are the authoritative result of the turn.",
+        "Pass `patches: []` when no experience update is needed; omit `employee_id` to target this work item's assigned employee.",
+    ),
 }
 
 
@@ -922,6 +940,7 @@ _EXTERNAL_CLI_KEY_ARGUMENTS: dict[str, tuple[str, ...]] = {
     "inbox": ("action", "message_ids", "limit"),
     "manager_board_read": ("parent_work_item_id", "include_children"),
     "close_human_review": ("summary", "user_message"),
+    "submit_self_evolution_patches": ("patches",),
     "send_dm": ("to_agent", "subject", "body", "blocking", "timeout_action", "timeout_seconds"),
     "reply_message": ("message_id", "body", "subject"),
     "broadcast_issue": ("to_agents", "subject", "body", "blocking", "timeout_action", "timeout_seconds"),
@@ -1599,6 +1618,51 @@ def create_collaboration_tools(
             "closed_checkpoint_ids": closed_checkpoint_ids,
             "summary": close_summary,
             "user_message": close_user_message,
+        }
+
+    async def submit_self_evolution_patches(
+        patches: list[dict[str, Any]] | None = None,
+        task: Task | None = None,
+    ) -> dict[str, Any]:
+        role_id = _active_role(task)
+        if not task or not role_id:
+            raise ValueError("submit_self_evolution_patches requires an active assigned task")
+        if not is_self_evolution_work_item(task):
+            raise ValueError(
+                "submit_self_evolution_patches is only available on self-evolution work items"
+            )
+        normalized: list[dict[str, Any]] = []
+        for index, patch in enumerate(list(patches or [])):
+            if not isinstance(patch, dict):
+                raise ValueError(f"patches[{index}] must be a JSON object")
+            employee_id = str(patch.get("employee_id", "") or "").strip()
+            if not employee_id:
+                assignment = dict(task.metadata.get("employee_assignment", {}) or {})
+                employee_id = str(assignment.get("employee_id", "") or "").strip()
+            if not employee_id:
+                raise ValueError(
+                    f"patches[{index}] needs an employee_id and this work item has no assigned employee"
+                )
+            normalized.append({**patch, "employee_id": employee_id})
+        task.metadata = dict(task.metadata or {})
+        task.context_snapshot = dict(task.context_snapshot or {})
+        record = {
+            "patches": normalized,
+            "submitted_at": datetime.now().isoformat(),
+            "submitted_by_role": role_id,
+        }
+        task.metadata["self_evolution_submitted_patch"] = record
+        task.context_snapshot["self_evolution_submitted_patch"] = dict(record)
+        store = getattr(communication, "store", None)
+        if store is not None and hasattr(store, "save_task"):
+            await store.save_task(task)
+        return {
+            "status": "recorded",
+            "patch_count": len(normalized),
+            "note": (
+                "Patches recorded for this self-evolution work item. "
+                "Finish the turn with a short completion note."
+            ),
         }
 
     async def delegate_work(
@@ -2689,33 +2753,32 @@ def create_collaboration_tools(
                         claimed_by_seat_id="",
                     )
                     if descendant.phase not in DONE_PHASES:
-                        await store.update_delegation_work_item(
+                        await transition_work_item(
+                            store,
                             descendant.work_item_id,
-                            phase=Phase.CANCELLED,
+                            target_phase=Phase.CANCELLED,
+                            reason=descendant_reason,
+                            release_claim=True,
                             blocked_reason=descendant_reason[:500],
                             handoff_status="cancelled",
-                            claimed_by_role_runtime_session_id="",
-                            claimed_by_seat_id="",
                         )
+                        # Task.status is projected from the phase by the
+                        # transition hooks; here we only stamp the task-owned
+                        # audit trail and release the execution lock.
+                        if callable(get_runtime_task):
+                            runtime_task = await get_runtime_task(descendant.work_item_id)
+                            if runtime_task is not None:
+                                runtime_task.execution_lock = False
+                                runtime_task.execution_locked_at = None
+                                runtime_task.metadata = {
+                                    **dict(runtime_task.metadata or {}),
+                                    "last_stop_reason": "manager_deleted_ancestor_work_item",
+                                    "deleted_by_manager_tool": True,
+                                    "cascade_deleted_by_work_item_id": item.work_item_id,
+                                }
+                                if hasattr(store, "save_task"):
+                                    await store.save_task(runtime_task)
                     cascade_deleted_ids.append(descendant.work_item_id)
-                    if callable(get_runtime_task):
-                        runtime_task = await get_runtime_task(descendant.work_item_id)
-                        if runtime_task is not None and runtime_task.status not in {
-                            TaskStatus.DONE,
-                            TaskStatus.FAILED,
-                            TaskStatus.CANCELLED,
-                        }:
-                            runtime_task.status = TaskStatus.CANCELLED
-                            runtime_task.execution_lock = False
-                            runtime_task.execution_locked_at = None
-                            runtime_task.metadata = {
-                                **dict(runtime_task.metadata or {}),
-                                "last_stop_reason": "manager_deleted_ancestor_work_item",
-                                "deleted_by_manager_tool": True,
-                                "cascade_deleted_by_work_item_id": item.work_item_id,
-                            }
-                            if hasattr(store, "save_task"):
-                                await store.save_task(runtime_task)
                 except Exception:
                     logger.opt(exception=True).warning(
                         "delete_work_item: failed to cascade delete descendant {}",
@@ -3062,6 +3125,40 @@ def create_collaboration_tools(
                 "required": ["summary"],
             },
             func=close_human_review,
+            category="collaboration",
+        ),
+        ToolDefinition(
+            name="submit_self_evolution_patches",
+            description=(
+                "Record employee experience patches for the current self-evolution work item. "
+                "This tool is the authoritative channel for self-evolution results: patches recorded "
+                "here are applied regardless of what the final turn text says. Pass an empty patches "
+                "list when no experience update is needed for this role. Each patch targets this work "
+                "item's assigned employee (employee_id is filled in automatically when omitted)."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "patches": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "employee_id": {"type": "string"},
+                                "summary": {"type": "string"},
+                                "strengths": {"type": "array", "items": {"type": "string"}},
+                                "adjustments": {"type": "array", "items": {"type": "string"}},
+                                "avoid_next_time": {"type": "array", "items": {"type": "string"}},
+                                "routing_notes": {"type": "string"},
+                                "evidence_task_ids": {"type": "array", "items": {"type": "string"}},
+                                "confidence": {"type": "number"},
+                            },
+                        },
+                    },
+                },
+                "required": ["patches"],
+            },
+            func=submit_self_evolution_patches,
             category="collaboration",
         ),
         ToolDefinition(

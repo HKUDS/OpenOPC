@@ -112,6 +112,21 @@ def test_task_org_id_field_is_org_identity_fallback() -> None:
     assert identity.org_id == "quantum_harbor"
 
 
+def test_durable_task_org_id_wins_over_stale_metadata_org_id() -> None:
+    task = SimpleNamespace(
+        metadata={
+            "exec_mode": "org",
+            "company_profile": "custom",
+            "organization_id": "active-org",
+        },
+        org_id="selected-org",
+    )
+
+    identity = execution_identity_from_task(task)
+
+    assert identity.org_id == "selected-org"
+
+
 def test_default_org_id_applies_only_when_task_has_no_persisted_identity() -> None:
     task = SimpleNamespace(metadata={}, org_id=None)
 
@@ -145,4 +160,43 @@ def test_explicit_company_identity_ignores_default_org_id() -> None:
 
     assert identity.exec_mode == "company"
     assert identity.company_profile == "corporate"
+    assert identity.org_id == ""
+
+
+def test_company_mode_marker_without_profile_is_company_identity() -> None:
+    task = SimpleNamespace(
+        metadata={"mode": "company"},
+        org_id=None,
+    )
+
+    identity = execution_identity_from_task(task)
+
+    assert identity.exec_mode == "company"
+    assert identity.company_profile == "corporate"
+    assert identity.org_id == ""
+
+
+def test_work_item_runtime_marker_without_profile_is_company_identity() -> None:
+    task = SimpleNamespace(
+        metadata={"work_item_runtime": True},
+        org_id=None,
+    )
+
+    identity = execution_identity_from_task(task)
+
+    assert identity.exec_mode == "company"
+    assert identity.company_profile == "corporate"
+    assert identity.org_id == ""
+
+
+def test_company_runtime_marker_with_custom_profile_is_org_identity() -> None:
+    task = SimpleNamespace(
+        metadata={"mode": "company", "work_item_runtime": True, "company_profile": "custom"},
+        org_id=None,
+    )
+
+    identity = execution_identity_from_task(task)
+
+    assert identity.exec_mode == "org"
+    assert identity.company_profile == "custom"
     assert identity.org_id == ""

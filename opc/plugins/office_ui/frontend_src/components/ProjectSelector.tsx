@@ -87,13 +87,14 @@ export function ProjectSelector({ projects, activeId, onSelect, onCreate, onDele
           background: 'rgba(0,0,0,0.5)',
         }}>
           <div style={{
-            background: 'var(--bg-surface, #1e1e2e)', borderRadius: 12, padding: '24px 32px',
+            background: 'var(--bg-elevated)', borderRadius: 12, padding: '24px 32px',
+            border: '1px solid var(--border)', color: 'var(--text)',
             maxWidth: 400, boxShadow: '0 8px 32px rgba(0,0,0,0.4)', textAlign: 'center',
           }}>
-            <p style={{ margin: '0 0 8px', fontWeight: 600, fontSize: 15 }}>
+            <p style={{ margin: '0 0 8px', fontWeight: 600, fontSize: 15, color: 'var(--text)' }}>
               {t('project.confirmTitle', { name: confirmDelete })}
             </p>
-            <p style={{ margin: '0 0 20px', fontSize: 13, opacity: 0.7 }}>
+            <p style={{ margin: '0 0 20px', fontSize: 13, color: 'var(--text-secondary)' }}>
               {t('project.confirmBody')}
             </p>
             <div style={{ display: 'flex', gap: 8, justifyContent: 'center' }}>

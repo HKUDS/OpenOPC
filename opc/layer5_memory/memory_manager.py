@@ -65,6 +65,33 @@ class MemoryManager:
     def set_history_compactor(self, compactor: Any | None) -> None:
         self.history_compactor = compactor
 
+    async def maybe_compact_session_history(
+        self,
+        session_id: str,
+        project_id: str | None = None,
+    ) -> bool:
+        """Threshold-gated session-transcript compaction.
+
+        Chat-style callers invoke this before building prompt context so a
+        long transcript is folded into a summary snapshot instead of growing
+        without bound. Best-effort: failures never block prompt building.
+        """
+        compactor = self.history_compactor
+        maybe_compact = getattr(compactor, "maybe_compact_session", None) if compactor else None
+        if not callable(maybe_compact) or not session_id:
+            return False
+        try:
+            return bool(
+                await maybe_compact(
+                    project_id=self._resolve_project_id(project_id),
+                    session_id=session_id,
+                    force=False,
+                )
+            )
+        except Exception as exc:
+            logger.debug(f"Session history compaction skipped: {exc}")
+            return False
+
     def _resolve_project_id(self, project_id: str | None = None) -> str:
         return str(project_id or self.project_id or "default")
 

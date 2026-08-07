@@ -976,7 +976,7 @@ class NativeRuntimeV2Tests(unittest.IsolatedAsyncioTestCase):
                 ),
             )
 
-        # Must NOT block on a human — completes so the company workflow advances.
+        # Must NOT block on a human — completes so the company run advances.
         self.assertEqual(result.status, TaskStatus.DONE)
         # The failed verdict is still recorded for audit / downstream review.
         self.assertIn("verification", result.artifacts)

@@ -387,6 +387,33 @@ def build_work_item_owner_execution_copy(work_item: DelegationWorkItem | None) -
     }
 
 
+def build_company_resume_identity_restore(
+    *,
+    role_id: str,
+    seat_id: str,
+    role_runtime_session_id: str,
+) -> dict[str, Any]:
+    """Map checkpoint-validated resume identity onto Task execution-copy keys.
+
+    Company resume restores missing Task projection fields from the durable
+    checkpoint after the authoritative WorkItem has been cross-checked (the
+    checkpoint may hold values the WorkItem row lacks, so this is not always
+    derivable via ``build_work_item_owner_execution_copy``). The key spelling
+    lives here, next to the owner spec, so runtime code never hand-writes
+    WorkItem-owned execution-copy keys.
+    """
+    payload: dict[str, Any] = {
+        "work_item_role_id": str(role_id or "").strip(),
+    }
+    seat = str(seat_id or "").strip()
+    if seat:
+        payload["delegation_seat_id"] = seat
+    session = str(role_runtime_session_id or "").strip()
+    if session:
+        payload["delegation_role_session_id"] = session
+    return payload
+
+
 def strip_disallowed_work_item_metadata_from_runtime_task(task: Task) -> list[str]:
     """Remove WorkItem-owned fields that are not valid Task execution copies."""
     metadata = dict(getattr(task, "metadata", {}) or {})

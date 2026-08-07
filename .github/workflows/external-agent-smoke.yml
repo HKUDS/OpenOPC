@@ -22,7 +22,7 @@ jobs:
         with:
           python-version: "3.11"
       - name: Install package
-        run: python -m pip install -e .
+        run: python -m pip install -e ".[dev]"
       - name: Run external-agent smoke checks
         run: >
           python -m pytest -q

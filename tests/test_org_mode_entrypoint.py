@@ -13,6 +13,7 @@ from opc.core.org_config import (
 )
 from opc.engine import OPCEngine
 from opc.layer2_organization.custom_runtime import CustomRuntimeRunner
+from opc.plugins.office_ui.services.models import ServiceError
 
 
 def test_requested_mode_normalization_keeps_core_company_router_main_compatible() -> None:
@@ -59,6 +60,34 @@ def test_custom_runtime_runner_loads_org_storage_without_mutating_parent_config(
     assert engine.config.org.organization_id != "lab"
     assert not (config_dir / "company_index.yaml").exists()
     assert (config_dir / "company_orgs" / "org_lab_config.yaml").exists()
+
+
+def test_process_message_rejects_org_mode_without_org_id() -> None:
+    engine = OPCEngine.__new__(OPCEngine)
+    engine.opc_home = None
+    engine.config = OPCConfig()
+    runner = CustomRuntimeRunner(engine)
+    caught: ServiceError | None = None
+
+    async def _run() -> None:
+        await runner.process_message(
+            "run org",
+            project_id="default",
+            session_id="session-1",
+            org_id=None,
+            preferred_agent=None,
+            domains=None,
+            origin_task_id=None,
+            attachment_refs=None,
+            message_metadata=None,
+        )
+
+    try:
+        asyncio.run(_run())
+    except ServiceError as exc:
+        caught = exc
+    assert caught is not None
+    assert caught.code == "org_id_required"
 
 
 def test_process_message_routes_org_mode_to_custom_runner(monkeypatch) -> None:

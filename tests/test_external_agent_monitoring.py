@@ -1506,7 +1506,7 @@ class ExternalAgentMonitoringTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn("## Skill: memory", worker_task.description)
             self.assertIn("## Skill: memory", final_task.description)
 
-    async def test_engine_stages_uploaded_attachments_for_external_resume_prompt(self) -> None:
+    async def test_engine_provisions_uploaded_attachments_for_external_resume_prompt(self) -> None:
         engine = OPCEngine()
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -2800,7 +2800,6 @@ class ExternalAgentMonitoringTests(unittest.IsolatedAsyncioTestCase):
         proc = type("Proc", (), {"pid": 321, "stdin": None, "stdout": object(), "stderr": object()})()
         task = Task(title="demo", description="demo")
         prompt = adapter.build_task_prompt(task)
-        cmd, metadata = adapter.build_interactive_invocation(task, workspace_path="/repo")
 
         tmpdir = _make_test_dir("codex-no-pty-argv-prompt")
         try:
@@ -2809,6 +2808,12 @@ class ExternalAgentMonitoringTests(unittest.IsolatedAsyncioTestCase):
                     "opc.layer3_agent.adapters.codex_adapter.asyncio.create_subprocess_exec",
                     AsyncMock(return_value=proc),
                 ) as spawn_mock:
+                # Build inside the no-PTY patch: build_interactive_invocation
+                # records stdin_policy/interactive_input_channel in metadata,
+                # and on a real PTY-less host build and start observe the same
+                # platform capability. Building outside the patch would bake in
+                # this host's PTY support and contradict the patched start.
+                cmd, metadata = adapter.build_interactive_invocation(task, workspace_path="/repo")
                 started = await adapter.start_process(
                     cmd,
                     tmpdir,
@@ -3132,7 +3137,8 @@ class ExternalAgentMonitoringTests(unittest.IsolatedAsyncioTestCase):
         task = Task(title="demo", description="body")
         prompt = adapter.build_task_prompt(task)
 
-        cmd, metadata = adapter.build_interactive_invocation(task, workspace_path="/repo")
+        with patch.object(ClaudeCodeAdapter, "_windows_multiline_argv_is_unsafe", return_value=False):
+            cmd, metadata = adapter.build_interactive_invocation(task, workspace_path="/repo")
 
         self.assertEqual(cmd[-2:], ["--", prompt])
         self.assertEqual(metadata["prompt_transport"], "argv")
@@ -3145,7 +3151,8 @@ class ExternalAgentMonitoringTests(unittest.IsolatedAsyncioTestCase):
             config=ExternalAgentConfig(command="claude", approval_mode="full-auto")
         )
         task = Task(title="demo", description="body")
-        cmd, metadata = adapter.build_interactive_invocation(task, workspace_path="/repo")
+        with patch.object(ClaudeCodeAdapter, "_windows_multiline_argv_is_unsafe", return_value=False):
+            cmd, metadata = adapter.build_interactive_invocation(task, workspace_path="/repo")
         proc = type("Proc", (), {"pid": 321, "stdin": None, "stdout": object(), "stderr": object()})()
 
         tmpdir = _make_test_dir("claude-full-auto-devnull")
@@ -3174,7 +3181,8 @@ class ExternalAgentMonitoringTests(unittest.IsolatedAsyncioTestCase):
             config=ExternalAgentConfig(command="claude", approval_mode="auto")
         )
         task = Task(title="demo", description="body")
-        cmd, metadata = adapter.build_interactive_invocation(task, workspace_path="/repo")
+        with patch.object(ClaudeCodeAdapter, "_windows_multiline_argv_is_unsafe", return_value=False):
+            cmd, metadata = adapter.build_interactive_invocation(task, workspace_path="/repo")
         proc = type("Proc", (), {"pid": 321, "stdin": None, "stdout": object(), "stderr": object()})()
 
         tmpdir = _make_test_dir("claude-auto-approval-stdin")
@@ -3197,6 +3205,90 @@ class ExternalAgentMonitoringTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(adapter.supports_approval_prompt_handling(cmd, metadata))
         self.assertEqual(spawn_mock.await_args.kwargs["stdin"], asyncio.subprocess.PIPE)
         self.assertEqual(metadata["stdin_policy"], "pipe_open")
+
+    def test_claude_adapter_windows_multiline_prompt_uses_stdin_transport(self) -> None:
+        adapter = ClaudeCodeAdapter()
+        task = Task(
+            title="demo",
+            description="## Task Brief\n在工作区里创建一个 hello.py\n\n## OpenOPC Context\nctx",
+            metadata={"external_prompt_contract": "description_is_full_prompt"},
+        )
+        prompt = adapter.build_task_prompt(task)
+
+        with patch("opc.layer3_agent.adapters.claude_code.os.name", "nt"), \
+            patch(
+                "opc.layer3_agent.adapters.claude_code.shutil.which",
+                return_value=r"C:\Users\me\AppData\Roaming\npm\claude.CMD",
+            ):
+            cmd, metadata = adapter.build_interactive_invocation(task, workspace_path="/repo")
+
+        self.assertNotIn("--", cmd)
+        self.assertNotIn(prompt, cmd)
+        self.assertIn("--input-format", cmd)
+        self.assertEqual(cmd[cmd.index("--input-format") + 1], "text")
+        self.assertEqual(metadata["prompt_transport"], "stdin")
+        self.assertEqual(metadata["stdin_prompt_channel"], "pipe")
+        self.assertEqual(metadata["prompt_transport_reason"], "windows_multiline_argv_unsafe")
+        self.assertEqual(
+            adapter.stdin_policy_for_process(cmd, metadata),
+            "pipe_prompt_then_close",
+        )
+
+    def test_claude_adapter_windows_single_line_prompt_stays_on_argv(self) -> None:
+        adapter = ClaudeCodeAdapter()
+        task = Task(
+            title="demo",
+            description="创建一个 hello.py",
+            metadata={"external_prompt_contract": "description_is_full_prompt"},
+        )
+        prompt = adapter.build_task_prompt(task)
+
+        with patch("opc.layer3_agent.adapters.claude_code.os.name", "nt"), \
+            patch(
+                "opc.layer3_agent.adapters.claude_code.shutil.which",
+                return_value=r"C:\Users\me\AppData\Roaming\npm\claude.CMD",
+            ):
+            cmd, metadata = adapter.build_interactive_invocation(task, workspace_path="/repo")
+
+        self.assertEqual(cmd[-2:], ["--", prompt])
+        self.assertEqual(metadata["prompt_transport"], "argv")
+
+    def test_claude_adapter_windows_multiline_batch_prompt_uses_stdin_transport(self) -> None:
+        adapter = ClaudeCodeAdapter()
+        task = Task(
+            title="demo",
+            description="## Task Brief\n在工作区里创建一个 hello.py",
+            metadata={"external_prompt_contract": "description_is_full_prompt"},
+        )
+        prompt = adapter.build_task_prompt(task)
+
+        with patch("opc.layer3_agent.adapters.claude_code.os.name", "nt"), \
+            patch(
+                "opc.layer3_agent.adapters.claude_code.shutil.which",
+                return_value=r"C:\Users\me\AppData\Roaming\npm\claude.CMD",
+            ):
+            cmd, metadata = adapter.build_invocation(task, workspace_path="/repo")
+
+        self.assertNotIn("--", cmd)
+        self.assertNotIn(prompt, cmd)
+        self.assertIn("--input-format", cmd)
+        self.assertEqual(metadata["prompt_transport"], "stdin")
+        self.assertEqual(metadata["prompt_transport_reason"], "windows_multiline_argv_unsafe")
+
+    def test_claude_adapter_posix_multiline_prompt_stays_on_argv(self) -> None:
+        adapter = ClaudeCodeAdapter()
+        task = Task(
+            title="demo",
+            description="## Task Brief\nline two",
+            metadata={"external_prompt_contract": "description_is_full_prompt"},
+        )
+        prompt = adapter.build_task_prompt(task)
+
+        with patch("opc.layer3_agent.adapters.claude_code.os.name", "posix"):
+            cmd, metadata = adapter.build_interactive_invocation(task, workspace_path="/repo")
+
+        self.assertEqual(cmd[-2:], ["--", prompt])
+        self.assertEqual(metadata["prompt_transport"], "argv")
 
     def test_claude_adapter_large_interactive_prompt_uses_stdin(self) -> None:
         adapter = ClaudeCodeAdapter()
@@ -3497,6 +3589,49 @@ class ExternalAgentMonitoringTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result.status, TaskStatus.DONE)
         self.assertEqual(spawn_mock.await_args.kwargs["stdin"], asyncio.subprocess.DEVNULL)
+
+    def test_cursor_adapter_large_prompt_spills_to_workspace_file(self) -> None:
+        adapter = CursorAdapter(config=ExternalAgentConfig(command="cursor-agent"))
+        prompt = "x" * (CursorAdapter._ARGV_PROMPT_MAX_BYTES + 1)
+        task = Task(id="task-large", title="large", description=prompt)
+        full_prompt = adapter.build_task_prompt(task)
+        tmpdir = _make_test_dir("cursor-large-prompt-file")
+        try:
+            cmd, metadata = adapter.build_interactive_invocation(
+                task, workspace_path=tmpdir
+            )
+            self.assertEqual(metadata["prompt_transport"], "file")
+            self.assertEqual(
+                metadata["prompt_transport_reason"],
+                "prompt_too_large_for_argv",
+            )
+            prompt_file = Path(str(metadata["prompt_file"]))
+            self.assertTrue(prompt_file.is_file())
+            self.assertEqual(prompt_file.read_text(encoding="utf-8"), full_prompt)
+            self.assertNotIn(full_prompt, cmd)
+            self.assertIn(str(prompt_file), str(cmd[-1]))
+            self.assertNotIn(prompt[:64], metadata["command"])
+            self.assertLess(len(cmd[-1].encode("utf-8")), CursorAdapter._ARGV_PROMPT_MAX_BYTES)
+            # Hygiene: one stable file per task (retries overwrite) and a
+            # self-ignoring directory so workspace git never picks it up.
+            self.assertEqual(prompt_file.name, "cursor_task-large.md")
+            _cmd2, metadata2 = adapter.build_interactive_invocation(
+                task, workspace_path=tmpdir
+            )
+            self.assertEqual(metadata2["prompt_file"], str(prompt_file))
+            self.assertEqual(
+                sorted(p.name for p in prompt_file.parent.iterdir()),
+                [".gitignore", "cursor_task-large.md"],
+            )
+        finally:
+            _cleanup_test_dir(tmpdir)
+
+    def test_cursor_adapter_small_prompt_stays_on_argv(self) -> None:
+        adapter = CursorAdapter(config=ExternalAgentConfig(command="cursor-agent"))
+        task = Task(title="demo", description="short body")
+        cmd, metadata = adapter.build_invocation(task, workspace_path="/tmp/opc-ws")
+        self.assertEqual(metadata["prompt_transport"], "argv")
+        self.assertEqual(cmd[-1], adapter.build_task_prompt(task))
 
     def test_codex_adapter_mirrors_user_auth_and_config_with_copy_fallback(self) -> None:
         adapter = CodexAdapter()

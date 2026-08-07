@@ -377,7 +377,8 @@ async def test_ui_project_switch_uses_delegate_without_cancelling_background_tas
                 await asyncio.sleep(0)
 
             root._get_project_delegate.assert_awaited_once_with("project-b")
-            assert handler.engine is root
+            # Project switch deliberately rebinds the handler to the delegate.
+            assert handler.engine is delegate
             assert handler._client_project_ids[ws] == "project-b"
             assert handler._client_switch_seq[ws] == "seq-1"
             sent_types = [call.args[0]["type"] for call in ws.send_json.await_args_list]
@@ -748,6 +749,7 @@ async def test_kanban_create_task_routes_by_request_project_id() -> None:
     engine_b = _ui_engine("project-b", _MemoryStore([]))
     chat_store = _ui_chat_store()
     handler = WSHandler(engine_a, MagicMock(), chat_store, _ui_event_adapter())
+    engine_a._get_project_delegate = AsyncMock(return_value=engine_b)
     handler._engine_for_project = AsyncMock(
         side_effect=lambda project_id: engine_b if project_id == "project-b" else engine_a,
     )
@@ -877,7 +879,6 @@ def test_explicit_agent_overrides_company_role_agent_defaults() -> None:
         runtime_topology=topology,
         decision=decision,
         project_id="proj",
-        role_agent_overrides={"ceo": "codex"},
     )
 
     seat = enriched["seats"][0]

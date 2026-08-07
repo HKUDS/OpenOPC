@@ -250,6 +250,16 @@ def _parse_tool_arguments(tool_name: str, arguments: Any) -> tuple[Any, str | No
         return raw, raw, error
 
 
+class ProviderQuotaExhaustedError(RuntimeError):
+    """The provider rejected the request for quota/rate-limit reasons.
+
+    Raised by the agent runtime instead of retrying in place: replaying the
+    same payload against an exhausted quota can only fail, so the company
+    dispatcher parks the work (returns the item to READY and backs off)
+    rather than failing it terminally (OBS-6).
+    """
+
+
 class LLMProvider:
     """Unified LLM interface via LiteLLM supporting tool calls."""
 
@@ -476,6 +486,44 @@ class LLMProvider:
         raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
         return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
+    def is_rate_limit_error(self, error: Exception) -> bool:
+        """Classify provider quota / rate-limit rejections.
+
+        These never produce model output and never get better by replaying
+        the identical payload, so callers must park/back off instead of
+        burning conversation-feedback retries (OBS-6). Classification is by
+        exception type when available and by error text otherwise — the
+        streaming path re-raises provider errors as plain RuntimeError with
+        only the message preserved.
+        """
+        if isinstance(error, litellm.exceptions.RateLimitError):
+            return True
+        if "ratelimit" in type(error).__name__.lower():
+            return True
+        if getattr(error, "status_code", None) == 429:
+            return True
+        message = str(error).lower()
+        keywords = (
+            "rate limit",
+            "rate_limit",
+            "ratelimit",
+            "too many requests",
+            "insufficient_quota",
+            "quota exceeded",
+            "exceeded your quota",
+            "quota exhausted",
+            "error code: 429",
+            "status code: 429",
+            "http 429",
+            # Chinese-provider spellings of the same rejection (Volces/DeepSeek
+            # and other domestic endpoints return localized error text).
+            "请求过于频繁",
+            "配额已用完",
+            "配额耗尽",
+            "触发限流",
+        )
+        return any(keyword in message for keyword in keywords)
+
     def is_context_overflow_error(self, error: Exception) -> bool:
         if isinstance(error, litellm.exceptions.ContextWindowExceededError):
             return True
@@ -596,6 +644,8 @@ class LLMProvider:
             "max_tokens": max_tok,
             **kwargs,
         }
+        if self.config.reasoning_effort and "reasoning_effort" not in call_kwargs:
+            call_kwargs["reasoning_effort"] = self.config.reasoning_effort
         if self._api_base:
             call_kwargs["api_base"] = self._api_base
         if self._api_key:
@@ -744,6 +794,8 @@ class LLMProvider:
             "stream": True,
             **kwargs,
         }
+        if self.config.reasoning_effort and "reasoning_effort" not in call_kwargs:
+            call_kwargs["reasoning_effort"] = self.config.reasoning_effort
         if self._api_base:
             call_kwargs["api_base"] = self._api_base
         if self._api_key:

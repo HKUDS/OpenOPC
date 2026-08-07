@@ -1,0 +1,310 @@
+schema_version: 2
+kind: opc_org_architecture
+organization_id: quantum_harbor
+organization_name: Quantum Harbor Research Studio
+company:
+  name: Quantum Harbor Research Studio
+  topology: Founder-led matrix for software, investment research, and risk review
+  company_profile: custom
+  execution_model: actor_runtime
+  final_decider_role_id: founder_ceo
+  company_profiles:
+  - corporate
+  - custom
+roles:
+- id: founder_ceo
+  name: Founder CEO
+  responsibility: Directly face the user, frame the mission, assign work, arbitrate
+    tradeoffs, and deliver the final answer.
+  reports_to: owner
+  icon: leader
+  can_spawn:
+  - product_chief
+  - quant_chief
+  - engineering_chief
+  - risk_chief
+  tools:
+  - todo_write
+  - send_dm
+  preferred_external_agent: null
+  prompt_refs:
+  - Act as the user-facing CEO. Keep ownership of final decisions and make the final
+    response coherent.
+  skill_refs: []
+  handoff_template_ref: null
+  memory_policy_ref: null
+  artifact_contract_ref: null
+  runtime_policy:
+    execution_strategy: auto
+    allowed_downstream_roles: []
+    review_role: null
+    default_turn_type: work
+    shell_timeout_override: null
+    setup_env_type: null
+    coordination_hints: {}
+    signal_capabilities: []
+    parallelism_constraints: []
+    gate_preferences: {}
+  capabilities: []
+  role_type: worker
+  coordinator_policy: null
+- id: product_chief
+  name: Product Chief
+  responsibility: Convert ambiguous goals into product requirements, milestones, and
+    user-impact tradeoffs.
+  reports_to: founder_ceo
+  icon: strategy
+  can_spawn:
+  - market_researcher
+  tools:
+  - todo_write
+  - web_search
+  preferred_external_agent: null
+  prompt_refs:
+  - Clarify product goals, user workflows, and acceptance criteria.
+  skill_refs: []
+  handoff_template_ref: null
+  memory_policy_ref: null
+  artifact_contract_ref: null
+  runtime_policy:
+    execution_strategy: auto
+    allowed_downstream_roles: []
+    review_role: null
+    default_turn_type: work
+    shell_timeout_override: null
+    setup_env_type: null
+    coordination_hints: {}
+    signal_capabilities: []
+    parallelism_constraints: []
+    gate_preferences: {}
+  capabilities: []
+  role_type: worker
+  coordinator_policy: null
+- id: quant_chief
+  name: Quant Chief
+  responsibility: Lead investment reasoning, scenario analysis, portfolio assumptions,
+    and data-backed synthesis.
+  reports_to: founder_ceo
+  icon: analytics
+  can_spawn:
+  - portfolio_analyst
+  tools:
+  - python_exec
+  - web_search
+  preferred_external_agent: null
+  prompt_refs:
+  - Treat forecasts as uncertain and separate evidence from assumptions.
+  skill_refs: []
+  handoff_template_ref: null
+  memory_policy_ref: null
+  artifact_contract_ref: null
+  runtime_policy:
+    execution_strategy: auto
+    allowed_downstream_roles: []
+    review_role: null
+    default_turn_type: work
+    shell_timeout_override: null
+    setup_env_type: null
+    coordination_hints: {}
+    signal_capabilities: []
+    parallelism_constraints: []
+    gate_preferences: {}
+  capabilities: []
+  role_type: worker
+  coordinator_policy: null
+- id: engineering_chief
+  name: Engineering Chief
+  responsibility: Design and verify technical implementation plans, risks, and delivery
+    sequencing.
+  reports_to: founder_ceo
+  icon: code
+  can_spawn:
+  - platform_engineer
+  tools:
+  - file_read
+  - shell_exec
+  - todo_write
+  preferred_external_agent: null
+  prompt_refs:
+  - Prefer simple architecture, testable changes, and explicit operational risks.
+  skill_refs: []
+  handoff_template_ref: null
+  memory_policy_ref: null
+  artifact_contract_ref: null
+  runtime_policy:
+    execution_strategy: auto
+    allowed_downstream_roles: []
+    review_role: null
+    default_turn_type: work
+    shell_timeout_override: null
+    setup_env_type: null
+    coordination_hints: {}
+    signal_capabilities: []
+    parallelism_constraints: []
+    gate_preferences: {}
+  capabilities: []
+  role_type: worker
+  coordinator_policy: null
+- id: risk_chief
+  name: Risk Chief
+  responsibility: Review legal, security, financial, and operational risks before
+    final delivery.
+  reports_to: founder_ceo
+  icon: shield
+  can_spawn:
+  - compliance_analyst
+  tools:
+  - file_read
+  - web_search
+  preferred_external_agent: null
+  prompt_refs:
+  - Surface blockers, missing evidence, and risk controls.
+  skill_refs: []
+  handoff_template_ref: null
+  memory_policy_ref: null
+  artifact_contract_ref: null
+  runtime_policy:
+    execution_strategy: auto
+    allowed_downstream_roles: []
+    review_role: null
+    default_turn_type: work
+    shell_timeout_override: null
+    setup_env_type: null
+    coordination_hints: {}
+    signal_capabilities: []
+    parallelism_constraints: []
+    gate_preferences: {}
+  capabilities: []
+  role_type: worker
+  coordinator_policy: null
+- id: market_researcher
+  name: Market Researcher
+  responsibility: Gather market, customer, and competitor signals for product decisions.
+  reports_to: product_chief
+  icon: null
+  can_spawn: []
+  tools:
+  - web_search
+  preferred_external_agent: null
+  prompt_refs: []
+  skill_refs: []
+  handoff_template_ref: null
+  memory_policy_ref: null
+  artifact_contract_ref: null
+  runtime_policy:
+    execution_strategy: auto
+    allowed_downstream_roles: []
+    review_role: null
+    default_turn_type: work
+    shell_timeout_override: null
+    setup_env_type: null
+    coordination_hints: {}
+    signal_capabilities: []
+    parallelism_constraints: []
+    gate_preferences: {}
+  capabilities: []
+  role_type: worker
+  coordinator_policy: null
+- id: portfolio_analyst
+  name: Portfolio Analyst
+  responsibility: Build scenarios, compare assets, and summarize investment constraints.
+  reports_to: quant_chief
+  icon: null
+  can_spawn: []
+  tools:
+  - python_exec
+  - web_search
+  preferred_external_agent: null
+  prompt_refs: []
+  skill_refs: []
+  handoff_template_ref: null
+  memory_policy_ref: null
+  artifact_contract_ref: null
+  runtime_policy:
+    execution_strategy: auto
+    allowed_downstream_roles: []
+    review_role: null
+    default_turn_type: work
+    shell_timeout_override: null
+    setup_env_type: null
+    coordination_hints: {}
+    signal_capabilities: []
+    parallelism_constraints: []
+    gate_preferences: {}
+  capabilities: []
+  role_type: worker
+  coordinator_policy: null
+- id: platform_engineer
+  name: Platform Engineer
+  responsibility: Turn technical plans into implementation steps and verification
+    gates.
+  reports_to: engineering_chief
+  icon: null
+  can_spawn: []
+  tools:
+  - file_read
+  - shell_exec
+  preferred_external_agent: null
+  prompt_refs: []
+  skill_refs: []
+  handoff_template_ref: null
+  memory_policy_ref: null
+  artifact_contract_ref: null
+  runtime_policy:
+    execution_strategy: auto
+    allowed_downstream_roles: []
+    review_role: null
+    default_turn_type: work
+    shell_timeout_override: null
+    setup_env_type: null
+    coordination_hints: {}
+    signal_capabilities: []
+    parallelism_constraints: []
+    gate_preferences: {}
+  capabilities: []
+  role_type: worker
+  coordinator_policy: null
+- id: compliance_analyst
+  name: Compliance Analyst
+  responsibility: Check constraints, disclaimers, and governance requirements.
+  reports_to: risk_chief
+  icon: null
+  can_spawn: []
+  tools:
+  - file_read
+  preferred_external_agent: null
+  prompt_refs: []
+  skill_refs: []
+  handoff_template_ref: null
+  memory_policy_ref: null
+  artifact_contract_ref: null
+  runtime_policy:
+    execution_strategy: auto
+    allowed_downstream_roles: []
+    review_role: null
+    default_turn_type: work
+    shell_timeout_override: null
+    setup_env_type: null
+    coordination_hints: {}
+    signal_capabilities: []
+    parallelism_constraints: []
+    gate_preferences: {}
+  capabilities: []
+  role_type: worker
+  coordinator_policy: null
+employees: []
+escalation_rules: []
+runtime_policies: {}
+talent_templates: []
+teams: []
+team_runtime:
+  default_team_id: ''
+  shared_role_session_scope: team
+  allow_shared_role_sessions: true
+  seat_refresh_interval_seconds: 30
+  metadata: {}
+installed_packages: []
+role_serial_queue_enabled: true
+metadata:
+  source: org_mode
+  organization_config_file: orgs/org_quantum_harbor_config.yaml

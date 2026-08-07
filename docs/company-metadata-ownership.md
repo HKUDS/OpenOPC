@@ -11,7 +11,7 @@ The executable owner matrix lives in `opc/layer2_organization/metadata_ownership
 
 | Owner | Examples | Rule |
 |---|---|---|
-| `work_item` | `work_kind`, `current_turn_mode`, dependency/waiting ids, handoff/context preview, prompt contracts, progress logs, role and employee context, review/report metadata, verification fields, delivery package, self-evolution fields | Scheduling, board projection, collaboration, review/report, and user-visible progress reads should use `DelegationWorkItem.metadata`. |
+| `work_item` | `work_kind`, `current_turn_mode`, dependency/waiting ids, handoff/context preview, prompt contracts, `progress_log`, role and employee context, review/report metadata, verification fields, delivery package, self-evolution fields | Scheduling, board projection, collaboration, review/report, and user-visible progress reads should use `DelegationWorkItem.metadata`. |
 | `runtime_task` | `runtime_v2`, `runtime_verification*`, `member_session_state`, `external_resume_*`, `working_memory`, `interrupted_recovery`, `last_stop_reason`, `peer_wait`, comms reactivation audit, `runtime_control_state`, runtime session team/seat ids | Execution infrastructure should store these only on runtime `Task.metadata`. They must not become WorkItem business facts. |
 | `execution_copy` | `mode`, `execution_mode`, `runtime_model`, `company_profile`, organization/runtime topology, delegation ids, seat/role routing, execution-agent selection, workspace/comms roots, parent session id | Runtime `Task` may carry these as immutable routing and UI envelope copies. They are not the authoritative business facts. |
 

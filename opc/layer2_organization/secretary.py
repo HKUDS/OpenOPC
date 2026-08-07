@@ -103,6 +103,9 @@ class SecretaryService:
     async def _build_prompt(self, content: str, project_id: str | None, session_id: str) -> str:
         policy_summary = self.policies.summarize_policies(project_id=project_id)
         project_knowledge = await self.memory.build_project_knowledge_context(project_id=project_id)
+        maybe_compact = getattr(self.memory, "maybe_compact_session_history", None)
+        if callable(maybe_compact):
+            await maybe_compact(session_id, project_id=project_id)
         session_history = await self.memory.build_session_prompt_context(
             session_id,
             include_latest_user_turn=False,

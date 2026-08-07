@@ -315,6 +315,9 @@ class Dispatcher:
         history_context = ""
         if self.engine.memory and session_id:
             try:
+                maybe_compact = getattr(self.engine.memory, "maybe_compact_session_history", None)
+                if callable(maybe_compact):
+                    await maybe_compact(session_id)
                 history_context = await self.engine.memory.build_session_prompt_context(
                     session_id,
                     include_latest_user_turn=False,

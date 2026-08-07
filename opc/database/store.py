@@ -74,8 +74,10 @@ from opc.layer2_organization.phase import (
     IN_PROGRESS_PHASES,
     IN_REVIEW_PHASES,
     InvalidPhaseTransition,
+    RUNNABLE_PHASES,
     TODO_PHASES,
     coerce_phase,
+    is_runnable,
     is_stale_claim_releasable,
     is_terminal,
     kanban_column,
@@ -4579,7 +4581,11 @@ class OPCStore:
                 phase = coerce_phase(phase_str)
             except (TypeError, ValueError):
                 continue
-            if not is_stale_claim_releasable(phase):
+            # Runnable phases are covered too: the phase-write invariant
+            # keeps READY / READY_FOR_REWORK rows unowned, so any claim
+            # found on one is corrupt legacy state that would starve the
+            # claim CAS forever.
+            if not (is_stale_claim_releasable(phase) or is_runnable(phase)):
                 continue
             metadata = _json_loads(metadata_json, {})
             metadata["claimed_by_role_session_id"] = ""
@@ -5465,6 +5471,18 @@ class OPCStore:
             if metadata_updates:
                 metadata.update(dict(metadata_updates))
             item.metadata = metadata
+        if phase is not None and item.phase in RUNNABLE_PHASES:
+            # Invariant: a fresh-runnable card is unowned. The claim CAS
+            # refuses cards with any leftover claim, so entering READY /
+            # READY_FOR_REWORK must release ownership in the same write —
+            # otherwise the card is permanently unclaimable and the
+            # dispatcher livelocks (project-0011 wedge).
+            item.claimed_by_role_runtime_session_id = ""
+            item.claimed_by_seat_id = ""
+            metadata = dict(item.metadata or {})
+            metadata["claimed_by_role_session_id"] = ""
+            metadata["claimed_task_id"] = ""
+            item.metadata = metadata
         item.updated_at = datetime.now()
         await self.save_delegation_work_item(item)
         return item
@@ -5485,6 +5503,12 @@ class OPCStore:
         shutdown transition.  Keeping the phase, claim, queue, and durable
         hold predicates in the same UPDATE prevents that stale snapshot from
         resurrecting a suspended WorkItem.
+
+        Ownership truth is the two claim columns. The metadata mirror keys
+        (``claimed_by_role_session_id`` / ``claimed_task_id``) are written for
+        observability but must never gate the claim: a mirror key that a
+        release path forgot to blank would make a runnable card permanently
+        unclaimable (the project-0011 dispatcher livelock).
         """
 
         phase = coerce_phase(expected_phase)
@@ -5528,8 +5552,6 @@ class OPCStore:
                  AND phase = ?
                  AND COALESCE(claimed_by_role_runtime_session_id, '') = ''
                  AND COALESCE(claimed_by_seat_id, '') = ''
-                 AND COALESCE(json_extract(metadata, '$.claimed_by_role_session_id'), '') = ''
-                 AND COALESCE(json_extract(metadata, '$.claimed_task_id'), '') = ''
                  AND COALESCE(json_extract(metadata, '$.dispatch_hold'), '') = ''
                  AND COALESCE(json_extract(metadata, '$.queued_behind_session'), '') = ''
                  AND COALESCE(
@@ -5602,12 +5624,22 @@ class OPCStore:
         expected_source = str(source_report_work_item_id or "").strip()
         db = self._require_db()
 
+        # A rework verdict sends the card back to the dispatch queue; the
+        # claim CAS refuses owned cards, so ownership must be released in
+        # the same UPDATE that writes the runnable phase (project-0011
+        # wedge: REJECT kept the worker's claim and the card became
+        # permanently unclaimable).
+        release_ownership = target in RUNNABLE_PHASES
+
         for _attempt in range(3):
             item = await self.get_delegation_work_item(work_item_id)
             if item is None or item.phase != Phase.AWAITING_MANAGER_REVIEW:
                 return None
             metadata = dict(item.metadata or {})
             metadata.update(dict(metadata_updates or {}))
+            if release_ownership:
+                metadata["claimed_by_role_session_id"] = ""
+                metadata["claimed_task_id"] = ""
             if (
                 self._metadata_has_work_item_projection_identity(metadata)
                 or str(item.projection_id or "").strip()
@@ -5622,9 +5654,18 @@ class OPCStore:
                 )
             previous_updated_at = item.updated_at.isoformat()
             updated_at = datetime.now()
+            claimed_session = (
+                "" if release_ownership
+                else str(item.claimed_by_role_runtime_session_id or "")
+            )
+            claimed_seat = (
+                "" if release_ownership else str(item.claimed_by_seat_id or "")
+            )
             cursor = await db.execute(
                 """UPDATE delegation_work_items
-                   SET phase = ?, blocked_reason = ?, metadata = ?, updated_at = ?
+                   SET phase = ?, blocked_reason = ?, metadata = ?, updated_at = ?,
+                       claimed_by_role_runtime_session_id = ?,
+                       claimed_by_seat_id = ?
                    WHERE work_item_id = ?
                      AND phase = ?
                      AND updated_at = ?
@@ -5651,6 +5692,8 @@ class OPCStore:
                     str(blocked_reason or ""),
                     _json_dumps(metadata),
                     updated_at.isoformat(),
+                    claimed_session,
+                    claimed_seat,
                     work_item_id,
                     Phase.AWAITING_MANAGER_REVIEW.value,
                     previous_updated_at,

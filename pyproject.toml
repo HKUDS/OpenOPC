@@ -73,6 +73,11 @@ all = [
     "matrix-nio>=0.24.0",
 ]
 
+dev = [
+    "pytest>=9.0",
+    "pytest-timeout>=2.3",
+]
+
 [project.scripts]
 opc = "opc.cli.app:main"
 
@@ -93,3 +98,8 @@ include = [
     "README.md",
     "pyproject.toml",
 ]
+
+[tool.pytest.ini_options]
+# Backstop against wedged tests: a hung test fails after 5 minutes instead
+# of stalling the whole suite (requires pytest-timeout, in the `dev` extra).
+timeout = 300

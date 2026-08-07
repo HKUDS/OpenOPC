@@ -7,6 +7,7 @@ import copy
 import hashlib
 import inspect
 import json
+import os
 import re
 import shutil
 import time
@@ -36,6 +37,7 @@ from opc.core.config import (
     company_org_path,
     get_opc_home,
     get_project_workplace,
+    validate_organization_id,
 )
 from opc.core.events import EventBus
 from opc.core.models import (
@@ -79,7 +81,7 @@ from opc.layer2_organization.org_engine import (
     TASK_MODE_COMPANY_ONLY_TOOLS,
 )
 from opc.layer2_organization.task_graph import TaskGraphScheduler
-from opc.layer2_organization.approval import ApprovalEngine
+from opc.layer2_organization.approval import ApprovalEngine, normalize_escalation_reply
 from opc.layer2_organization.escalation import EscalationEngine
 from opc.layer2_organization.communication import CommunicationManager
 from opc.layer2_organization.collaboration_policy import ownership_guard_violation
@@ -103,6 +105,7 @@ from opc.layer2_organization.company_runtime_identity import (
     load_company_runtime_identity_index,
 )
 from opc.layer2_organization.metadata_ownership import (
+    build_company_resume_identity_restore,
     build_work_item_owner_execution_copy,
 )
 from opc.layer2_organization.phase import (
@@ -638,9 +641,21 @@ class OPCEngine:
         self.org_engine = OrgEngine(self.config, self.opc_home, store=self.store)
         self.talent_market = TalentMarket(self.opc_home, self.config)
         self.task_scheduler = TaskGraphScheduler(self.store, self.event_bus)
+        escalation_timeout_seconds = self.config.system.escalation_timeout_seconds
+        # Test/ops override: lets a harness shrink the inline approval wait
+        # (e.g. to seconds) so the late-click park/resume cycle can be
+        # exercised without waiting out the production timeout.
+        raw_escalation_timeout = str(os.environ.get("OPC_ESCALATION_TIMEOUT_SECONDS", "") or "").strip()
+        if raw_escalation_timeout:
+            try:
+                escalation_timeout_seconds = max(1, int(raw_escalation_timeout))
+            except ValueError:
+                logger.warning(
+                    f"Ignoring invalid OPC_ESCALATION_TIMEOUT_SECONDS={raw_escalation_timeout!r}"
+                )
         self.escalation = EscalationEngine(
             self.event_bus,
-            timeout_seconds=self.config.system.escalation_timeout_seconds,
+            timeout_seconds=escalation_timeout_seconds,
             user_reply_callback=self.on_escalation,
         )
         self.communication = CommunicationManager(self.store, self.event_bus, self.llm, self.org_engine)
@@ -1279,11 +1294,50 @@ class OPCEngine:
             if str(item.get("template_id", "") or "").strip()
         }
         roles: list[dict[str, Any]] = []
-        default_agent = "codex"
+        # The card's per-role agent defaults become recruitment_role_agents on
+        # approve, which outrank the session-level agent choice as explicit
+        # per-role overrides. They must therefore be the RESOLVED effective
+        # backend, not a hardcoded external preference: an explicit
+        # preferred_agent from the user wins, a role template preference only
+        # applies when that adapter can actually run, everything else is
+        # native. (OBS-11: hardcoded "codex" defaults poisoned the execution
+        # identity of runs the user explicitly requested as native.)
+        explicit_session_agent = normalize_recruitment_agent_choice(
+            getattr(decision, "preferred_agent", None)
+        )
+        available_external_agents = set(self._available_external_agents())
+
+        def _staffing_agent_is_runnable(agent_name: str) -> bool:
+            # Unknown availability (no adapter registry) fails open, matching
+            # the dispatch selector; a registry that exists and excludes the
+            # agent is proof it cannot run.
+            if agent_name == "native":
+                return True
+            if self.adapter_registry is None:
+                return True
+            return agent_name in available_external_agents
+
         for agent in self.org_engine.list_agents():
             role_id = str(getattr(agent, "role_id", "") or "").strip()
             if not role_id or role_id == "task_generalist":
                 continue
+            role_preferred_agent = normalize_recruitment_agent_choice(
+                getattr(agent, "preferred_external_agent", None)
+            )
+            if explicit_session_agent:
+                default_agent = (
+                    explicit_session_agent
+                    if _staffing_agent_is_runnable(explicit_session_agent)
+                    else "native"
+                )
+            elif (
+                role_preferred_agent
+                and role_preferred_agent != "native"
+                and _staffing_agent_is_runnable(role_preferred_agent)
+            ):
+                default_agent = role_preferred_agent
+            else:
+                default_agent = "native"
             same_role_employees = employee_by_role.get(role_id, [])
             default_selection: dict[str, Any] = {"kind": "fallback"}
             default_source = "system"
@@ -1310,6 +1364,8 @@ class OPCEngine:
                 }
                 default_source = "org"
             selected_agent = normalize_recruitment_agent_choice(saved_agents.get(role_id), default=default_agent) or default_agent
+            if not _staffing_agent_is_runnable(selected_agent):
+                selected_agent = default_agent
             roles.append(
                 {
                     "role_id": role_id,
@@ -2916,6 +2972,7 @@ class OPCEngine:
             else None
         )
         explicit_force_native = explicit_agent_choice == "native"
+        enrichment_available_external_agents = set(self._available_external_agents())
         seats: list[dict[str, Any]] = []
         for raw_seat in list(enriched.get("seats", []) or []):
             seat = dict(raw_seat or {})
@@ -2971,6 +3028,21 @@ class OPCEngine:
                 or explicit_agent_choice
                 or ("native" if force_native_execution or not preferred_external_agent else preferred_external_agent)
             )
+            execution_agent_unavailable = ""
+            if (
+                selected_execution_agent
+                and selected_execution_agent != "native"
+                and self.adapter_registry is not None
+                and selected_execution_agent not in enrichment_available_external_agents
+            ):
+                # The chosen external backend cannot run. Dispatch would fall
+                # back to native while seat/task metadata kept claiming the
+                # external agent, and the resume gate trusts that identity
+                # (OBS-11). Record the truth up front; the wish stays visible
+                # via execution_agent_unavailable.
+                execution_agent_unavailable = selected_execution_agent
+                selected_execution_agent = "native"
+                preferred_external_agent = None
             execution_agent_locked = bool(selected_role_agent or explicit_agent_choice)
             selection_source = (
                 "recruitment_user_override"
@@ -2986,6 +3058,7 @@ class OPCEngine:
             seat["execution_agent_locked"] = execution_agent_locked
             seat["selected_execution_agent_source"] = selection_source
             seat["force_native_execution"] = force_native_execution
+            seat["execution_agent_unavailable"] = execution_agent_unavailable
             seat["metadata"] = {
                 **dict(seat.get("metadata", {}) or {}),
                 "employee_prompt_context": str((employee_assignment or {}).get("prompt_context", "")).strip(),
@@ -3492,6 +3565,39 @@ class OPCEngine:
         return bool(dict(getattr(task, "metadata", {}) or {}).get("shared_role_session", False))
 
     @staticmethod
+    def _normalize_durable_org_id(value: Any) -> str:
+        try:
+            return validate_organization_id(value)
+        except ValueError:
+            return ""
+
+    @staticmethod
+    def _runtime_org_id_for_identity(
+        decision: RouterDecision | None,
+        metadata: dict[str, Any] | None,
+        org_config: Any | None,
+    ) -> str | None:
+        """Return the durable custom-org ID for a company runtime task."""
+        task_metadata = dict(metadata or {})
+        profile = str(
+            getattr(decision, "company_profile", "")
+            or task_metadata.get("company_profile", "")
+            or getattr(org_config, "company_profile", "")
+            or ""
+        ).strip().lower()
+        if profile != "custom":
+            return None
+        for candidate in (
+            getattr(decision, "org_id", None),
+            task_metadata.get("org_id"),
+            task_metadata.get("organization_id"),
+        ):
+            normalized = str(candidate or "").strip()
+            if normalized:
+                return normalized
+        return None
+
+    @staticmethod
     def _shared_company_role_session_id(
         parent_session_id: str,
         role_id: str,
@@ -3529,6 +3635,17 @@ class OPCEngine:
         root_session: bool = False,
     ) -> Task:
         assert self.store and self.memory
+        runtime_company_profile = str(
+            getattr(decision, "company_profile", "")
+            or (work_item.metadata or {}).get("company_profile", "")
+            or getattr(getattr(self.config, "org", None), "company_profile", "")
+            or ""
+        ).strip().lower()
+        runtime_org_id = self._runtime_org_id_for_identity(
+            decision,
+            getattr(work_item, "metadata", None),
+            getattr(getattr(self, "config", None), "org", None),
+        )
         role_id = str(work_item.role_id or "").strip()
         seat_id = str((work_item.metadata or {}).get("seat_id", "") or "").strip()
         team_id = str((work_item.metadata or {}).get("team_id", "") or work_item.cell_id or "").strip()
@@ -3581,6 +3698,42 @@ class OPCEngine:
             set_linked_work_item_id(existing, work_item.work_item_id)
             existing.session_id = session_id
             existing.metadata = dict(existing.metadata or {})
+            if runtime_company_profile == "custom":
+                persisted_org_id = self._normalize_durable_org_id(getattr(existing, "org_id", None))
+                incoming_org_id = self._normalize_durable_org_id(runtime_org_id)
+                if persisted_org_id and incoming_org_id and persisted_org_id != incoming_org_id:
+                    from opc.plugins.office_ui.services.models import ServiceError
+                    raise ServiceError(
+                        "org_id_conflict",
+                        "org_id_conflict",
+                        {
+                            "project_id": self.project_id or "default",
+                            "task_id": str(getattr(work_item, "work_item_id", "") or ""),
+                            "persisted_org_id": persisted_org_id,
+                            "incoming_org_id": incoming_org_id,
+                            "reason": "custom_company_run_org_id_conflict",
+                        },
+                    )
+                resolved_org_id = persisted_org_id or incoming_org_id
+                if not resolved_org_id:
+                    from opc.plugins.office_ui.services.models import ServiceError
+                    raise ServiceError(
+                        "org_id_required",
+                        "org_id_required",
+                        {
+                            "project_id": self.project_id or "default",
+                            "task_id": str(getattr(work_item, "work_item_id", "") or ""),
+                            "reason": "custom_company_run_requires_durable_org_id",
+                        },
+                    )
+                runtime_org_id = resolved_org_id
+                existing.org_id = resolved_org_id
+                existing.metadata["org_id"] = resolved_org_id
+                existing.metadata["organization_id"] = resolved_org_id
+            elif runtime_org_id:
+                existing.org_id = runtime_org_id
+                existing.metadata["org_id"] = runtime_org_id
+                existing.metadata["organization_id"] = runtime_org_id
             existing.metadata["shared_role_session"] = True
             existing.metadata["shared_role_id"] = role_id
             existing.metadata["company_runtime_root_session_id"] = parent_session_id
@@ -3622,6 +3775,17 @@ class OPCEngine:
             )
             await self.store.save_task(existing)
             return existing
+        if runtime_company_profile == "custom" and not runtime_org_id:
+            from opc.plugins.office_ui.services.models import ServiceError
+            raise ServiceError(
+                "org_id_required",
+                "org_id_required",
+                {
+                    "project_id": self.project_id or "default",
+                    "task_id": str(getattr(work_item, "work_item_id", "") or ""),
+                    "reason": "custom_company_run_requires_durable_org_id",
+                },
+            )
         employee_assignment = dict(topology_seat.get("employee_assignment", {}) or {})
         if not employee_assignment and self.org_engine and role_id:
             preferred_employee_id = str(topology_seat.get("employee_id", "") or "").strip() or None
@@ -3672,6 +3836,18 @@ class OPCEngine:
         owner_execution_copy = build_work_item_owner_execution_copy(work_item)
         owner_execution_copy.setdefault("delegation_role_session_id", role_session_id)
         owner_execution_copy["work_kind"] = work_item_turn_type
+        runtime_identity_metadata = (
+            {
+                "org_id": runtime_org_id or "",
+                "organization_id": runtime_org_id or "",
+            }
+            if runtime_company_profile == "custom"
+            else {
+                "organization_id": str(
+                    getattr(getattr(self.config, "org", None), "organization_id", "") or ""
+                ).strip(),
+            }
+        )
         task = Task(
             title=str(work_item.title or work_item_projection_ref or "Runtime Work Item").strip(),
             description=(
@@ -3685,6 +3861,7 @@ class OPCEngine:
             session_id=session_id,
             parent_session_id=parent_session_id,
             assigned_external_agent=assigned_external_agent,
+            org_id=runtime_org_id,
             metadata=mark_work_item_projection(mark_work_item_runtime({
                 "mode": "company",
                 "execution_mode": decision.mode.value,
@@ -3693,7 +3870,6 @@ class OPCEngine:
                 "original_message": original_message,
                 "router_preferred_agent": decision.preferred_agent,
                 "company_profile": decision.company_profile or getattr(self.config.org, "company_profile", "corporate"),
-                "organization_id": getattr(self.config.org, "organization_id", ""),
                 "organization_name": getattr(self.config.org, "organization_name", ""),
                 "organization_config_file": getattr(self.config.org, "organization_config_file", ""),
                 "delegation_playbook": dict(delegation_playbook),
@@ -3708,6 +3884,7 @@ class OPCEngine:
                 ),
                 "runtime_topology": copy.deepcopy(runtime_topology),
                 **owner_execution_copy,
+                **runtime_identity_metadata,
                 "work_item_projection_ref": work_item_projection_ref,
                 "seat_manager_role_id": str(topology_seat.get("manager_role_id", "") or "").strip(),
                 "manager_role_id": str(topology_seat.get("manager_role_id", "") or "").strip(),
@@ -4244,9 +4421,17 @@ class OPCEngine:
                     "created_at": latest_compaction.created_at.isoformat(),
                 })
 
-        permission_requests: list[dict[str, Any]] = []
+        # Preserve any permission_requests already recorded on the payload —
+        # they carry the blocked call's tool_args, which are the only source
+        # of the command text for a late allowlist grant. Rebuilding from the
+        # legacy approval/pause_request keys is a fallback, not a replacement.
+        permission_requests: list[dict[str, Any]] = [
+            dict(item)
+            for item in list(payload_data.get("permission_requests", []) or [])
+            if isinstance(item, dict)
+        ]
         approval = dict(payload_data.get("approval", {}) or {})
-        if approval:
+        if approval and not permission_requests:
             permission_requests.append({
                 "tool_name": str(payload_data.get("tool_name", "") or ""),
                 "resolution": "ask",
@@ -4739,6 +4924,28 @@ class OPCEngine:
             default=("native" if not str(task.assigned_external_agent or "").strip() else str(task.assigned_external_agent or "").strip()),
         )
         if task.metadata.get("execution_agent_locked") and locked_agent:
+            if (
+                locked_agent != "native"
+                and self.adapter_registry is not None
+                and locked_agent not in self._available_external_agents()
+            ):
+                # A locked external backend that cannot run must not be
+                # stamped as execution identity: this attempt actually runs
+                # native (the external candidate pool is empty) and resume
+                # trusts this metadata (OBS-11).
+                task.assigned_external_agent = None
+                task.metadata["selected_execution_agent"] = "native"
+                task.metadata["preferred_external_agent"] = None
+                task.metadata["execution_agent_unavailable"] = locked_agent
+                task.metadata["agent_selection"] = {
+                    "selected": "native",
+                    "strategy": WorkItemExecutionStrategy.NATIVE.value,
+                    "role_id": task.assigned_to or task.metadata.get("work_item_role_id", ""),
+                    "decision_reason": "locked_external_agent_unavailable_native_fallback",
+                    "available_external_agents": self._available_external_agents(),
+                    "selection_source": "availability_fallback",
+                }
+                return None
             selected = None if locked_agent == "native" else locked_agent
             task.assigned_external_agent = selected
             task.metadata["preferred_external_agent"] = selected
@@ -6253,13 +6460,13 @@ class OPCEngine:
             identity.get("selected_execution_agent_source", "") or ""
         ).strip()
 
-        metadata["work_item_role_id"] = identity["role_id"] or task_role_id
-        if identity["seat_id"]:
-            metadata["delegation_seat_id"] = identity["seat_id"]
-        if identity["role_runtime_session_id"]:
-            metadata["delegation_role_session_id"] = identity[
-                "role_runtime_session_id"
-            ]
+        metadata.update(
+            build_company_resume_identity_restore(
+                role_id=identity["role_id"] or task_role_id,
+                seat_id=identity["seat_id"],
+                role_runtime_session_id=identity["role_runtime_session_id"],
+            )
+        )
         if identity.get("explicit") or identity["employee_assignment"]:
             metadata["employee_assignment"] = copy.deepcopy(
                 identity["employee_assignment"]
@@ -6383,12 +6590,59 @@ class OPCEngine:
             # not fully initialized / delegate context) — fail open and let the
             # dispatch-time selector guard decide; only a registry that exists
             # and excludes the pinned agent is proof of unavailability.
-            if (
+            pinned_agent_unavailable = bool(
                 pinned_agent != "native"
                 and not work_item_already_terminal
                 and self.adapter_registry is not None
                 and pinned_agent not in self._available_external_agents()
-            ):
+            )
+            if pinned_agent_unavailable:
+                gate_external_session = dict(
+                    (payload.get("external_sessions", {}) or {}).get(task.id) or {}
+                )
+                has_resumable_external_session = bool(
+                    gate_external_session
+                ) and external_session_status_allows_resume(
+                    gate_external_session.get("status")
+                )
+                if not has_resumable_external_session:
+                    # The pin is a preference, not a fact: this work item has
+                    # no external session to revive, so dispatch would run it
+                    # natively anyway (availability fallback). Heal the
+                    # checkpointed identity to native and resume instead of
+                    # failing the item — a run the user launched as native
+                    # must survive stop/resume even when a disabled external
+                    # agent leaked into its metadata (OBS-11).
+                    healed_identity = dict(
+                        task_snapshot.get("execution_identity", {}) or {}
+                    )
+                    healed_identity["selected_execution_agent"] = "native"
+                    healed_identity["assigned_external_agent"] = ""
+                    if not str(
+                        healed_identity.get("preferred_external_agent", "") or ""
+                    ).strip():
+                        healed_identity["preferred_external_agent"] = pinned_agent
+                    task_snapshot["execution_identity"] = healed_identity
+                    task_snapshot["selected_execution_agent"] = "native"
+                    task_snapshot["assigned_external_agent"] = ""
+                    # The task's durable identity must agree with the healed
+                    # snapshot, or the restore validation below rejects the
+                    # resume as an identity mismatch.
+                    task.metadata = dict(task.metadata or {})
+                    task.metadata["resume_execution_agent_healed_from"] = pinned_agent
+                    task.metadata["selected_execution_agent"] = "native"
+                    task.metadata.pop("agent_selection", None)
+                    task.metadata.pop("preferred_external_agent", None)
+                    task.assigned_external_agent = None
+                    logger.info(
+                        "company runtime resume: healed work item {} to native — pinned "
+                        "external agent {!r} is unavailable and no resumable external "
+                        "session exists",
+                        work_item_id or task.id,
+                        pinned_agent,
+                    )
+                    pinned_agent_unavailable = False
+            if pinned_agent_unavailable:
                 diagnostic = (
                     f"Cannot resume work item: its execution is pinned to external agent "
                     f"'{pinned_agent}', which is currently disabled or unavailable. "
@@ -8545,7 +8799,43 @@ class OPCEngine:
 
     @staticmethod
     def _reply_metadata_requests_force_resume(reply_metadata: dict[str, Any] | None) -> bool:
-        return bool(dict(reply_metadata or {}).get("ui_force_resume", False))
+        metadata = dict(reply_metadata or {})
+        # ui_force_resume is what the Office UI resume button sends;
+        # force_resume is the documented key for chat/headless callers.
+        # Both express the same control intent (OBS-11: only recognizing the
+        # UI spelling pushed headless resumes into the content-followup path).
+        return bool(
+            metadata.get("ui_force_resume", False)
+            or metadata.get("force_resume", False)
+        )
+
+    @staticmethod
+    def _is_plain_resume_control_reply(user_reply: str) -> bool:
+        """A bare continuation acknowledgement carries no new instructions.
+
+        Such a reply to a suspended-runtime checkpoint means "resume the run",
+        never "route this text to the final decider as a follow-up" — routing
+        it as content reopens the already-approved intake card and churns the
+        run it was supposed to continue (OBS-11).
+        """
+        normalized = " ".join(str(user_reply or "").strip().lower().split())
+        return normalized in {
+            "",
+            "continue",
+            "resume",
+            "proceed",
+            "go",
+            "go on",
+            "ok",
+            "okay",
+            "y",
+            "yes",
+            # Chinese spellings of the same continuation intent.
+            "继续",
+            "恢复",
+            "继续执行",
+            "继续跑",
+        }
 
     async def _maybe_resume_existing_company_runtime(
         self,
@@ -8578,6 +8868,28 @@ class OPCEngine:
             blocked_tasks = [task for task in tasks if task.status == TaskStatus.BLOCKED]
             no_active_runtime_work = not live_running_tasks and not waiting_tasks and not pending_tasks and not failed_tasks and not blocked_tasks
             has_closed_delivery_review = any(self._is_closed_company_delivery_review_task(task) for task in tasks)
+            run_terminally_failed = (
+                bool(failed_tasks)
+                and not has_closed_delivery_review
+                and all(
+                    t.status in {TaskStatus.DONE, TaskStatus.CANCELLED, TaskStatus.FAILED}
+                    for t in tasks
+                )
+            )
+            if run_terminally_failed:
+                # The run is a corpse: re-executing it drops the user's new
+                # content on the floor (OBS-5). Content-bearing input falls
+                # through to start a fresh run; bare control replies get an
+                # honest status instead of a fake resume.
+                if force_resume or self._is_plain_resume_control_reply(user_reply):
+                    snapshot_text = self._format_company_runtime_snapshot(tasks)
+                    return (
+                        "This company run ended with failed work items and is closed. "
+                        "It cannot be resumed. Send a new request (for example the "
+                        "original goal, optionally adjusted) to start a fresh run.\n\n"
+                        f"{snapshot_text}"
+                    )
+                return None
             if not force_resume:
                 if not (no_active_runtime_work and has_closed_delivery_review):
                     followup_result = await self._resume_company_runtime_via_final_decider(
@@ -10960,6 +11272,12 @@ class OPCEngine:
                 return "This request is no longer active."
             if str(getattr(checkpoint, "status", "") or "").strip().lower() != "pending":
                 if str(getattr(checkpoint, "checkpoint_type", "") or "").strip() == "company_delivery_feedback":
+                    if str(getattr(checkpoint, "status", "") or "").strip().lower() == "consuming":
+                        # Duplicate approve/feedback while the first reply is
+                        # still driving the self-evolution run: answer
+                        # idempotently instead of re-routing the click as a
+                        # fresh session message.
+                        return "Self-evolution for this delivery is already running."
                     return None
                 return "This request is no longer active."
             if not await self._checkpoint_task_still_waiting(checkpoint):
@@ -10996,9 +11314,29 @@ class OPCEngine:
         if checkpoint.checkpoint_type == "company_work_item_gate":
             return await self._resume_company_runtime_checkpoint(checkpoint, user_reply)
         if self._is_company_runtime_suspend_checkpoint(checkpoint.checkpoint_type):
-            if self._reply_metadata_requests_force_resume(reply_metadata):
+            if self._reply_metadata_requests_force_resume(
+                reply_metadata
+            ) or self._is_plain_resume_control_reply(user_reply):
                 return await self._resume_company_suspend_checkpoint(checkpoint, user_reply)
             return await self._resume_company_suspend_checkpoint_via_final_decider(checkpoint, user_reply)
+        if checkpoint.checkpoint_type == "company_run_failure_review":
+            if not explicit_checkpoint_id:
+                # Closure cards must never swallow ordinary session messages.
+                return None
+            normalized_failure_reply = " ".join(
+                str(user_reply or "").strip().lower().split()
+            )
+            await self.store.resolve_execution_checkpoint(
+                checkpoint.checkpoint_id, status="resolved"
+            )
+            if normalized_failure_reply in {
+                # trailing entries are Chinese acknowledgement spellings
+                "", "dismiss", "ignore", "close", "ok", "okay", "知道了", "关闭",
+            }:
+                return "Company run closure acknowledged."
+            # Content-bearing reply: the failed run is closed, so let the
+            # message continue as a fresh request through normal routing.
+            return None
         if checkpoint.checkpoint_type == "company_delivery_feedback":
             if not explicit_checkpoint_id:
                 return None
@@ -11136,9 +11474,89 @@ class OPCEngine:
             await self.store.resolve_execution_checkpoint(checkpoint.checkpoint_id, status="invalid")
             return "Could not resume the pending task because it no longer exists."
 
-        task.context_snapshot = dict(task.context_snapshot)
-        task.context_snapshot["user_supplied_input"] = user_reply.strip()
+        # Unified approval channel (OBS-7): when the pause was a blocked tool
+        # and the reply is an explicit decision, apply it through the same
+        # engine the Office UI card click uses. Without this bridge the chat
+        # route is input-only: the worker retries the still-blocked command
+        # and re-escalates until the attempt ledger terminalizes the card.
         pause_request = dict(payload.get("pause_request", {}))
+        injected_reply = user_reply.strip()
+        permission_context = dict(pause_request.get("permission_context", {}) or {})
+        blocked_tool_name = str(permission_context.get("tool_name", "") or "").strip()
+        blocked_tool_args: dict[str, Any] = {}
+        if not blocked_tool_name:
+            # Company runtime parks persist the blocked call as a
+            # permission_requests entry (runtime_v2 artifacts), not as
+            # pause_request.permission_context. Without this fallback a late
+            # approval reply resumes the task but records no allowlist grant,
+            # so the identical command re-blocks and re-parks on a fresh card
+            # every cycle (the project-0012 approve treadmill).
+            for request in reversed(list(payload.get("permission_requests", []) or [])):
+                if not isinstance(request, dict):
+                    continue
+                if str(request.get("resolution", "") or "").strip() != "ask":
+                    continue
+                candidate_tool = str(request.get("tool_name", "") or "").strip()
+                if not candidate_tool:
+                    continue
+                blocked_tool_name = candidate_tool
+                raw_request_args = request.get("tool_args")
+                if isinstance(raw_request_args, dict):
+                    blocked_tool_args = dict(raw_request_args)
+                break
+        decision_token = normalize_escalation_reply(user_reply)
+        if blocked_tool_name and decision_token and self.approval_engine is not None:
+            arguments: dict[str, Any] = {}
+            raw_args = (
+                payload.get("tool_args")
+                or pause_request.get("tool_args")
+                or blocked_tool_args
+                or {}
+            )
+            if isinstance(raw_args, dict):
+                arguments = dict(raw_args)
+            candidate = str(permission_context.get("candidate", "") or "").strip()
+            if candidate and not str(arguments.get("command", "") or "").strip():
+                arguments["command"] = candidate
+            try:
+                context = self.approval_engine.escalation_context_for_blocked_tool(
+                    task,
+                    tool_name=blocked_tool_name,
+                    arguments=arguments,
+                )
+                outcome = self.approval_engine.apply_deferred_escalation_decision(
+                    decision_token,
+                    context,
+                )
+            except Exception:
+                logger.opt(exception=True).warning(
+                    "Checkpoint {} approval reply {} failed to apply; degrading to plain input",
+                    checkpoint.checkpoint_id,
+                    decision_token,
+                )
+            else:
+                approved = bool(outcome.get("approved"))
+                logger.info(
+                    "Checkpoint {} approval decision applied via reply: {} -> "
+                    "approved={} scope={} patterns={}",
+                    checkpoint.checkpoint_id,
+                    decision_token,
+                    approved,
+                    outcome.get("scope"),
+                    outcome.get("patterns"),
+                )
+                injected_reply = (
+                    f"Approval decision applied: {decision_token}. The blocked "
+                    f"`{blocked_tool_name}` action is now allowlisted — retry it "
+                    "and continue the task."
+                    if approved
+                    else
+                    f"Approval decision applied: deny. Do not retry the blocked "
+                    f"`{blocked_tool_name}` action; take an alternative approach "
+                    "or report the limitation in your handoff."
+                )
+        task.context_snapshot = dict(task.context_snapshot)
+        task.context_snapshot["user_supplied_input"] = injected_reply
         if pause_request:
             task.context_snapshot["requested_user_input"] = pause_request
         self._restore_runtime_state_from_checkpoint(task, payload)
@@ -11194,6 +11612,26 @@ class OPCEngine:
             # Re-register child tasks so WSHandler can dual-route progress
             # events from child work items to the parent session channel.
             self._reregister_company_runtime_children(tasks, checkpoint_session_id=checkpoint.session_id)
+            # Single-dispatcher-per-run: when the run's dispatcher is live in
+            # this process, the answer is already persisted (task input +
+            # released human wait) — wake the loop and let it claim the work.
+            # Re-entering _execute_company_mode here would overlay a second
+            # dispatcher on the live run: the resume reset cleared live claim
+            # registries and the attempt ledger stamped every in-flight card
+            # as interrupted (project t2 forensics, OBS-4).
+            run_id = str((task.metadata or {}).get("delegation_run_id", "") or "").strip()
+            wake = getattr(getattr(self, "company_executor", None), "wake_live_run_dispatcher", None)
+            if run_id and callable(wake) and wake(run_id):
+                logger.info(
+                    "Checkpoint {} answered with live dispatcher for run {}; "
+                    "input delivered in place without re-entry",
+                    checkpoint.checkpoint_id,
+                    run_id,
+                )
+                return (
+                    "Input received. The company runtime is live and will pick "
+                    "it up on its next dispatch tick."
+                )
             plan_data = payload.get("company_work_item_plan") or task.metadata.get("company_work_item_plan")
             if isinstance(plan_data, dict) and plan_data:
                 return await self._execute_company_mode(tasks, deserialize_company_work_item_runtime_plan(plan_data))
@@ -11271,6 +11709,21 @@ class OPCEngine:
         if execution_mode == ExecutionMode.COMPANY_MODE.value:
             # Re-register child tasks for WSHandler dual-routing
             self._reregister_company_runtime_children(tasks, checkpoint_session_id=checkpoint.session_id)
+            # Single-dispatcher-per-run: deliver + wake instead of re-entry
+            # when the run's dispatcher is live (see _resume_task_checkpoint).
+            run_id = str((task.metadata or {}).get("delegation_run_id", "") or "").strip()
+            wake = getattr(getattr(self, "company_executor", None), "wake_live_run_dispatcher", None)
+            if run_id and callable(wake) and wake(run_id):
+                logger.info(
+                    "Peer checkpoint {} answered with live dispatcher for run {}; "
+                    "input delivered in place without re-entry",
+                    checkpoint.checkpoint_id,
+                    run_id,
+                )
+                return (
+                    "Input received. The company runtime is live and will pick "
+                    "it up on its next dispatch tick."
+                )
             plan_data = payload.get("company_work_item_plan") or task.metadata.get("company_work_item_plan")
             if isinstance(plan_data, dict) and plan_data:
                 return await self._execute_company_mode(tasks, deserialize_company_work_item_runtime_plan(plan_data))
@@ -12301,7 +12754,12 @@ class OPCEngine:
             seen_employee_ids.add(employee_id)
             history = ""
             if self.memory:
-                organization_id = str(getattr(getattr(self.config, "org", None), "organization_id", "") or "").strip()
+                organization_id = str(
+                    getattr(delivery_task, "org_id", "")
+                    or (delivery_task.metadata or {}).get("org_id")
+                    or (delivery_task.metadata or {}).get("organization_id")
+                    or ""
+                ).strip()
                 history = self.memory.employee_evolution.build_employee_delta_context(
                     employee_id,
                     project_id=task.project_id,
@@ -12447,10 +12905,12 @@ class OPCEngine:
         task_brief = (
             "Run employee self-evolution for this role from the completed company delivery review.\n"
             f"{review_text}\n\n"
-            "Decide whether your assigned employee should update its experience. If direct reports should also learn, "
-            "delegate child WorkItems with `work_kind=\"self_evolution\"`. Do not continue the original user task, "
-            "do not edit files, and do not produce a user-facing report. Final response must be strict JSON only: "
-            "`{\"patches\": [...]}`."
+            "Decide whether your assigned employee should update its experience, then record the result "
+            "by calling the `submit_self_evolution_patches` tool (an empty `patches` list means no update "
+            "is needed). The tool submission is the authoritative result of this turn; the final text can "
+            "be a brief completion note. If direct reports should also learn, delegate child WorkItems "
+            "with `work_kind=\"self_evolution\"`. Do not continue the original user task, do not edit "
+            "files, and do not produce a user-facing report."
         )
         return make_prompt_contract(
             task_brief=task_brief,
@@ -12462,14 +12922,15 @@ class OPCEngine:
             owned_outcome_kind="self_evolution",
             scope_key=f"self_evolution::{source.get('checkpoint_id', '')}::{role_id}",
             deliverables=[
-                "Strict JSON only with top-level `patches` list.",
+                "A `submit_self_evolution_patches` tool call recording this role's patches.",
                 "Use `patches: []` if no employee experience update is needed for this role.",
                 "Use `delegate_work` with `work_kind=\"self_evolution\"` for direct reports that should reflect on their own work.",
             ],
             acceptance_criteria=[
-                "No prose, markdown, file edits, or user-facing delivery content.",
+                "Patches are recorded through the `submit_self_evolution_patches` tool, not only in free text.",
                 "Patch employee_id must be the employee assigned to this role's self-evolution work item.",
                 "Each patch may include summary, strengths, adjustments, avoid_next_time, routing_notes, evidence_task_ids, and confidence.",
+                "No file edits or user-facing delivery content.",
             ],
             coordination_notes=json.dumps(
                 {
@@ -12714,6 +13175,46 @@ class OPCEngine:
                 })
         return {"recorded": recorded, "errors": errors}
 
+    # Total wall-clock budget for one delivery-review self-evolution pass
+    # (root reflection plus any delegated child reflections). The reply to
+    # the review card blocks on this pass like every other company message,
+    # so a stuck reflection must have a bounded lifetime.
+    _SELF_EVOLUTION_RUN_TIMEOUT_SEC: float = 2400.0
+
+    async def _settle_self_evolution_deadline(self, run_id: str) -> None:
+        """Cancel non-terminal self-evolution work items after the time budget."""
+        if not self.store or not run_id:
+            return
+        list_work_items = getattr(self.store, "list_delegation_work_items", None)
+        if not callable(list_work_items):
+            return
+        try:
+            work_items = await list_work_items(run_id)
+        except Exception:
+            logger.opt(exception=True).debug("self-evolution deadline: work item load failed")
+            return
+        from opc.layer2_organization.work_item_transition import transition_work_item
+
+        for item in list(work_items or []):
+            if str(getattr(item, "kind", "") or "").strip().lower() != "self_evolution":
+                continue
+            if getattr(item, "phase", None) in DONE_PHASES:
+                continue
+            try:
+                await transition_work_item(
+                    self.store,
+                    str(getattr(item, "work_item_id", "") or ""),
+                    target_phase=Phase.CANCELLED,
+                    reason="self_evolution_deadline",
+                    summary="Self-evolution run exceeded its time budget and was closed.",
+                    release_claim=True,
+                )
+            except Exception:
+                logger.opt(exception=True).debug(
+                    "self-evolution deadline: cancel failed for work item "
+                    f"{getattr(item, 'work_item_id', '')}"
+                )
+
     async def run_company_delivery_self_evolution_checkpoint(
         self,
         checkpoint: ExecutionCheckpoint,
@@ -12730,9 +13231,47 @@ class OPCEngine:
             )
         checkpoint = await self._ensure_checkpoint_runtime_v2_payload(checkpoint)
         status = str(getattr(checkpoint, "status", "") or "").strip().lower()
+        if status == "consuming":
+            return "Self-evolution for this delivery is already running."
         if status and status != "pending":
             return "This self-evolution review is no longer active."
+        # Claim the card before spawning anything: a second approve/feedback
+        # while this one is processing must not re-enter and reset the live
+        # self-evolution work item (same defect class as duplicate resume).
+        claimed = await self._mark_company_runtime_checkpoint_status(
+            checkpoint,
+            status="consuming",
+            payload_updates={"self_evolution_claimed_at": datetime.now().isoformat()},
+            expected_statuses={"pending"},
+        )
+        if not claimed:
+            return "Self-evolution for this delivery is already running."
+        try:
+            return await self._run_company_delivery_self_evolution_consumed(
+                checkpoint,
+                action=action,
+                feedback=feedback,
+            )
+        except Exception as exc:
+            # An unexpected crash must not strand the card in "consuming"
+            # (that would answer every retry with "already running" forever)
+            # — hand the claim back so the user can retry.
+            await self._mark_company_runtime_checkpoint_status(
+                checkpoint,
+                status="pending",
+                payload_updates={"self_evolution_consume_error": str(exc)[:500]},
+                expected_statuses={"consuming"},
+            )
+            raise
 
+    async def _run_company_delivery_self_evolution_consumed(
+        self,
+        checkpoint: ExecutionCheckpoint,
+        *,
+        action: str,
+        feedback: str = "",
+    ) -> str:
+        assert self.store
         payload = dict(checkpoint.payload or {})
         waiting_task_id = str(payload.get("waiting_task_id", "") or payload.get("task_id", "") or "").strip()
         if not waiting_task_id:
@@ -12762,13 +13301,19 @@ class OPCEngine:
             await self._mark_company_runtime_checkpoint_status(checkpoint, status="invalid")
             return "Could not run self-evolution because the runtime task set could not be restored."
 
+        from opc.plugins.office_ui.execution_identity import resolve_delivery_task_org_identity
+
+        organization_id, identity_error = resolve_delivery_task_org_identity(
+            waiting_task,
+            payload=payload,
+            active_org_id=getattr(getattr(self.config, "org", None), "organization_id", ""),
+            default_org_id=DEFAULT_ORGANIZATION_ID,
+        )
+        if identity_error:
+            await self._mark_company_runtime_checkpoint_status(checkpoint, status="invalid")
+            return f"Could not run self-evolution because {identity_error}."
+
         plan = deserialize_company_work_item_runtime_plan(payload.get("company_work_item_plan") or payload.get("plan", {}))
-        organization_id = str(
-            getattr(waiting_task, "org_id", "")
-            or payload.get("organization_id")
-            or getattr(getattr(self.config, "org", None), "organization_id", "")
-            or DEFAULT_ORGANIZATION_ID
-        ).strip() or DEFAULT_ORGANIZATION_ID
         root_role_id = str(
             getattr(plan, "final_decider_role_id", "")
             or plan.metadata.get("final_decider_role_id", "")
@@ -12834,11 +13379,22 @@ class OPCEngine:
             tasks=tasks,
             root_work_item=root_work_item,
         )
-        await self.company_executor.execute(plan, tasks)
+        run_id = str(getattr(root_work_item, "run_id", "") or "").strip()
+        deadline_hit = False
+        try:
+            await asyncio.wait_for(
+                self.company_executor.execute(plan, tasks),
+                timeout=self._SELF_EVOLUTION_RUN_TIMEOUT_SEC,
+            )
+        except asyncio.TimeoutError:
+            deadline_hit = True
+            await self._settle_self_evolution_deadline(run_id)
         result = await self._collect_company_self_evolution_result(
             checkpoint_id=checkpoint.checkpoint_id,
-            run_id=str(getattr(root_work_item, "run_id", "") or "").strip(),
+            run_id=run_id,
         )
+        if deadline_hit:
+            result.setdefault("errors", []).append({"error": "self_evolution_deadline"})
 
         waiting_task.metadata = dict(waiting_task.metadata or {})
         review_record = {
@@ -12870,6 +13426,12 @@ class OPCEngine:
             task_metadata_updates=task_metadata_updates,
         )
         recorded_count = len(result.get("recorded", []))
+        if deadline_hit:
+            return (
+                f"Self-evolution hit its {int(self._SELF_EVOLUTION_RUN_TIMEOUT_SEC // 60)}-minute "
+                f"time budget and was closed with {recorded_count} recorded update(s); "
+                "the remaining reflection work was cancelled."
+            )
         if recorded_count:
             return f"Self-evolution completed. Recorded {recorded_count} employee experience update(s)."
         errors = list(result.get("errors", []))

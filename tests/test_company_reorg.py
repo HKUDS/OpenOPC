@@ -20,7 +20,15 @@ from opc.layer2_organization.org_engine import OrgEngine
 from opc.layer2_organization.reorg_manager import ReorgManager
 from tests._temp_paths import WorkspaceTemporaryDirectory
 
-tempfile.TemporaryDirectory = WorkspaceTemporaryDirectory  # type: ignore[assignment]
+_REAL_TEMPORARY_DIRECTORY = tempfile.TemporaryDirectory
+
+
+def setUpModule() -> None:
+    tempfile.TemporaryDirectory = WorkspaceTemporaryDirectory  # type: ignore[assignment]
+
+
+def tearDownModule() -> None:
+    tempfile.TemporaryDirectory = _REAL_TEMPORARY_DIRECTORY  # type: ignore[assignment]
 
 
 class CompanyReorgTests(unittest.IsolatedAsyncioTestCase):

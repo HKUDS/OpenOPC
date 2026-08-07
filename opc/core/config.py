@@ -275,6 +275,7 @@ class LLMConfig(BaseModel):
     fallback: dict[str, Any] = Field(default_factory=dict)
     temperature: float = 0.3
     max_tokens: int = 32768
+    reasoning_effort: str | None = None
     # Total input context window (tokens) for the active model. Set this when
     # the model is not mapped in litellm (e.g. proxy/self-hosted models like
     # doubao/minimax/glm), so the context-usage ring and compaction thresholds
@@ -587,8 +588,9 @@ class StreamRenderingConfig(BaseModel):
 
 class ContextGuardConfig(BaseModel):
     enabled: bool = True
-    soft_threshold: float = 0.60
-    hard_threshold: float = 0.80
+    # Below this usage ratio the history is never rewritten; at or above it
+    # the runtime folds old messages into one LLM summary (durable compaction).
+    hard_threshold: float = 0.90
     warn_remaining_pct: int = 15
     tool_output_char_budget: int = 12_000
     shell_stdout_char_budget: int = 12_000

@@ -328,7 +328,7 @@ class WorkItemRuntimeLinkTests(unittest.IsolatedAsyncioTestCase):
             {item.work_item_id: canonical.id},
         )
 
-    async def test_task_delete_cascades_link_and_allows_rematerialization(self) -> None:
+    async def test_task_delete_cascades_link_and_work_item_row(self) -> None:
         item = _work_item("wi-cascade")
         task = _task("task-cascade")
         await self.store.save_delegation_work_item(item)
@@ -337,10 +337,13 @@ class WorkItemRuntimeLinkTests(unittest.IsolatedAsyncioTestCase):
 
         await self.store.hard_delete_task(task.id)
 
+        # Hard delete removes the linked work item row together with the
+        # runtime traces, so the identity cannot be rematerialized.
         self.assertEqual(await self.store.get_runtime_links_for_work_items([item.work_item_id]), {})
+        self.assertIsNone(await self.store.get_delegation_work_item(item.work_item_id))
         replacement = _task("task-cascade-replacement")
         await self.store.save_task(replacement)
-        self.assertTrue(await self.store.link_work_item_runtime_task(item.work_item_id, replacement.id))
+        self.assertFalse(await self.store.link_work_item_runtime_task(item.work_item_id, replacement.id))
 
     async def test_transition_from_task_uses_structured_link_without_legacy_metadata(self) -> None:
         item = _work_item("wi-transition")

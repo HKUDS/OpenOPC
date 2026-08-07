@@ -87,8 +87,12 @@ class CliBoardAppPilotTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             self.assertEqual(app.state.pane_focus, "context")
 
-            await pilot.press("right")
+            # Selecting the running task earlier auto-focused the Session
+            # context tab (CliBoardApp._load_selected_detail), so cycling
+            # right moves session -> activity.
             self.assertEqual(app.state.context_tab, "session")
+            await pilot.press("right")
+            self.assertEqual(app.state.context_tab, "activity")
 
             await pilot.press("f")
             self.assertFalse(app.state.show_done)

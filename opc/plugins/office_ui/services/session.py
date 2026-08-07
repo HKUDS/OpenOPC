@@ -1163,6 +1163,12 @@ class SessionService:
         else:
             checkpoint = None
         org_id = self.resolve_task_org_id(config_task) if engine_mode == "org" else ""
+        if engine_mode == "org" and not org_id:
+            raise ServiceError(
+                "org_id_required",
+                "org_id_required",
+                {"project_id": project_id, "task_id": resolved_task_id},
+            )
         message_metadata: dict[str, Any] = {"ui_force_resume": True}
         if checkpoint is not None:
             message_metadata.update({

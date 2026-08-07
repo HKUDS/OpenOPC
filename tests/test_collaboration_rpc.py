@@ -131,11 +131,22 @@ class CollaborationRpcTransportTests(unittest.IsolatedAsyncioTestCase):
                 )
                 parser = cli_collab._build_parser()
                 opts = parser.parse_args(["delegate_work", "--args-json-file", str(args_path)])
-                with patch.object(cli_collab.os, "name", "nt"), patch.dict(
+                # Simulate os.name == "nt" only at the product's single decision
+                # point instead of patching the global os.name, which would turn
+                # every pathlib.Path in this process into a WindowsPath and break
+                # the POSIX file reads the test itself performs. The real
+                # rpc_env_configured() check still runs against the patched env,
+                # so the Windows guard branch is exercised end to end.
+                with patch.object(
+                    cli_collab,
+                    "_windows_external_rpc_env_configured",
+                    lambda: rpc_env_configured(),
+                ), patch.dict(
                     "os.environ",
                     server.client_env,
                     clear=True,
                 ):
+                    self.assertTrue(cli_collab._windows_external_rpc_env_configured())
                     tool_args = cli_collab._collect_tool_args(opts)
                     payload, is_error = await cli_collab._dispatch(opts.tool, tool_args)
         finally:

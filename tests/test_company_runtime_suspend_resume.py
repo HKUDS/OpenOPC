@@ -1146,8 +1146,12 @@ class CompanyRuntimeSuspendResumeTests(unittest.IsolatedAsyncioTestCase):
 
         engine.company_executor = DummyCompanyExecutor()
 
+        # A bare "continue" is a control reply and takes the plain-resume
+        # path (OBS-11); only content-bearing text routes to the final
+        # decider as a follow-up.
+        followup_text = "Additional requirement: add a risk-analysis section to the report"
         response = await engine._maybe_resume_checkpoint(
-            "continue",
+            followup_text,
             "sess-parent",
         )
         checkpoints = await store.get_pending_checkpoints(
@@ -1161,18 +1165,18 @@ class CompanyRuntimeSuspendResumeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response, "ceo handled follow-up")
         self.assertEqual(captured["plan"].metadata["final_decider_role_id"], "executor")
         self.assertEqual(routed_task.status, TaskStatus.PENDING)
-        self.assertEqual(routed_task.context_snapshot["user_supplied_input"], "continue")
-        self.assertEqual(routed_task.metadata["latest_user_directive"], "continue")
-        self.assertEqual(routed_task.metadata["manager_mutation_user_input"], "continue")
+        self.assertEqual(routed_task.context_snapshot["user_supplied_input"], followup_text)
+        self.assertEqual(routed_task.metadata["latest_user_directive"], followup_text)
+        self.assertEqual(routed_task.metadata["manager_mutation_user_input"], followup_text)
         self.assertTrue(routed_task.metadata["followup_routed_to_final_decider"])
         self.assertEqual(checkpoints, [])
         assert refreshed_item is not None
         self.assertEqual(refreshed_item.phase, Phase.READY)
         self.assertEqual(refreshed_item.metadata.get("dispatch_hold"), "")
         self.assertEqual(refreshed_item.metadata.get("resume_source"), "primary_session_followup")
-        self.assertEqual(refreshed_item.metadata.get("resume_user_reply"), "continue")
-        self.assertEqual(refreshed_item.metadata.get("latest_user_directive"), "continue")
-        self.assertEqual(refreshed_item.metadata.get("manager_mutation_user_input"), "continue")
+        self.assertEqual(refreshed_item.metadata.get("resume_user_reply"), followup_text)
+        self.assertEqual(refreshed_item.metadata.get("latest_user_directive"), followup_text)
+        self.assertEqual(refreshed_item.metadata.get("manager_mutation_user_input"), followup_text)
         self.assertEqual(refreshed_item.metadata.get("current_turn_mode"), "dispatch_required")
         self.assertTrue(refreshed_item.metadata.get("followup_routed_to_final_decider"))
 

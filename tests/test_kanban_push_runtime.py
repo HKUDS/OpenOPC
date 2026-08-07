@@ -134,6 +134,99 @@ class ReviewQueuePriorityTests(unittest.TestCase):
         self.assertEqual(popped, "task-1")
         self.assertEqual(list(queue), ["work-item::wi-2"])
 
+    def test_review_backlog_pops_in_arrival_order(self) -> None:
+        """A review backlog must drain oldest-first. Reviews still preempt
+        regular work, but among themselves queue position (arrival order)
+        decides — a newer review must never jump an older one."""
+        queue: deque[str] = deque(
+            [
+                "work-item::wi-plain",
+                "review-work-item::review::wi-old::v1",
+                "review-work-item::review::wi-new::v1",
+            ]
+        )
+        first = CompanyRuntime._pop_next_queue_entry(queue)
+        second = CompanyRuntime._pop_next_queue_entry(queue)
+        self.assertEqual(first, "review-work-item::review::wi-old::v1")
+        self.assertEqual(second, "review-work-item::review::wi-new::v1")
+        self.assertEqual(list(queue), ["work-item::wi-plain"])
+
+    def test_enqueue_keeps_review_work_items_in_arrival_order(self) -> None:
+        """Regression for the project-0012 review inversion: review work
+        items used to be prepended to the role queue, so with two reviews
+        waiting the dispatcher claimed the newest first (LIFO) and the
+        oldest submission waited behind every later arrival."""
+        runtime = CompanyRuntime(org_engine=None, communication=None)
+
+        def _review_item(work_item_id: str) -> DelegationWorkItem:
+            return DelegationWorkItem(
+                work_item_id=work_item_id,
+                run_id="run-1",
+                cell_id="team::coo",
+                team_id="team::coo",
+                role_id="coo",
+                seat_id="seat::team::coo::coo",
+                title=f"Review {work_item_id}",
+                summary="Review the child deliverable.",
+                kind="review",
+                projection_id=work_item_id,
+                phase=Phase.READY,
+                metadata={
+                    "session_scope_id": "scope-1",
+                    "review_execution_work_item": True,
+                    "review_target_work_item_id": "wi-target",
+                },
+            )
+
+        older = _review_item("review::wi-older::v1")
+        newer = _review_item("review::wi-newer::v1")
+        # Tick 1: only the older review exists. Tick 2: both are runnable
+        # (the older one is deduped, the newer one is appended behind it).
+        runtime.enqueue_runnable_work_items([older])
+        runtime.enqueue_runnable_work_items([older, newer])
+
+        queue = runtime.role_queues["scope-1::coo"]
+        self.assertEqual(
+            list(queue),
+            [
+                "review-work-item::review::wi-older::v1",
+                "review-work-item::review::wi-newer::v1",
+            ],
+        )
+        popped = CompanyRuntime._pop_next_queue_entry(queue)
+        self.assertEqual(popped, "review-work-item::review::wi-older::v1")
+
+    def test_enqueue_keeps_review_tasks_in_arrival_order(self) -> None:
+        """Same arrival-order contract for the plain review-Task path."""
+        runtime = CompanyRuntime(org_engine=None, communication=None)
+
+        def _review_task(task_id: str) -> Task:
+            return Task(
+                id=task_id,
+                title=f"Review task {task_id}",
+                project_id="p",
+                session_id="s",
+                status=TaskStatus.PENDING,
+                assigned_to="coo",
+                metadata={"review_task": True},
+            )
+
+        older = _review_task("task-review-older")
+        newer = _review_task("task-review-newer")
+        runtime.enqueue_runnable_tasks([older])
+        runtime.enqueue_runnable_tasks([older, newer])
+
+        queue = runtime.role_queues["s::coo"]
+        self.assertEqual(
+            list(queue),
+            [
+                "review-task::task-review-older",
+                "review-task::task-review-newer",
+            ],
+        )
+        popped = CompanyRuntime._pop_next_queue_entry(queue)
+        self.assertEqual(popped, "review-task::task-review-older")
+
 
 def _build_executor(store: OPCStore, org_engine: OrgEngine) -> CompanyWorkItemExecutor:
     communication = CommunicationManager(store, EventBus(), org_engine=org_engine)
@@ -394,7 +487,7 @@ class ReviewWorkItemLifecycleTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ReviewWorkItemRoutingTests(unittest.TestCase):
-    def test_review_work_item_enqueue_goes_to_front_of_manager_queue(self) -> None:
+    def test_review_work_item_preempts_regular_work_at_pop_time(self) -> None:
         runtime = CompanyRuntime(
             org_engine=MagicMock(),
             communication=None,
@@ -464,9 +557,12 @@ class ReviewWorkItemRoutingTests(unittest.TestCase):
         queue_key = runtime._queue_key_for_task(manager_task)
         queue = runtime.role_queues.get(queue_key)
         assert queue is not None
-        self.assertEqual(queue[0], "review-work-item::review::wi-child")
+        # The review sits behind the earlier-arrived regular task in the
+        # deque (arrival order is preserved) but must still be claimed
+        # first: preemption is a pop-time contract, not a queue layout.
         popped = CompanyRuntime._pop_next_queue_entry(queue)
         self.assertEqual(popped, "review-work-item::review::wi-child")
+        self.assertEqual(list(queue), ["regular-task"])
 
     def test_soft_wake_allows_blocked_manager_to_claim_review_work_item(self) -> None:
         runtime = CompanyRuntime(

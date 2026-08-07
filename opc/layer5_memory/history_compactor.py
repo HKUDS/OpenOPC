@@ -13,7 +13,6 @@ from opc.core.models import (
     AgentMemorySnapshotRecord,
     SessionCompactionRecord,
     SessionMemorySnapshotRecord,
-    SessionMessageRecord,
 )
 
 
@@ -39,9 +38,55 @@ class HistoryCompactor:
         self.task_type = task_type
         self.compression_threshold = compression_threshold
 
-    async def maybe_compact_after_message(self, message: SessionMessageRecord) -> None:
-        _ = message
-        return
+    async def summarize_runtime_history(
+        self,
+        *,
+        project_id: str,
+        session_id: str,
+        messages: list[dict[str, Any]],
+        existing_summary: str = "",
+    ) -> str:
+        """Summarize in-memory runtime messages for durable context compaction.
+
+        Used by NativeRuntimeV2 when live context reaches the hard threshold:
+        the returned summary replaces the folded span of the message list.
+        Raises on non-recoverable LLM errors so the caller can count failures.
+        """
+        if not messages:
+            return ""
+        if not self.llm:
+            return self._fallback_session_summary(messages, existing_summary)["history_summary"]
+        payload = {
+            "project_id": project_id,
+            "session_id": session_id,
+            "existing_summary": existing_summary,
+            "messages": messages,
+        }
+        raw = await self._simple_chat_with_retry(
+            payload=payload,
+            system=(
+                "You are compacting the live working context of an agent that must "
+                "continue its task seamlessly from your output.\n"
+                "Return strict JSON with a single key `history_summary`.\n"
+                "`history_summary` must be detailed markdown with sections:\n"
+                "1. Primary Request and Intent\n"
+                "2. Key Technical Concepts\n"
+                "3. Files and Code Sections\n"
+                "4. Errors and Fixes (especially user corrections)\n"
+                "5. Problem Solving\n"
+                "6. All User Messages\n"
+                "7. Pending Tasks\n"
+                "8. Current Work\n"
+                "9. Next Step\n"
+                "Quote exact identifiers, paths, commands, and values the agent will "
+                "need to continue; do not invent details."
+            ),
+        )
+        parsed = self._parse_json_response(raw)
+        summary = str((parsed or {}).get("history_summary", "")).strip()
+        if summary:
+            return summary
+        return self._fallback_session_summary(messages, existing_summary)["history_summary"]
 
     async def maybe_compact_session(
         self,
@@ -276,19 +321,6 @@ class HistoryCompactor:
             threshold = max(0, threshold - reserve_tokens)
         return threshold
 
-    def should_compact_prompt(
-        self,
-        messages: list[dict[str, Any]],
-        *,
-        tools: list[dict[str, Any]] | None = None,
-        force: bool = False,
-        reserve_tokens: int = 0,
-    ) -> bool:
-        _ = messages
-        _ = tools
-        _ = force
-        _ = reserve_tokens
-        return False
 
     def _is_context_overflow_error(self, error: Exception) -> bool:
         detector = getattr(self.llm, "is_context_overflow_error", None)

@@ -4,6 +4,7 @@ import asyncio
 import importlib
 import json
 import os
+import re
 import sqlite3
 import tempfile
 import unittest
@@ -57,6 +58,17 @@ from opc.plugins.office_ui.services.context import OfficeServiceContext
 from opc.plugins.office_ui.services.project import ProjectService
 from opc.plugins.office_ui.services.session import SessionService
 from opc.plugins.office_ui.services.work_item import WorkItemService
+
+_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
+
+def _plain_output(text: str) -> str:
+    """CLI output with ANSI styling stripped.
+
+    Keeps plain-text assertions stable when the invoking shell forces
+    color (e.g. FORCE_COLOR) onto rich/typer output.
+    """
+    return _ANSI_ESCAPE_RE.sub("", text)
 
 
 class CliEscalationFormattingTests(unittest.TestCase):
@@ -305,7 +317,7 @@ class CliInitProjectTests(unittest.TestCase):
                 result = runner.invoke(app, ["init", "dupe"])
 
             self.assertNotEqual(result.exit_code, 0)
-            self.assertIn("Project 'dupe' already exists", result.output)
+            self.assertIn("Project 'dupe' already exists", _plain_output(result.output))
             self.assertFalse((opc_home / "projects" / "dupe").exists())
 
     def test_init_existing_config_cancel_preserves_config_and_does_not_create_project(self) -> None:
@@ -3119,7 +3131,7 @@ class CliChannelCommandTests(unittest.TestCase):
 
         self.assertEqual(result.exit_code, 0)
         mock_kill.assert_called_once()
-        self.assertIn("PID 4321", result.stdout)
+        self.assertIn("PID 4321", _plain_output(result.stdout))
 
     def test_channels_status_reports_runtime_and_capabilities(self) -> None:
         config = OPCConfig()
@@ -3165,9 +3177,10 @@ class CliAutomationCommandTests(unittest.TestCase):
         result = self.runner.invoke(app, ["exec", "--help"])
 
         self.assertEqual(result.exit_code, 0)
-        self.assertIn("--session-id", result.output)
-        self.assertIn("--resume", result.output)
-        self.assertIn("--stream-json", result.output)
+        help_text = _plain_output(result.output)
+        self.assertIn("--session-id", help_text)
+        self.assertIn("--resume", help_text)
+        self.assertIn("--stream-json", help_text)
 
     def test_exec_rejects_json_and_stream_json_together(self) -> None:
         result = self.runner.invoke(app, ["exec", "hello", "--json", "--stream-json"])
@@ -3207,9 +3220,9 @@ class CliTalentCommandTests(unittest.TestCase):
             self.assertEqual(import_result.exit_code, 0)
             self.assertEqual(hire_result.exit_code, 0)
             self.assertEqual(list_result.exit_code, 0)
-            self.assertIn("Imported 1 talent templates", import_result.stdout)
-            self.assertIn("Bea Backend", hire_result.stdout)
-            self.assertIn("engineering-backend-architect", list_result.stdout)
+            self.assertIn("Imported 1 talent templates", _plain_output(import_result.stdout))
+            self.assertIn("Bea Backend", _plain_output(hire_result.stdout))
+            self.assertIn("engineering-backend-architect", _plain_output(list_result.stdout))
 
             config = OPCConfig.load(opc_home / "config")
             self.assertEqual(config.org.talent_templates, [])

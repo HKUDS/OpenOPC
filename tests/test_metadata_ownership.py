@@ -432,6 +432,8 @@ class MetadataOwnershipMigratorTests(unittest.IsolatedAsyncioTestCase):
                 "work_item_projection_id": "ceo::deliver::1",
                 "work_item_turn_type": "deliver",
                 "authoritative_output": True,
+                "user_visible": True,
+                "feedback_scope": "final",
             },
         )
         set_linked_work_item_id(task, item.work_item_id)

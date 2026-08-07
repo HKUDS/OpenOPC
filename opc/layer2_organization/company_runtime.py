@@ -29,6 +29,8 @@ from opc.layer2_organization.phase import (
     is_dispatchable,
     is_report_execution_work_item_metadata,
     is_review_execution_work_item_metadata,
+    is_runnable,
+    is_terminal,
 )
 from opc.layer2_organization.metadata_ownership import sync_work_item_current_turn_mode
 from opc.layer2_organization.session_scoping import (
@@ -1154,11 +1156,14 @@ class CompanyRuntime:
             review_tag = f"review-task::{task.id}"
             if task.id in queue or review_tag in queue:
                 continue
-            # Kanban-push review tasks take priority over regular work so a
-            # manager role always clears its review backlog before dispatching
-            # or executing its own work.
+            # Review tasks still preempt regular work — that priority is
+            # enforced at pop time (`_pop_next_queue_entry` pulls the first
+            # review entry anywhere in the queue). Appending here keeps
+            # reviews in arrival order among themselves; prepending would
+            # invert a review backlog to newest-first and starve the oldest
+            # submission while newer reviews keep jumping ahead.
             if bool((task.metadata or {}).get("review_task", False)):
-                queue.appendleft(review_tag)
+                queue.append(review_tag)
             else:
                 queue.append(task.id)
 
@@ -1209,8 +1214,11 @@ class CompanyRuntime:
             review_tag = f"review-work-item::{work_item_id}"
             if work_tag in queue or review_tag in queue:
                 continue
+            # Same ordering contract as enqueue_runnable_tasks: review
+            # priority lives in `_pop_next_queue_entry`, so reviews are
+            # appended to preserve FIFO among a review backlog.
             if is_review_execution_work_item_metadata(metadata):
-                queue.appendleft(review_tag)
+                queue.append(review_tag)
             else:
                 queue.append(work_tag)
 
@@ -1266,11 +1274,41 @@ class CompanyRuntime:
                 )
                 continue
             if session_status == "blocked" and not can_soft_wake:
-                _skip(
-                    "session.status=blocked and no review-soft-wake entry in queue",
-                    session=session_label,
-                )
-                continue
+                # Stale-block reconcile: `blocked` means "parked on my focused
+                # item until something external advances it". The park reason
+                # is gone when that item is runnable again (rework bounce /
+                # children-done wake), when it is TERMINAL (the awaited event
+                # already happened — observed shape: a review-preempt turn
+                # leaves the session parked on its own approved review card),
+                # or when there is no focus at all. Phase is the single
+                # source of truth, so converge the session instead of
+                # skipping forever.
+                focused_id = str(session.focused_work_item_id or "").strip()
+                focused_item = work_item_map.get(focused_id) if focused_id else None
+                focused_phase = getattr(focused_item, "phase", None)
+                if not focused_id or (
+                    focused_item is not None
+                    and (is_runnable(focused_phase) or is_terminal(focused_phase))
+                ):
+                    logger.info(
+                        "claim reconcile: stale blocked session converged to "
+                        "idle  session={} focused={} phase={}",
+                        session_label,
+                        focused_id or "<none>",
+                        getattr(focused_phase, "value", focused_phase),
+                    )
+                    session.current_task_id = ""
+                    session.focused_work_item_id = ""
+                    self._set_member_session_status(session, "idle")
+                    session_status = "idle"
+                else:
+                    _skip(
+                        "session.status=blocked and no review-soft-wake entry in queue",
+                        session=session_label,
+                        focused=focused_id or None,
+                        focused_phase=getattr(focused_phase, "value", None),
+                    )
+                    continue
             role_session = self._role_session_for_member_session(session)
             role_session_status = ""
             if role_session is not None:

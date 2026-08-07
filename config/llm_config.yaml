@@ -7,6 +7,8 @@ llm:
 
   temperature: 1
   max_tokens: 32768
+  # reasoning_effort: "high"  # optional; use a provider-supported level
+                              # such as low, medium, or high
   routing: {}
   fallback: {}
 

@@ -420,7 +420,12 @@ class ResumeAvailabilityGateTests(unittest.IsolatedAsyncioTestCase):
         )
         return engine
 
-    async def test_resume_fails_closed_when_pinned_agent_unavailable(self) -> None:
+    async def test_resume_heals_pin_to_native_when_agent_unavailable(self) -> None:
+        """A pin to a disabled external agent with NO resumable external
+        session heals to native and resumes (OBS-11): dispatch would fall
+        back to native anyway, so failing the item punished runs — including
+        fully native ones whose metadata inherited a template preference —
+        for an availability gap that does not block execution."""
         store = await self._store()
         task = await self._seed(store, external_agent="codex")
         engine = self._engine(store, available=["opencode"])  # codex disabled
@@ -449,19 +454,25 @@ class ResumeAvailabilityGateTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(response)
         refreshed_item = await store.get_delegation_work_item("work-item-1")
         assert refreshed_item is not None
-        self.assertEqual(refreshed_item.phase, Phase.FAILED)
-        self.assertIn("codex", str(refreshed_item.blocked_reason or ""))
-        refreshed_task = await store.get_task(task.id)
-        assert refreshed_task is not None
-        self.assertEqual(refreshed_task.status, TaskStatus.FAILED)
+        self.assertEqual(refreshed_item.phase, Phase.RUNNING)
+        self.assertIn("tasks", executed)
+        resumed_task = executed["tasks"][0]
+        self.assertIsNone(resumed_task.assigned_external_agent)
         self.assertEqual(
-            refreshed_task.metadata.get("resume_unavailable_external_agent"),
+            resumed_task.metadata.get("selected_execution_agent"), "native"
+        )
+        self.assertEqual(
+            resumed_task.metadata.get("resume_execution_agent_healed_from"),
             "codex",
         )
-        # The runtime still executed (the rest of the org resumes normally).
-        self.assertIn("tasks", executed)
+        pin = dict(
+            resumed_task.metadata.get(
+                "_company_runtime_resume_execution_agent_pin", {}
+            )
+        )
+        self.assertEqual(pin.get("selected_execution_agent"), "native")
 
-    async def test_plain_message_after_gate_failure_converges_without_revival(self) -> None:
+    async def test_plain_message_after_terminal_failure_converges_without_revival(self) -> None:
         """A plain text follow-up (final-decider routing path) on a run whose
         decider card failed terminally must drain the checkpoint and must not
         clobber the FAILED task back to PENDING (InvalidPhaseTransition crash
@@ -480,12 +491,14 @@ class ResumeAvailabilityGateTests(unittest.IsolatedAsyncioTestCase):
                 return "runtime resumed"
 
         engine.company_executor = DummyCompanyExecutor()
-        # First resume: gate fails the codex-pinned decider card closed.
-        await engine._maybe_resume_checkpoint(
-            "continue",
-            "sess-parent",
-            reply_metadata={"ui_force_resume": True},
-        )
+        # The decider card failed terminally after the suspend (the resume
+        # gate no longer fails pins without external sessions — OBS-11 — so
+        # the terminal failure is seeded directly).
+        await store.update_delegation_work_item("work-item-1", phase=Phase.FAILED)
+        failed_task = await store.get_task(task.id)
+        assert failed_task is not None
+        failed_task.status = TaskStatus.FAILED
+        await store.save_task(failed_task)
         refreshed_item = await store.get_delegation_work_item("work-item-1")
         assert refreshed_item is not None
         self.assertEqual(refreshed_item.phase, Phase.FAILED)

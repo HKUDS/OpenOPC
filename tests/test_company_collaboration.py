@@ -1431,7 +1431,7 @@ class CompanyCollaborationTests(unittest.IsolatedAsyncioTestCase):
                     task_id="task-1",
                     workspace_path="/tmp/work",
                     run_mode="interactive",
-                    status="failed",
+                    status="done",
                     metadata={"resume_session_id": "resume-token-1"},
                     updated_at=datetime.now(),
                 )
@@ -1466,7 +1466,7 @@ class CompanyCollaborationTests(unittest.IsolatedAsyncioTestCase):
                     task_id="task-2",
                     workspace_path="/tmp/work",
                     run_mode="interactive",
-                    status="failed",
+                    status="done",
                     metadata={},
                     updated_at=datetime.now(),
                 )
@@ -1518,79 +1518,6 @@ class CompanyCollaborationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(resume_metadata, {})
         self.assertNotIn("external_resume_session_id", task.metadata)
         self.assertNotIn("external_resume_session_scope_id", task.metadata)
-
-    @unittest.skip("Filesystem handoff stack removed; see plans/task-cleanup-dead-comms.md"
-    )
-    async def test_structured_handoff_is_persisted_and_injected(self) -> None:
-        with _workspace_tempdir() as tmpdir:
-            store = OPCStore(Path(tmpdir) / "tasks.db")
-            await store.initialize()
-            communication = CommunicationManager(store, EventBus())
-            memory = DummyMemory()
-
-            async def execute_task(task: Task) -> TaskResult:
-                result = TaskResult(
-                    status=TaskStatus.DONE,
-                    content="Decision: use SQLite\nRisk: guest posting must remain blocked",
-                    artifacts={"workspace": "/tmp/demo", "files": ["src/app.py"]},
-                )
-                task.status = result.status
-                task.result = {"content": result.content, "artifacts": result.artifacts}
-                return result
-
-            executor = CompanyWorkItemExecutor(
-                org_engine=DummyOrgEngine(),
-                communication=communication,
-                approval_engine=SimpleNamespace(),
-                memory=memory,
-                execute_task=execute_task,
-                save_task=store.save_task,
-            )
-
-            upstream = Task(
-                id="planning-task",
-                title="Planning",
-                project_id="proj1",
-                assigned_to="reviewer",
-                status=TaskStatus.DONE,
-                result={"content": "Plan approved with clear milestones.", "artifacts": {}},
-                metadata={
-                    "work_item_projection_id": "planning",
-                    "work_item_summary_for_downstream": "Plan approved",
-                    "decisions": ["Use SQLite for local persistence"],
-                    "risks": ["Guest posting must remain blocked"],
-                    "artifacts": ["doc: docs/plan.md"],
-                    "acceptance_criteria": ["Implementation follows approved milestones"],
-                },
-            )
-            downstream = Task(
-                id="execution-task",
-                title="Execution",
-                project_id="proj1",
-                assigned_to="executor",
-                status=TaskStatus.PENDING,
-                dependencies=["planning"],
-                metadata={
-                    "work_item_projection_id": "execution",
-                    "work_item_role_id": "executor",
-                    "work_item_execution_strategy": "native",
-                    "work_item_gate": None,
-                    "progress_log": [],
-                },
-            )
-            await store.save_task(upstream)
-            await store.save_task(downstream)
-
-            await executor._run_work_item(downstream, {"planning": upstream, "execution": downstream})
-
-            handoffs = await store.get_handoff_records(project_id="proj1", target_projection_id="execution")
-            self.assertEqual(len(handoffs), 1)
-            self.assertEqual(handoffs[0].payload["decisions"], ["Use SQLite for local persistence"])
-            self.assertIn("Objective: Planning", downstream.metadata["handoff_context"])
-            self.assertIn("Use SQLite for local persistence", downstream.metadata["handoff_context"])
-            self.assertEqual(downstream.context_snapshot["handoff_payloads"][0]["source_projection_id"], "planning")
-            self.assertEqual(memory.calls, [])
-            await store.close()
 
     async def test_company_gate_prefers_structured_review_verdict_and_persists_work_item_state(self) -> None:
         memory = DummyMemory()
@@ -3442,7 +3369,11 @@ class CompanyCollaborationTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(retry.status, TaskStatus.PENDING)
         self.assertEqual(task.metadata["self_evolution_patch_retry_count"], 1)
-        self.assertIn("strict JSON", task.context_snapshot["self_evolution_patch_retry_feedback"])
+        # Retry feedback points the agent at the authoritative tool channel.
+        self.assertIn(
+            "submit_self_evolution_patches",
+            task.context_snapshot["self_evolution_patch_retry_feedback"],
+        )
         save_task.assert_awaited_once()
 
         task.metadata["self_evolution_patch_retry_count"] = 2
@@ -3450,8 +3381,10 @@ class CompanyCollaborationTests(unittest.IsolatedAsyncioTestCase):
             task,
             TaskResult(status=TaskStatus.DONE, content="still not json", artifacts={}),
         )
-        self.assertEqual(failed.status, TaskStatus.FAILED)
-        self.assertEqual(task.status, TaskStatus.FAILED)
+        # Abandoned reflection settles CANCELLED so it cannot pollute the
+        # delivered run's terminal verdict (the error record keeps the why).
+        self.assertEqual(failed.status, TaskStatus.CANCELLED)
+        self.assertEqual(task.status, TaskStatus.CANCELLED)
         self.assertEqual(task.metadata["self_evolution_error"]["attempts"], 3)
 
     async def test_self_evolution_work_item_retries_patch_for_wrong_employee(self) -> None:
@@ -7197,65 +7130,6 @@ class CompanyCollaborationTests(unittest.IsolatedAsyncioTestCase):
                 )
             await store.close()
 
-    @unittest.skip("Filesystem handoff stack removed; see plans/task-cleanup-dead-comms.md"
-    )
-    async def test_required_handoff_records_are_persisted_as_sent_and_received(self) -> None:
-        # The agent-facing `ack_handoff` / `review_handoff` tools were
-        # deleted; the underlying handoff record is still created and
-        # transitions sent → received on inbox read. The former
-        # acked/accepted transitions used to require tool calls and are
-        # now obsolete.
-        with _workspace_tempdir() as tmpdir:
-            store = OPCStore(Path(tmpdir) / "tasks.db")
-            await store.initialize()
-            communication = CommunicationManager(store, EventBus())
-            target_task = Task(
-                id="review-task",
-                title="Review",
-                project_id="proj1",
-                assigned_to="reviewer",
-                metadata={
-                    "work_item_projection_id": "review",
-                    "execution_mode": "company_mode",
-                    "workspace_root": str(tmpdir),
-                    "output_root": str(Path(tmpdir) / "deliverables"),
-                    "target_output_dir": str(Path(tmpdir) / "deliverables"),
-                    "comms_root": str(Path(tmpdir) / ".opc-comms"),
-                },
-            )
-            await store.save_task(target_task)
-
-            message = await communication.send_handoff(
-                task_id=target_task.id,
-                from_agent="executor",
-                to_agent="reviewer",
-                subject="Execution handoff",
-                body="Please review the implementation package.",
-                handoff={
-                    "handoff_id": "handoff-1",
-                    "summary": "Execution package ready",
-                    "source_projection_id": "execution",
-                    "target_projection_id": "review",
-                },
-                requires_ack=True,
-            )
-            sent = await store.get_handoff_record("handoff-1")
-            assert sent is not None
-            self.assertEqual(sent.status, "sent")
-            self.assertEqual(message.metadata["handoff_id"], "handoff-1")
-
-            _ = await communication.read_inbox(
-                agent_id="reviewer",
-                task=target_task,
-                unread_only=True,
-                limit=10,
-                mark_read=True,
-            )
-            received = await store.get_handoff_record("handoff-1")
-            assert received is not None
-            self.assertEqual(received.status, "received")
-            await store.close()
-
     async def test_send_dm_writes_file_comms_and_read_inbox_projects_from_file(self) -> None:
         with _workspace_tempdir() as tmpdir:
             store = OPCStore(Path(tmpdir) / "tasks.db")
@@ -8909,64 +8783,6 @@ class CompanyCollaborationTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(message.to_agents, ["content_specialist"])
             self.assertEqual(len(inbox), 1)
             self.assertEqual(inbox[0]["subject"], "Cross-functional copy review")
-            await store.close()
-
-    @unittest.skip("Filesystem handoff stack removed; see plans/task-cleanup-dead-comms.md"
-    )
-    async def test_context_assembler_includes_ownership_contract_and_pending_handoffs(self) -> None:
-        class _MemoryStub:
-            async def build_focused_memory_context(self, **_kwargs: object) -> str:
-                return ""
-
-            async def build_memory_context(self, **_kwargs: object) -> str:
-                return ""
-
-        with _workspace_tempdir() as tmpdir:
-            store = OPCStore(Path(tmpdir) / "tasks.db")
-            await store.initialize()
-            communication = CommunicationManager(store, EventBus())
-            task = Task(
-                id="execution-work-item",
-                session_id="sess-owner",
-                project_id="proj1",
-                assigned_to="executor",
-                metadata={
-                    "execution_mode": "company_mode",
-                    "work_item_projection_id": "execution",
-                    "work_item_projection_title": "Engineering Execution",
-                    "work_item_turn_type": "execute",
-                    "member_session_id": "member::proj1::executor::eng-1",
-                    "ownership_contract": {
-                        "summary": "Implement only the assigned API slice.",
-                        "write_scope": str((Path(tmpdir) / "workspace").resolve()),
-                        "expected_artifacts": ["Updated API implementation", "Verification evidence"],
-                        "downstream_consumer": ["reviewer"],
-                        "allowed_collaboration_targets": ["reviewer", "cto"],
-                    },
-                },
-            )
-            await store.save_task(task)
-            await communication.send_handoff(
-                task_id=task.id,
-                from_agent="planner",
-                to_agent="executor",
-                subject="Plan handoff",
-                body="Use the approved API contract.",
-                handoff={
-                    "handoff_id": "handoff-ctx",
-                    "summary": "Approved API contract",
-                    "source_projection_id": "planning",
-                    "target_projection_id": "execution",
-                },
-                requires_ack=True,
-            )
-            assembler = ContextAssembler(_MemoryStub(), store=store, communication=communication)
-            system_context = await assembler.build_system_context(task, role_id="executor")
-
-            self.assertIn("## Topology", system_context)
-            self.assertIn("Write scope:", system_context)
-            self.assertIn("Pending Handoff Acknowledgements", system_context)
-            self.assertIn("handoff-ctx", system_context)
             await store.close()
 
     async def test_context_assembler_renders_runtime_owned_mailbox_and_manager_board_summary(self) -> None:

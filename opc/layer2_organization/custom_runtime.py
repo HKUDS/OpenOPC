@@ -64,8 +64,22 @@ class CustomRuntimeRunner:
     ) -> str:
         from opc.engine import OPCEngine
         from opc.layer2_organization.phase_hooks import unregister_dispatcher_wake
+        from opc.plugins.office_ui.services.models import ServiceError
 
-        org_config, resolved_org_id = self._build_org_config(org_id)
+        normalized_org_id = str(org_id or "").strip()
+        if not normalized_org_id:
+            # Isolated org mode must carry a durable org_id; resolving the
+            # active index here would silently route the run to whichever
+            # organization is currently loaded.
+            raise ServiceError(
+                "org_id_required",
+                "org_id_required",
+                {
+                    "project_id": project_id or self.parent.project_id or "default",
+                    "reason": "custom_company_run_requires_durable_org_id",
+                },
+            )
+        org_config, resolved_org_id = self._build_org_config(normalized_org_id)
         normalized_project_id = str(project_id or self.parent.project_id or "default").strip() or "default"
         shared_store = getattr(self.parent, "store", None)
         runtime = OPCEngine(

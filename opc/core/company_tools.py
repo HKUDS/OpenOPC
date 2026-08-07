@@ -58,12 +58,14 @@ DEBUG_ADMIN_TOOL_NAMES: tuple[str, ...] = (
 
 MEETING_RESPONSE_TOOL_NAMES: tuple[str, ...] = ("respond_meeting",)
 HUMAN_REVIEW_TOOL_NAMES: tuple[str, ...] = ("close_human_review",)
+SELF_EVOLUTION_TOOL_NAMES: tuple[str, ...] = ("submit_self_evolution_patches",)
 
 
 COMPANY_COLLABORATION_TOOL_NAMES: tuple[str, ...] = (
     *COORDINATOR_DEFAULT_TOOL_NAMES,
     *MEETING_RESPONSE_TOOL_NAMES,
     *HUMAN_REVIEW_TOOL_NAMES,
+    *SELF_EVOLUTION_TOOL_NAMES,
 )
 
 COMPANY_DEBUG_TOOL_NAMES: tuple[str, ...] = DEBUG_ADMIN_TOOL_NAMES
@@ -164,6 +166,13 @@ def _is_execute_or_review_work_item(task: object | None) -> bool:
         return False
     turn_type = _work_item_turn_type(metadata)
     return turn_type in {"execute", "review"}
+
+
+def is_self_evolution_work_item(task: object | None) -> bool:
+    metadata = _task_metadata(task)
+    if _work_item_turn_type(metadata) == "self_evolution":
+        return True
+    return bool(metadata.get("self_evolution_work_item", False))
 
 
 def _has_active_meeting(task: object | None, runtime_state: dict[str, Any]) -> bool:
@@ -306,6 +315,8 @@ def resolve_allowed_collaboration_tools(
         allowed.update(MEETING_RESPONSE_TOOL_NAMES)
     if _human_review_close_allowed(task, state):
         allowed.update(HUMAN_REVIEW_TOOL_NAMES)
+    if is_self_evolution_work_item(task):
+        allowed.update(SELF_EVOLUTION_TOOL_NAMES)
     return allowed
 
 

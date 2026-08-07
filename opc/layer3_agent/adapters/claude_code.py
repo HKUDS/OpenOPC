@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import os
+import shutil
 from pathlib import Path
 from typing import Any
 
@@ -250,10 +252,16 @@ class ClaudeCodeAdapter(ExternalAgentAdapter):
         }
 
     def _build_stdin_prompt_metadata(self, prompt: str) -> dict[str, object]:
+        prompt_bytes = len(prompt.encode("utf-8"))
         return {
             "prompt_transport": "stdin",
-            "prompt_bytes": len(prompt.encode("utf-8")),
+            "prompt_bytes": prompt_bytes,
             "stdin_prompt_channel": "pipe",
+            "prompt_transport_reason": (
+                "prompt_too_large_for_argv"
+                if prompt_bytes > self._INTERACTIVE_ARGV_PROMPT_MAX_BYTES
+                else "windows_multiline_argv_unsafe"
+            ),
             "interactive_input_limitation": (
                 "large initial prompt is delivered through stdin; live approval replies "
                 "are unavailable after stdin closes"
@@ -261,8 +269,28 @@ class ClaudeCodeAdapter(ExternalAgentAdapter):
         }
 
     def _interactive_prompt_transport(self, prompt: str) -> str:
-        prompt_bytes = len(prompt.encode("utf-8"))
-        return "argv" if prompt_bytes <= self._INTERACTIVE_ARGV_PROMPT_MAX_BYTES else "stdin"
+        if len(prompt.encode("utf-8")) > self._INTERACTIVE_ARGV_PROMPT_MAX_BYTES:
+            return "stdin"
+        return "stdin" if self._windows_multiline_argv_is_unsafe(prompt) else "argv"
+
+    def _windows_multiline_argv_is_unsafe(self, prompt: str) -> bool:
+        # `claude` installed via npm resolves to a `.cmd` shim on Windows, so
+        # the spawn path wraps it in `cmd.exe /d /s /c ...`. cmd.exe treats a
+        # newline inside an argument as end-of-command, which silently
+        # truncates a multiline prompt at the first line break (the agent then
+        # sees just "## Task Brief"). Route such prompts over stdin instead.
+        if os.name != "nt":
+            return False
+        if "\n" not in prompt and "\r" not in prompt:
+            return False
+        command = self.configured_command()
+        resolved = shutil.which(command)
+        if not resolved:
+            # Unresolvable here means _resolve_launch_command will also fail to
+            # resolve it and spawn the bare name, which cmd.exe never wraps.
+            return False
+        resolved = self._resolve_windows_command_shim(command, resolved)
+        return os.path.splitext(str(resolved))[1].lower() in {".cmd", ".bat"}
 
     @staticmethod
     def _redact_prompt_arg(cmd: list[str], prompt: str) -> list[str]:

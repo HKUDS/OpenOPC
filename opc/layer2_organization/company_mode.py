@@ -8,6 +8,7 @@ import hashlib
 import inspect
 import json
 import re
+import time
 import uuid
 from contextvars import ContextVar, Token
 from dataclasses import asdict, dataclass, field
@@ -21,7 +22,11 @@ from opc.core.active_task_runs import (
     ActiveTaskRunAdmissionClosed,
     ActiveTaskRunRegistry,
 )
-from opc.core.config import DEFAULT_EXTERNAL_AGENT_STARTUP_TIMEOUT_SECONDS, DEFAULT_ORGANIZATION_ID
+from opc.core.config import (
+    DEFAULT_EXTERNAL_AGENT_STARTUP_TIMEOUT_SECONDS,
+    DEFAULT_ORGANIZATION_ID,
+    validate_organization_id,
+)
 from opc.core.models import (
     AdaptiveRoleProfile,
     AdaptiveSignalSpec,
@@ -156,6 +161,7 @@ from opc.layer2_organization.work_item_runtime_invariants import (
     validate_work_item_runtime_projection,
 )
 from opc.layer4_tools.output_budget import clip_text
+from opc.llm.provider import ProviderQuotaExhaustedError
 from opc.llm.retry import LLMRetryError, call_llm_json_with_retry
 
 
@@ -232,6 +238,12 @@ DEFAULT_MAX_PRE_DELIVERY_REWORKS = 3
 # reviewer-side output failures (no extractable approve/reject label), not
 # honest-but-rejected work.
 MAX_VERDICT_PARSE_RETRIES = 2
+
+# Cap consecutive FAILED report cards for one parent while it stays in
+# AWAITING_MANAGER_REVIEW. Reconcile treats FAILED as "no active report" and
+# would otherwise mint Report #N forever (seen when cursor-agent spawn dies
+# with ARG_MAX before the process starts).
+DEFAULT_MAX_CONSECUTIVE_REPORT_FAILURES = 3
 
 _REVIEW_VERDICT_PARSE_RETRY_HINT = (
     "\n\n[REVIEW RETRY — Your previous verdict could not be parsed. The "
@@ -1318,6 +1330,26 @@ class CompanyRuntimeSpecBuilder(CompanyRuntimeWorkItemHelper):
             or "corporate"
         ).strip() or "corporate"
         org_config = getattr(self.org_engine.config, "org", None)
+        selected_org_id = ""
+        if profile == "custom":
+            try:
+                selected_org_id = validate_organization_id(getattr(decision, "org_id", None))
+            except ValueError:
+                selected_org_id = ""
+            if not selected_org_id:
+                # A custom-organization run must carry a durable org_id on the
+                # decision.  Never derive it from the process-wide active
+                # config; fail closed before any work items are created.
+                from opc.plugins.office_ui.services.models import ServiceError
+                raise ServiceError(
+                    "org_id_required",
+                    "org_id_required",
+                    {
+                        "company_profile": profile,
+                        "reason": "custom_company_run_requires_durable_org_id",
+                    },
+                )
+            decision.org_id = selected_org_id
         metadata: dict[str, Any] = {
             "source": "work_item_runtime",
             "execution_mode": "company_mode",
@@ -1325,7 +1357,11 @@ class CompanyRuntimeSpecBuilder(CompanyRuntimeWorkItemHelper):
             "runtime_model": "multi_team_org",
             "work_item_driven": True,
             "company_profile": profile,
-            "organization_id": str(getattr(org_config, "organization_id", "") or "").strip(),
+            "organization_id": (
+                selected_org_id
+                if profile == "custom"
+                else str(getattr(org_config, "organization_id", "") or "").strip()
+            ),
             "organization_name": str(getattr(org_config, "organization_name", "") or "").strip(),
             "organization_config_file": str(getattr(org_config, "organization_config_file", "") or "").strip(),
             "original_request": original_message,
@@ -1333,7 +1369,7 @@ class CompanyRuntimeSpecBuilder(CompanyRuntimeWorkItemHelper):
             "domains": list(getattr(decision, "domains", []) or []),
             "preferred_agent": getattr(decision, "preferred_agent", None),
             "requested_sub_tasks": list(getattr(decision, "sub_tasks", []) or []),
-            "org_id": getattr(decision, "org_id", None),
+            "org_id": selected_org_id if profile == "custom" else getattr(decision, "org_id", None),
         }
         return CompanyRuntimeSpec(
             profile=profile,
@@ -1423,6 +1459,21 @@ class CompanyWorkItemExecutor:
         # waits on this Event so children are claimed+spawned without
         # waiting for the parent turn's gather batch to drain.
         self._dispatcher_wake = asyncio.Event()
+        # Provider-quota park (OBS-6): while monotonic time is below
+        # _quota_park_until the dispatcher stops claiming new work instead of
+        # hammering an exhausted quota. The streak drives exponential backoff
+        # (60s → 900s cap); parks separated by more than 30 min restart it.
+        self._quota_park_until = 0.0
+        self._quota_park_streak = 0
+        self._quota_last_park_at = 0.0
+        # Single-dispatcher-per-run invariant: refcount of live
+        # _execute_multi_team_org loops keyed by delegation run id.
+        # Checkpoint answers consult this via wake_live_run_dispatcher —
+        # a live run receives input in place instead of a second
+        # _execute_company_mode entry (re-entry reset live claim
+        # registries and the attempt ledger stamped every in-flight
+        # card as interrupted).
+        self._live_run_dispatchers: dict[str, int] = {}
         if communication is not None and getattr(communication, "on_work_items_created", None) is None:
             communication.on_work_items_created = self._signal_dispatcher_wake
         # D2: register the wake callback with the phase-transition hook
@@ -3864,6 +3915,13 @@ class CompanyWorkItemExecutor:
                 else:
                     # No unconsumed durable report exists. This is either the
                     # first handoff for the phase or a later rework cycle.
+                    # Brake: consecutive FAILED report cards must not mint a
+                    # new Report #N on every reconcile tick.
+                    if await self._should_hold_report_chain(
+                        parent,
+                        work_items=work_items,
+                    ):
+                        continue
                     spawned = await self._ensure_report_work_item_for_work_item(
                         target_id,
                         run_items=work_items,
@@ -4217,7 +4275,21 @@ class CompanyWorkItemExecutor:
         existing_task_ids = {str(task.id or "").strip() for task in existing_tasks if str(task.id or "").strip()}
         existing_work_item_ids = set(task_by_linked_work_item_id(existing_tasks))
         root_task = sorted(existing_tasks, key=lambda item: (item.created_at, item.id))[0]
-        runtime_topology = dict((root_task.metadata or {}).get("runtime_topology", {}) or {})
+        root_metadata = dict(root_task.metadata or {})
+        custom_runtime = str(root_metadata.get("company_profile", "") or "").strip().lower() == "custom"
+        runtime_org_id = str(
+            getattr(root_task, "org_id", "")
+            or root_metadata.get("org_id")
+            or root_metadata.get("organization_id")
+            or ""
+        ).strip() or None
+        if not custom_runtime:
+            runtime_org_id = None
+        if runtime_org_id:
+            for existing_task in existing_tasks:
+                if self._sync_runtime_org_identity(existing_task, runtime_org_id):
+                    await self.store.save_task(existing_task)
+        runtime_topology = dict(root_metadata.get("runtime_topology", {}) or {})
         root_parent_session_id = str(
             root_task.parent_session_id
             or root_task.session_id
@@ -4253,6 +4325,8 @@ class CompanyWorkItemExecutor:
                 persisted = await get_runtime_task(work_item_id)
             if persisted is not None:
                 set_linked_work_item_id(persisted, work_item_id)
+                if self._sync_runtime_org_identity(persisted, runtime_org_id):
+                    await self.store.save_task(persisted)
                 self._raise_for_runtime_projection_issues(persisted, work_item, work_item_by_id)
                 if persisted.id not in existing_task_ids:
                     existing_tasks.append(persisted)
@@ -4383,6 +4457,9 @@ class CompanyWorkItemExecutor:
             task_metadata.update(copy_work_item_execution_metadata(work_item))
             task_metadata.update(owner_execution_copy)
             task_metadata[WORK_ITEM_TURN_TYPE_KEY] = turn_type
+            if custom_runtime:
+                task_metadata["org_id"] = runtime_org_id or ""
+                task_metadata["organization_id"] = runtime_org_id or ""
             temp_task = Task(
                 id=str(uuid.uuid4()),
                 title=str(getattr(work_item, "title", "") or projection_id or "Runtime Work Item").strip(),
@@ -4393,6 +4470,7 @@ class CompanyWorkItemExecutor:
                 session_id=session_id,
                 parent_session_id=root_parent_session_id,
                 assigned_external_agent=assigned_external_agent,
+                org_id=runtime_org_id,
                 metadata=task_metadata,
             )
             dependency_projection_ids: list[str] = []
@@ -4424,6 +4502,7 @@ class CompanyWorkItemExecutor:
                 parent_session_id=temp_task.parent_session_id,
                 assigned_external_agent=temp_task.assigned_external_agent,
                 dependencies=dependency_projection_ids,
+                org_id=runtime_org_id,
                 metadata=task_metadata,
             )
             set_linked_work_item_id(task, work_item_id)
@@ -4441,6 +4520,8 @@ class CompanyWorkItemExecutor:
                             "failed to link new runtime Task "
                             f"{task.id} for WorkItem {work_item_id}"
                         )
+            if self._sync_runtime_org_identity(task, runtime_org_id):
+                await self.store.save_task(task)
             set_linked_work_item_id(task, work_item_id)
             self._raise_for_runtime_projection_issues(task, work_item, work_item_by_id)
             if self.memory is not None and task.session_id:
@@ -4479,6 +4560,23 @@ class CompanyWorkItemExecutor:
                 await self._record_handoffs(task, task_by_projection_id)
                 await self.save_task(task)
         return existing_tasks
+
+    @staticmethod
+    def _sync_runtime_org_identity(task: Task, org_id: str | None) -> bool:
+        normalized_org_id = str(org_id or "").strip()
+        if not normalized_org_id:
+            return False
+        metadata = dict(task.metadata or {})
+        changed = str(getattr(task, "org_id", "") or "").strip() != normalized_org_id
+        changed = changed or metadata.get("org_id") != normalized_org_id
+        changed = changed or metadata.get("organization_id") != normalized_org_id
+        if not changed:
+            return False
+        task.org_id = normalized_org_id
+        metadata["org_id"] = normalized_org_id
+        metadata["organization_id"] = normalized_org_id
+        task.metadata = metadata
+        return True
 
     @staticmethod
     def _runtime_work_kind_to_work_item_turn_type(work_kind: str) -> str:
@@ -4580,6 +4678,31 @@ class CompanyWorkItemExecutor:
             if ownership is not None:
                 ownership.release()
 
+    def wake_live_run_dispatcher(self, run_id: str) -> bool:
+        """Wake the live dispatcher for ``run_id``; False when none is live.
+
+        Callers must have already persisted whatever the dispatcher should
+        pick up (task status, work-item phase, user input) — the wake is
+        only a scheduling nudge. This is how checkpoint answers reach a
+        live run without starting a second ``_execute_company_mode`` over
+        it (the single-dispatcher-per-run invariant).
+        """
+        clean = str(run_id or "").strip()
+        if not clean or self._live_run_dispatchers.get(clean, 0) <= 0:
+            return False
+        self._signal_dispatcher_wake()
+        return True
+
+    @staticmethod
+    def _delegation_run_id_for_tasks(tasks: list[Task]) -> str:
+        for task in tasks:
+            run_id = str(
+                (getattr(task, "metadata", {}) or {}).get("delegation_run_id", "") or ""
+            ).strip()
+            if run_id:
+                return run_id
+        return ""
+
     async def _execute_multi_team_org(
         self,
         plan: CompanyWorkItemRuntimePlan,
@@ -4589,9 +4712,20 @@ class CompanyWorkItemExecutor:
             CompanyExecutorRunState(active_plan=plan, active_tasks=list(tasks))
         )
         runtime_token = self.runtime.use_state(self.runtime.create_state())
+        run_id = self._delegation_run_id_for_tasks(tasks)
+        if run_id:
+            self._live_run_dispatchers[run_id] = (
+                self._live_run_dispatchers.get(run_id, 0) + 1
+            )
         try:
             return await self._execute_multi_team_org_scoped(plan, tasks)
         finally:
+            if run_id:
+                remaining = self._live_run_dispatchers.get(run_id, 0) - 1
+                if remaining > 0:
+                    self._live_run_dispatchers[run_id] = remaining
+                else:
+                    self._live_run_dispatchers.pop(run_id, None)
             self.runtime.reset_state(runtime_token)
             self._reset_run_state(run_token)
 
@@ -4716,12 +4850,23 @@ class CompanyWorkItemExecutor:
                 self._rehydrate_parked_member_sessions(work_items)
                 # Claim whatever is immediately claimable and spawn each
                 # work item as an independent asyncio.Task so the loop no
-                # longer blocks on the slowest sibling.
-                claims = await self._claim_and_create_work_item_tasks(
-                    tasks,
-                    work_items,
-                    active_work_item_tasks,
-                )
+                # longer blocks on the slowest sibling. While a provider
+                # quota park is active, claiming is skipped so an exhausted
+                # quota is not hammered with doomed dispatches (OBS-6).
+                if self._quota_park_until and time.monotonic() < self._quota_park_until:
+                    claims = []
+                else:
+                    if self._quota_park_until:
+                        self._quota_park_until = 0.0
+                        await self._emit_progress(
+                            "[Company] provider quota backoff elapsed — resuming dispatch",
+                            task_id=tasks[0].id if tasks else "",
+                        )
+                    claims = await self._claim_and_create_work_item_tasks(
+                        tasks,
+                        work_items,
+                        active_work_item_tasks,
+                    )
                 # Termination: only when nothing is in-flight AND nothing
                 # else is runnable.  If work items are still running, even an
                 # "empty runnable" snapshot may become non-empty within
@@ -4928,6 +5073,10 @@ class CompanyWorkItemExecutor:
                             res,
                         )
                 active_work_item_tasks.clear()
+        try:
+            await self._settle_run_lifecycle_on_convergence(tasks)
+        except Exception:
+            logger.opt(exception=True).debug("run failure settlement skipped")
         return self._summarize_multi_team_org_results(tasks)
 
     @staticmethod
@@ -5092,12 +5241,80 @@ class CompanyWorkItemExecutor:
             ) == "running"
         )
 
+    def _exception_is_provider_quota(self, exc: BaseException | None) -> bool:
+        seen: set[int] = set()
+        while exc is not None and id(exc) not in seen:
+            if isinstance(exc, ProviderQuotaExhaustedError):
+                return True
+            seen.add(id(exc))
+            exc = exc.__cause__ or exc.__context__
+        return False
+
+    async def _park_claimed_work_item_for_quota(
+        self,
+        member_session: CompanyMemberSession,
+        task: Task,
+        exc: Exception,
+    ) -> None:
+        """Return the item to READY and back off instead of failing it.
+
+        An exhausted provider quota is an environment outage, not a defect in
+        the work: failing the card (the previous behavior) terminally killed
+        intake and with it the whole run, with no way to continue after the
+        quota window reset (OBS-6). Parking keeps the run alive; dispatch
+        resumes automatically after the backoff, and stop/resume stays
+        available throughout.
+        """
+        projection_id = self._projection_id_for_task(task)
+        now = time.monotonic()
+        if now - self._quota_last_park_at > 1800:
+            self._quota_park_streak = 0
+        self._quota_park_streak += 1
+        self._quota_last_park_at = now
+        backoff_sec = min(60 * (2 ** (self._quota_park_streak - 1)), 900)
+        self._quota_park_until = now + backoff_sec
+        summary = (
+            f"[Company:{projection_id}] provider quota/rate limit exhausted — "
+            f"work item returned to the queue; dispatch pauses for {backoff_sec}s "
+            f"(streak {self._quota_park_streak}). {str(exc)[:300]}"
+        )
+        logger.warning(summary)
+        if self._claimed_work_item_needs_cleanup(member_session, task):
+            try:
+                await transition_work_item_from_task(
+                    self.store, task,
+                    target_status_or_phase=Phase.READY,
+                    reason="provider_quota_exhausted",
+                    summary=summary or None,
+                    release_claim=True,
+                    attempt_outcome="interrupted",
+                )
+            except Exception:
+                logger.opt(exception=True).error(
+                    f"[Company:{projection_id}] quota park: READY transition failed"
+                )
+        self.runtime._claimed_task_ids.discard(task.id)
+        work_item_id = linked_work_item_id_for_task(task)
+        if work_item_id:
+            self.runtime._claimed_work_item_ids.discard(work_item_id)
+        member_session.status = "idle"
+        member_session.resident_status = "idle"
+        member_session.current_task_id = ""
+        member_session.focused_work_item_id = ""
+        member_session.current_work_item = {}
+        member_session.current_assignment = {}
+        member_session.updated_at = datetime.now()
+        await self._emit_progress(summary, task_id=task.id)
+
     async def _handle_claimed_work_item_exception(
         self,
         member_session: CompanyMemberSession,
         task: Task,
         exc: Exception,
     ) -> None:
+        if self._exception_is_provider_quota(exc):
+            await self._park_claimed_work_item_for_quota(member_session, task, exc)
+            return
         projection_id = self._projection_id_for_task(task)
         work_item_id = linked_work_item_id_for_task(task)
         summary = (
@@ -5325,21 +5542,51 @@ class CompanyWorkItemExecutor:
 
     @staticmethod
     def _parse_self_evolution_patch_json(raw: str | None) -> dict[str, Any] | None:
+        """Extract the ``{"patches": [...]}`` object from a turn's final text.
+
+        Native runtime turns rarely end with bare JSON: the model narrates
+        around it, wraps it in a markdown fence, or the runtime appends a
+        verification status line after it. Any of those killed the old
+        strict ``json.loads`` — so scan fenced blocks and every balanced
+        JSON object in the text, preferring the first one that carries a
+        ``patches`` key.
+        """
         text = str(raw or "").strip()
         if not text:
             return None
-        if text.startswith("```"):
-            text = text.split("\n", 1)[1] if "\n" in text else text[3:]
-            if text.endswith("```"):
-                text = text[:-3]
-            text = text.strip()
-            if text.lower().startswith("json\n"):
-                text = text.split("\n", 1)[1].strip()
-        try:
-            parsed = json.loads(text)
-        except Exception:
-            return None
-        return parsed if isinstance(parsed, dict) else None
+        decoder = json.JSONDecoder()
+
+        def _scan(candidate: str) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+            with_patches: dict[str, Any] | None = None
+            bare: dict[str, Any] | None = None
+            for match in re.finditer(r"\{", candidate):
+                try:
+                    value, _ = decoder.raw_decode(candidate, match.start())
+                except Exception:
+                    continue
+                if not isinstance(value, dict):
+                    continue
+                if "patches" in value:
+                    return value, bare
+                if bare is None:
+                    bare = value
+            return with_patches, bare
+
+        candidates = [
+            fence.group(1)
+            for fence in re.finditer(
+                r"```(?:json)?\s*(.*?)```", text, flags=re.DOTALL | re.IGNORECASE
+            )
+        ]
+        candidates.append(text)
+        first_bare: dict[str, Any] | None = None
+        for candidate in candidates:
+            found, bare = _scan(candidate)
+            if found is not None:
+                return found
+            if first_bare is None and bare is not None:
+                first_bare = bare
+        return first_bare
 
     @staticmethod
     def _self_evolution_patch_validation_error(patches: list[Any], employee_id: str) -> str:
@@ -5395,15 +5642,19 @@ class CompanyWorkItemExecutor:
                 "self_evolution_error": error_record,
                 "self_evolution_recorded": [],
             })
+        # Self-evolution is an opt-in reflection pass over an already
+        # delivered run. Settling as CANCELLED (not FAILED) keeps the
+        # abandoned reflection from polluting the delivered run's terminal
+        # verdict; the error record above preserves the diagnosis.
         await transition_work_item_from_task(
             self.store,
             task,
-            target_status_or_phase=Phase.FAILED,
-            reason="invalid_self_evolution_json",
+            target_status_or_phase=Phase.CANCELLED,
+            reason="self_evolution_abandoned",
             summary=feedback,
         )
         await self.save_task(task)
-        return TaskResult(status=TaskStatus.FAILED, content=feedback, artifacts={"self_evolution_error": error_record})
+        return TaskResult(status=TaskStatus.CANCELLED, content=feedback, artifacts={"self_evolution_error": error_record})
 
     async def _finalize_self_evolution_work_item(
         self,
@@ -5411,14 +5662,30 @@ class CompanyWorkItemExecutor:
         result: TaskResult,
     ) -> TaskResult | None:
         content = str(result.content or "").strip()
-        data = self._parse_self_evolution_patch_json(content)
+        # The tool submission is the authoritative channel: patches recorded
+        # via `submit_self_evolution_patches` survive whatever shape the
+        # final narration takes. Text parsing is the fallback only.
+        submitted = dict((task.metadata or {}).get("self_evolution_submitted_patch", {}) or {})
+        if isinstance(submitted.get("patches"), list):
+            data: dict[str, Any] | None = {"patches": list(submitted.get("patches") or [])}
+        else:
+            data = self._parse_self_evolution_patch_json(content)
         patches = data.get("patches") if isinstance(data, dict) else None
         retry_count = int((task.metadata or {}).get("self_evolution_patch_retry_count", 0) or 0)
         max_retries = int((task.metadata or {}).get("self_evolution_patch_max_retries", 3) or 3)
         if data is None or not isinstance(patches, list):
+            excerpt = content[:200].replace("\n", " ")
+            problem = (
+                "no JSON object with a top-level `patches` list was found in the final response"
+                if data is None
+                else "the JSON object found has no `patches` list"
+            )
             feedback = (
-                "Self-evolution output must be strict JSON with a top-level `patches` list. "
-                "Do not include prose, markdown, or delivery content."
+                "Self-evolution result was not machine-readable: "
+                f"{problem}. Received: `{excerpt}`. "
+                "Call the `submit_self_evolution_patches` tool with your `patches` list "
+                "(pass an empty list when no experience update is needed); the tool "
+                "records the patches regardless of your final text."
             )
             return await self._retry_or_fail_self_evolution_output(
                 task,
@@ -5471,6 +5738,7 @@ class CompanyWorkItemExecutor:
         task.context_snapshot = dict(task.context_snapshot or {})
         task.metadata.pop("self_evolution_patch_retry_feedback", None)
         task.context_snapshot.pop("self_evolution_patch_retry_feedback", None)
+        task.metadata.pop("self_evolution_submitted_patch", None)
         task.metadata["self_evolution_patch_retry_count"] = retry_count
         task.metadata["self_evolution_recorded"] = list(recorded)
         task.metadata["self_evolution_patch"] = {"patches": patches}
@@ -6091,6 +6359,37 @@ class CompanyWorkItemExecutor:
                 review_evidence["manager_dispatch"] = dict(manager_turn_context)
             if review_evidence:
                 metadata_updates["review_evidence"] = review_evidence
+            if target_phase == Phase.AWAITING_MANAGER_REVIEW:
+                # A fresh execute→review handoff must clear any prior report
+                # storm hold so rework cycles can spawn Report #1 again.
+                # Baseline the failure streak on already-minted report attempts
+                # so historical FAILED cards from a previous cycle do not
+                # immediately re-trigger the hold.
+                prior_attempts = 0
+                if linked_work_item is not None:
+                    try:
+                        prior_items = await self._run_items_for_parent(linked_work_item)
+                        prior_attempts = max(
+                            (
+                                self._auxiliary_attempt_number(item, kind="report")
+                                for item in self._targeting_auxiliary_items(
+                                    prior_items,
+                                    work_item_id,
+                                    kind="report",
+                                )
+                            ),
+                            default=0,
+                        )
+                    except Exception:
+                        prior_attempts = int(
+                            (linked_work_item_metadata or {}).get("report_attempt_count", 0)
+                            or 0
+                        )
+                metadata_updates["report_chain_hold"] = ""
+                metadata_updates["report_chain_hold_reason"] = ""
+                metadata_updates["report_chain_hold_at"] = ""
+                metadata_updates["report_chain_failed_attempts"] = 0
+                metadata_updates["report_failure_baseline_attempt"] = prior_attempts
 
         # Phase write + local status sync via the canonical helper. Returns
         # False only if wid disappeared between our lookup and the call —
@@ -6604,6 +6903,166 @@ class CompanyWorkItemExecutor:
             if getattr(item, "phase", None) not in DONE_PHASES
         ]
         return active[-1] if active else None
+
+    @classmethod
+    def _consecutive_failed_auxiliary_attempts(
+        cls,
+        run_items: list[DelegationWorkItem],
+        target_work_item_id: str,
+        *,
+        kind: str,
+        baseline_attempt: int = 0,
+    ) -> int:
+        """Count trailing FAILED auxiliary cards since the last non-failed one.
+
+        Why this exists: each crashed report card settles as Phase.FAILED
+        (a DONE_PHASE), so ``_active_auxiliary_item`` returns None and
+        reconcile mints a fresh attempt. Counting the trailing failure
+        streak lets the runtime stop before Report #295.
+
+        ``baseline_attempt`` ignores older cards from a previous execute→
+        review cycle so a rework handoff can spawn again after the hold
+        was cleared.
+        """
+        floor = max(0, int(baseline_attempt or 0))
+        streak = 0
+        for item in reversed(
+            cls._targeting_auxiliary_items(
+                run_items,
+                target_work_item_id,
+                kind=kind,
+            )
+        ):
+            attempt_no = cls._auxiliary_attempt_number(item, kind=kind)
+            if attempt_no <= floor:
+                break
+            if getattr(item, "phase", None) == Phase.FAILED:
+                streak += 1
+                continue
+            break
+        return streak
+
+    @classmethod
+    def _report_failure_limit(cls, parent_item: DelegationWorkItem) -> int:
+        metadata = dict(getattr(parent_item, "metadata", {}) or {})
+        raw = metadata.get("max_consecutive_report_failures")
+        try:
+            value = int(raw) if raw is not None else DEFAULT_MAX_CONSECUTIVE_REPORT_FAILURES
+        except (TypeError, ValueError):
+            value = DEFAULT_MAX_CONSECUTIVE_REPORT_FAILURES
+        return max(1, value)
+
+    async def _should_hold_report_chain(
+        self,
+        parent_item: DelegationWorkItem,
+        *,
+        work_items: list[DelegationWorkItem] | None = None,
+    ) -> bool:
+        """True when reconcile must stop minting new report cards for parent.
+
+        Over the failure limit the parent is terminalized to FAILED so the
+        normal settlement machinery (dependents refresh, manager visibility,
+        rework/resume) takes over — a parent parked in
+        AWAITING_MANAGER_REVIEW with no spawnable report card can never
+        advance on its own. The ``report_chain_hold`` stamp survives only as
+        the quarantine fallback when even the FAILED write does not land,
+        mirroring the attempt ledger's terminalize pattern.
+        """
+        if getattr(parent_item, "phase", None) in DONE_PHASES:
+            return True
+        parent_metadata = dict(getattr(parent_item, "metadata", {}) or {})
+        if str(parent_metadata.get("report_chain_hold", "") or "").strip():
+            return True
+        all_run_items = await self._run_items_for_parent(parent_item, work_items)
+        try:
+            baseline = int(parent_metadata.get("report_failure_baseline_attempt", 0) or 0)
+        except (TypeError, ValueError):
+            baseline = 0
+        consecutive_failures = self._consecutive_failed_auxiliary_attempts(
+            all_run_items,
+            parent_item.work_item_id,
+            kind="report",
+            baseline_attempt=baseline,
+        )
+        limit = self._report_failure_limit(parent_item)
+        if consecutive_failures < limit:
+            return False
+        block_reason = (
+            f"report_chain_failure: {consecutive_failures} consecutive report "
+            f"cards failed (limit {limit})"
+        )
+        summary_text = (
+            "Work item failed because its report handoff pipeline is broken: "
+            f"{consecutive_failures} consecutive report cards died before a "
+            f"durable report landed (limit {limit}). The execution result is "
+            "preserved on the card; rework retries the handoff."
+        )
+        try:
+            await transition_work_item(
+                self.store,
+                parent_item.work_item_id,
+                target_phase=Phase.FAILED,
+                reason="report_chain_failure",
+                summary=summary_text,
+                metadata_updates={
+                    "report_chain_failed_attempts": consecutive_failures,
+                },
+                release_claim=True,
+            )
+            try:
+                await self.store.update_delegation_work_item(
+                    parent_item.work_item_id,
+                    blocked_reason=block_reason,
+                )
+            except Exception:
+                logger.opt(exception=True).debug(
+                    "report_chain_failure blocked_reason write failed for {}",
+                    parent_item.work_item_id,
+                )
+            await self._emit_progress(
+                f"[Company:{projection_id_for_work_item(parent_item)}] {summary_text}"
+            )
+        except InvalidPhaseTransition:
+            # A concurrent writer moved the parent (e.g. a racing manager
+            # approval). Skip minting this tick; the next reconcile pass
+            # re-evaluates from the fresh phase.
+            logger.opt(exception=True).debug(
+                "report_chain_failure terminalize lost a phase race for {}",
+                parent_item.work_item_id,
+            )
+        except Exception:
+            logger.opt(exception=True).warning(
+                "report_chain_failure FAILED terminalize did not land for {}; "
+                "quarantining via report_chain_hold",
+                parent_item.work_item_id,
+            )
+            try:
+                await self.store.update_delegation_work_item(
+                    parent_item.work_item_id,
+                    metadata_updates={
+                        "report_chain_hold": "consecutive_report_failures",
+                        "report_chain_hold_reason": block_reason,
+                        "report_chain_hold_at": datetime.now().isoformat(),
+                        "report_chain_failed_attempts": consecutive_failures,
+                    },
+                )
+            except Exception:
+                logger.opt(exception=True).error(
+                    "report_chain_hold quarantine write also failed for {}",
+                    parent_item.work_item_id,
+                )
+        await self._record_work_item_runtime_diagnostic(
+            code="report_chain_failure_terminalized",
+            severity="error",
+            work_item=parent_item,
+            message=summary_text,
+            details={
+                "consecutive_failures": consecutive_failures,
+                "limit": limit,
+                "baseline_attempt": baseline,
+            },
+        )
+        return True
 
     @classmethod
     def _next_auxiliary_attempt(
@@ -7323,6 +7782,13 @@ class CompanyWorkItemExecutor:
             target_work_item_id,
             kind="review",
         ) is not None:
+            return None
+        # Defense in depth: even callers outside reconcile (e.g. DONE
+        # transition) must not mint Report #N after a failure storm.
+        if await self._should_hold_report_chain(
+            worker_item,
+            work_items=all_run_items,
+        ):
             return None
         existing_card = self._active_auxiliary_item(
             all_run_items,
@@ -13853,6 +14319,133 @@ class CompanyWorkItemExecutor:
             await self.store.save_delegation_run(run)
         except Exception:
             logger.opt(exception=True).debug("Failed to save delegation run owner review lifecycle update")
+
+    async def _settle_run_lifecycle_on_convergence(self, tasks: list[Task]) -> None:
+        """Close the delegation run when its tree converged in terminal failure.
+
+        The success path closes through delivery review (awaiting_owner plus
+        the feedback card). A run whose intake or delivery failed previously
+        stayed running/active forever: no closure signal, no card, and new
+        session input was routed into resuming the dead run (OBS-5).
+        """
+        if not self.store or not hasattr(self.store, "get_delegation_run"):
+            return
+        run_id = self._delegation_run_id_for_tasks(tasks)
+        if not run_id:
+            return
+        list_work_items = getattr(self.store, "list_delegation_work_items", None)
+        if not callable(list_work_items):
+            return
+        try:
+            work_items = await list_work_items(run_id)
+        except Exception:
+            logger.opt(exception=True).debug("run failure settlement: work item load failed")
+            return
+        # Self-evolution items are an opt-in post-delivery reflection pass;
+        # their outcome must never decide the business run's terminal verdict.
+        work_items = [
+            item
+            for item in work_items
+            if str(getattr(item, "kind", "") or "").strip().lower() != "self_evolution"
+        ]
+        if not work_items:
+            return
+        if any(getattr(item, "phase", None) not in DONE_PHASES for item in work_items):
+            return
+        failed_core = [
+            item
+            for item in work_items
+            if str(getattr(item, "kind", "") or "").strip().lower() in {"intake", "delivery"}
+            and getattr(item, "phase", None) in {Phase.FAILED, Phase.CANCELLED}
+        ]
+        if not failed_core:
+            return
+        try:
+            run = await self.store.get_delegation_run(run_id)
+        except Exception:
+            logger.opt(exception=True).debug("run failure settlement: run load failed")
+            return
+        if run is None:
+            return
+        lifecycle = str(getattr(run, "lifecycle_status", "") or "").strip()
+        if lifecycle in {"closed_failed", "awaiting_owner"}:
+            return
+        failed_items = [
+            {
+                "work_item_id": str(getattr(item, "work_item_id", "") or ""),
+                "kind": str(getattr(item, "kind", "") or ""),
+                "role_id": str(getattr(item, "role_id", "") or ""),
+                "phase": str(getattr(getattr(item, "phase", None), "value", "") or ""),
+                "blocked_reason": str(getattr(item, "blocked_reason", "") or "")[:300],
+            }
+            for item in work_items
+            if getattr(item, "phase", None) in {Phase.FAILED, Phase.CANCELLED}
+        ]
+        closed_at = datetime.now().isoformat()
+        run.status = (
+            "failed"
+            if any(item["phase"] == Phase.FAILED.value for item in failed_items)
+            else "cancelled"
+        )
+        run.lifecycle_status = "closed_failed"
+        run.metadata = {
+            **dict(run.metadata or {}),
+            "run_failure": {
+                "closed_at": closed_at,
+                "failed_items": failed_items,
+            },
+        }
+        try:
+            await self.store.save_delegation_run(run)
+        except Exception:
+            logger.opt(exception=True).debug("run failure settlement: run save failed")
+            return
+        origin_task = tasks[0] if tasks else None
+        failure_lines = "\n".join(
+            f"- `{item['kind']}::{item['role_id']}` {item['phase']}"
+            + (f" — {item['blocked_reason']}" if item["blocked_reason"] else "")
+            for item in failed_items
+        )
+        await self._emit_progress(
+            f"[Company] run closed after terminal failure — {len(failed_items)} "
+            f"failed/cancelled work item(s). Send a new request to start a fresh run.",
+            task_id=origin_task.id if origin_task else "",
+        )
+        if self.checkpoint_callback and origin_task is not None:
+            original_request = str(
+                (origin_task.metadata or {}).get("original_request", "")
+                or origin_task.description
+                or origin_task.title
+                or ""
+            ).strip()
+            try:
+                await self.checkpoint_callback(
+                    {
+                        "checkpoint_type": "company_run_failure_review",
+                        "project_id": origin_task.project_id,
+                        "session_id": origin_task.session_id,
+                        "task_id": origin_task.id,
+                        "payload": {
+                            "run_id": run_id,
+                            "waiting_task_id": origin_task.id,
+                            "session_id": origin_task.session_id,
+                            "task_ids": [t.id for t in tasks],
+                            "closed_at": closed_at,
+                            "failed_items": failed_items,
+                            "original_request": original_request,
+                            "prompt": (
+                                "This company run ended with failed work items and has "
+                                "been closed.\n\n"
+                                f"{failure_lines}\n\n"
+                                "Reply `dismiss` to acknowledge, or send a new request "
+                                "(for example the original goal with adjustments) to "
+                                "start a fresh run."
+                            ),
+                        },
+                    }
+                )
+            except Exception:
+                logger.opt(exception=True).debug("run failure settlement: checkpoint save failed")
 
     async def _finalize_completed_work_item(self, task: Task) -> None:
         if self._is_authoritative_delivery_work_item(task):

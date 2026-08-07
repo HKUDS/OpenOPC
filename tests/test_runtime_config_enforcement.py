@@ -11,9 +11,15 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import yaml
 from pydantic import ValidationError
 
-from opc.core.config import AgentsConfig, ExternalAgentConfig, OPCConfig
+from opc.core.config import (
+    AgentsConfig,
+    DEFAULT_ORGANIZATION_ID,
+    ExternalAgentConfig,
+    OPCConfig,
+)
 from opc.core.models import (
     DelegationWorkItem,
+    ExecutionCheckpoint,
     ExecutionMode,
     RouterDecision,
     SessionMessageRecord,
@@ -24,7 +30,8 @@ from opc.core.models import (
     WorkItemExecutionStrategy,
 )
 from opc.engine import OPCEngine
-from opc.layer2_organization.company_mode import CompanyWorkItemExecutor
+from opc.layer2_organization.company_mode import CompanyRuntimeSpecBuilder, CompanyWorkItemExecutor
+from opc.plugins.office_ui.services.models import ServiceError
 from opc.layer3_agent.adapters.claude_code import ClaudeCodeAdapter
 from opc.layer3_agent.adapters.codex_adapter import CodexAdapter
 from opc.layer3_agent.adapters.cursor_adapter import CursorAdapter
@@ -323,6 +330,650 @@ class RuntimeConfigEnforcementTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(task.metadata["preferred_external_agent"], "opencode")
         self.assertEqual(task.metadata["work_item_execution_strategy"], WorkItemExecutionStrategy.EXTERNAL.value)
 
+    async def test_company_root_task_persists_decision_org_over_active_config(self) -> None:
+        engine = OPCEngine(config=OPCConfig(), project_id="proj1")
+        engine.config.org.company_profile = "custom"
+        engine.config.org.organization_id = "active-org"
+        engine.store = SimpleNamespace(
+            get_runtime_task_for_work_item=AsyncMock(return_value=None),
+            save_delegation_work_item=AsyncMock(),
+            save_task=AsyncMock(),
+            link_work_item_runtime_task=AsyncMock(return_value=True),
+        )
+        engine.memory = SimpleNamespace(ensure_session=AsyncMock())
+        engine.org_engine = SimpleNamespace(
+            current_org_version=MagicMock(return_value=1),
+            current_runtime_topology_version=MagicMock(return_value=1),
+        )
+        engine._requests_explicit_project_knowledge = MagicMock(return_value=False)
+        work_item = DelegationWorkItem(
+            work_item_id="wi-selected-org",
+            run_id="run-selected-org",
+            cell_id="team::engineering",
+            team_instance_id="team-instance-1",
+            role_id="engineer",
+            seat_id="seat-engineer",
+            title="Engineering execution",
+            summary="Implement the requested change.",
+            kind="execute",
+            projection_id="engineering-execute",
+            metadata={"seat_id": "seat-engineer", "team_id": "team::engineering"},
+        )
+
+        task = await engine._ensure_runtime_work_item_task(
+            work_item=work_item,
+            parent_session_id="sess-company",
+            original_message="Build the thing.",
+            decision=RouterDecision(
+                mode=ExecutionMode.COMPANY_MODE,
+                domains=[],
+                company_profile="custom",
+                org_id="selected-org",
+            ),
+            runtime_topology={
+                "final_decider_role_id": "lead",
+                "seats": [
+                    {
+                        "seat_id": "seat-engineer",
+                        "team_id": "team::engineering",
+                        "role_id": "engineer",
+                        "employee_assignment": {"employee_id": "eng-1", "name": "Engineer"},
+                        "metadata": {"role_name": "Engineer"},
+                    }
+                ],
+            },
+            delegation_playbook={},
+            secretary_context="",
+            target_output_dir=None,
+            origin_channel="cli",
+            origin_chat_id="",
+            origin_thread_id="",
+            origin_task_id=None,
+            attachment_refs=[],
+            attachment_context="",
+            force_native_execution=False,
+        )
+
+        self.assertEqual(task.org_id, "selected-org")
+        self.assertEqual(task.metadata["org_id"], "selected-org")
+        self.assertEqual(task.metadata["organization_id"], "selected-org")
+
+    def test_build_spec_rejects_custom_run_without_durable_org_id(self) -> None:
+        builder = CompanyRuntimeSpecBuilder(
+            org_engine=SimpleNamespace(
+                get_company_profile=lambda: "custom",
+                config=SimpleNamespace(
+                    org=SimpleNamespace(
+                        organization_id="active-org",
+                        organization_name="Active Org",
+                        organization_config_file="org_active-org_config.yaml",
+                        company_profile="custom",
+                    )
+                ),
+            )
+        )
+        with self.assertRaises(ServiceError) as ctx:
+            builder.build_spec(
+                RouterDecision(
+                    mode=ExecutionMode.COMPANY_MODE,
+                    company_profile="custom",
+                    org_id=None,
+                ),
+                original_message="Run the company.",
+            )
+        assert ctx.exception.code == "org_id_required"
+
+    def test_build_spec_serializes_selected_org_not_active_config(self) -> None:
+        builder = CompanyRuntimeSpecBuilder(
+            org_engine=SimpleNamespace(
+                get_company_profile=lambda: "custom",
+                config=SimpleNamespace(
+                    org=SimpleNamespace(
+                        organization_id="active-org",
+                        organization_name="Active Org",
+                        organization_config_file="org_active-org_config.yaml",
+                        company_profile="custom",
+                    )
+                ),
+            )
+        )
+        decision = RouterDecision(
+            mode=ExecutionMode.COMPANY_MODE,
+            company_profile="custom",
+            org_id="selected-org",
+        )
+        spec = builder.build_spec(decision, original_message="Run the company.")
+        assert spec.metadata["org_id"] == "selected-org"
+        assert spec.metadata["organization_id"] == "selected-org"
+
+    def test_runtime_org_id_for_identity_never_derives_from_active_config(self) -> None:
+        engine = OPCEngine(config=OPCConfig(), project_id="proj1")
+        engine.config.org.company_profile = "custom"
+        engine.config.org.organization_id = "active-org"
+        decision = RouterDecision(
+            mode=ExecutionMode.COMPANY_MODE,
+            company_profile="custom",
+            org_id=None,
+        )
+        resolved = OPCEngine._runtime_org_id_for_identity(
+            decision,
+            {},
+            engine.config.org,
+        )
+        assert resolved is None
+
+    async def test_ensure_runtime_work_item_task_rejects_custom_without_durable_org(self) -> None:
+        engine = OPCEngine(config=OPCConfig(), project_id="proj1")
+        engine.config.org.company_profile = "custom"
+        engine.config.org.organization_id = "active-org"
+        engine.store = SimpleNamespace(
+            get_runtime_task_for_work_item=AsyncMock(return_value=None),
+            save_delegation_work_item=AsyncMock(),
+            save_task=AsyncMock(),
+            link_work_item_runtime_task=AsyncMock(return_value=True),
+        )
+        engine.memory = SimpleNamespace(ensure_session=AsyncMock())
+        engine.org_engine = SimpleNamespace(
+            current_org_version=MagicMock(return_value=1),
+            current_runtime_topology_version=MagicMock(return_value=1),
+        )
+        engine._requests_explicit_project_knowledge = MagicMock(return_value=False)
+        work_item = DelegationWorkItem(
+            work_item_id="wi-no-durable-org",
+            run_id="run-no-durable-org",
+            cell_id="team::engineering",
+            team_instance_id="team-instance-1",
+            role_id="engineer",
+            seat_id="seat-engineer",
+            title="Engineering execution",
+            summary="Implement the requested change.",
+            kind="execute",
+            projection_id="engineering-execute",
+            metadata={"seat_id": "seat-engineer", "team_id": "team::engineering"},
+        )
+        with self.assertRaises(ServiceError) as ctx:
+            await engine._ensure_runtime_work_item_task(
+                work_item=work_item,
+                parent_session_id="sess-company",
+                original_message="Build the thing.",
+                decision=RouterDecision(
+                    mode=ExecutionMode.COMPANY_MODE,
+                    company_profile="custom",
+                    org_id=None,
+                ),
+                runtime_topology={
+                    "final_decider_role_id": "lead",
+                    "seats": [
+                        {
+                            "seat_id": "seat-engineer",
+                            "team_id": "team::engineering",
+                            "role_id": "engineer",
+                            "employee_assignment": {"employee_id": "eng-1", "name": "Engineer"},
+                            "metadata": {"role_name": "Engineer"},
+                        }
+                    ],
+                },
+                delegation_playbook={},
+                secretary_context="",
+                target_output_dir=None,
+                origin_channel="cli",
+                origin_chat_id="",
+                origin_thread_id="",
+                origin_task_id=None,
+                attachment_refs=[],
+                attachment_context="",
+                force_native_execution=False,
+            )
+        assert ctx.exception.code == "org_id_required"
+        engine.store.save_task.assert_not_awaited()
+
+    async def test_ensure_runtime_work_item_task_rejects_existing_custom_task_without_durable_org(self) -> None:
+        existing = Task(
+            id="existing-no-org",
+            title="Engineering execution",
+            project_id="proj1",
+            session_id="sess-company:wi-existing-no-org",
+            assigned_to="engineer",
+            metadata={
+                "execution_mode": "company_mode",
+                "runtime_model": "multi_team_org",
+                "work_item_runtime": True,
+                "work_item_projection_id": "engineering-execute",
+                "work_item_turn_type": "execute",
+                "company_profile": "custom",
+                "delegation_seat_id": "seat-engineer",
+            },
+        )
+        engine = OPCEngine(config=OPCConfig(), project_id="proj1")
+        engine.config.org.company_profile = "custom"
+        engine.config.org.organization_id = "active-org"
+        engine.store = SimpleNamespace(
+            get_runtime_task_for_work_item=AsyncMock(return_value=existing),
+            save_delegation_work_item=AsyncMock(),
+            save_task=AsyncMock(),
+            link_work_item_runtime_task=AsyncMock(return_value=True),
+        )
+        engine.memory = SimpleNamespace(ensure_session=AsyncMock())
+        work_item = DelegationWorkItem(
+            work_item_id="wi-existing-no-org",
+            run_id="run-existing-no-org",
+            cell_id="team::engineering",
+            team_instance_id="team-instance-1",
+            role_id="engineer",
+            seat_id="seat-engineer",
+            title="Engineering execution",
+            summary="Implement the requested change.",
+            kind="execute",
+            projection_id="engineering-execute",
+            metadata={"seat_id": "seat-engineer", "team_id": "team::engineering"},
+        )
+        with self.assertRaises(ServiceError) as ctx:
+            await engine._ensure_runtime_work_item_task(
+                work_item=work_item,
+                parent_session_id="sess-company",
+                original_message="Build the thing.",
+                decision=RouterDecision(
+                    mode=ExecutionMode.COMPANY_MODE,
+                    company_profile="custom",
+                    org_id=None,
+                ),
+                runtime_topology={
+                    "final_decider_role_id": "lead",
+                    "seats": [
+                        {
+                            "seat_id": "seat-engineer",
+                            "team_id": "team::engineering",
+                            "role_id": "engineer",
+                            "employee_assignment": {"employee_id": "eng-1", "name": "Engineer"},
+                            "metadata": {"role_name": "Engineer"},
+                        }
+                    ],
+                },
+                delegation_playbook={},
+                secretary_context="",
+                target_output_dir=None,
+                origin_channel="cli",
+                origin_chat_id="",
+                origin_thread_id="",
+                origin_task_id=None,
+                attachment_refs=[],
+                attachment_context="",
+                force_native_execution=False,
+            )
+        assert ctx.exception.code == "org_id_required"
+        engine.store.save_task.assert_not_awaited()
+
+    async def test_ensure_runtime_work_item_task_rejects_conflicting_org_ids(self) -> None:
+        existing = Task(
+            id="existing-conflict-org",
+            title="Engineering execution",
+            project_id="proj1",
+            session_id="sess-company:wi-existing-conflict-org",
+            assigned_to="engineer",
+            org_id="persisted-org",
+            metadata={
+                "execution_mode": "company_mode",
+                "runtime_model": "multi_team_org",
+                "work_item_runtime": True,
+                "work_item_projection_id": "engineering-execute",
+                "work_item_turn_type": "execute",
+                "company_profile": "custom",
+                "organization_id": "persisted-org",
+                "delegation_seat_id": "seat-engineer",
+            },
+        )
+        engine = OPCEngine(config=OPCConfig(), project_id="proj1")
+        engine.config.org.company_profile = "custom"
+        engine.config.org.organization_id = "active-org"
+        engine.store = SimpleNamespace(
+            get_runtime_task_for_work_item=AsyncMock(return_value=existing),
+            save_delegation_work_item=AsyncMock(),
+            save_task=AsyncMock(),
+            link_work_item_runtime_task=AsyncMock(return_value=True),
+        )
+        engine.memory = SimpleNamespace(ensure_session=AsyncMock())
+        work_item = DelegationWorkItem(
+            work_item_id="wi-existing-conflict-org",
+            run_id="run-existing-conflict-org",
+            cell_id="team::engineering",
+            team_instance_id="team-instance-1",
+            role_id="engineer",
+            seat_id="seat-engineer",
+            title="Engineering execution",
+            summary="Implement the requested change.",
+            kind="execute",
+            projection_id="engineering-execute",
+            metadata={"seat_id": "seat-engineer", "team_id": "team::engineering"},
+        )
+        with self.assertRaises(ServiceError) as ctx:
+            await engine._ensure_runtime_work_item_task(
+                work_item=work_item,
+                parent_session_id="sess-company",
+                original_message="Build the thing.",
+                decision=RouterDecision(
+                    mode=ExecutionMode.COMPANY_MODE,
+                    company_profile="custom",
+                    org_id="selected-org",
+                ),
+                runtime_topology={
+                    "final_decider_role_id": "lead",
+                    "seats": [
+                        {
+                            "seat_id": "seat-engineer",
+                            "team_id": "team::engineering",
+                            "role_id": "engineer",
+                            "employee_assignment": {"employee_id": "eng-1", "name": "Engineer"},
+                            "metadata": {"role_name": "Engineer"},
+                        }
+                    ],
+                },
+                delegation_playbook={},
+                secretary_context="",
+                target_output_dir=None,
+                origin_channel="cli",
+                origin_chat_id="",
+                origin_thread_id="",
+                origin_task_id=None,
+                attachment_refs=[],
+                attachment_context="",
+                force_native_execution=False,
+            )
+        assert ctx.exception.code == "org_id_conflict"
+        engine.store.save_task.assert_not_awaited()
+
+    async def test_ensure_runtime_work_item_task_repairs_existing_custom_task_from_persisted_durable_org(self) -> None:
+        existing = Task(
+            id="existing-durable-org",
+            title="Engineering execution",
+            project_id="proj1",
+            session_id="sess-company:wi-existing-durable-org",
+            assigned_to="engineer",
+            org_id="persisted-org",
+            metadata={
+                "execution_mode": "company_mode",
+                "runtime_model": "multi_team_org",
+                "work_item_runtime": True,
+                "work_item_projection_id": "engineering-execute",
+                "work_item_turn_type": "execute",
+                "company_profile": "custom",
+                "organization_id": "stale-org",
+                "delegation_seat_id": "seat-engineer",
+            },
+        )
+        engine = OPCEngine(config=OPCConfig(), project_id="proj1")
+        engine.config.org.company_profile = "custom"
+        engine.config.org.organization_id = "active-org"
+        engine.store = SimpleNamespace(
+            get_runtime_task_for_work_item=AsyncMock(return_value=existing),
+            save_delegation_work_item=AsyncMock(),
+            save_task=AsyncMock(),
+            link_work_item_runtime_task=AsyncMock(return_value=True),
+        )
+        engine.memory = SimpleNamespace(ensure_session=AsyncMock())
+        work_item = DelegationWorkItem(
+            work_item_id="wi-existing-durable-org",
+            run_id="run-existing-durable-org",
+            cell_id="team::engineering",
+            team_instance_id="team-instance-1",
+            role_id="engineer",
+            seat_id="seat-engineer",
+            title="Engineering execution",
+            summary="Implement the requested change.",
+            kind="execute",
+            projection_id="engineering-execute",
+            metadata={"seat_id": "seat-engineer", "team_id": "team::engineering"},
+        )
+        repaired = await engine._ensure_runtime_work_item_task(
+            work_item=work_item,
+            parent_session_id="sess-company",
+            original_message="Build the thing.",
+            decision=RouterDecision(
+                mode=ExecutionMode.COMPANY_MODE,
+                company_profile="custom",
+                org_id=None,
+            ),
+            runtime_topology={
+                "final_decider_role_id": "lead",
+                "seats": [
+                    {
+                        "seat_id": "seat-engineer",
+                        "team_id": "team::engineering",
+                        "role_id": "engineer",
+                        "employee_assignment": {"employee_id": "eng-1", "name": "Engineer"},
+                        "metadata": {"role_name": "Engineer"},
+                    }
+                ],
+            },
+            delegation_playbook={},
+            secretary_context="",
+            target_output_dir=None,
+            origin_channel="cli",
+            origin_chat_id="",
+            origin_thread_id="",
+            origin_task_id=None,
+            attachment_refs=[],
+            attachment_context="",
+            force_native_execution=False,
+        )
+        self.assertEqual(repaired.id, "existing-durable-org")
+        self.assertEqual(repaired.org_id, "persisted-org")
+        self.assertEqual(repaired.metadata["org_id"], "persisted-org")
+        self.assertEqual(repaired.metadata["organization_id"], "persisted-org")
+        engine.store.save_task.assert_awaited_with(existing)
+
+    async def test_delivery_self_evolution_custom_without_durable_org_fails_closed(self) -> None:
+        engine = OPCEngine(config=OPCConfig(), project_id="proj1")
+        engine.config.org.company_profile = "custom"
+        engine.config.org.organization_id = "active-org"
+        waiting_task = Task(
+            id="waiting-custom",
+            project_id="proj1",
+            session_id="sess-delivery",
+            metadata={
+                "execution_mode": "company_mode",
+                "company_profile": "custom",
+                "work_item_runtime": True,
+                "work_item_projection_id": "delivery",
+                "work_item_turn_type": "deliver",
+            },
+        )
+        engine.store = SimpleNamespace(get_task=AsyncMock(return_value=waiting_task))
+        engine._mark_company_runtime_checkpoint_status = AsyncMock()
+        engine._create_company_self_evolution_root_work_item = AsyncMock()
+        checkpoint = ExecutionCheckpoint(
+            checkpoint_id="cp-delivery",
+            project_id="proj1",
+            session_id="sess-delivery",
+            task_id="waiting-custom",
+            checkpoint_type="company_delivery_feedback",
+            payload={"waiting_task_id": "waiting-custom", "task_ids": ["waiting-custom"]},
+        )
+        result = await engine._run_company_delivery_self_evolution_consumed(
+            checkpoint,
+            action="approve",
+        )
+        assert "durable org identity" in result
+        engine._mark_company_runtime_checkpoint_status.assert_awaited_once_with(
+            checkpoint,
+            status="invalid",
+        )
+        engine._create_company_self_evolution_root_work_item.assert_not_awaited()
+
+    async def test_delivery_self_evolution_custom_uses_durable_org_over_payload_and_config(self) -> None:
+        engine = OPCEngine(config=OPCConfig(), project_id="proj1")
+        engine.config.org.company_profile = "custom"
+        engine.config.org.organization_id = "active-org"
+        waiting_task = Task(
+            id="waiting-custom-2",
+            project_id="proj1",
+            session_id="sess-delivery",
+            org_id="selected-org",
+            metadata={
+                "execution_mode": "company_mode",
+                "company_profile": "custom",
+                "work_item_runtime": True,
+                "work_item_projection_id": "delivery",
+                "work_item_turn_type": "deliver",
+            },
+        )
+        engine.store = SimpleNamespace(get_task=AsyncMock(return_value=waiting_task))
+        engine._mark_company_runtime_checkpoint_status = AsyncMock()
+        engine.org_engine = None
+        engine._company_followup_target_task = MagicMock(
+            return_value=SimpleNamespace(assigned_to="lead", metadata={}),
+        )
+        engine.company_executor = SimpleNamespace()
+        engine._self_evolution_assignments_by_role = MagicMock(return_value={})
+        engine._create_company_self_evolution_root_work_item = AsyncMock(return_value=None)
+        checkpoint = ExecutionCheckpoint(
+            checkpoint_id="cp-delivery-2",
+            project_id="proj1",
+            session_id="sess-delivery",
+            task_id="waiting-custom-2",
+            checkpoint_type="company_delivery_feedback",
+            payload={
+                "waiting_task_id": "waiting-custom-2",
+                "task_ids": ["waiting-custom-2"],
+                "organization_id": "stale-org",
+            },
+        )
+        await engine._run_company_delivery_self_evolution_consumed(
+            checkpoint,
+            action="approve",
+        )
+        call = engine._create_company_self_evolution_root_work_item.await_args
+        assert call is not None
+        assert call.kwargs["organization_id"] == "selected-org"
+
+    async def test_delivery_self_evolution_corporate_still_uses_config_default(self) -> None:
+        engine = OPCEngine(config=OPCConfig(), project_id="proj1")
+        waiting_task = Task(
+            id="waiting-corporate",
+            project_id="proj1",
+            session_id="sess-delivery",
+            metadata={
+                "execution_mode": "company_mode",
+                "company_profile": "corporate",
+                "work_item_runtime": True,
+                "work_item_projection_id": "delivery",
+                "work_item_turn_type": "deliver",
+            },
+        )
+        engine.store = SimpleNamespace(get_task=AsyncMock(return_value=waiting_task))
+        engine._mark_company_runtime_checkpoint_status = AsyncMock()
+        engine.org_engine = None
+        engine._company_followup_target_task = MagicMock(
+            return_value=SimpleNamespace(assigned_to="lead", metadata={}),
+        )
+        engine.company_executor = SimpleNamespace()
+        engine._self_evolution_assignments_by_role = MagicMock(return_value={})
+        engine._create_company_self_evolution_root_work_item = AsyncMock(return_value=None)
+        checkpoint = ExecutionCheckpoint(
+            checkpoint_id="cp-delivery-corp",
+            project_id="proj1",
+            session_id="sess-delivery",
+            task_id="waiting-corporate",
+            checkpoint_type="company_delivery_feedback",
+            payload={"waiting_task_id": "waiting-corporate", "task_ids": ["waiting-corporate"]},
+        )
+        await engine._run_company_delivery_self_evolution_consumed(
+            checkpoint,
+            action="approve",
+        )
+        call = engine._create_company_self_evolution_root_work_item.await_args
+        assert call is not None
+        assert call.kwargs["organization_id"] == DEFAULT_ORGANIZATION_ID
+
+    async def test_delivery_self_evolution_metadata_only_legacy_custom_uses_metadata_org(self) -> None:
+        engine = OPCEngine(config=OPCConfig(), project_id="proj1")
+        engine.config.org.company_profile = "custom"
+        engine.config.org.organization_id = "active-org"
+        waiting_task = Task(
+            id="waiting-legacy-metadata",
+            project_id="proj1",
+            session_id="sess-delivery",
+            metadata={
+                "work_item_runtime": True,
+                "work_item_projection_id": "delivery",
+                "work_item_turn_type": "deliver",
+                "org_id": "selected-org",
+            },
+        )
+        engine.store = SimpleNamespace(get_task=AsyncMock(return_value=waiting_task))
+        engine._mark_company_runtime_checkpoint_status = AsyncMock()
+        engine.org_engine = None
+        engine._company_followup_target_task = MagicMock(
+            return_value=SimpleNamespace(assigned_to="lead", metadata={}),
+        )
+        engine.company_executor = SimpleNamespace()
+        engine._self_evolution_assignments_by_role = MagicMock(return_value={})
+        engine._create_company_self_evolution_root_work_item = AsyncMock(return_value=None)
+        checkpoint = ExecutionCheckpoint(
+            checkpoint_id="cp-delivery-legacy",
+            project_id="proj1",
+            session_id="sess-delivery",
+            task_id="waiting-legacy-metadata",
+            checkpoint_type="company_delivery_feedback",
+            payload={
+                "waiting_task_id": "waiting-legacy-metadata",
+                "task_ids": ["waiting-legacy-metadata"],
+            },
+        )
+        await engine._run_company_delivery_self_evolution_consumed(
+            checkpoint,
+            action="approve",
+        )
+        call = engine._create_company_self_evolution_root_work_item.await_args
+        assert call is not None
+        assert call.kwargs["organization_id"] == "selected-org"
+
+    async def test_delivery_self_evolution_conflicting_org_ids_fail_closed(self) -> None:
+        engine = OPCEngine(config=OPCConfig(), project_id="proj1")
+        engine.config.org.company_profile = "custom"
+        engine.config.org.organization_id = "active-org"
+        waiting_task = Task(
+            id="waiting-conflict",
+            project_id="proj1",
+            session_id="sess-delivery",
+            org_id="selected-org",
+            metadata={
+                "work_item_runtime": True,
+                "work_item_projection_id": "delivery",
+                "work_item_turn_type": "deliver",
+                "org_id": "other-org",
+            },
+        )
+        engine.store = SimpleNamespace(get_task=AsyncMock(return_value=waiting_task))
+        engine._mark_company_runtime_checkpoint_status = AsyncMock()
+        engine.org_engine = None
+        engine._company_followup_target_task = MagicMock(
+            return_value=SimpleNamespace(assigned_to="lead", metadata={}),
+        )
+        engine.company_executor = SimpleNamespace()
+        engine._self_evolution_assignments_by_role = MagicMock(return_value={})
+        engine._create_company_self_evolution_root_work_item = AsyncMock(return_value=None)
+        checkpoint = ExecutionCheckpoint(
+            checkpoint_id="cp-delivery-conflict",
+            project_id="proj1",
+            session_id="sess-delivery",
+            task_id="waiting-conflict",
+            checkpoint_type="company_delivery_feedback",
+            payload={
+                "waiting_task_id": "waiting-conflict",
+                "task_ids": ["waiting-conflict"],
+            },
+        )
+        result = await engine._run_company_delivery_self_evolution_consumed(
+            checkpoint,
+            action="approve",
+        )
+        assert "org identity" in result
+        engine._mark_company_runtime_checkpoint_status.assert_awaited_once_with(
+            checkpoint,
+            status="invalid",
+        )
+        engine._create_company_self_evolution_root_work_item.assert_not_awaited()
+
     async def test_company_materialized_work_item_uses_selected_agent_over_template_preference(self) -> None:
         saved_tasks: list[Task] = []
 
@@ -388,6 +1039,132 @@ class RuntimeConfigEnforcementTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(created.metadata["preferred_external_agent"], "cursor")
         self.assertEqual(created.metadata["work_item_execution_strategy"], WorkItemExecutionStrategy.EXTERNAL.value)
         self.assertEqual(saved_tasks[0].assigned_external_agent, "cursor")
+
+    async def test_company_materialization_persists_durable_org_on_new_role_task(self) -> None:
+        executor = CompanyWorkItemExecutor(
+            org_engine=SimpleNamespace(),
+            communication=SimpleNamespace(),
+            approval_engine=SimpleNamespace(),
+            memory=SimpleNamespace(ensure_session=AsyncMock()),
+            execute_task=AsyncMock(),
+            save_task=AsyncMock(),
+        )
+        executor.store = SimpleNamespace(
+            get_runtime_task_for_work_item=AsyncMock(return_value=None),
+            save_delegation_work_item=AsyncMock(),
+            save_task=AsyncMock(),
+            link_work_item_runtime_task=AsyncMock(return_value=True),
+        )
+        root_task = Task(
+            id="root-custom-org",
+            title="Root",
+            project_id="proj1",
+            session_id="sess-company",
+            org_id="selected-org",
+            metadata={
+                "execution_mode": "company_mode",
+                "runtime_model": "multi_team_org",
+                "company_profile": "custom",
+                "organization_id": "active-org",
+                "runtime_topology": {
+                    "seats": [
+                        {
+                            "seat_id": "seat-engineer",
+                            "team_id": "team::engineering",
+                            "role_id": "engineer",
+                            "metadata": {"role_name": "Engineer"},
+                        }
+                    ]
+                },
+            },
+        )
+        work_item = DelegationWorkItem(
+            work_item_id="wi-new-custom-org",
+            run_id="run-custom-org",
+            cell_id="team::engineering",
+            team_instance_id="team-instance-1",
+            role_id="engineer",
+            seat_id="seat-engineer",
+            title="Engineering execution",
+            summary="Implement the requested change.",
+            kind="execute",
+            projection_id="engineering-execute",
+            metadata={"seat_id": "seat-engineer", "team_id": "team::engineering"},
+        )
+
+        tasks = await executor._materialize_work_item_tasks([root_task], [work_item])
+        created = next(task for task in tasks if task.id != root_task.id)
+
+        self.assertEqual(created.org_id, "selected-org")
+        self.assertEqual(created.metadata["org_id"], "selected-org")
+        self.assertEqual(created.metadata["organization_id"], "selected-org")
+
+    async def test_company_materialization_repairs_existing_role_task_org_identity(self) -> None:
+        existing = Task(
+            id="existing-custom-role",
+            title="Engineering execution",
+            project_id="proj1",
+            session_id="sess-company:wi-existing-custom-org",
+            assigned_to="engineer",
+            org_id="active-org",
+            metadata={
+                "execution_mode": "company_mode",
+                "runtime_model": "multi_team_org",
+                "work_item_runtime": True,
+                "work_item_projection_id": "engineering-execute",
+                "work_item_turn_type": "execute",
+                "company_profile": "custom",
+                "organization_id": "active-org",
+                "delegation_seat_id": "seat-engineer",
+            },
+        )
+        executor = CompanyWorkItemExecutor(
+            org_engine=SimpleNamespace(),
+            communication=SimpleNamespace(),
+            approval_engine=SimpleNamespace(),
+            memory=SimpleNamespace(ensure_session=AsyncMock()),
+            execute_task=AsyncMock(),
+            save_task=AsyncMock(),
+        )
+        executor.store = SimpleNamespace(
+            get_runtime_task_for_work_item=AsyncMock(return_value=existing),
+            save_delegation_work_item=AsyncMock(),
+            save_task=AsyncMock(),
+        )
+        root_task = Task(
+            id="root-custom-org-existing",
+            title="Root",
+            project_id="proj1",
+            session_id="sess-company",
+            org_id="selected-org",
+            metadata={
+                "execution_mode": "company_mode",
+                "runtime_model": "multi_team_org",
+                "company_profile": "custom",
+                "organization_id": "active-org",
+            },
+        )
+        work_item = DelegationWorkItem(
+            work_item_id="wi-existing-custom-org",
+            run_id="run-custom-org",
+            cell_id="team::engineering",
+            team_instance_id="team-instance-1",
+            role_id="engineer",
+            seat_id="seat-engineer",
+            title="Engineering execution",
+            summary="Implement the requested change.",
+            kind="execute",
+            projection_id="engineering-execute",
+            metadata={"seat_id": "seat-engineer", "team_id": "team::engineering"},
+        )
+
+        tasks = await executor._materialize_work_item_tasks([root_task], [work_item])
+        repaired = next(task for task in tasks if task.id == existing.id)
+
+        self.assertEqual(repaired.org_id, "selected-org")
+        self.assertEqual(repaired.metadata["org_id"], "selected-org")
+        self.assertEqual(repaired.metadata["organization_id"], "selected-org")
+        executor.store.save_task.assert_any_await(existing)
 
     async def test_task_mode_external_followup_reuses_primary_session_external_agent_session(self) -> None:
         engine = OPCEngine(config=OPCConfig(), project_id="proj1")

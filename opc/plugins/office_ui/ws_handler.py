@@ -4967,6 +4967,50 @@ class WSHandler:
     def _resolve_task_org_id(self, task: Any | None) -> str:
         return self._ensure_office_services().session.resolve_task_org_id(task)
 
+    async def _resolve_session_runtime_config_task(
+        self,
+        task_id: str,
+        task: Any | None,
+        *,
+        engine: Any,
+    ) -> Any | None:
+        """Resolve company-session config from the durable runtime identity."""
+        if task is None:
+            return None
+        exec_mode, _ = self._resolve_task_session_config(task)
+        runtime_bound = is_company_runtime_task(task)
+        if not runtime_bound and not self._is_company_session_exec_mode(exec_mode):
+            return task
+        try:
+            target = await self._resolve_company_runtime_target(task_id, engine=engine)
+        except ServiceError:
+            if runtime_bound:
+                raise
+            logger.opt(exception=True).debug(
+                "failed to resolve durable session config task"
+            )
+            return task
+        except Exception as exc:
+            if runtime_bound:
+                raise ServiceError(
+                    "company_runtime_identity_mismatch",
+                    "Company runtime identity could not be resolved",
+                    {"task_id": str(task_id or "").strip()},
+                ) from exc
+            logger.opt(exception=True).debug(
+                "failed to resolve durable session config task"
+            )
+            return task
+        if target is not None:
+            return target.get("config_task") or task
+        if runtime_bound:
+            raise ServiceError(
+                "company_runtime_identity_mismatch",
+                "Company runtime identity could not be resolved",
+                {"task_id": str(task_id or "").strip()},
+            )
+        return task
+
     @staticmethod
     def _is_company_session_exec_mode(exec_mode: Any) -> bool:
         return str(exec_mode or "").strip().lower() in {"company", "org", "custom"}
@@ -5037,14 +5081,24 @@ class WSHandler:
         # Look up session_id from task
         session_id: str | None = None
         task = None
+        config_task = None
         preferred_agent = self._task_preferred_agent
         session_org_id = self._normalize_session_org_id(org_id)
         if task_id and getattr(engine, "store", None):
             task = await engine.store.get_task(task_id)
             if task:
                 session_id = task.session_id
-                identity = self._resolve_task_identity(
+
+        company_runtime_target: dict[str, Any] | None = None
+        try:
+            if task is not None:
+                config_task = await self._resolve_session_runtime_config_task(
+                    task_id,
                     task,
+                    engine=engine,
+                )
+                identity = self._resolve_task_identity(
+                    config_task,
                     default_exec_mode=mode,
                     default_company_profile=profile,
                     default_preferred_agent=preferred_agent,
@@ -5054,9 +5108,12 @@ class WSHandler:
                 profile = identity.company_profile
                 session_org_id = identity.org_id
                 preferred_agent = identity.preferred_agent
-
-        company_runtime_target: dict[str, Any] | None = None
-        try:
+                if identity.is_custom_org and not identity.org_id:
+                    raise ServiceError(
+                        "org_id_required",
+                        "org_id_required",
+                        {"project_id": pid, "task_id": task_id},
+                    )
             content = f"{title}\n{description}".strip()
             engine_mode, company_profile = self._resolve_engine_mode(mode, profile)
             engine_preferred_agent = preferred_agent if engine_mode == "project" else None
@@ -7797,6 +7854,16 @@ class WSHandler:
                         parent_task = await run_engine.store.get_task(parent_task_id)
                     except Exception:
                         logger.opt(exception=True).debug("failed to load parent task for delivery feedback reply")
+                if parent_task is None:
+                    raise ServiceError(
+                        "org_id_required",
+                        "org_id_required",
+                        {
+                            "project_id": pid,
+                            "task_id": parent_task_id,
+                            "reason": "delivery_feedback_requires_durable_parent_task",
+                        },
+                    )
                 session_exec_mode = self._normalize_session_exec_mode(self._exec_mode)
                 session_company_profile = self._normalize_session_company_profile(self._company_profile)
                 session_org_id = ""
@@ -8102,17 +8169,6 @@ class WSHandler:
         pid = self._normalize_project_id(run_project_id or getattr(run_engine, "project_id", None))
         async with lock:
             try:
-                try:
-                    await self._set_company_runtime_control(
-                        target,
-                        state="resuming",
-                        checkpoint_id=str(
-                            getattr(checkpoint, "checkpoint_id", "") or ""
-                        ).strip(),
-                    )
-                except Exception:
-                    logger.opt(exception=True).debug("failed to broadcast company suspend reply routing state")
-
                 config_task = target.get("config_task")
                 session_exec_mode = self._normalize_session_exec_mode(self._exec_mode)
                 session_company_profile = self._normalize_session_company_profile(self._company_profile)
@@ -8124,6 +8180,27 @@ class WSHandler:
                     session_exec_mode,
                     session_company_profile,
                 )
+                if engine_mode == "org" and not session_org_id:
+                    raise ServiceError(
+                        "org_id_required",
+                        "org_id_required",
+                        {
+                            "project_id": pid,
+                            "task_id": str(target.get("config_source_task_id", "") or "").strip(),
+                        },
+                    )
+
+                try:
+                    await self._set_company_runtime_control(
+                        target,
+                        state="resuming",
+                        checkpoint_id=str(
+                            getattr(checkpoint, "checkpoint_id", "") or ""
+                        ).strip(),
+                    )
+                except Exception:
+                    logger.opt(exception=True).debug("failed to broadcast company suspend reply routing state")
+
                 engine_message_metadata = dict(message_metadata or {})
                 engine_message_metadata.update({
                     "response_to_checkpoint_id": str(getattr(checkpoint, "checkpoint_id", "") or ""),
@@ -8525,6 +8602,173 @@ class WSHandler:
             logger.opt(exception=True).debug("failed to persist checkpoint card terminal state")
             return None
 
+    _LOCK_FREE_CHECKPOINT_ANSWER_TYPES = frozenset({
+        "task_user_input",
+        "company_work_item_gate",
+    })
+
+    async def _try_lock_free_parked_checkpoint_answer(
+        self,
+        *,
+        task_id: str,
+        content: str,
+        session_id: str | None,
+        message_metadata: dict[str, Any] | None,
+        user_message_id: str | None,
+        user_message_created_at: float | None,
+        engine: Any,
+        pid: str,
+        channel_id: str,
+        session_exec_mode: str,
+        session_company_profile: str | None,
+        session_org_id: str,
+        attachment_refs: list[dict] | None,
+    ) -> bool:
+        """Answer a pending park checkpoint without taking the per-task turn lock.
+
+        A company goal turn can hold the per-task lock for hours while its live
+        dispatcher waits on AWAITING_HUMAN approval cards. The card answers are
+        themselves session messages, so they queue behind that same lock — a
+        circular wait: dispatcher waits for the answer, the answer waits for the
+        lock, the lock waits for the dispatcher (project-0012 late-approval
+        wedge). When the reply explicitly targets a pending park checkpoint and
+        the lock is currently held, deliver it straight through the engine's
+        checkpoint-resume channel instead: with a live dispatcher the engine
+        only persists the input, applies the approval decision, releases the
+        human wait, and wakes the loop — no second dispatcher, no re-entry.
+
+        Returns True when the reply was fully handled here.
+        """
+        metadata = dict(message_metadata or {})
+        checkpoint_id = str(metadata.get("response_to_checkpoint_id", "") or "").strip()
+        checkpoint_type = str(metadata.get("response_to_checkpoint_type", "") or "").strip()
+        if not checkpoint_id or checkpoint_type not in self._LOCK_FREE_CHECKPOINT_ANSWER_TYPES:
+            return False
+        lock = self._get_task_lock(task_id)
+        if not lock.locked():
+            # No turn in flight: the serialized path works and preserves
+            # ordering, so keep the existing behavior.
+            return False
+        store = getattr(engine, "store", None)
+        if not self._store_is_ready(store):
+            return False
+        getter = getattr(store, "get_pending_checkpoints", None)
+        if not callable(getter):
+            return False
+        try:
+            pending = await getter(project_id=pid)
+        except Exception:
+            logger.opt(exception=True).debug(
+                "Lock-free checkpoint answer: failed to load pending checkpoints"
+            )
+            return False
+        checkpoint = next(
+            (
+                item
+                for item in pending or []
+                if str(getattr(item, "checkpoint_id", "") or "").strip() == checkpoint_id
+                and str(getattr(item, "checkpoint_type", "") or "").strip() == checkpoint_type
+            ),
+            None,
+        )
+        if checkpoint is None:
+            return False
+        # Ownership scoping must accept every channel the card legitimately
+        # reaches, not just the task that raised the checkpoint: company gate
+        # cards raised by role work items are answered from the run's anchor
+        # chat, whose task id only appears in payload["task_ids"] (the same
+        # linkage set _find_parked_checkpoint_for_deferred_resume uses). An
+        # exact task/session equality check would silently disable this fast
+        # path for those answers and re-open the late-approval lock wedge.
+        checkpoint_payload = dict(getattr(checkpoint, "payload", {}) or {})
+        requester_task_id = str(task_id or "").strip()
+        requester_session_id = str(session_id or "").strip()
+        linked_task_ids = {
+            str(checkpoint_payload.get("task_id") or "").strip(),
+            str(checkpoint_payload.get("waiting_task_id") or "").strip(),
+            str(getattr(checkpoint, "task_id", "") or "").strip(),
+        }
+        linked_task_ids.update(
+            str(item or "").strip()
+            for item in list(checkpoint_payload.get("task_ids", []) or [])
+        )
+        linked_task_ids.discard("")
+        linked_session_ids = {
+            str(getattr(checkpoint, "session_id", "") or "").strip(),
+            str(checkpoint_payload.get("session_id") or "").strip(),
+        }
+        linked_session_ids.discard("")
+        has_linkage = bool(linked_task_ids or linked_session_ids)
+        if has_linkage and (
+            requester_task_id not in linked_task_ids
+            and (not requester_session_id or requester_session_id not in linked_session_ids)
+        ):
+            return False
+        logger.info(
+            f"Lock-free checkpoint answer: task lock for {task_id} is held by a "
+            f"live turn; delivering reply to pending checkpoint {checkpoint_id} "
+            "through the engine resume channel"
+        )
+        try:
+            engine_mode, company_profile = self._resolve_engine_mode(
+                session_exec_mode,
+                session_company_profile,
+            )
+            engine_message_metadata = dict(metadata)
+            engine_message_metadata.update(_ui_message_identity_metadata(
+                message_id=user_message_id,
+                conversation_turn_id=_ui_conversation_turn_id(user_message_id),
+                created_at=user_message_created_at,
+            ))
+            response = await engine.process_message(
+                content,
+                project_id=pid,
+                session_id=session_id,
+                mode=engine_mode,
+                org_id=session_org_id or None,
+                company_profile=company_profile,
+                origin_task_id=task_id,
+                attachment_refs=attachment_refs,
+                message_metadata=engine_message_metadata or None,
+            )
+            updated_checkpoint_msg = await self._mark_checkpoint_card_after_engine_response(
+                channel_id=channel_id,
+                project_id=pid,
+                engine=engine,
+                message_metadata=engine_message_metadata,
+                response_message_id=user_message_id,
+            )
+            if updated_checkpoint_msg is not None:
+                await self.broadcast({"type": "session_message", "payload": updated_checkpoint_msg})
+            reply_text = str(response or "").strip() or "Input received."
+            reply_msg = await self.chat_store.insert_message(
+                channel_id=channel_id,
+                sender="assistant",
+                sender_name="OPC",
+                content=reply_text,
+                project_id=pid,
+                metadata={"type": "system", "checkpoint_answer_lock_free": True},
+            )
+            await self.broadcast({"type": "session_message", "payload": reply_msg})
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            # Do NOT fall back to the locked path: it would silently queue
+            # behind the in-flight turn — exactly the wedge this path exists
+            # to break. Surface the failure so the user can retry.
+            logger.opt(exception=True).warning(
+                f"Lock-free checkpoint answer failed for {checkpoint_id}"
+            )
+            helper = await self.chat_store.insert_message(
+                channel_id=channel_id,
+                sender="system",
+                sender_name="OPC",
+                content=f"Failed to deliver the approval reply: {exc}. Please click the card again.",
+                project_id=pid,
+            )
+            await self.broadcast({"type": "session_message", "payload": helper})
+        return True
+
     async def _process_session_message(
         self, task_id: str, content: str, *,
         session_id: str | None = None,
@@ -8557,14 +8801,73 @@ class WSHandler:
         session_preferred_agent = self._task_preferred_agent
         session_org_id = ""
         task = None
+        config_task = None
         store = engine.store
         if self._store_is_ready(store):
             from opc.core.models import TaskStatus
             task = await store.get_task(task_id)
             if task:
-                session_exec_mode, session_company_profile = self._resolve_task_session_config(task)
-                session_org_id = self._resolve_task_org_id(task)
-                session_preferred_agent = self._resolve_task_preferred_agent(task)
+                # This coroutine usually runs as a fire-and-forget background
+                # task (_track_session), where a raised ServiceError is only
+                # logged and the user's message silently vanishes. Fail closed
+                # with a visible chat error instead of raising.
+                try:
+                    config_task = await self._resolve_session_runtime_config_task(
+                        task_id,
+                        task,
+                        engine=engine,
+                    )
+                    session_exec_mode, session_company_profile = self._resolve_task_session_config(
+                        config_task
+                    )
+                    session_org_id = self._resolve_task_org_id(config_task)
+                    session_preferred_agent = self._resolve_task_preferred_agent(config_task)
+                    if (
+                        session_exec_mode in {"org", "custom"}
+                        and not session_org_id
+                        and is_company_runtime_task(task)
+                    ):
+                        raise ServiceError(
+                            "org_id_required",
+                            "org_id_required",
+                            {"project_id": pid, "task_id": task_id},
+                        )
+                except ServiceError as exc:
+                    logger.warning(
+                        f"Session message for task {task_id} rejected during "
+                        f"runtime identity resolution: {exc.code}"
+                    )
+                    try:
+                        msg = await self.chat_store.insert_message(
+                            channel_id=channel_id,
+                            sender="system",
+                            sender_name="OPC",
+                            content=f"Error: {exc.message}",
+                            project_id=pid,
+                        )
+                        await self.broadcast({"type": "session_message", "payload": msg})
+                    except Exception:
+                        logger.opt(exception=True).debug(
+                            "failed to surface session identity error"
+                        )
+                    return
+
+        if await self._try_lock_free_parked_checkpoint_answer(
+            task_id=task_id,
+            content=content,
+            session_id=session_id,
+            message_metadata=message_metadata,
+            user_message_id=user_message_id,
+            user_message_created_at=user_message_created_at,
+            engine=engine,
+            pid=pid,
+            channel_id=channel_id,
+            session_exec_mode=session_exec_mode,
+            session_company_profile=session_company_profile,
+            session_org_id=session_org_id,
+            attachment_refs=attachment_refs,
+        ):
+            return
 
         # Per-task lock: same session serialized, different sessions concurrent
         async with self._get_task_lock(task_id):
@@ -8575,9 +8878,26 @@ class WSHandler:
                 from opc.core.models import TaskStatus
                 task = await store.get_task(task_id)
                 if task:
-                    session_exec_mode, session_company_profile = self._resolve_task_session_config(task)
-                    session_org_id = self._resolve_task_org_id(task)
-                    session_preferred_agent = self._resolve_task_preferred_agent(task)
+                    config_task = await self._resolve_session_runtime_config_task(
+                        task_id,
+                        task,
+                        engine=engine,
+                    )
+                    session_exec_mode, session_company_profile = self._resolve_task_session_config(
+                        config_task
+                    )
+                    session_org_id = self._resolve_task_org_id(config_task)
+                    session_preferred_agent = self._resolve_task_preferred_agent(config_task)
+                    if (
+                        session_exec_mode in {"org", "custom"}
+                        and not session_org_id
+                        and is_company_runtime_task(task)
+                    ):
+                        raise ServiceError(
+                            "org_id_required",
+                            "org_id_required",
+                            {"project_id": pid, "task_id": task_id},
+                        )
                     if task.status == TaskStatus.DONE and self._is_company_session_exec_mode(session_exec_mode):
                         task.status = TaskStatus.IDLE
                         task.metadata = dict(getattr(task, "metadata", {}) or {})
@@ -8603,12 +8923,17 @@ class WSHandler:
                 except Exception:
                     logger.opt(exception=True).debug("failed to mark company session runtime running")
             try:
-                engine_mode, company_profile = self._resolve_engine_mode(
-                    session_exec_mode,
-                    session_company_profile,
+                config_task_id = str(getattr(config_task, "id", "") or "").strip()
+                selected_task_id = str(getattr(task, "id", "") or "").strip()
+                should_persist_selected_config = bool(
+                    task is not None
+                    and (
+                        not config_task_id
+                        or config_task_id == selected_task_id
+                        or (session_exec_mode == "org" and not session_org_id)
+                    )
                 )
-                engine_preferred_agent = session_preferred_agent if session_exec_mode == "task" else None
-                if task is not None:
+                if should_persist_selected_config:
                     await self._persist_session_config(
                         task,
                         exec_mode=session_exec_mode,
@@ -8617,6 +8942,22 @@ class WSHandler:
                         org_id=session_org_id,
                         engine=engine,
                     )
+                    persisted_identity = self._resolve_task_identity(
+                        task,
+                        default_exec_mode=session_exec_mode,
+                        default_company_profile=session_company_profile,
+                        default_preferred_agent=session_preferred_agent,
+                        default_org_id=session_org_id,
+                    )
+                    session_exec_mode = persisted_identity.exec_mode
+                    session_company_profile = persisted_identity.company_profile
+                    session_preferred_agent = persisted_identity.preferred_agent
+                    session_org_id = persisted_identity.org_id
+                engine_mode, company_profile = self._resolve_engine_mode(
+                    session_exec_mode,
+                    session_company_profile,
+                )
+                engine_preferred_agent = session_preferred_agent if session_exec_mode == "task" else None
                 engine_message_metadata = dict(message_metadata or {})
                 engine_message_metadata.update(_ui_message_identity_metadata(
                     message_id=user_message_id,

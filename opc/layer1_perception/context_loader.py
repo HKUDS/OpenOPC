@@ -91,6 +91,10 @@ class ContextLoader:
             session_id=None,
             include_project_knowledge=include_project_knowledge,
         )
+        if session_id:
+            maybe_compact = getattr(self.memory, "maybe_compact_session_history", None)
+            if callable(maybe_compact):
+                await maybe_compact(session_id, project_id=project_id)
         ctx.session_memory = (
             await self.memory.build_session_prompt_context(
                 session_id,

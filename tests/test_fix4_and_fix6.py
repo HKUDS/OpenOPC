@@ -18,7 +18,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from opc.core.models import DelegationWorkItem, Phase, RoleRuntimeSession
+from opc.core.models import DelegationWorkItem, Phase, RoleRuntimeSession, Task
 from opc.database.store import OPCStore
 from opc.layer2_organization import phase_hooks  # noqa: F401  (register hooks)
 from opc.layer3_agent.adapters.base import ExternalAgentAdapter
@@ -126,7 +126,15 @@ class ReviewPromptSchemaTests(unittest.TestCase):
         self.assertNotIn("auto-rejected", text.lower())
 
     def test_native_agent_prompt_keeps_suggested_schema(self) -> None:
-        text = native_agent._COMPANY_REVIEW_WORK_ITEM_GUIDELINES
+        # The guidelines live in company_runtime_contract; the native agent
+        # injects them through build_company_work_item_contract, so assert
+        # through the wiring the native agent actually uses.
+        task = Task(
+            id="review-task",
+            title="Review work item",
+            metadata={"work_item_turn_type": "review"},
+        )
+        text = native_agent.build_company_work_item_contract(task)
         self.assertIn("review_verdict", text)
         self.assertIn("blocking_issues", text)
         self.assertNotIn("Mandatory verdict schema", text)

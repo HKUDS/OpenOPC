@@ -108,6 +108,36 @@ _SHELL_COMMAND_PREFIX_ARITY = {
 }
 
 
+_ESCALATION_DECISION_TOKENS: frozenset[str] = frozenset({
+    "approve_once",
+    "approve_session",
+    "always_project",
+    "always_global",
+    "deny",
+})
+
+_ESCALATION_APPROVE_SYNONYMS: frozenset[str] = frozenset({
+    "approve", "approved", "yes", "y", "ok", "allow", "同意", "批准", "允许",
+})
+
+_ESCALATION_DENY_SYNONYMS: frozenset[str] = frozenset({
+    "no", "n", "denied", "reject", "rejected", "拒绝", "不允许",
+})
+
+
+def normalize_escalation_reply(reply: str) -> str:
+    """Map a human reply to an approval decision token; ``""`` when the text
+    is not a decision (it is then ordinary task input, never a silent deny)."""
+    text = str(reply or "").strip().lower()
+    if text in _ESCALATION_DECISION_TOKENS:
+        return text
+    if text in _ESCALATION_APPROVE_SYNONYMS:
+        return "approve_once"
+    if text in _ESCALATION_DENY_SYNONYMS:
+        return "deny"
+    return ""
+
+
 class ApprovalEngine:
     """Bounded-autonomy policy engine."""
 
@@ -1944,6 +1974,50 @@ class ApprovalEngine:
             policy_source="human_escalation",
             metadata=result_metadata,
         )
+
+    def escalation_context_for_blocked_tool(
+        self,
+        task: Task | None,
+        *,
+        tool_name: str,
+        arguments: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Rebuild the ``approval_context`` an inline escalation would carry
+        for a runtime-blocked tool.
+
+        A block that outlived its inline wait survives only as checkpoint
+        payload (``pause_request.permission_context``), which does not carry
+        the allowlist context an approval card stores. This builder lets any
+        reply surface (chat, CLI, headless API) route its decision through
+        ``apply_deferred_escalation_decision`` — the same channel as the
+        Office UI card click — instead of degrading to plain task input.
+        """
+        action_kind = "tool"
+        action_name = str(tool_name or "").strip()
+        metadata: dict[str, Any] = {"arguments": dict(arguments or {})}
+        allowlist_enabled = self._allowlist_enabled_for_action(action_kind, metadata)
+        patterns = (
+            self._build_allowlist_patterns(
+                action_kind=action_kind,
+                action_name=action_name,
+                metadata=metadata,
+            )
+            if allowlist_enabled
+            else []
+        )
+        return {
+            "action_kind": action_kind,
+            "action_name": action_name,
+            "project_id": str(getattr(task, "project_id", "") or "") if task else "",
+            "session_scope_id": self._approval_session_scope_id(task),
+            "allowlist_enabled": allowlist_enabled,
+            "allowlist_patterns": list(patterns),
+            "candidates": self._build_allowlist_candidates(
+                action_kind=action_kind,
+                action_name=action_name,
+                metadata=metadata,
+            ),
+        }
 
     def apply_deferred_escalation_decision(
         self,

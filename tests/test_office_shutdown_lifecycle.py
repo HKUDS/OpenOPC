@@ -9,6 +9,30 @@ from opc.core.models import ExecutionCheckpoint, Task
 from opc.plugins.office_ui.ws_handler import WSHandler
 
 
+def _make_handler(root_engine: SimpleNamespace | None = None, **overrides: object) -> WSHandler:
+    """Build a real WSHandler over stub dependencies.
+
+    Constructed through ``__init__`` (rather than ``__new__`` plus a
+    hand-copied attribute list) so every attribute ``shutdown()`` touches is
+    initialized by the constructor itself; each test only overrides what its
+    scenario controls. ``__init__`` is side-effect free for stub inputs: it
+    assigns state, builds Dispatcher/OfficeServices holders, and wires engine
+    callbacks via defensive setattr/getattr.
+    """
+    engine = root_engine if root_engine is not None else SimpleNamespace()
+    if not hasattr(engine, "project_id"):
+        engine.project_id = "default"
+    handler = WSHandler(
+        engine=engine,
+        agent_store=SimpleNamespace(),
+        chat_store=None,
+        event_adapter=SimpleNamespace(),
+    )
+    for name, value in overrides.items():
+        setattr(handler, name, value)
+    return handler
+
+
 def test_ws_shutdown_checkpoints_before_cancelling_and_awaiting_sessions() -> None:
     async def scenario() -> None:
         events: list[str] = []
@@ -29,18 +53,12 @@ def test_ws_shutdown_checkpoints_before_cancelling_and_awaiting_sessions() -> No
         execution_task = asyncio.create_task(execution())
         await started.wait()
 
-        handler = WSHandler.__new__(WSHandler)
-        handler.engine = SimpleNamespace()
-        handler._root_engine = SimpleNamespace(
-            prepare_active_company_runtimes_for_shutdown=prepare,
+        handler = _make_handler(
+            SimpleNamespace(prepare_active_company_runtimes_for_shutdown=prepare),
+            _background_tasks={execution_task},
+            _task_bg_context={execution_task: {"task_id": "runtime-task"}},
+            _task_bg_map={"runtime-task": {execution_task}},
         )
-        handler._shutting_down = False
-        handler._progress_flush_task = None
-        handler._clients = set()
-        handler._active_message_tasks = set()
-        handler._background_tasks = {execution_task}
-        handler._task_bg_context = {execution_task: {"task_id": "runtime-task"}}
-        handler._task_bg_map = {"runtime-task": {execution_task}}
 
         await handler.shutdown(timeout=1.0)
 
@@ -63,20 +81,16 @@ def test_ws_shutdown_checkpoint_failure_does_not_cancel_execution_or_close_the_g
         execution_task = asyncio.create_task(execution())
         await asyncio.sleep(0)
 
-        handler = WSHandler.__new__(WSHandler)
-        handler.engine = SimpleNamespace()
-        handler._root_engine = SimpleNamespace(
-            prepare_active_company_runtimes_for_shutdown=AsyncMock(
-                side_effect=RuntimeError("checkpoint unavailable")
+        handler = _make_handler(
+            SimpleNamespace(
+                prepare_active_company_runtimes_for_shutdown=AsyncMock(
+                    side_effect=RuntimeError("checkpoint unavailable")
+                ),
             ),
+            _background_tasks={execution_task},
+            _task_bg_context={execution_task: {"task_id": "runtime-task"}},
+            _task_bg_map={"runtime-task": {execution_task}},
         )
-        handler._shutting_down = False
-        handler._progress_flush_task = None
-        handler._clients = set()
-        handler._active_message_tasks = set()
-        handler._background_tasks = {execution_task}
-        handler._task_bg_context = {execution_task: {"task_id": "runtime-task"}}
-        handler._task_bg_map = {"runtime-task": {execution_task}}
 
         try:
             await handler.shutdown(timeout=1.0)
@@ -101,9 +115,7 @@ def test_ws_shutdown_rejects_background_work_scheduled_by_late_ingress() -> None
             nonlocal entered
             entered = True
 
-        handler = WSHandler.__new__(WSHandler)
-        handler._shutting_down = True
-        handler._background_tasks = set()
+        handler = _make_handler(_shutting_down=True)
         task = handler._track(late_work())
         await asyncio.gather(task, return_exceptions=True)
         await asyncio.sleep(0)
@@ -133,17 +145,7 @@ def test_ws_shutdown_drains_queued_duplicate_handoff_before_checkpointing() -> N
             _active_task_run_registry=registry,
             prepare_active_company_runtimes_for_shutdown=prepare,
         )
-        handler = WSHandler.__new__(WSHandler)
-        handler.engine = root_engine
-        handler._root_engine = root_engine
-        handler._shutting_down = False
-        handler._progress_flush_task = None
-        handler._clients = set()
-        handler._active_message_tasks = set()
-        handler._background_tasks = set()
-        handler._task_bg_context = {}
-        handler._task_bg_map = {}
-        handler._handoff_route_tasks = {}
+        handler = _make_handler(root_engine)
 
         async def execution() -> None:
             async with runtime_lock:
@@ -213,20 +215,16 @@ def test_ws_shutdown_fails_closed_while_execution_cleanup_is_still_running() -> 
         execution_task = asyncio.create_task(execution())
         await asyncio.sleep(0)
 
-        handler = WSHandler.__new__(WSHandler)
-        handler.engine = SimpleNamespace()
-        handler._root_engine = SimpleNamespace(
-            prepare_active_company_runtimes_for_shutdown=AsyncMock(return_value=[]),
+        handler = _make_handler(
+            SimpleNamespace(
+                prepare_active_company_runtimes_for_shutdown=AsyncMock(return_value=[]),
+            ),
+            _background_tasks={execution_task},
+            _task_bg_context={
+                execution_task: {"task_id": "runtime-task", "execution_handoff": True}
+            },
+            _task_bg_map={"runtime-task": {execution_task}},
         )
-        handler._shutting_down = False
-        handler._progress_flush_task = None
-        handler._clients = set()
-        handler._active_message_tasks = set()
-        handler._background_tasks = {execution_task}
-        handler._task_bg_context = {
-            execution_task: {"task_id": "runtime-task", "execution_handoff": True}
-        }
-        handler._task_bg_map = {"runtime-task": {execution_task}}
 
         try:
             await handler.shutdown(timeout=0.01)
@@ -263,21 +261,21 @@ def test_ws_shutdown_cancels_execution_before_waiting_for_client_close() -> None
         execution_task = asyncio.create_task(execution())
         await asyncio.sleep(0)
         client = BlockingWebSocket()
-        handler = WSHandler.__new__(WSHandler)
-        handler.engine = SimpleNamespace()
-        handler._root_engine = SimpleNamespace(
-            prepare_active_company_runtimes_for_shutdown=AsyncMock(return_value=[]),
+        handler = _make_handler(
+            SimpleNamespace(
+                prepare_active_company_runtimes_for_shutdown=AsyncMock(return_value=[]),
+            ),
+            _clients={client},
+            _background_tasks={execution_task},
+            _task_bg_context={execution_task: {"task_id": "runtime-task"}},
+            _task_bg_map={"runtime-task": {execution_task}},
         )
-        handler._shutting_down = False
-        handler._progress_flush_task = None
-        handler._clients = {client}
-        handler._active_message_tasks = set()
-        handler._background_tasks = {execution_task}
-        handler._task_bg_context = {execution_task: {"task_id": "runtime-task"}}
-        handler._task_bg_map = {"runtime-task": {execution_task}}
 
         shutdown_task = asyncio.create_task(handler.shutdown(timeout=1.0))
-        await close_entered.wait()
+        # close_entered only fires from inside shutdown's client-close loop.
+        # Bound the wait so a shutdown crash before that loop fails the test
+        # instead of wedging the whole suite.
+        await asyncio.wait_for(close_entered.wait(), timeout=5.0)
 
         assert execution_released.is_set()
         assert execution_task.done()
@@ -302,19 +300,7 @@ def test_duplicate_resume_does_not_leave_shutdown_handoff_barrier_queued() -> No
             _active_task_run_registry=registry,
             prepare_active_company_runtimes_for_shutdown=prepare,
         )
-        handler = WSHandler.__new__(WSHandler)
-        handler.engine = root_engine
-        handler._root_engine = root_engine
-        handler.chat_store = None
-        handler._shutting_down = False
-        handler._progress_flush_task = None
-        handler._clients = set()
-        handler._active_message_tasks = set()
-        handler._background_tasks = set()
-        handler._task_bg_context = {}
-        handler._task_bg_map = {}
-        handler._company_stop_finalize_tasks = {}
-        handler._company_suspend_reply_locks = {}
+        handler = _make_handler(root_engine)
 
         checkpoint = ExecutionCheckpoint(
             checkpoint_id="checkpoint-1",

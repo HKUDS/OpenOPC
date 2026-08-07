@@ -11,7 +11,15 @@ from opc.engine import OPCEngine
 from opc.layer5_memory.secretary_policy import SecretaryPolicyManager
 from tests._temp_paths import WorkspaceTemporaryDirectory, workspace_path
 
-tempfile.TemporaryDirectory = WorkspaceTemporaryDirectory  # type: ignore[assignment]
+_REAL_TEMPORARY_DIRECTORY = tempfile.TemporaryDirectory
+
+
+def setUpModule() -> None:
+    tempfile.TemporaryDirectory = WorkspaceTemporaryDirectory  # type: ignore[assignment]
+
+
+def tearDownModule() -> None:
+    tempfile.TemporaryDirectory = _REAL_TEMPORARY_DIRECTORY  # type: ignore[assignment]
 
 
 class _StubStore:

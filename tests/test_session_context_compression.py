@@ -202,17 +202,30 @@ class SessionContextCompressionTests(unittest.IsolatedAsyncioTestCase):
             store = OPCStore(db_path)
             await store.initialize()
             memory = MemoryManager(root, "proj1", store=store)
-            memory.set_history_compactor(
-                HistoryCompactor(
-                    llm=_StubLLM(),
-                    store=store,
-                    memory_manager=memory,
-                    compression_threshold=0.85,
-                )
+            compactor = HistoryCompactor(
+                llm=_StubLLM(),
+                store=store,
+                memory_manager=memory,
+                compression_threshold=0.85,
             )
+            memory.set_history_compactor(compactor)
             session_id = "session-restart"
 
             for idx in range(6):
+                role = "user" if idx % 2 == 0 else "assistant"
+                payload = f"message {idx} " + ("alpha beta gamma delta " * 40)
+                await memory.append_session_message(session_id=session_id, role=role, text=payload)
+
+            # Append no longer auto-compacts; compaction is an explicit call.
+            # Forced compaction consumes everything up to the latest message,
+            # so the raw tail comes from messages appended afterwards.
+            compacted = await compactor.maybe_compact_session(
+                project_id="proj1",
+                session_id=session_id,
+                force=True,
+            )
+            self.assertTrue(compacted)
+            for idx in range(6, 8):
                 role = "user" if idx % 2 == 0 else "assistant"
                 payload = f"message {idx} " + ("alpha beta gamma delta " * 40)
                 await memory.append_session_message(session_id=session_id, role=role, text=payload)
@@ -225,7 +238,7 @@ class SessionContextCompressionTests(unittest.IsolatedAsyncioTestCase):
             context = await memory.build_session_prompt_context(session_id)
             self.assertIn("## Session Memory", context)
             self.assertIn("Session history summary before restart", context)
-            self.assertIn("message 5", context)
+            self.assertIn("message 7", context)
 
             await store.close()
 
@@ -236,7 +249,7 @@ class SessionContextCompressionTests(unittest.IsolatedAsyncioTestCase):
             restarted_context = await restarted_memory.build_session_prompt_context(session_id)
 
             self.assertTrue(any("Session history summary before restart" in item["content"] for item in restarted_history))
-            self.assertTrue(any("message 5" in item["content"] for item in restarted_history))
+            self.assertTrue(any("message 7" in item["content"] for item in restarted_history))
             self.assertFalse(any("message 0" in item["content"] for item in restarted_history))
             self.assertNotIn("message 0", restarted_context)
 
