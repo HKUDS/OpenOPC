@@ -171,6 +171,52 @@ def _is_poe_base(api_base: str | None) -> bool:
     return hostname == "api.poe.com"
 
 
+_LOCAL_MODEL_PREFIXES = (
+    "ollama/",
+    "ollama_chat/",
+    "localai/",
+    "vllm/",
+    "hosted_vllm/",
+    "lmstudio/",
+    "llama-cpp/",
+    "llamacpp/",
+    "tgi/",
+)
+
+_LOCAL_HOSTNAME_HINTS = (
+    "localhost",
+    "127.0.0.1",
+    "0.0.0.0",
+    "::1",
+)
+
+
+def _is_local_endpoint(api_base: str | None = None, model: str | None = None) -> bool:
+    """True when target api_base or model represents a self-hosted / local LLM node."""
+    if model:
+        normalized_model = model.strip().lower()
+        if any(normalized_model.startswith(prefix) for prefix in _LOCAL_MODEL_PREFIXES):
+            return True
+
+    if api_base:
+        normalized_base = api_base.strip().lower()
+        try:
+            parsed = urlparse(normalized_base)
+            hostname = (parsed.hostname or "").strip().lower()
+            if hostname in _LOCAL_HOSTNAME_HINTS or hostname.endswith(".local"):
+                return True
+        except Exception:
+            pass
+
+    if any(
+        os.environ.get(var)
+        for var in ("OLLAMA_HOST", "OLLAMA_API_BASE", "LOCAL_LLM_API_BASE", "VLLM_API_BASE", "LOCALAI_API_BASE")
+    ):
+        return True
+
+    return False
+
+
 def _looks_like_multimodal_model(model: str) -> bool:
     normalized = _normalized_model_name(model)
     if any(hint in normalized for hint in _MULTIMODAL_MODEL_HINTS):
@@ -237,19 +283,38 @@ class LLMProvider:
         self._api_key = config.api_key or (
             os.environ.get(config.api_key_env) if config.api_key_env else None
         ) or None
-        self._api_base = config.api_base or None
+        self._api_base = config.api_base or (
+            os.environ.get("OLLAMA_API_BASE")
+            or os.environ.get("OLLAMA_HOST")
+            or os.environ.get("LOCAL_LLM_API_BASE")
+            or os.environ.get("OPENAI_API_BASE")
+        ) or None
+
+        # Auto-resolve default local api_base if model prefix implies a local provider and no api_base was set
+        default_model = (config.default_model or "").lower()
+        if not self._api_base:
+            if default_model.startswith("ollama/") or default_model.startswith("ollama_chat/"):
+                self._api_base = "http://localhost:11434"
+            elif default_model.startswith("vllm/") or default_model.startswith("hosted_vllm/"):
+                self._api_base = "http://localhost:8000/v1"
+            elif default_model.startswith("localai/") or default_model.startswith("llamacpp/"):
+                self._api_base = "http://localhost:8080/v1"
+            elif default_model.startswith("lmstudio/"):
+                self._api_base = "http://localhost:1234/v1"
 
     def has_credentials(self) -> bool:
         """Whether an LLM call can plausibly authenticate.
 
-        True when a key is configured (``api_key`` / ``api_key_env``) or a
-        well-known provider env var is present. False only when no credential
-        is found anywhere — callers use that to skip LLM work that would
-        certainly fail (e.g. native agent selection when an external agent can
-        run the task instead). A False at worst degrades to rule-based behavior,
-        which stays functional; it never blocks execution.
+        True when a key is configured (``api_key`` / ``api_key_env``), a
+        well-known provider env var is present, OR when target model/api_base is a
+        self-hosted / local LLM endpoint (Ollama, LocalAI, vLLM, LM Studio, Llama.cpp)
+        that does not require authentication.
         """
         if self._api_key:
+            return True
+        if getattr(self.config, "is_local", False):
+            return True
+        if _is_local_endpoint(self._api_base, self.config.default_model):
             return True
         return any(os.environ.get(var) for var in self._CREDENTIAL_ENV_VARS)
 
@@ -366,7 +431,16 @@ class LLMProvider:
         resolved_model = model or self._select_model(task_type)
         normalized = _normalized_model_name(resolved_model)
         provider_family = resolved_model.split("/", 1)[0].strip().lower() if "/" in resolved_model else ""
-        supports_thinking = any(hint in normalized for hint in ("o1", "o3", "o4", "gpt-5", "claude", "reason"))
+        if not provider_family and getattr(self.config, "provider", ""):
+            provider_family = self.config.provider.strip().lower()
+        if not provider_family and _is_local_endpoint(self._api_base, resolved_model):
+            provider_family = "local"
+
+        is_local = (
+            getattr(self.config, "is_local", False)
+            or _is_local_endpoint(self._api_base, resolved_model)
+        )
+        supports_thinking = any(hint in normalized for hint in ("o1", "o3", "o4", "gpt-5", "claude", "reason", "r1"))
         return ModelCapabilitySet(
             model=resolved_model,
             supports_streaming=True,
@@ -379,6 +453,7 @@ class LLMProvider:
             provider_family=provider_family,
             metadata={
                 "api_base": self._api_base or "",
+                "is_local": is_local,
             },
         )
 
@@ -525,6 +600,8 @@ class LLMProvider:
             call_kwargs["api_base"] = self._api_base
         if self._api_key:
             call_kwargs["api_key"] = self._api_key
+        elif _is_local_endpoint(self._api_base, model) or getattr(self.config, "is_local", False):
+            call_kwargs["api_key"] = "local"
         if tools:
             call_kwargs["tools"] = tools
             call_kwargs["tool_choice"] = "auto"
@@ -671,6 +748,8 @@ class LLMProvider:
             call_kwargs["api_base"] = self._api_base
         if self._api_key:
             call_kwargs["api_key"] = self._api_key
+        elif _is_local_endpoint(self._api_base, model) or getattr(self.config, "is_local", False):
+            call_kwargs["api_key"] = "local"
         if tools:
             call_kwargs["tools"] = tools
             call_kwargs["tool_choice"] = "auto"

@@ -269,6 +269,8 @@ class LLMConfig(BaseModel):
     api_base: str = ""
     api_key: str = ""
     api_key_env: str = ""
+    provider: str = ""
+    is_local: bool = False
     routing: dict[str, str] = Field(default_factory=dict)
     fallback: dict[str, Any] = Field(default_factory=dict)
     temperature: float = 0.3
