@@ -16,6 +16,7 @@ import { useSessionStore, type SessionStoreState } from './stores/SessionStore'
 import { useProjectStore, type ProjectStoreState } from './stores/ProjectStore'
 import { ExecutionPanel } from './kanban/ExecutionPanel'
 import { ProjectSelector } from './components/ProjectSelector'
+import { LLMModelSettingsModal } from './components/LLMModelSettingsModal'
 import { OrgTab } from './org/OrgTab'
 import { notifyTaskAssigned } from './lib/taskChatBridge'
 import { mapCollabSyncPayload, mapBackendMessage, mapBackendChannel, mapBackendSession, mapBackendBoard, mapBackendColumn, mapBackendTask, mergeSessionDetailHasMore } from './lib/collabSync'
@@ -474,6 +475,7 @@ export default function App() {
   const [activePage, setActivePage] = useState<AppPage>('workspace')
   const [swarmAgents, setSwarmAgents] = useState<AgentInfo[]>([])
   const [showDevTools, setShowDevTools] = useState(false)
+  const [showLLMModal, setShowLLMModal] = useState(false)
   const [lastTaskDoneAgent, setLastTaskDoneAgent] = useState<string | null>(null)
   const [globalExecMode, setGlobalExecMode] = useState<AppExecMode>('task')
   const [globalCompanyProfile, setGlobalCompanyProfile] = useState<'corporate' | 'custom'>('corporate')
@@ -2470,11 +2472,17 @@ export default function App() {
             <option value="cozy">{t('theme.cozy')}</option>
             <option value="openopc">{t('theme.openopc')}</option>
           </select>
+          <button className={`icon-btn ${showLLMModal ? 'active' : ''}`} onClick={() => setShowLLMModal((v) => !v)} title="LLM & Local Model Settings" aria-label="LLM Settings">
+            <span style={{ fontSize: '14px' }}>🤖</span>
+          </button>
           <button className={`icon-btn ${showDevTools ? 'active' : ''}`} onClick={() => setShowDevTools((v) => !v)} title={t('dev.tools')} aria-label={t('dev.tools')}>
             <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M5.5 2L2 5.5 5.5 9" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/><path d="M10.5 7L14 10.5 10.5 14" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/></svg>
           </button>
         </div>
       </header>
+
+      {/* LLM & Local Model Provider Modal */}
+      <LLMModelSettingsModal isOpen={showLLMModal} onClose={() => setShowLLMModal(false)} />
 
       {/* Workspace Page (unified Chat + Kanban) */}
       {activePage === 'workspace' && (
