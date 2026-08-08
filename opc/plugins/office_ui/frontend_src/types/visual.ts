@@ -85,6 +85,7 @@ export type SocketEnvelope =
   | { type: 'execution_mode_resolved'; payload: { project_id: string; mode: string; profile?: string } }
   | { type: 'collab_sync_push'; payload: Record<string, unknown> }
   | { type: 'project_index_push'; payload: Record<string, unknown> }
+  | { type: 'project_workplace'; payload: { project_id: string; workplace_path: string; source: string; exists: boolean } }
   | { type: 'kanban_view_data'; payload: KanbanViewDataPayload }
   | { type: 'session_created'; payload: { project_id: string; task_id: string; channel_id: string; session_id?: string; parent_session_id?: string; title: string; status: string; created_at: number; exec_mode?: string; company_profile?: string; org_id?: string; organization_id?: string; preferred_agent?: TaskPreferredAgent; selected_execution_agent?: TaskPreferredAgent } }
   | { type: 'session_updated'; payload: { project_id: string; task_id: string; exec_mode?: string; company_profile?: string; org_id?: string; organization_id?: string; preferred_agent?: TaskPreferredAgent; selected_execution_agent?: TaskPreferredAgent } }

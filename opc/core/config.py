@@ -42,13 +42,43 @@ def get_opc_home() -> Path:
 
 
 def get_default_workplace_root() -> Path:
-    """Return the default shared workplace root beside the OpenOPC repo."""
+    """Return the default shared workplace root beside the OpenOPC repo.
+
+    Resolution order:
+      1. ``$OPC_WORKPLACE_ROOT`` environment variable (explicit global override)
+      2. ``{project_root_parent}/{project_root_name}_workplace``  (default)
+    """
+    env = os.environ.get("OPC_WORKPLACE_ROOT")
+    if env:
+        try:
+            return Path(env).expanduser().resolve()
+        except Exception:
+            pass  # malformed path — fall through to default
     project_root = _find_project_root()
     return project_root.parent / f"{project_root.name}_workplace"
 
 
-def get_project_workplace(project_id: str) -> Path:
+def get_project_workplace(project_id: str, custom_path: str | None = None) -> Path:
+    """Return the workplace directory for *project_id*.
+
+    Resolution order:
+      1. *custom_path* — project-specific override (supplied by the engine
+         after reading the ``project_config`` DB table).
+      2. ``$OPC_WORKPLACE_ROOT`` / *project_id*  (global env override).
+      3. Default: ``OpenOPC_workplace`` / *project_id*.
+
+    The ``custom_path`` parameter exists so callers with DB access can pass
+    the stored value in; callers without DB access (e.g. tests, preflight)
+    simply omit it and get the env-var / default behaviour.
+    """
     project = str(project_id or "default").strip() or "default"
+    if custom_path:
+        raw = str(custom_path).strip()
+        if raw:
+            try:
+                return Path(raw).expanduser().resolve()
+            except Exception:
+                pass  # fall through
     return get_default_workplace_root() / project
 
 

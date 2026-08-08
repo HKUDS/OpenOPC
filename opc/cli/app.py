@@ -1744,6 +1744,139 @@ def project_delete(
     asyncio.run(_run_service_command(project, lambda svc: svc.project.delete(project_id), json_output=json_output))
 
 
+@project_app.command("set-workplace")
+def project_set_workplace(
+    project_id: str = typer.Argument(..., help="Project ID"),
+    path: str = typer.Option(..., "--path", help="Absolute path to the workplace directory"),
+    create: bool = typer.Option(False, "--create", help="Create the directory if it does not exist"),
+    json_output: bool = typer.Option(False, "--json", help="Print JSON"),
+):
+    """Set a custom workplace directory for a project.
+
+    The workplace is where agents read and write project files.  By default
+    OpenOPC uses ``../OpenOPC_workplace/<project_id>/``.  Use this command to
+    point a project at an existing code repository or any other directory.
+
+    Examples::
+
+        opc project set-workplace ragflow --path D:\\code\\ragflow
+        opc project set-workplace myapp --path /home/user/myapp --create
+    """
+    from pathlib import Path as _Path
+    workplace = _Path(path).expanduser().resolve()
+    if not workplace.exists():
+        if create:
+            try:
+                workplace.mkdir(parents=True, exist_ok=True)
+                if not json_output:
+                    console.print(f"[green]Created:[/green] {workplace}")
+            except Exception as exc:
+                console.print(f"[red]Could not create directory:[/red] {exc}")
+                raise typer.Exit(code=1)
+        else:
+            console.print(f"[yellow]Path does not exist:[/yellow] {workplace}")
+            console.print("[dim]Use --create to create it automatically.[/dim]")
+            if not typer.confirm("Continue anyway?"):
+                raise typer.Abort()
+
+    from opc.plugins.office_ui.services import ServiceResult
+
+    async def _set(svc: Any) -> Any:
+        engine = svc.context.root_engine
+        store = getattr(engine, "store", None)
+        if store and hasattr(store, "save_project_workplace"):
+            await store.save_project_workplace(project_id, str(workplace), source="manual")
+        svc.context.set_project_workplace_cache(project_id, str(workplace))
+        refresh = getattr(engine, "refresh_project_workplace", None)
+        if callable(refresh):
+            await refresh(project_id)
+        return ServiceResult({
+            "action": "set_project_workplace",
+            "project_id": project_id,
+            "workplace_path": str(workplace),
+            "source": "manual",
+        })
+
+    asyncio.run(_run_service_command(project_id, _set, json_output=json_output))
+
+
+@project_app.command("show-workplace")
+def project_show_workplace(
+    project_id: str = typer.Argument(..., help="Project ID"),
+    json_output: bool = typer.Option(False, "--json", help="Print JSON"),
+):
+    """Show the resolved workplace directory for a project."""
+    import os as _os
+    from pathlib import Path as _Path
+    from opc.core.config import get_project_workplace as _gpw
+
+    from opc.plugins.office_ui.services import ServiceResult
+
+    async def _show(svc: Any) -> Any:
+        engine = svc.context.root_engine
+        store = getattr(engine, "store", None)
+        custom = ""
+        source = "default"
+        if store and hasattr(store, "get_project_config"):
+            cfg = await store.get_project_config(project_id)
+            if cfg and cfg.get("workplace_path"):
+                custom = cfg["workplace_path"]
+                source = cfg.get("workplace_source", "manual")
+        if not custom and _os.environ.get("OPC_WORKPLACE_ROOT"):
+            source = "env"
+        path = _gpw(project_id, custom_path=custom or None)
+        return ServiceResult({
+            "action": "show_project_workplace",
+            "project_id": project_id,
+            "workplace_path": str(path),
+            "source": source,
+            "exists": path.exists(),
+        })
+
+    def _render(payload: dict) -> None:
+        exists_txt = "[green]yes[/green]" if payload.get("exists") else "[red]no (path not found)[/red]"
+        console.print(f"[bold]Project  :[/bold] {payload.get('project_id')}")
+        console.print(f"[bold]Workplace:[/bold] {payload.get('workplace_path')}")
+        console.print(f"[bold]Source   :[/bold] {payload.get('source')}")
+        console.print(f"[bold]Exists   :[/bold] {exists_txt}")
+
+    asyncio.run(_run_service_command(project_id, _show, json_output=json_output, render=_render))
+
+
+@project_app.command("reset-workplace")
+def project_reset_workplace(
+    project_id: str = typer.Argument(..., help="Project ID"),
+    json_output: bool = typer.Option(False, "--json", help="Print JSON"),
+):
+    """Reset the workplace for a project to the default path.
+
+    Removes any custom workplace configuration so the project reverts to
+    ``../OpenOPC_workplace/<project_id>/``.
+    """
+    from opc.core.config import get_project_workplace as _gpw
+
+    from opc.plugins.office_ui.services import ServiceResult
+
+    async def _reset(svc: Any) -> Any:
+        engine = svc.context.root_engine
+        store = getattr(engine, "store", None)
+        if store and hasattr(store, "delete_project_workplace"):
+            await store.delete_project_workplace(project_id)
+        svc.context.clear_project_workplace_cache(project_id)
+        refresh = getattr(engine, "refresh_project_workplace", None)
+        if callable(refresh):
+            await refresh(project_id)
+        default_path = _gpw(project_id)
+        return ServiceResult({
+            "action": "reset_project_workplace",
+            "project_id": project_id,
+            "workplace_path": str(default_path),
+            "source": "default",
+        })
+
+    asyncio.run(_run_service_command(project_id, _reset, json_output=json_output))
+
+
 session_app = typer.Typer(help="Manage OPC sessions")
 app.add_typer(session_app, name="session")
 

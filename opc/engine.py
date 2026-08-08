@@ -397,6 +397,11 @@ class OPCEngine:
         self.store: OPCStore | None = store
         self._owns_store = bool(owns_store)
         self._run_startup_reconcile = bool(run_startup_reconcile)
+        # Custom workplace path for this engine's project, loaded from the
+        # ``project_config`` table by refresh_project_workplace() during
+        # initialize().  Kept as a plain string so the synchronous workspace
+        # resolvers (_resolve_external_workspace) can read it without awaiting.
+        self._custom_workplace_path: str = ""
         if active_task_run_registry is None:
             self._active_task_run_registry = ActiveTaskRunRegistry()
             default_registry_owner = True
@@ -599,6 +604,7 @@ class OPCEngine:
             if self._owns_store:
                 await self.store.initialize()
         self._ensure_attachment_store()
+        await self.refresh_project_workplace()
 
         # LLM
         self.llm = LLMProvider(self.config.llm, opc_home=self.opc_home)
@@ -5031,6 +5037,65 @@ class OPCEngine:
             return str(parent)
         return str(output_path)
 
+    async def refresh_project_workplace(self, project_id: str | None = None) -> Path:
+        """Reload this project's custom workplace path from the DB into cache.
+
+        Called during initialize() and whenever the workplace configuration
+        changes, so that the synchronous resolvers below can read the custom
+        path without awaiting.  Returns the resolved workplace directory.
+        """
+        pid = str(project_id or self.project_id or "default").strip() or "default"
+        custom = ""
+        store = self.store
+        if store is not None and hasattr(store, "get_project_config"):
+            try:
+                cfg = await store.get_project_config(pid)
+                if cfg:
+                    custom = str(cfg.get("workplace_path") or "").strip()
+            except Exception as exc:
+                logger.debug(f"Could not load workplace config for '{pid}': {exc}")
+        self._custom_workplace_path = custom
+        return get_project_workplace(pid, custom_path=custom or None)
+
+    def project_workplace_path(self, project_id: str | None = None) -> Path:
+        """Synchronously resolve the workplace directory for a project.
+
+        Uses the cached custom path when *project_id* matches this engine's
+        project; other projects fall back to env-var / default resolution
+        (each project has its own engine, which caches its own path).
+        """
+        pid = str(project_id or self.project_id or "default").strip() or "default"
+        own = str(self.project_id or "default").strip() or "default"
+        custom = self._custom_workplace_path if pid == own else ""
+        return get_project_workplace(pid, custom_path=custom or None)
+
+    def _is_derivable_workspace_root(self, value: str | None) -> bool:
+        """True when *value* is just this project's workplace path (default or
+        currently configured custom) — i.e. carries no session-specific intent.
+
+        Sticky session defaults exist to keep an *explicitly chosen* working
+        directory stable across turns.  Persisting the plain project workplace
+        there adds no information but permanently pins the session to whatever
+        the workplace was at first message, so later `set-workplace` changes
+        never take effect.  Derivable values are therefore skipped on read and
+        cleared on write.
+        """
+        raw = str(value or "").strip()
+        if not raw:
+            return False
+        try:
+            resolved = os.path.normcase(str(Path(raw).expanduser().resolve()))
+        except Exception:
+            return False
+        pid = str(self.project_id or "default").strip() or "default"
+        for candidate in (get_project_workplace(pid), self.project_workplace_path(pid)):
+            try:
+                if os.path.normcase(str(Path(candidate).resolve())) == resolved:
+                    return True
+            except Exception:
+                continue
+        return False
+
     async def _resolve_workspace_root(
         self,
         session_id: str | None = None,
@@ -5039,10 +5104,10 @@ class OPCEngine:
     ) -> str | None:
         session_defaults = await self._load_session_execution_defaults(session_id)
         sticky_workspace = str(session_defaults.get("workspace_root") or "").strip()
-        if sticky_workspace:
+        if sticky_workspace and not self._is_derivable_workspace_root(sticky_workspace):
             return sticky_workspace
         sticky_comms_workspace = str(session_defaults.get("comms_workspace_root") or "").strip()
-        if sticky_comms_workspace:
+        if sticky_comms_workspace and not self._is_derivable_workspace_root(sticky_comms_workspace):
             return sticky_comms_workspace
         sticky_output = str(session_defaults.get("target_output_dir") or "").strip()
         if sticky_output:
@@ -5053,7 +5118,7 @@ class OPCEngine:
         if inferred:
             return inferred
         project_id = str(self.project_id or "default").strip() or "default"
-        workplace = get_project_workplace(project_id)
+        workplace = self.project_workplace_path(project_id)
         workplace.mkdir(parents=True, exist_ok=True)
         return str(workplace.resolve())
 
@@ -5116,15 +5181,43 @@ class OPCEngine:
         metadata = dict(session.metadata)
         previous = metadata.get("execution_defaults", {})
         previous_defaults = dict(previous) if isinstance(previous, dict) else {}
+
+        # Never pin the plain project workplace as a sticky session value —
+        # it is always re-derivable and pinning it would freeze the session
+        # to a stale path after `set-workplace` changes.  Storing "" (rather
+        # than keeping the previous value) actively heals sessions that were
+        # pinned before this rule existed.
+        ws_value = str(workspace_root or "").strip()
+        if ws_value and self._is_derivable_workspace_root(ws_value):
+            ws_store = ""
+        else:
+            ws_store = ws_value or previous_defaults.get("workspace_root", "")
+        cws_value = str(comms_workspace_root or "").strip()
+        if cws_value and self._is_derivable_workspace_root(cws_value):
+            cws_store = ""
+        else:
+            cws_store = cws_value or previous_defaults.get("comms_workspace_root", "")
+        croot_value = str(comms_root or "").strip()
+        croot_parent = ""
+        if croot_value:
+            try:
+                croot_parent = str(Path(croot_value).parent)
+            except Exception:
+                croot_parent = ""
+        if croot_value and croot_parent and self._is_derivable_workspace_root(croot_parent):
+            croot_store = ""
+        else:
+            croot_store = croot_value or previous_defaults.get("comms_root", "")
+
         metadata["execution_defaults"] = {
             **previous_defaults,
             "mode": decision.mode.value,
             "company_profile": decision.company_profile or previous_defaults.get("company_profile", ""),
             "preferred_agent": decision.preferred_agent or previous_defaults.get("preferred_agent", ""),
             "target_output_dir": target_output_dir or previous_defaults.get("target_output_dir", ""),
-            "workspace_root": workspace_root or previous_defaults.get("workspace_root", ""),
-            "comms_workspace_root": comms_workspace_root or previous_defaults.get("comms_workspace_root", ""),
-            "comms_root": comms_root or previous_defaults.get("comms_root", ""),
+            "workspace_root": ws_store,
+            "comms_workspace_root": cws_store,
+            "comms_root": croot_store,
             "updated_at": datetime.now().isoformat(),
         }
         session.metadata = metadata
@@ -9174,7 +9267,7 @@ class OPCEngine:
             except Exception as e:
                 logger.warning(f"Failed to prepare external workspace {workspace_root}: {e}")
 
-        workspace = get_project_workplace(task.project_id or "default")
+        workspace = self.project_workplace_path(task.project_id or "default")
         workspace.mkdir(parents=True, exist_ok=True)
         return str(workspace.resolve())
 

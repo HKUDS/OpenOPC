@@ -438,6 +438,25 @@ OpenOPC 把运行时/配置状态与交付物工作区文件分开存放。
 | `../OpenOPC_workplace/<project>/.opc-comms/` | Company 模式内部通讯信箱、会议与工具结果暂存区。 |
 
 若希望配置与运行时状态放在仓库之外，设置 `OPC_HOME=/path/to/opc-home`。
+
+**为项目指定自定义工作目录** — 将任意项目指向已有的代码仓库：
+
+```bash
+# CLI
+opc project set-workplace myapp --path /path/to/existing/repo
+opc project show-workplace myapp
+opc project reset-workplace myapp          # 恢复默认路径
+
+# 或设置全局根目录，对所有项目生效
+export OPC_WORKPLACE_ROOT=/my/workspaces   # 每个项目使用 /my/workspaces/<project_id>
+```
+
+在 **Office UI** 中，点击项目选择器旁的 **⚙** 按钮，打开"项目设置"并配置工作目录。创建新项目时也可以直接填写工作目录路径。
+
+每个项目工作目录的解析优先级：
+1. 通过 `opc project set-workplace` 手动配置的路径（存储在项目数据库中）
+2. `$OPC_WORKPLACE_ROOT` 环境变量（对所有项目生效）
+3. 默认路径：`../OpenOPC_workplace/<project_id>/`
 </details>
 
 </details>

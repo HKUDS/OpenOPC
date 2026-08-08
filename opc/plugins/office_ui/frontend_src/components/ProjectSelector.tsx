@@ -1,28 +1,43 @@
-import { useState, useCallback } from 'react'
+import { useState, useCallback, useMemo } from 'react'
 import type { Project } from '../types/kanban'
 import { useI18n } from '../i18n'
+
+function toProjectSlug(value: string): string {
+  return value.trim().toLowerCase().replace(/[^a-z0-9_-]+/g, '-').replace(/^-|-$/g, '')
+}
 
 interface ProjectSelectorProps {
   projects: Project[]
   activeId: string
   onSelect: (id: string) => void
-  onCreate: (id: string) => void
+  onCreate: (id: string, workplacePath?: string) => void
   onDelete?: (id: string) => void
+  onSettings?: (id: string) => void
 }
 
-export function ProjectSelector({ projects, activeId, onSelect, onCreate, onDelete }: ProjectSelectorProps) {
+export function ProjectSelector({
+  projects,
+  activeId,
+  onSelect,
+  onCreate,
+  onDelete,
+  onSettings,
+}: ProjectSelectorProps) {
   const { t } = useI18n()
   const [creating, setCreating] = useState(false)
   const [newName, setNewName] = useState('')
+  const [newWorkplace, setNewWorkplace] = useState('')
   const [confirmDelete, setConfirmDelete] = useState<string | null>(null)
 
+  const newSlug = useMemo(() => toProjectSlug(newName), [newName])
+
   const handleCreate = useCallback(() => {
-    const id = newName.trim().toLowerCase().replace(/[^a-z0-9_-]+/g, '-').replace(/^-|-$/g, '')
-    if (!id) return
-    onCreate(id)
+    if (!newSlug) return
+    onCreate(newSlug, newWorkplace.trim() || undefined)
     setNewName('')
+    setNewWorkplace('')
     setCreating(false)
-  }, [newName, onCreate])
+  }, [newSlug, newWorkplace, onCreate])
 
   const handleDelete = useCallback(() => {
     if (!confirmDelete || !onDelete) return
@@ -43,22 +58,100 @@ export function ProjectSelector({ projects, activeId, onSelect, onCreate, onDele
           <option key={p.id} value={p.id}>{p.name}</option>
         ))}
       </select>
+
       {creating ? (
-        <form
-          onSubmit={e => { e.preventDefault(); handleCreate() }}
-          style={{ display: 'flex', gap: 4 }}
+        <div
+          style={{
+            position: 'fixed', inset: 0, zIndex: 9999,
+            display: 'flex', alignItems: 'center', justifyContent: 'center',
+            background: 'rgba(0,0,0,0.55)',
+          }}
+          onClick={e => { if (e.target === e.currentTarget) { setCreating(false); setNewName(''); setNewWorkplace('') } }}
         >
-          <input
-            autoFocus
-            className="theme-select"
-            value={newName}
-            placeholder={t('project.placeholder')}
-            onChange={e => setNewName(e.target.value)}
-            onKeyDown={e => { if (e.key === 'Escape') setCreating(false) }}
-            style={{ width: 120 }}
-          />
-          <button type="submit" className="pill-btn" style={{ fontSize: 11, padding: '2px 8px' }}>+</button>
-        </form>
+          <form
+            onSubmit={e => { e.preventDefault(); handleCreate() }}
+            onKeyDown={e => { if (e.key === 'Escape') { setCreating(false); setNewName(''); setNewWorkplace('') } }}
+            style={{
+              background: 'var(--bg-elevated)',
+              border: '1px solid var(--border)',
+              color: 'var(--text)',
+              borderRadius: 12,
+              padding: '24px 32px',
+              minWidth: 420,
+              maxWidth: 520,
+              boxShadow: '0 8px 32px rgba(0,0,0,0.4)',
+              display: 'flex',
+              flexDirection: 'column',
+              gap: 16,
+            }}
+          >
+            <h3 style={{ margin: 0, fontSize: 15, fontWeight: 600, color: 'var(--text)' }}>
+              {t('project.new')}
+            </h3>
+
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+              <label style={{ fontSize: 13, fontWeight: 500, color: 'var(--text)' }}>
+                {t('project.nameLabel')}
+              </label>
+              <input
+                autoFocus
+                className="theme-select"
+                value={newName}
+                placeholder={t('project.placeholder')}
+                onChange={e => setNewName(e.target.value)}
+                style={{ width: '100%', boxSizing: 'border-box' }}
+              />
+              {newName.trim() && !newSlug && (
+                <p style={{ margin: 0, fontSize: 11, color: '#f87171' }}>
+                  {t('project.nameInvalid')}
+                </p>
+              )}
+              {newSlug && newSlug !== newName.trim() && (
+                <p style={{ margin: 0, fontSize: 11, color: 'var(--text-dim)' }}>
+                  {t('project.slugPreview', { slug: newSlug })}
+                </p>
+              )}
+            </div>
+
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+              <label style={{ fontSize: 13, fontWeight: 500, color: 'var(--text)' }}>
+                {t('project.workplace')}
+                <span style={{ fontSize: 11, color: 'var(--text-dim)', marginLeft: 6 }}>
+                  {t('project.workplaceOptional')}
+                </span>
+              </label>
+              <input
+                className="theme-select"
+                value={newWorkplace}
+                placeholder={t('project.workplacePlaceholder')}
+                onChange={e => setNewWorkplace(e.target.value)}
+                style={{ width: '100%', boxSizing: 'border-box', fontFamily: 'monospace', fontSize: 12 }}
+              />
+              <p style={{ margin: 0, fontSize: 11, color: 'var(--text-dim)' }}>
+                {t('project.workplaceHint')}
+              </p>
+            </div>
+
+            <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
+              <button
+                type="button"
+                className="pill-btn"
+                onClick={() => { setCreating(false); setNewName(''); setNewWorkplace('') }}
+                style={{ fontSize: 12, padding: '4px 12px' }}
+              >
+                {t('common.cancel')}
+              </button>
+              <button
+                type="submit"
+                className="pill-btn"
+                disabled={!newSlug}
+                style={{ fontSize: 12, padding: '4px 14px', fontWeight: 600, opacity: newSlug ? 1 : 0.5 }}
+              >
+                {t('project.createButton')}
+              </button>
+            </div>
+          </form>
+        </div>
       ) : (
         <button
           className="pill-btn"
@@ -69,7 +162,20 @@ export function ProjectSelector({ projects, activeId, onSelect, onCreate, onDele
           +
         </button>
       )}
-      {onDelete && activeId !== 'default' && !confirmDelete && (
+
+      {/* Settings button */}
+      {onSettings && !creating && (
+        <button
+          className="pill-btn"
+          onClick={() => onSettings(activeId)}
+          title={t('project.settings')}
+          style={{ fontSize: 11, padding: '2px 8px' }}
+        >
+          ⚙
+        </button>
+      )}
+
+      {onDelete && activeId !== 'default' && !creating && !confirmDelete && (
         <button
           className="pill-btn"
           onClick={() => setConfirmDelete(activeId)}
