@@ -514,7 +514,7 @@ class WSHandler:
         self.services_context.load_active_org_config = lambda org_id: self._load_active_org_config_into_engine(org_id)
         self.services_context.set_active_saved_org_name = self._service_set_active_saved_org_name
         self.services_context.get_active_saved_org_name = self._service_get_active_saved_org_name
-        self.services_context.project_workplace_hook = lambda project_id: get_project_workplace(project_id)  # type: ignore[attr-defined]
+        self.services_context.project_workplace_hook = self._service_project_workplace  # type: ignore[attr-defined]
         self.services_context.on_engine_activated = self._on_service_engine_activated
         self.services_context.persist_runtime_config = self._persist_runtime_config
         self.services_context.rebind_engine_config = self._rebind_engine_config
@@ -582,6 +582,22 @@ class WSHandler:
         self.services_context = context
         self.services = OfficeServices(context)
         return self.services
+
+    def _service_project_workplace(self, project_id: str) -> Path:
+        """Resolve a project's workplace, honouring per-project custom paths.
+
+        Prefers the active engine's cached custom path; falls back to plain
+        env-var / default resolution when no engine is available.  The real
+        engine check keeps the fallback path in force for stubbed or mocked
+        engines, which expose every attribute as a callable.
+        """
+        engine = getattr(self.services_context, "engine", None) or self.engine
+        if self._is_real_opc_engine(engine):
+            try:
+                return Path(engine.project_workplace_path(project_id))
+            except Exception as exc:
+                logger.debug(f"engine workplace resolve failed for '{project_id}': {exc}")
+        return get_project_workplace(project_id)
 
     async def _service_set_active_saved_org_name(self, org_id: str) -> None:
         await self._set_active_saved_org_name(org_id)
@@ -9705,15 +9721,94 @@ class WSHandler:
         await self._send_ack(ws, ok=True, **result.payload)
 
     async def _handle_create_project(self, ws: Any, data: dict) -> None:
-        """Create a new project directory."""
+        """Create a new project directory, optionally with a custom workplace path."""
         try:
             result = await self.services.project.create(
                 data.get("project_id", ""),
                 active_project_id=self._client_active_project_id(ws),
+                workplace_path=data.get("workplace_path") or None,
             )
             await self._send_ack(ws, ok=True, **result.payload)
         except ServiceError as exc:
             await self._send_service_error(ws, exc, action="create_project")
+
+    async def _handle_set_project_workplace(self, ws: Any, data: dict) -> None:
+        """Set or update the custom workplace directory for a project."""
+        project_id = str(data.get("project_id") or "").strip()
+        workplace_path = str(data.get("workplace_path") or "").strip()
+        if not project_id:
+            await self._send_ack(ws, ok=False, error="Missing project_id", action="set_project_workplace")
+            return
+        try:
+            from pathlib import Path as _Path
+            resolved = str(_Path(workplace_path).expanduser().resolve()) if workplace_path else ""
+            engine = await self.services_context.engine_for_project(project_id)
+            store = getattr(engine, "store", None)
+            if store is None or not hasattr(store, "save_project_workplace"):
+                await self._send_ack(ws, ok=False, error="Store unavailable", action="set_project_workplace")
+                return
+            if resolved:
+                await store.save_project_workplace(project_id, resolved, source="manual")
+            else:
+                # Empty path == reset to default
+                await store.delete_project_workplace(project_id)
+            self.services_context.set_project_workplace_cache(project_id, resolved)
+            # Refresh the engine's own cache so in-flight/next task runs pick
+            # up the new path without a restart.
+            refresh = getattr(engine, "refresh_project_workplace", None)
+            final_path = ""
+            if callable(refresh):
+                final_path = str(await refresh(project_id))
+            else:
+                from opc.core.config import get_project_workplace as _gpw
+                final_path = str(_gpw(project_id, custom_path=resolved or None))
+            try:
+                _Path(final_path).mkdir(parents=True, exist_ok=True)
+            except Exception as exc:
+                logger.warning(f"Could not create workplace dir {final_path}: {exc}")
+            await self._send_ack(
+                ws, ok=True,
+                action="set_project_workplace",
+                project_id=project_id,
+                workplace_path=final_path,
+                source="manual" if resolved else "default",
+            )
+            # Push the fresh state so the settings dialog reflects reality.
+            await self._handle_get_project_workplace(ws, {"project_id": project_id})
+        except Exception as exc:
+            logger.opt(exception=True).error(f"set_project_workplace failed: {exc}")
+            await self._send_ack(ws, ok=False, error=str(exc), action="set_project_workplace")
+
+    async def _handle_get_project_workplace(self, ws: Any, data: dict) -> None:
+        """Return the resolved workplace path for a project."""
+        project_id = str(data.get("project_id") or self._client_active_project_id(ws) or "default").strip()
+        try:
+            engine = await self.services_context.engine_for_project(project_id)
+            store = getattr(engine, "store", None)
+            custom = ""
+            source = "default"
+            if store and hasattr(store, "get_project_config"):
+                cfg = await store.get_project_config(project_id)
+                if cfg and cfg.get("workplace_path"):
+                    custom = cfg["workplace_path"]
+                    source = cfg.get("workplace_source", "manual")
+            import os as _os
+            from opc.core.config import get_project_workplace as _gpw
+            if not custom and _os.environ.get("OPC_WORKPLACE_ROOT"):
+                source = "env"
+            path = _gpw(project_id, custom_path=custom or None)
+            await self._send_envelope_to_client(ws, {
+                "type": "project_workplace",
+                "payload": {
+                    "project_id": project_id,
+                    "workplace_path": str(path),
+                    "source": source,
+                    "exists": path.exists(),
+                },
+            })
+        except Exception as exc:
+            logger.opt(exception=True).error(f"get_project_workplace failed: {exc}")
+            await self._send_ack(ws, ok=False, error=str(exc), action="get_project_workplace")
 
     async def _handle_delete_project(self, ws: Any, data: dict) -> None:
         """Delete a project and all its data. Switches to 'default' if active."""
@@ -10512,10 +10607,12 @@ class WSHandler:
         # Secretary handler
         "secretary_send":      _handle_secretary_send,
         # Project management
-        "list_projects":       _handle_list_projects,
-        "create_project":      _handle_create_project,
-        "delete_project":      _handle_delete_project,
-        "switch_project":      _handle_switch_project,
+        "list_projects":              _handle_list_projects,
+        "create_project":             _handle_create_project,
+        "delete_project":             _handle_delete_project,
+        "switch_project":             _handle_switch_project,
+        "set_project_workplace":      _handle_set_project_workplace,
+        "get_project_workplace":      _handle_get_project_workplace,
         # Org info
         "org_info":            _handle_org_info,
         # Phase 4: Talent Market, Employee Detail, Reorg

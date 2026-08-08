@@ -86,7 +86,7 @@ class ProjectService:
             "active_project_id": self.context.normalize_project_id(active),
         })
 
-    async def create(self, project_id: str, *, active_project_id: str | None = None) -> ServiceResult:
+    async def create(self, project_id: str, *, active_project_id: str | None = None, workplace_path: str | None = None) -> ServiceResult:
         project_id = str(project_id or "").strip()
         if not project_id:
             raise ServiceError("missing_project_id", "Missing project_id")
@@ -101,12 +101,38 @@ class ProjectService:
             raise ServiceError("project_exists", f"Project '{project_id}' already exists")
 
         projects_dir.mkdir(parents=True, exist_ok=False)
-        workplace.mkdir(parents=True, exist_ok=False)
+
+        # If a custom workplace path was supplied, persist it into the NEW
+        # project's own database (each project has its own tasks.db) and
+        # update the cache before creating the directory so
+        # project_workplace() below already resolves to the new path.
+        resolved_custom: str | None = None
+        if workplace_path:
+            raw = str(workplace_path).strip()
+            if raw:
+                try:
+                    from pathlib import Path as _Path
+                    resolved_custom = str(_Path(raw).expanduser().resolve())
+                    from opc.database.store import OPCStore
+                    project_store = OPCStore(projects_dir / "tasks.db")
+                    await project_store.initialize()
+                    try:
+                        await project_store.save_project_workplace(project_id, resolved_custom, source="manual")
+                    finally:
+                        await project_store.close()
+                    self.context.set_project_workplace_cache(project_id, resolved_custom)
+                except Exception as _exc:
+                    logger.warning(f"Failed to save custom workplace for {project_id}: {_exc}")
+                    resolved_custom = None
+
+        workplace = self.context.project_workplace(project_id)
+        workplace.mkdir(parents=True, exist_ok=True)
         memory_store.ensure_memory_file(project_id, f"# Project Memory ({project_id})")
         active = active_project_id or self.context.active_engine_project_id()
         return ServiceResult({
             "action": "create_project",
             "project_id": project_id,
+            "workplace_path": str(workplace),
             "projects": self.context.list_project_entries(),
             "active_project_id": self.context.normalize_project_id(active),
         })
@@ -306,6 +332,16 @@ class ProjectService:
             elif not self.context.project_dir(new_id).is_dir():
                 raise ServiceError("project_not_found", f"Project '{new_id}' does not exist", {"project_id": new_id, "switch_seq": switch_seq})
             engine = await self.context.activate_project(new_id)
+            # Populate workplace cache from DB so project_workplace() reflects
+            # any custom path without requiring async calls downstream.
+            try:
+                store = getattr(engine, "store", None)
+                if store and hasattr(store, "get_project_config"):
+                    cfg = await store.get_project_config(new_id)
+                    custom = (cfg.get("workplace_path") or "") if cfg else ""
+                    self.context.set_project_workplace_cache(new_id, custom)
+            except Exception as _exc:
+                logger.debug(f"workplace cache load failed for {new_id}: {_exc}")
             await self.context.chat_store.ensure_activity_channel(project_id=new_id)
             await self.context.chat_store.ensure_secretary_channel(project_id=new_id)
 

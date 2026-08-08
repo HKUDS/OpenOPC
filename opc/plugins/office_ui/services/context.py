@@ -77,6 +77,10 @@ class OfficeServiceContext:
         self.cancel_task_tree: CancelTaskTreeHook | None = None
         self.runtime_stop_hook: RuntimeControlHook | None = None
         self.runtime_continue_hook: RuntimeControlHook | None = None
+        # Workplace path cache: project_id -> resolved absolute path string.
+        # Populated lazily by set_project_workplace_cache() so that
+        # project_workplace() stays synchronous everywhere it is called.
+        self._workplace_cache: dict[str, str] = {}
 
     @property
     def engine(self) -> Any:
@@ -138,7 +142,30 @@ class OfficeServiceContext:
         hook = getattr(self, "project_workplace_hook", None)
         if callable(hook):
             return Path(hook(self.normalize_project_id(project_id)))
-        return get_project_workplace(self.normalize_project_id(project_id))
+        pid = self.normalize_project_id(project_id)
+        # Use cached custom path when available (populated by set_project_workplace_cache)
+        custom = self._workplace_cache.get(pid)
+        return get_project_workplace(pid, custom_path=custom)
+
+    def set_project_workplace_cache(self, project_id: str, workplace_path: str) -> None:
+        """Store a resolved workplace path in the in-memory cache.
+
+        Called after a successful ``save_project_workplace`` DB write so that
+        subsequent synchronous calls to ``project_workplace()`` see the new
+        value immediately without an extra DB round-trip.
+        """
+        pid = self.normalize_project_id(project_id)
+        if workplace_path:
+            self._workplace_cache[pid] = workplace_path
+        else:
+            self._workplace_cache.pop(pid, None)
+
+    def clear_project_workplace_cache(self, project_id: str | None = None) -> None:
+        """Evict one or all entries from the workplace path cache."""
+        if project_id:
+            self._workplace_cache.pop(self.normalize_project_id(project_id), None)
+        else:
+            self._workplace_cache.clear()
 
     def list_project_entries(self) -> list[dict[str, str]]:
         projects_dir = self.opc_home / "projects"

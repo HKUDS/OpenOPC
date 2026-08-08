@@ -1286,6 +1286,15 @@ class OPCStore:
                 created_at TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS project_config (
+                project_id TEXT PRIMARY KEY,
+                workplace_path TEXT DEFAULT '',
+                workplace_source TEXT DEFAULT 'default',
+                metadata TEXT DEFAULT '{}',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS sessions (
                 session_id TEXT PRIMARY KEY,
                 project_id TEXT DEFAULT 'default',
@@ -6300,6 +6309,66 @@ class OPCStore:
             tasks = [self._row_to_task(row, cursor.description) for row in rows]
         await self.hydrate_task_work_item_links(tasks)
         return tasks
+
+    # --- Project config ---
+
+    async def get_project_config(self, project_id: str) -> dict[str, Any] | None:
+        """Return project config row (workplace_path, workplace_source) or None."""
+        assert self._db
+        async with self._db.execute(
+            "SELECT * FROM project_config WHERE project_id = ?",
+            (str(project_id or "").strip(),),
+        ) as cursor:
+            row = await cursor.fetchone()
+            if not row:
+                return None
+            cols = [d[0] for d in cursor.description]
+            d = dict(zip(cols, row))
+        try:
+            metadata = json.loads(d.get("metadata") or "{}")
+        except Exception:
+            metadata = {}
+        return {
+            "project_id": d.get("project_id", ""),
+            "workplace_path": d.get("workplace_path", "") or "",
+            "workplace_source": d.get("workplace_source", "default") or "default",
+            "metadata": metadata,
+            "created_at": d.get("created_at", ""),
+            "updated_at": d.get("updated_at", ""),
+        }
+
+    async def save_project_workplace(
+        self,
+        project_id: str,
+        workplace_path: str,
+        source: str = "manual",
+    ) -> None:
+        """Upsert the custom workplace path for a project."""
+        assert self._db
+        now = datetime.now().isoformat()
+        pid = str(project_id or "").strip()
+        path = str(workplace_path or "").strip()
+        await self._db.execute(
+            """
+            INSERT INTO project_config (project_id, workplace_path, workplace_source, metadata, created_at, updated_at)
+            VALUES (?, ?, ?, '{}', ?, ?)
+            ON CONFLICT(project_id) DO UPDATE SET
+                workplace_path   = excluded.workplace_path,
+                workplace_source = excluded.workplace_source,
+                updated_at       = excluded.updated_at
+            """,
+            (pid, path, source, now, now),
+        )
+        await self._db.commit()
+
+    async def delete_project_workplace(self, project_id: str) -> None:
+        """Remove custom workplace config so the project falls back to default."""
+        assert self._db
+        await self._db.execute(
+            "DELETE FROM project_config WHERE project_id = ?",
+            (str(project_id or "").strip(),),
+        )
+        await self._db.commit()
 
     # --- Session memory ---
 
