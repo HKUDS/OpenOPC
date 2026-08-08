@@ -16,6 +16,7 @@ import { useSessionStore, type SessionStoreState } from './stores/SessionStore'
 import { useProjectStore, type ProjectStoreState } from './stores/ProjectStore'
 import { ExecutionPanel } from './kanban/ExecutionPanel'
 import { ProjectSelector } from './components/ProjectSelector'
+import { ProjectSettings, type ProjectWorkplaceInfo } from './components/ProjectSettings'
 import { OrgTab } from './org/OrgTab'
 import { notifyTaskAssigned } from './lib/taskChatBridge'
 import { mapCollabSyncPayload, mapBackendMessage, mapBackendChannel, mapBackendSession, mapBackendBoard, mapBackendColumn, mapBackendTask, mergeSessionDetailHasMore } from './lib/collabSync'
@@ -456,6 +457,8 @@ export default function App() {
   const [wsUrlInput, setWsUrlInput] = useState(initialUrl)
   const [status, setStatus] = useState<SocketStatus>('disconnected')
   const [statusDetail, setStatusDetail] = useState('')
+  const [settingsProjectId, setSettingsProjectId] = useState<string | null>(null)
+  const [workplaceInfo, setWorkplaceInfo] = useState<ProjectWorkplaceInfo | null>(null)
   const [snapshot, setSnapshot] = useState<VisualSnapshot | null>(null)
   const [events, setEvents] = useState<VisualEvent[]>([])
   const [uiTick, setUiTick] = useState(0)
@@ -1224,6 +1227,10 @@ export default function App() {
       },
       onCollabMessage: (type, payload) => {
         try {
+          if (type === 'project_workplace') {
+            setWorkplaceInfo(payload as any)
+            return
+          }
           if (type === 'project_index_push') {
             if (!payloadMatchesCurrentSwitch(payload)) return
           } else if (!payloadMatchesActiveProject(payload, false)) return
@@ -2390,10 +2397,15 @@ export default function App() {
               const switchSeq = beginProjectSwitch(id)
               clientRef.current?.switchProject(id, switchSeq)
             }}
-            onCreate={(id) => {
-              clientRef.current?.createProject(id)
+            onCreate={(id, workplacePath) => {
+              clientRef.current?.createProject(id, workplacePath)
             }}
             onDelete={(id) => clientRef.current?.deleteProject(id)}
+            onSettings={(id) => {
+              setSettingsProjectId(id)
+              setWorkplaceInfo(null)
+              clientRef.current?.getProjectWorkplace(id)
+            }}
           />
         </div>
         <div className="topbar-center">
@@ -2618,6 +2630,22 @@ export default function App() {
         <div className="editor-page">
           <CollisionEditor bridge={bridgeRef.current} />
         </div>
+      )}
+
+      {settingsProjectId && (
+        <ProjectSettings
+          projectId={settingsProjectId}
+          workplaceInfo={workplaceInfo}
+          onSave={(id, path) => {
+            clientRef.current?.setProjectWorkplace(id, path)
+            setSettingsProjectId(null)
+          }}
+          onReset={(id) => {
+            clientRef.current?.setProjectWorkplace(id, '')
+            setSettingsProjectId(null)
+          }}
+          onClose={() => setSettingsProjectId(null)}
+        />
       )}
 
       {/* Main Grid */}

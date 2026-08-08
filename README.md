@@ -444,6 +444,25 @@ OpenOPC separates runtime/config state from deliverable workspace files.
 | `../OpenOPC_workplace/<project>/.opc-comms/` | Internal company-mode comms mailboxes, meetings, and tool-result scratch space. |
 
 Set `OPC_HOME=/path/to/opc-home` if you want config and runtime state outside the repo.
+
+**Custom workplace per project** — point any project at an existing code repository:
+
+```bash
+# CLI
+opc project set-workplace myapp --path /path/to/existing/repo
+opc project show-workplace myapp
+opc project reset-workplace myapp          # revert to default
+
+# Or set a global root for all projects
+export OPC_WORKPLACE_ROOT=/my/workspaces   # each project uses /my/workspaces/<project_id>
+```
+
+From the **Office UI**, click the **⚙** button next to the project selector to open Project Settings and set or clear the workplace path. You can also provide a path when creating a new project.
+
+Resolution order for each project's workplace path:
+1. Project-specific path saved via `opc project set-workplace` (stored in the project DB)
+2. `$OPC_WORKPLACE_ROOT` environment variable (applied to all projects)
+3. Default: `../OpenOPC_workplace/<project_id>/`
 </details>
 
 </details>

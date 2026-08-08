@@ -513,8 +513,12 @@ export class VisualSocketClient {
     this.send({ type: 'list_projects' })
   }
 
-  createProject(projectId: string): void {
-    this.send({ type: 'create_project', project_id: this.normalizeProjectId(projectId) })
+  createProject(projectId: string, workplacePath?: string): void {
+    this.send({
+      type: 'create_project',
+      project_id: this.normalizeProjectId(projectId),
+      ...(workplacePath ? { workplace_path: workplacePath } : {}),
+    })
   }
 
   deleteProject(projectId: string): void {
@@ -523,6 +527,21 @@ export class VisualSocketClient {
 
   switchProject(projectId: string, switchSeq?: string): void {
     this.send({ type: 'switch_project', project_id: this.normalizeProjectId(projectId), switch_seq: switchSeq })
+  }
+
+  setProjectWorkplace(projectId: string, workplacePath: string): void {
+    this.send({
+      type: 'set_project_workplace',
+      project_id: this.normalizeProjectId(projectId),
+      workplace_path: workplacePath,
+    })
+  }
+
+  getProjectWorkplace(projectId: string): void {
+    this.send({
+      type: 'get_project_workplace',
+      project_id: this.normalizeProjectId(projectId),
+    })
   }
 
   // ── Org info ──────────────────────────────────────────────────────────
@@ -758,6 +777,7 @@ export class VisualSocketClient {
       case 'kanban_board_created':
       case 'collab_sync_push':
       case 'project_index_push':
+      case 'project_workplace':
         this.handlers.onCollabMessage?.(parsed.type, parsed.payload as Record<string, unknown>)
         break
       case 'agent_runtime_update':
