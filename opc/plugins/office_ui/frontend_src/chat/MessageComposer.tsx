@@ -177,6 +177,11 @@ function ContextRing({
   )
 }
 
+// Unsent composer drafts, keyed by channel id. Module-level so drafts follow
+// the conversation: parents remount the composer with `key={channelId}` on
+// session switches, which would otherwise discard whatever the user typed.
+const composerDrafts = new Map<string, string>()
+
 interface MessageComposerProps {
   disabled?: boolean
   placeholder?: string
@@ -264,9 +269,19 @@ export function MessageComposer({
   onStop,
   onContinueInNewChat,
 }: MessageComposerProps) {
-  const [text, setText] = useState('')
+  const [text, setText] = useState(() => (channelId && composerDrafts.get(channelId)) || '')
   const [focused, setFocused] = useState(false)
   const [pending, setPending] = useState<PendingAttachment[]>([])
+
+  // Write-through: keep the per-channel draft in sync with every keystroke so
+  // switching sessions (which remounts this component) can restore it.
+  const updateText = useCallback((value: string) => {
+    setText(value)
+    if (channelId) {
+      if (value) composerDrafts.set(channelId, value)
+      else composerDrafts.delete(channelId)
+    }
+  }, [channelId])
   const [lightbox, setLightbox] = useState<string | null>(null)
   const textareaRef = useRef<HTMLTextAreaElement>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
@@ -292,7 +307,10 @@ export function MessageComposer({
   }, [text])
 
   useEffect(() => {
-    setText('')
+    // Restore the draft for this channel instead of wiping it — drafts follow
+    // the conversation. Attachments still reset: their object URLs and upload
+    // state are tied to this mount.
+    setText(channelId ? composerDrafts.get(channelId) ?? '' : '')
     setPending(prev => {
       prev.forEach(attachment => {
         if (attachment.preview_url) URL.revokeObjectURL(attachment.preview_url)
@@ -383,12 +401,12 @@ export function MessageComposer({
     }))
 
     onSend(content || 'Sent with attachments', attachments.length ? attachments : undefined)
-    setText('')
+    updateText('')
     pending.forEach(attachment => {
       if (attachment.preview_url) URL.revokeObjectURL(attachment.preview_url)
     })
     setPending([])
-  }, [disabled, isWorking, text, pending, onSend])
+  }, [disabled, isWorking, text, pending, onSend, updateText])
 
   const handlePaste = useCallback((event: React.ClipboardEvent) => {
     const files = event.clipboardData?.files
@@ -550,7 +568,7 @@ export function MessageComposer({
           <textarea
             ref={textareaRef}
             value={text}
-            onChange={event => setText(event.target.value)}
+            onChange={event => updateText(event.target.value)}
             onFocus={() => setFocused(true)}
             onBlur={() => setFocused(false)}
             onPaste={handlePaste}
