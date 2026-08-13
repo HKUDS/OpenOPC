@@ -108,6 +108,9 @@ export type SocketEnvelope =
   | { type: 'market_browse'; payload: { presets: Array<Record<string, unknown>> } }
   | { type: 'market_preview'; payload: Record<string, unknown> }
   | { type: 'org_config_export'; payload: { yaml: string } }
+  | { type: 'get_llm_config'; payload: Record<string, unknown> }
+  | { type: 'update_llm_config'; payload: Record<string, unknown> }
+  | { type: 'llm_config_updated'; payload: Record<string, unknown> }
   | { type: 'org_config_import'; payload: { ok: boolean; dry_run?: boolean; preview?: { roles_added: number; roles_removed: number; employees_changed: number }; error?: string; validation_errors?: string[] } }
   | { type: 'org_saved_list'; payload: { orgs: SavedOrgSummary[]; active_name?: string | null } }
   | { type: 'org_saved_save_as'; payload: { ok: boolean; name: string; error?: string } }

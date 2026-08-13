@@ -692,6 +692,19 @@ export default function App() {
   const sessionStore = useSessionStore()
   const projectStore = useProjectStore()
 
+  const [llmConfig, setLlmConfig] = useState<import('./components/LLMModelSettingsModal').LLMSettingsData | null>(null)
+
+  useEffect(() => {
+    if (showLLMModal) {
+      fetch('/api/llm/config')
+        .then((res) => res.json())
+        .then((data) => {
+          if (data.ok) setLlmConfig(data)
+        })
+        .catch((err) => console.error('Failed to fetch LLM config:', err))
+    }
+  }, [showLLMModal])
+
   // Per-session recruitment (role_id -> recruited names) for the org canvas.
   // The org_info payload is project-global, so the canvas otherwise can't show
   // the *selected* session's hires; this derives them from that session's chat
@@ -2482,7 +2495,29 @@ export default function App() {
       </header>
 
       {/* LLM & Local Model Provider Modal */}
-      <LLMModelSettingsModal isOpen={showLLMModal} onClose={() => setShowLLMModal(false)} />
+      <LLMModelSettingsModal
+        isOpen={showLLMModal}
+        initialConfig={llmConfig}
+        onClose={() => setShowLLMModal(false)}
+        onSave={async (settings) => {
+          try {
+            const res = await fetch('/api/llm/config', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(settings),
+            })
+            const data = await res.json()
+            if (data.ok) {
+              setLlmConfig(data)
+              return true
+            }
+            throw new Error(data.error || 'Failed to save settings')
+          } catch (err: any) {
+            console.error('Failed to save LLM settings:', err)
+            throw err
+          }
+        }}
+      />
 
       {/* Workspace Page (unified Chat + Kanban) */}
       {activePage === 'workspace' && (

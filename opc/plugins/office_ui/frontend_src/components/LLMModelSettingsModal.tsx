@@ -5,78 +5,71 @@ export interface LLMSettingsData {
   default_model: string
   api_base: string
   api_key: string
+  has_api_key?: boolean
   is_local: boolean
   context_window?: number
 }
 
 interface LLMModelSettingsModalProps {
   isOpen: boolean
+  initialConfig?: LLMSettingsData | null
   onClose: () => void
-  onSave?: (settings: LLMSettingsData) => void
+  onSave?: (settings: LLMSettingsData) => Promise<boolean> | boolean
 }
 
 const PROVIDER_OPTIONS = [
   { value: 'ollama', label: 'Ollama (Local Node)', defaultBase: 'http://localhost:11434', defaultModel: 'ollama/llama3.3', isLocal: true },
   { value: 'vllm', label: 'vLLM Engine (Local)', defaultBase: 'http://localhost:8000/v1', defaultModel: 'vllm/meta-llama-3.1-8b-instruct', isLocal: true },
-  { value: 'lmstudio', label: 'LM Studio (Local Server)', defaultBase: 'http://localhost:1234/v1', defaultModel: 'lmstudio/deepseek-r1-distill-qwen-14b', isLocal: true },
-  { value: 'localai', label: 'LocalAI / Llama.cpp (Local)', defaultBase: 'http://localhost:8080/v1', defaultModel: 'localai/starcoder2-15b', isLocal: true },
+  { value: 'lmstudio', label: 'LM Studio (Local Server)', defaultBase: 'http://localhost:1234/v1', defaultModel: 'openai/deepseek-r1-distill-qwen-14b', isLocal: true },
+  { value: 'localai', label: 'LocalAI / Llama.cpp (Local)', defaultBase: 'http://localhost:8080/v1', defaultModel: 'openai/starcoder2-15b', isLocal: true },
   { value: 'openai', label: 'OpenAI (Cloud)', defaultBase: '', defaultModel: 'openai/gpt-4o', isLocal: false },
   { value: 'anthropic', label: 'Anthropic Claude (Cloud)', defaultBase: '', defaultModel: 'anthropic/claude-sonnet-4-20250514', isLocal: false },
   { value: 'openrouter', label: 'OpenRouter AI (Cloud)', defaultBase: '', defaultModel: 'openrouter/auto', isLocal: false },
-  { value: 'custom', label: 'Custom Self-Hosted / Proxy', defaultBase: 'http://localhost:8000/v1', defaultModel: 'custom-model', isLocal: true },
+  { value: 'custom', label: 'Custom Self-Hosted / Proxy', defaultBase: 'http://localhost:8000/v1', defaultModel: 'openai/custom-model', isLocal: true },
 ] as const
 
 const POPULAR_MODELS: Record<string, string[]> = {
   ollama: ['ollama/llama3.3', 'ollama/qwen2.5-coder', 'ollama/deepseek-r1:14b', 'ollama/mistral-nemo'],
   vllm: ['vllm/meta-llama-3.1-8b-instruct', 'vllm/qwen2.5-72b-instruct', 'vllm/mistral-7b-instruct-v0.3'],
-  lmstudio: ['lmstudio/deepseek-r1-distill-qwen-14b', 'lmstudio/llama-3.3-70b-instruct'],
-  localai: ['localai/starcoder2-15b', 'localai/llama-3-8b-instruct'],
+  lmstudio: ['openai/deepseek-r1-distill-qwen-14b', 'openai/llama-3.3-70b-instruct'],
+  localai: ['openai/starcoder2-15b', 'openai/llama-3-8b-instruct'],
   openai: ['openai/gpt-4o', 'openai/gpt-4o-mini', 'openai/o3-mini'],
   anthropic: ['anthropic/claude-sonnet-4-20250514', 'anthropic/claude-3-5-haiku-20241022'],
   openrouter: ['openrouter/auto', 'openrouter/anthropic/claude-3.5-sonnet'],
   custom: [],
 }
 
-const STORAGE_KEY = 'opc_llm_settings'
-
-export function getStoredLLMSettings(): LLMSettingsData {
-  try {
-    const raw = localStorage.getItem(STORAGE_KEY)
-    if (raw) return JSON.parse(raw) as LLMSettingsData
-  } catch {
-    /* fallback */
-  }
-  return {
-    provider: 'ollama',
-    default_model: 'ollama/llama3.3',
-    api_base: 'http://localhost:11434',
-    api_key: '',
-    is_local: true,
-    context_window: 0,
-  }
-}
-
-export function LLMModelSettingsModal({ isOpen, onClose, onSave }: LLMModelSettingsModalProps) {
+export function LLMModelSettingsModal({ isOpen, initialConfig, onClose, onSave }: LLMModelSettingsModalProps) {
   const [provider, setProvider] = useState<string>('ollama')
   const [defaultModel, setDefaultModel] = useState<string>('ollama/llama3.3')
   const [apiBase, setApiBase] = useState<string>('http://localhost:11434')
   const [apiKey, setApiKey] = useState<string>('')
   const [isLocal, setIsLocal] = useState<boolean>(true)
   const [contextWindow, setContextWindow] = useState<number>(0)
-  const [savedSuccess, setSavedSuccess] = useState<boolean>(false)
+  const [statusMessage, setStatusMessage] = useState<{ text: string; isError: boolean } | null>(null)
+  const [isSubmitting, setIsSubmitting] = useState<boolean>(false)
 
   useEffect(() => {
     if (isOpen) {
-      const stored = getStoredLLMSettings()
-      setProvider(stored.provider || 'ollama')
-      setDefaultModel(stored.default_model || 'ollama/llama3.3')
-      setApiBase(stored.api_base || 'http://localhost:11434')
-      setApiKey(stored.api_key || '')
-      setIsLocal(stored.is_local ?? true)
-      setContextWindow(stored.context_window || 0)
-      setSavedSuccess(false)
+      if (initialConfig) {
+        setProvider(initialConfig.provider || 'ollama')
+        setDefaultModel(initialConfig.default_model || 'ollama/llama3.3')
+        setApiBase(initialConfig.api_base || '')
+        setApiKey(initialConfig.api_key || '')
+        setIsLocal(initialConfig.is_local ?? true)
+        setContextWindow(initialConfig.context_window || 0)
+      } else {
+        setProvider('ollama')
+        setDefaultModel('ollama/llama3.3')
+        setApiBase('http://localhost:11434')
+        setApiKey('')
+        setIsLocal(true)
+        setContextWindow(0)
+      }
+      setStatusMessage(null)
+      setIsSubmitting(false)
     }
-  }, [isOpen])
+  }, [isOpen, initialConfig])
 
   if (!isOpen) return null
 
@@ -85,30 +78,48 @@ export function LLMModelSettingsModal({ isOpen, onClose, onSave }: LLMModelSetti
     const preset = PROVIDER_OPTIONS.find((p) => p.value === newProvider)
     if (preset) {
       setIsLocal(preset.isLocal)
-      if (preset.defaultBase) setApiBase(preset.defaultBase)
+      setApiBase(preset.defaultBase || '')
       if (preset.defaultModel) setDefaultModel(preset.defaultModel)
     }
   }
 
-  const handleSave = () => {
+  const handleSave = async () => {
+    if (!defaultModel.trim()) {
+      setStatusMessage({ text: 'Model identifier is required.', isError: true })
+      return
+    }
+
+    setIsSubmitting(true)
+    setStatusMessage(null)
+
     const settings: LLMSettingsData = {
       provider,
-      default_model: defaultModel,
-      api_base: apiBase,
-      api_key: apiKey,
+      default_model: defaultModel.trim(),
+      api_base: apiBase.trim(),
+      api_key: apiKey.trim(),
       is_local: isLocal,
       context_window: Number(contextWindow) || 0,
     }
+
     try {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(settings))
-    } catch {
-      /* local storage unavailable */
+      if (onSave) {
+        const success = await onSave(settings)
+        if (success !== false) {
+          setStatusMessage({ text: '✓ LLM Settings Saved & Applied to Backend!', isError: false })
+          setTimeout(() => {
+            onClose()
+          }, 800)
+        } else {
+          setStatusMessage({ text: 'Failed to update backend configuration.', isError: true })
+        }
+      } else {
+        setStatusMessage({ text: 'No save handler registered.', isError: true })
+      }
+    } catch (err: any) {
+      setStatusMessage({ text: err?.message || 'Error saving settings.', isError: true })
+    } finally {
+      setIsSubmitting(false)
     }
-    setSavedSuccess(true)
-    if (onSave) onSave(settings)
-    setTimeout(() => {
-      onClose()
-    }, 800)
   }
 
   return (
@@ -162,7 +173,7 @@ export function LLMModelSettingsModal({ isOpen, onClose, onSave }: LLMModelSetti
             <div>
               <strong>Keyless Local Model Active</strong>
               <div style={{ fontSize: '11px', opacity: 0.9 }}>
-                No remote API key required. Requests connect directly to your local endpoint.
+                No remote API key required. Requests connect directly to your local endpoint. Note: Model must support tool/function calling.
               </div>
             </div>
           </div>
@@ -220,7 +231,7 @@ export function LLMModelSettingsModal({ isOpen, onClose, onSave }: LLMModelSetti
                   onClick={() => setDefaultModel(m)}
                   style={{ fontSize: '11px', padding: '3px 9px' }}
                 >
-                  {m.replace(`${provider}/`, '')}
+                  {m.replace(/^[^/]+\//, '')}
                 </button>
               ))}
             </div>
@@ -245,7 +256,7 @@ export function LLMModelSettingsModal({ isOpen, onClose, onSave }: LLMModelSetti
             }}
             value={apiBase}
             onChange={(e) => setApiBase(e.target.value)}
-            placeholder="e.g. http://localhost:11434 or http://localhost:8000/v1"
+            placeholder={isLocal ? 'e.g. http://localhost:11434 or http://localhost:8000/v1' : 'Leave empty for standard cloud endpoint'}
           />
         </div>
 
@@ -312,13 +323,13 @@ export function LLMModelSettingsModal({ isOpen, onClose, onSave }: LLMModelSetti
 
         {/* Action Buttons */}
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginTop: '12px' }}>
-          {savedSuccess ? (
-            <span style={{ color: 'var(--green)', fontSize: '13px', fontWeight: 600 }}>
-              ✓ LLM Settings Saved Successfully!
+          {statusMessage ? (
+            <span style={{ color: statusMessage.isError ? 'var(--red, #ef4444)' : 'var(--green, #10b981)', fontSize: '13px', fontWeight: 600 }}>
+              {statusMessage.text}
             </span>
           ) : (
             <span style={{ fontSize: '11px', color: 'var(--text-secondary)' }}>
-              Settings are stored locally in your browser.
+              Config will be persisted atomically to backend `.opc/config/llm_config.yaml`.
             </span>
           )}
           <div style={{ display: 'flex', gap: '8px' }}>
@@ -326,6 +337,7 @@ export function LLMModelSettingsModal({ isOpen, onClose, onSave }: LLMModelSetti
               type="button"
               className="pill-btn"
               onClick={onClose}
+              disabled={isSubmitting}
               style={{ padding: '6px 14px', fontSize: '13px' }}
             >
               Cancel
@@ -334,9 +346,10 @@ export function LLMModelSettingsModal({ isOpen, onClose, onSave }: LLMModelSetti
               type="button"
               className="pill-btn active"
               onClick={handleSave}
+              disabled={isSubmitting}
               style={{ padding: '6px 16px', fontSize: '13px', fontWeight: 600 }}
             >
-              Save & Apply Settings
+              {isSubmitting ? 'Saving...' : 'Save & Apply Settings'}
             </button>
           </div>
         </div>

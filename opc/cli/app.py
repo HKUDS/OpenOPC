@@ -8375,12 +8375,6 @@ try:
 except ImportError:
     pass
 
-try:
-    from opc.plugins.shadow_adapter import register_cli_commands as register_shadow_cli
-    register_shadow_cli(app)
-except ImportError:
-    pass
-
 
 def main():
     keylog_path = pop_windows_sslkeylogfile()

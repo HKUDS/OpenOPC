@@ -19,17 +19,6 @@ ADAPTER_CLASSES: dict[str, type[ExternalAgentAdapter]] = {
     "opencode": OpenCodeAdapter,
 }
 
-# Auto-register ShadowModeAdapter if installed
-try:
-    from shadow_adapter.adapter import ShadowModeAdapter
-    ADAPTER_CLASSES["shadow"] = ShadowModeAdapter
-except ImportError:
-    try:
-        from opc.plugins.shadow_adapter.adapter import ShadowModeAdapter
-        ADAPTER_CLASSES["shadow"] = ShadowModeAdapter
-    except ImportError:
-        pass
-
 
 class AdapterRegistry:
     """Manages external agent adapters and preferred order."""

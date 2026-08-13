@@ -6,13 +6,15 @@ OpenOPC natively supports self-hosted local LLMs (Ollama, vLLM, LM Studio, Local
 
 ## 🚀 Supported Local Providers & Formats
 
-| Local Provider | Default Port | Model Prefix Format | Example Model Name |
+| Local Provider | Default Port | Model Prefix Format | Example Model Identifier |
 |---|---|---|---|
 | **Ollama** | `http://localhost:11434` | `ollama/<model>` | `ollama/llama3.3`, `ollama/qwen2.5-coder` |
 | **vLLM** | `http://localhost:8000/v1` | `vllm/<model>` or `openai/<model>` | `vllm/meta-llama-3.1-8b-instruct` |
-| **LM Studio** | `http://localhost:1234/v1` | `lmstudio/<model>` or `openai/<model>` | `lmstudio/deepseek-r1-distill-qwen-14b` |
-| **LocalAI** | `http://localhost:8080/v1` | `localai/<model>` | `localai/starcoder2-15b` |
-| **Llama.cpp** | `http://localhost:8080/v1` | `llama-cpp/<model>` | `llama-cpp/mistral-7b-instruct` |
+| **LM Studio** | `http://localhost:1234/v1` | `openai/<model>` | `openai/deepseek-r1-distill-qwen-14b` |
+| **LocalAI / Llama.cpp** | `http://localhost:8080/v1` | `openai/<model>` | `openai/starcoder2-15b` |
+| **Custom Local OpenAI Server** | `http://<host>:<port>/v1` | `openai/<model>` | `openai/custom-model` |
+
+> ⚠️ **Important Requirement**: Native OpenOPC agents require a local model that supports **tool calling / function calling** (such as `ollama/llama3.3` or `ollama/qwen2.5-coder`) to execute multi-step work items cleanly.
 
 ---
 
@@ -29,6 +31,7 @@ OpenOPC natively supports self-hosted local LLMs (Ollama, vLLM, LM Studio, Local
    llm:
      default_model: "ollama/llama3.3"
      api_base: "http://localhost:11434"
+     is_local: true
    ```
 
 3. **Launch OpenOPC Session**:
@@ -38,35 +41,24 @@ OpenOPC natively supports self-hosted local LLMs (Ollama, vLLM, LM Studio, Local
 
 ---
 
-## 🖥️ Running with vLLM / LM Studio / LocalAI
+## 🖥️ Running with LM Studio / LocalAI / OpenAI-Compatible Servers
 
-OpenAI-compatible local servers (like vLLM or LM Studio) can be used by setting `api_base`:
+For OpenAI-compatible local servers (like LM Studio or LocalAI), use `openai/<model>` together with `api_base`:
 
 ```yaml
 llm:
-  default_model: "vllm/meta-llama-3.1-8b-instruct"
-  api_base: "http://localhost:8000/v1"
-```
-
-Or via environment variables:
-
-```bash
-export OLLAMA_HOST="http://localhost:11434"
-# or
-export LOCAL_LLM_API_BASE="http://localhost:8000/v1"
+  default_model: "openai/deepseek-r1-distill-qwen-14b"
+  api_base: "http://localhost:1234/v1"
+  is_local: true
 ```
 
 ---
 
-## 🔧 Explicit `is_local` Flag
+## 🌐 Office UI Settings Modal Integration
 
-If your local server uses a non-standard port or hostname, mark `is_local: true` in `llm_config.yaml`:
+Settings can be changed dynamically from the browser using the **LLM & Local Model Settings Modal (`🤖` button)** in the top header of Office UI:
 
-```yaml
-llm:
-  default_model: "my-custom-local-model"
-  api_base: "http://192.168.1.150:9000/v1"
-  is_local: true
-```
-
-This instructs OpenOPC's LLM provider layer to skip remote credential validation and execute native AI agents using your local workstation.
+1. Click the **`🤖` button** in the header.
+2. Select your provider (Ollama, vLLM, LM Studio, LocalAI, OpenAI, Anthropic).
+3. Enter model identifier and API base URL.
+4. Click **Save & Apply Settings**. Changes are saved atomically to `.opc/config/llm_config.yaml` and reinitialize the runtime LLMProvider instantly.

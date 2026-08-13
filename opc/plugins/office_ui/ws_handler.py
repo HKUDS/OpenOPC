@@ -10586,6 +10586,91 @@ class WSHandler:
         except ServiceError as exc:
             await self._send_service_error(ws, exc, action="comms_read_message")
 
+    async def _handle_get_llm_config(self, ws: Any, data: dict) -> None:
+        """Return active LLM configuration for Office UI settings modal."""
+        if self._shutting_down:
+            return
+        try:
+            config = getattr(self.engine, "config", None)
+            if not config:
+                from opc.core.config import OPCConfig
+                config = OPCConfig.load(self.opc_home)
+
+            llm_cfg = config.llm
+            payload = {
+                "ok": True,
+                "provider": getattr(llm_cfg, "provider", "") or "",
+                "default_model": llm_cfg.default_model,
+                "api_base": llm_cfg.api_base,
+                "api_key": "***" if llm_cfg.api_key else "",
+                "has_api_key": bool(llm_cfg.api_key),
+                "is_local": getattr(llm_cfg, "is_local", False),
+                "context_window": llm_cfg.context_window,
+            }
+            await ws.send_json({"type": "get_llm_config", "payload": payload})
+        except Exception as exc:
+            await ws.send_json({"type": "get_llm_config", "payload": {"ok": False, "error": str(exc)}})
+
+    async def _handle_update_llm_config(self, ws: Any, data: dict) -> None:
+        """Update and atomically persist LLM configuration, then reconfigure runtime LLMProvider."""
+        if self._shutting_down:
+            return
+        try:
+            payload = data.get("payload") or {}
+            if not isinstance(payload, dict):
+                await ws.send_json({"type": "update_llm_config", "payload": {"ok": False, "error": "Invalid payload format"}})
+                return
+
+            new_model = str(payload.get("default_model", "") or "").strip()
+            if not new_model:
+                await ws.send_json({"type": "update_llm_config", "payload": {"ok": False, "error": "Model identifier cannot be empty"}})
+                return
+
+            new_api_base = str(payload.get("api_base", "") or "").strip()
+            new_api_key = str(payload.get("api_key", "") or "").strip()
+            new_provider = str(payload.get("provider", "") or "").strip()
+            is_local = bool(payload.get("is_local", False))
+            context_window = int(payload.get("context_window", 0) or 0)
+
+            # Load current config
+            from opc.core.config import OPCConfig
+            config = OPCConfig.load(self.opc_home)
+
+            # Update LLM section
+            config.llm.default_model = new_model
+            config.llm.api_base = new_api_base
+            if new_api_key and new_api_key != "***":
+                config.llm.api_key = new_api_key
+            config.llm.provider = new_provider
+            config.llm.is_local = is_local
+            config.llm.context_window = context_window
+
+            # Atomically save to disk (.opc/config/llm_config.yaml)
+            config.save(self.opc_home)
+
+            # Reconfigure active engine LLMProvider
+            if hasattr(self.engine, "llm"):
+                from opc.llm.provider import LLMProvider
+                self.engine.llm = LLMProvider(config.llm, opc_home=self.opc_home)
+
+            response_payload = {
+                "ok": True,
+                "provider": config.llm.provider,
+                "default_model": config.llm.default_model,
+                "api_base": config.llm.api_base,
+                "has_api_key": bool(config.llm.api_key),
+                "is_local": config.llm.is_local,
+                "context_window": config.llm.context_window,
+            }
+            await ws.send_json({"type": "update_llm_config", "payload": response_payload})
+            # Also broadcast config update to all connected clients
+            await self.broadcast({"type": "llm_config_updated", "payload": response_payload})
+        except Exception as exc:
+            logger.error(f"Failed to update LLM configuration: {exc}")
+            await ws.send_json({"type": "update_llm_config", "payload": {"ok": False, "error": str(exc)}})
+
     # Register handlers defined after _HANDLERS class-level dict
     _HANDLERS["comms_state"] = _handle_comms_state
     _HANDLERS["comms_read_message"] = _handle_comms_read_message
+    _HANDLERS["get_llm_config"] = _handle_get_llm_config
+    _HANDLERS["update_llm_config"] = _handle_update_llm_config
