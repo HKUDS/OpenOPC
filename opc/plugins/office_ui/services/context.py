@@ -9,13 +9,13 @@ from __future__ import annotations
 
 import asyncio
 import inspect
-import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Optional
 
 from loguru import logger
 from opc.core.config import get_project_workplace
+from opc.project_id import is_valid_project_id
 
 LoadOrgConfigHook = Callable[[Optional[str]], bool]
 SetActiveOrgHook = Callable[[str], Awaitable[None]]
@@ -92,7 +92,7 @@ class OfficeServiceContext:
 
     @staticmethod
     def is_safe_project_id(project_id: str) -> bool:
-        return bool(re.match(r"^[a-zA-Z0-9][a-zA-Z0-9_-]*$", project_id or ""))
+        return is_valid_project_id(project_id)
 
     @staticmethod
     def store_is_ready(store: Any) -> bool:

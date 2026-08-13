@@ -23,17 +23,6 @@ html, body, #root {
 /* ── Theme Tokens ───────────────────────────────────── */
 
 .app-shell {
-  --bg: #0c111b;
-  --bg-elevated: #141b2b;
-  --text: #e2e8f0;
-  --text-secondary: #8494a7;
-  --border: rgba(148, 163, 184, 0.12);
-  --border-hover: rgba(148, 163, 184, 0.22);
-  --surface: rgba(20, 27, 43, 0.7);
-  --surface-hover: rgba(30, 41, 63, 0.7);
-  --accent: #6366f1;
-  --accent-soft: rgba(99, 102, 241, 0.15);
-  --accent-glow: rgba(99, 102, 241, 0.3);
   --green: #34d399;
   --yellow: #fbbf24;
   --red: #f87171;
@@ -41,9 +30,6 @@ html, body, #root {
   --radius-sm: 8px;
   --radius-xs: 6px;
   --white: #ffffff;
-  --text-dim: #64748b;
-  --bg-card: #141b2b;
-  --bg-secondary: #1a2332;
 
   height: 100vh;
   max-height: 100vh;
@@ -55,8 +41,26 @@ html, body, #root {
   background: var(--bg);
 }
 
-/* Theme variants */
-.theme-neon {
+/* Theme variants. The data-theme values are the public CSS contract for the
+   canonical registry in lib/theme.ts. */
+.app-shell[data-theme="midnight"] {
+  --bg: #0c111b;
+  --bg-elevated: #141b2b;
+  --text: #e2e8f0;
+  --text-secondary: #8494a7;
+  --border: rgba(148, 163, 184, 0.12);
+  --border-hover: rgba(148, 163, 184, 0.22);
+  --surface: rgba(20, 27, 43, 0.7);
+  --surface-hover: rgba(30, 41, 63, 0.7);
+  --accent: #6366f1;
+  --accent-soft: rgba(99, 102, 241, 0.15);
+  --accent-glow: rgba(99, 102, 241, 0.3);
+  --text-dim: #64748b;
+  --bg-card: #141b2b;
+  --bg-secondary: #1a2332;
+}
+
+.app-shell[data-theme="neon"] {
   --bg: #05100e;
   --bg-elevated: #0a1f1a;
   --text: #d0fef0;
@@ -73,7 +77,7 @@ html, body, #root {
   --accent-glow: rgba(0, 221, 198, 0.3);
 }
 
-.theme-paper {
+.app-shell[data-theme="paper"] {
   --bg: #f8f9fb;
   --bg-elevated: #ffffff;
   --text: #1e293b;
@@ -94,15 +98,15 @@ html, body, #root {
   color-scheme: light;
 }
 
-.theme-paper .kanban-card:hover {
+.app-shell[data-theme="paper"] .kanban-card:hover {
   box-shadow: 0 2px 8px rgba(0, 0, 0, 0.06);
 }
 
-.theme-paper .kanban-card.is-dragging {
+.app-shell[data-theme="paper"] .kanban-card.is-dragging {
   box-shadow: 0 8px 24px rgba(0, 0, 0, 0.12);
 }
 
-.theme-retro {
+.app-shell[data-theme="retro"] {
   --bg: #080e08;
   --bg-elevated: #0e1a0e;
   --text: #a8d8a8;
@@ -119,7 +123,7 @@ html, body, #root {
   --accent-glow: rgba(74, 222, 128, 0.3);
 }
 
-.theme-terminal {
+.app-shell[data-theme="terminal"] {
   --bg: #080808;
   --bg-elevated: #111111;
   --text: #22c55e;
@@ -136,7 +140,7 @@ html, body, #root {
   --accent-glow: rgba(34, 197, 94, 0.3);
 }
 
-.theme-cozy {
+.app-shell[data-theme="cozy"] {
   --bg: #16120e;
   --bg-elevated: #201a14;
   --text: #ede0d4;
@@ -155,7 +159,7 @@ html, body, #root {
 
 /* ── OpenOPC theme ─────────────────────────────────── */
 /* Warm terracotta accent on near-black for focused work. */
-.theme-openopc {
+.app-shell[data-theme="openopc"] {
   --bg: #0a0a0a;
   --bg-elevated: #161616;
   --bg-card: #121111;
@@ -175,125 +179,125 @@ html, body, #root {
   --red: #e06c75;
 }
 
-.theme-openopc .topbar {
+.app-shell[data-theme="openopc"] .topbar {
   background: #0e0e0e;
   border-bottom-color: rgba(217, 119, 87, 0.08);
 }
 
-.theme-openopc .session-sidebar {
+.app-shell[data-theme="openopc"] .session-sidebar {
   background: #0e0e0e;
   border-right-color: rgba(217, 119, 87, 0.08);
 }
 
-.theme-openopc .session-new-btn {
+.app-shell[data-theme="openopc"] .session-new-btn {
   border-color: rgba(217, 119, 87, 0.18);
 }
 
-.theme-openopc .session-new-btn:hover {
+.app-shell[data-theme="openopc"] .session-new-btn:hover {
   border-color: var(--accent);
   color: var(--accent);
 }
 
-.theme-openopc .msg-content-user {
+.app-shell[data-theme="openopc"] .msg-content-user {
   background: linear-gradient(135deg, #d97757, #c96442);
   box-shadow: 0 2px 8px rgba(217, 119, 87, 0.15);
 }
 
-.theme-openopc .msg-content-agent-card {
+.app-shell[data-theme="openopc"] .msg-content-agent-card {
   background: #131313;
   border-color: rgba(217, 119, 87, 0.1);
   border-left-color: #d97757;
 }
 
-.theme-openopc .msg-row.agent:hover .msg-content-agent-card {
+.app-shell[data-theme="openopc"] .msg-row.agent:hover .msg-content-agent-card {
   border-color: rgba(217, 119, 87, 0.2);
   border-left-color: #d97757;
   box-shadow: 0 2px 12px rgba(217, 119, 87, 0.06);
 }
 
-.theme-openopc .msg-content-agent pre {
+.app-shell[data-theme="openopc"] .msg-content-agent pre {
   background: #0c0c0c;
   border-color: rgba(217, 119, 87, 0.08);
 }
 
-.theme-openopc .msg-content-agent blockquote {
+.app-shell[data-theme="openopc"] .msg-content-agent blockquote {
   background: rgba(217, 119, 87, 0.03);
   border-left-color: rgba(217, 119, 87, 0.25);
 }
 
-.theme-openopc .msg-card-actions {
+.app-shell[data-theme="openopc"] .msg-card-actions {
   border-top-color: rgba(217, 119, 87, 0.08);
 }
 
-.theme-openopc .agent-avatar {
+.app-shell[data-theme="openopc"] .agent-avatar {
   background: linear-gradient(135deg, rgba(217, 119, 87, 0.15), rgba(217, 119, 87, 0.05));
   border-color: rgba(217, 119, 87, 0.15);
   color: var(--accent);
 }
 
-.theme-openopc .composer-send-btn {
+.app-shell[data-theme="openopc"] .composer-send-btn {
   background: linear-gradient(135deg, #d97757, #c96442);
 }
 
-.theme-openopc .composer-send-btn:not(:disabled):hover {
+.app-shell[data-theme="openopc"] .composer-send-btn:not(:disabled):hover {
   filter: brightness(1.2);
 }
 
-.theme-openopc .task-header-bar {
+.app-shell[data-theme="openopc"] .task-header-bar {
   background: #0e0e0e;
   border-bottom-color: rgba(217, 119, 87, 0.08);
 }
 
-.theme-openopc .ptl-live-think {
+.app-shell[data-theme="openopc"] .ptl-live-think {
   background: rgba(217, 119, 87, 0.06);
 }
 
-.theme-openopc .ptl-live-tool-name {
+.app-shell[data-theme="openopc"] .ptl-live-tool-name {
   background: rgba(152, 195, 121, 0.1);
   color: #98c379;
 }
 
-.theme-openopc .ptl-tool-badge {
+.app-shell[data-theme="openopc"] .ptl-tool-badge {
   background: rgba(152, 195, 121, 0.08);
   color: #98c379;
 }
 
-.theme-openopc .ptl-dot {
+.app-shell[data-theme="openopc"] .ptl-dot {
   background: #131313;
   border-color: rgba(217, 119, 87, 0.12);
 }
 
-.theme-openopc .ptl-line {
+.app-shell[data-theme="openopc"] .ptl-line {
   background: rgba(217, 119, 87, 0.1);
 }
 
-.theme-openopc .agent-working-row .ptl-block {
+.app-shell[data-theme="openopc"] .agent-working-row .ptl-block {
   border-color: rgba(217, 119, 87, 0.15);
 }
 
-.theme-openopc .code-block-header {
+.app-shell[data-theme="openopc"] .code-block-header {
   background: #111111;
 }
 
-.theme-openopc .code-block-wrap pre {
+.app-shell[data-theme="openopc"] .code-block-wrap pre {
   background: #0e0e0e !important;
 }
 
-.theme-openopc .msg-content-agent code {
+.app-shell[data-theme="openopc"] .msg-content-agent code {
   background: rgba(217, 119, 87, 0.08);
   color: #ffb38a;
 }
 
-.theme-openopc .msg-content-agent pre code {
+.app-shell[data-theme="openopc"] .msg-content-agent pre code {
   background: transparent;
   color: #f0ede8;
 }
 
-.theme-openopc .kanban-card:hover {
+.app-shell[data-theme="openopc"] .kanban-card:hover {
   box-shadow: 0 2px 12px rgba(217, 119, 87, 0.06);
 }
 
-.theme-openopc .kanban-card.is-dragging {
+.app-shell[data-theme="openopc"] .kanban-card.is-dragging {
   box-shadow: 0 8px 24px rgba(217, 119, 87, 0.12);
 }
 
@@ -474,6 +478,27 @@ html, body, #root {
 
 .theme-select:focus {
   border-color: var(--accent);
+}
+
+.project-selector input[aria-invalid="true"] {
+  border-color: var(--red);
+  outline: 1px solid var(--red);
+}
+
+.project-name-validation {
+  position: absolute;
+  top: 100%;
+  left: 0;
+  z-index: 100;
+  margin-top: 4px;
+  padding: 3px 6px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--bg-elevated);
+  color: var(--red);
+  font-size: 11px;
+  line-height: 1.35;
+  white-space: nowrap;
 }
 
 .icon-btn {

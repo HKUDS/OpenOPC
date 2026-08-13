@@ -70,6 +70,7 @@ from opc.core.models import (
     CompanyProfile,
 )
 from opc.database.store import OPCStore
+from opc.project_id import is_valid_project_id
 from opc.llm.provider import LLMProvider
 from opc.layer0_interaction.message_bus import MessageBus
 from opc.channels import ChannelManager
@@ -1042,7 +1043,7 @@ class OPCEngine:
 
     def _project_company_staffing_defaults_path(self, project_id: str | None = None) -> Path | None:
         project = str(project_id or self.project_id or "default").strip() or "default"
-        if not re.match(r"^[a-zA-Z0-9][a-zA-Z0-9_-]*$", project):
+        if not is_valid_project_id(project):
             logger.warning(f"Skipping company staffing defaults for unsafe project_id={project!r}")
             return None
         return self.opc_home / "projects" / project / "company_staffing_defaults.json"

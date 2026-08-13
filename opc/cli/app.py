@@ -37,6 +37,7 @@ from opc.core.windows_ssl import (
 from opc.database.store import OPCStore
 from opc.layer2_organization.talent_market import TalentMarket
 from opc.core.models import OPCEvent
+from opc.project_id import is_valid_project_id
 
 # Proxy is configured via llm_config.yaml or shell environment — not hardcoded.
 # os.environ['https_proxy'] = 'http://127.0.0.1:7890'
@@ -1130,7 +1131,7 @@ def init(
     ApprovalAllowlistManager(opc_home).ensure_file()
 
     if project:
-        if not re.match(r"^[a-zA-Z0-9][a-zA-Z0-9_-]*$", project or ""):
+        if not is_valid_project_id(project):
             console.print("[error]Invalid project ID (use alphanumeric, hyphens, underscores).[/error]")
             raise typer.Exit(1)
         proj_dir = opc_home / "projects" / project
@@ -3112,10 +3113,6 @@ def _current_project_id(engine: Any) -> str:
     return str(getattr(engine, "project_id", None) or "default").strip() or "default"
 
 
-def _safe_project_id(project_id: str) -> bool:
-    return bool(re.match(r"^[a-zA-Z0-9][a-zA-Z0-9_-]*$", project_id or ""))
-
-
 def _value_text(value: Any, default: str = "") -> str:
     if value is None:
         return default
@@ -3482,7 +3479,7 @@ async def _switch_chat_project(state: _InteractiveChatState, project_id: str, *,
     if not project_id:
         console.print("[warning]Usage: /project switch <id>[/warning]")
         return
-    if not _safe_project_id(project_id):
+    if not is_valid_project_id(project_id):
         console.print("[warning]Invalid project id. Use letters, numbers, hyphens, and underscores.[/warning]")
         return
     if not _cli_project_exists(state.engine, project_id):
@@ -3513,7 +3510,7 @@ async def _switch_chat_project(state: _InteractiveChatState, project_id: str, *,
 
 
 async def _create_and_switch_chat_project(state: _InteractiveChatState, project_id: str) -> bool:
-    if not _safe_project_id(project_id):
+    if not is_valid_project_id(project_id):
         console.print("[warning]Invalid project id. Use letters, numbers, hyphens, and underscores.[/warning]")
         return False
     payload = await _run_chat_office_service(

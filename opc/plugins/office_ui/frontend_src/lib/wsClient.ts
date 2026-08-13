@@ -253,8 +253,15 @@ export class VisualSocketClient {
       window.clearTimeout(this.reconnectTimer)
       this.reconnectTimer = null
     }
-    this.ws?.close()
+    const socket = this.ws
     this.ws = null
+    if (socket) {
+      socket.onopen = null
+      socket.onmessage = null
+      socket.onerror = null
+      socket.onclose = null
+      socket.close()
+    }
   }
 
   send(payload: Record<string, unknown>): SendDisposition {

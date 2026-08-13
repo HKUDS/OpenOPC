@@ -225,4 +225,38 @@ const saturatedClient = new VisualSocketClient('ws://unit.test', {})
 const saturated = await saturatedClient.sessionDetail('project-a', 'task-saturated')
 assert.equal(saturated.error, 'send_queue_full', 'a saturated transport queue must fail immediately')
 
+// An explicitly retired client must detach transport callbacks before close.
+// Otherwise a delayed onclose from an old endpoint can overwrite the status
+// and policy loaded by its replacement.
+const originalWebSocket = globalThis.WebSocket
+let closeCalls = 0
+class ClosingSocket {
+  onopen: ((event: Event) => void) | null = null
+  onmessage: ((event: MessageEvent) => void) | null = null
+  onerror: ((event: Event) => void) | null = null
+  onclose: ((event: CloseEvent) => void) | null = null
+
+  close(): void {
+    closeCalls += 1
+    assert.equal(this.onopen, null)
+    assert.equal(this.onmessage, null)
+    assert.equal(this.onerror, null)
+    assert.equal(this.onclose, null)
+  }
+}
+
+try {
+  globalThis.WebSocket = ClosingSocket as unknown as typeof WebSocket
+  const endpointStatuses: string[] = []
+  const endpointClient = new VisualSocketClient('ws://retired.test', {
+    onStatus: status => { endpointStatuses.push(status) },
+  })
+  endpointClient.connect()
+  endpointClient.disconnect()
+  assert.deepEqual(endpointStatuses, ['connecting'])
+  assert.equal(closeCalls, 1)
+} finally {
+  globalThis.WebSocket = originalWebSocket
+}
+
 console.log('wsClient.test.ts: OK (session_detail correlation and lifecycle cleanup)')

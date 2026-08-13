@@ -1,28 +1,38 @@
-import { useState, useCallback } from 'react'
+import { useState, useCallback, useId, useMemo } from 'react'
 import type { Project } from '../types/kanban'
 import { useI18n } from '../i18n'
+import { toProjectSlug, type ProjectIdPolicy } from '../lib/projectIdPolicy'
 
 interface ProjectSelectorProps {
   projects: Project[]
   activeId: string
+  projectIdPolicy: ProjectIdPolicy | null
   onSelect: (id: string) => void
   onCreate: (id: string) => void
   onDelete?: (id: string) => void
 }
 
-export function ProjectSelector({ projects, activeId, onSelect, onCreate, onDelete }: ProjectSelectorProps) {
+export function ProjectSelector({ projects, activeId, projectIdPolicy, onSelect, onCreate, onDelete }: ProjectSelectorProps) {
   const { t } = useI18n()
+  const validationMessageId = useId()
   const [creating, setCreating] = useState(false)
   const [newName, setNewName] = useState('')
   const [confirmDelete, setConfirmDelete] = useState<string | null>(null)
 
+  const newSlug = useMemo(() => toProjectSlug(newName), [newName])
+  const hasName = newName.trim().length > 0
+  const slugValid = projectIdPolicy?.matches(newSlug) ?? false
+  const nameInvalid = hasName && projectIdPolicy !== null && !slugValid
+  const validationMessage = hasName && !slugValid
+    ? t(projectIdPolicy ? 'project.nameInvalid' : 'project.policyUnavailable')
+    : null
+
   const handleCreate = useCallback(() => {
-    const id = newName.trim().toLowerCase().replace(/[^a-z0-9_-]+/g, '-').replace(/^-|-$/g, '')
-    if (!id) return
-    onCreate(id)
+    if (!slugValid) return
+    onCreate(newSlug)
     setNewName('')
     setCreating(false)
-  }, [newName, onCreate])
+  }, [newSlug, onCreate, slugValid])
 
   const handleDelete = useCallback(() => {
     if (!confirmDelete || !onDelete) return
@@ -48,22 +58,45 @@ export function ProjectSelector({ projects, activeId, onSelect, onCreate, onDele
           onSubmit={e => { e.preventDefault(); handleCreate() }}
           style={{ display: 'flex', gap: 4 }}
         >
-          <input
-            autoFocus
-            className="theme-select"
-            value={newName}
-            placeholder={t('project.placeholder')}
-            onChange={e => setNewName(e.target.value)}
-            onKeyDown={e => { if (e.key === 'Escape') setCreating(false) }}
-            style={{ width: 120 }}
-          />
-          <button type="submit" className="pill-btn" style={{ fontSize: 11, padding: '2px 8px' }}>+</button>
+          <span style={{ position: 'relative', display: 'inline-flex' }}>
+            <input
+              autoFocus
+              className="theme-select"
+              value={newName}
+              placeholder={t('project.placeholder')}
+              onChange={e => setNewName(e.target.value)}
+              onKeyDown={e => { if (e.key === 'Escape') setCreating(false) }}
+              aria-invalid={nameInvalid || undefined}
+              aria-describedby={validationMessage ? validationMessageId : undefined}
+              title={validationMessage ?? undefined}
+              style={{ width: 120 }}
+            />
+            {validationMessage && (
+              <span
+                id={validationMessageId}
+                className="project-name-validation"
+                role="status"
+                aria-live="polite"
+              >
+                {validationMessage}
+              </span>
+            )}
+          </span>
+          <button
+            type="submit"
+            className="pill-btn"
+            disabled={!slugValid}
+            aria-label={t('project.create')}
+            title={t('project.create')}
+            style={{ fontSize: 11, padding: '2px 8px', opacity: slugValid ? 1 : 0.5 }}
+          >+</button>
         </form>
       ) : (
         <button
           className="pill-btn"
           onClick={() => setCreating(true)}
           title={t('project.new')}
+          aria-label={t('project.new')}
           style={{ fontSize: 11, padding: '2px 8px' }}
         >
           +

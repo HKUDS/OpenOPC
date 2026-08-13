@@ -26,5 +26,28 @@ jobs:
       - name: Run external-agent smoke checks
         run: >
           python -m pytest -q
+          tests/test_project_id.py
           tests/test_cli_app.py::CliInitProjectTests::test_external_agent_preflight_accepts_fake_agent_binaries
           tests/test_external_agent_preflight.py
+
+  frontend-contracts:
+    name: frontend-contracts
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: opc/plugins/office_ui/frontend_src/package-lock.json
+      - name: Install frontend dependencies
+        run: npm ci
+        working-directory: opc/plugins/office_ui/frontend_src
+      - name: Validate frontend contracts
+        run: npm run typecheck && npm run test:contracts && npm run build
+        working-directory: opc/plugins/office_ui/frontend_src
+      - name: Verify committed frontend bundle
+        run: |
+          git add --intent-to-add -- opc/plugins/office_ui/frontend_dist
+          git diff --exit-code -- opc/plugins/office_ui/frontend_dist

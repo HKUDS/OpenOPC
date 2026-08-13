@@ -460,7 +460,7 @@ function Fixture() {
   }, [])
 
   return (
-    <main className="app-shell theme-paper message-list-scroll-fixture">
+    <main className="app-shell message-list-scroll-fixture" data-theme="paper">
       <div className="message-list-scroll-fixture-header">
         Production MessageList fixture — {policy}
       </div>

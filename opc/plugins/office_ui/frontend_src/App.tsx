@@ -26,6 +26,8 @@ import { getExecutionTurnId } from './lib/workItemRuntimeIds'
 import { normalizeSessionCompanyProfile, normalizeSessionExecMode } from './lib/sessionIdentity'
 import { extractSessionRecruitmentByRole, sessionChannelId } from './lib/sessionRecruitment'
 import { resolveCanonicalTurnId, terminalAssistantTurnId } from './lib/turnIdentity'
+import { compileProjectIdPolicy, type ProjectIdPolicy } from './lib/projectIdPolicy'
+import { loadStoredTheme, saveStoredTheme, isThemeName, themeMessageKey, THEMES, type ThemeName } from './lib/theme'
 import { unassignAgent } from './game/map/OfficeStore'
 import type { AgentAnimStatus, EmployeeAssignment, KanbanPhase, KanbanTask, RoleAggregatedStatus, RoleWorkItemSummary, Session, TaskPreferredAgent } from './types/kanban'
 import { useI18n } from './i18n'
@@ -68,7 +70,6 @@ const SESSION_DETAIL_REFRESH_LOW_VALUE_RUNTIME_EVENTS = new Set([
   'member_inbox_updated',
 ])
 
-type ThemeName = 'midnight' | 'neon' | 'paper' | 'retro' | 'terminal' | 'cozy' | 'openopc'
 type AppPage = 'office' | 'workspace' | 'org' | 'mapEditor'
 type AppExecMode = 'task' | 'company' | 'org'
 
@@ -461,7 +462,8 @@ export default function App() {
   const [events, setEvents] = useState<VisualEvent[]>([])
   const [uiTick, setUiTick] = useState(0)
   const [selectedAgentId, setSelectedAgentId] = useState<string | null>(null)
-  const [theme, setTheme] = useState<ThemeName>('openopc')
+  const [projectIdPolicy, setProjectIdPolicy] = useState<ProjectIdPolicy | null>(null)
+  const [theme, setTheme] = useState<ThemeName>(loadStoredTheme)
   const [showSubagents, setShowSubagents] = useState(true)
   const [sidebarCollapsed, setSidebarCollapsed] = useState(() => {
     try { return localStorage.getItem('opc_office_sidebar_collapsed') === '1' } catch { return false }
@@ -1157,6 +1159,7 @@ export default function App() {
           }
           // Handle project list response
           if (payload.ok && Array.isArray(payload.projects)) {
+            setProjectIdPolicy(compileProjectIdPolicy(payload.project_id_policy))
             const ps = projectStoreRef.current
             if (ps) {
               const previousActiveId = getActiveProjectId()
@@ -1228,6 +1231,7 @@ export default function App() {
       onStatus: (next, detail) => {
         setStatus(next)
         setStatusDetail(detail ?? '')
+        if (next !== 'connected') setProjectIdPolicy(null)
         if (next === 'connected') {
           const projectId = getActiveProjectId()
           client.listProjects()
@@ -2387,7 +2391,7 @@ export default function App() {
 
 
   return (
-    <div className={`app-shell theme-${theme}`}>
+    <div className="app-shell" data-theme={theme}>
       {orgToast && (
         <div className={`org-toast org-toast--${orgToast.kind}`} role="status" aria-live="polite">
           {orgToast.text}
@@ -2401,6 +2405,7 @@ export default function App() {
           <ProjectSelector
             projects={projectStore.projects}
             activeId={projectStore.activeProjectId}
+            projectIdPolicy={status === 'connected' ? projectIdPolicy : null}
             onSelect={(id) => {
               const switchSeq = beginProjectSwitch(id)
               clientRef.current?.switchProject(id, switchSeq)
@@ -2476,14 +2481,21 @@ export default function App() {
             <option value="day">{t('outdoor.day')}</option>
             <option value="night">{t('outdoor.night')}</option>
           </select>
-          <select className="theme-select" value={theme} onChange={(e) => setTheme(e.target.value as ThemeName)}>
-            <option value="midnight">{t('theme.midnight')}</option>
-            <option value="neon">{t('theme.neon')}</option>
-            <option value="paper">{t('theme.paper')}</option>
-            <option value="retro">{t('theme.retro')}</option>
-            <option value="terminal">{t('theme.terminal')}</option>
-            <option value="cozy">{t('theme.cozy')}</option>
-            <option value="openopc">{t('theme.openopc')}</option>
+          <select
+            className="theme-select"
+            value={theme}
+            title={t('theme.label')}
+            aria-label={t('theme.label')}
+            onChange={(e) => {
+              const next = e.currentTarget.value
+              if (!isThemeName(next)) return
+              setTheme(next)
+              saveStoredTheme(next)
+            }}
+          >
+            {THEMES.map(({ name }) => (
+              <option key={name} value={name}>{t(themeMessageKey(name))}</option>
+            ))}
           </select>
           <button className={`icon-btn ${showLLMModal ? 'active' : ''}`} onClick={() => setShowLLMModal((v) => !v)} title="LLM & Local Model Settings" aria-label="LLM Settings">
             <span style={{ fontSize: '14px' }}>🤖</span>
