@@ -178,6 +178,48 @@ def test_write_active_org_config_never_writes_reserved_corporate_saved_org(tmp_p
     assert (config_dir / "company_orgs" / f"org_{cfg.org.organization_id}_config.yaml").exists()
 
 
+def test_project_activation_reloads_active_saved_org(tmp_path):
+    from opc.core.config import OPCConfig
+    from opc.core.org_config import write_org_index
+    from opc.plugins.office_ui import ws_handler as wh
+
+    config_dir = tmp_path / ".opc" / "config"
+    _write_saved_org(config_dir, "splinter", organization_name="Splinter AI Company", roles_count=1)
+    write_org_index(config_dir, "splinter")
+
+    delegate_config = OPCConfig()
+    delegate_config.org.company_profile = "corporate"
+    delegate_config.org.organization_id = "corporate"
+    delegate_org_engine = SimpleNamespace(
+        config=delegate_config,
+        reload_from_config=MagicMock(),
+    )
+    delegate = SimpleNamespace(
+        project_id="shipdocs",
+        opc_home=tmp_path / ".opc",
+        config=delegate_config,
+        org_engine=delegate_org_engine,
+        talent_market=SimpleNamespace(config=delegate_config),
+        _ensure_attachment_store=MagicMock(),
+    )
+
+    handler = wh.WSHandler.__new__(wh.WSHandler)
+    handler.engine = SimpleNamespace(project_id="default")
+    handler.chat_store = MagicMock()
+    handler._exec_mode = "org"
+    handler._company_profile = "custom"
+
+    handler._on_service_engine_activated(delegate, "shipdocs")
+
+    assert handler.engine is delegate
+    assert delegate.config.org.company_profile == "custom"
+    assert delegate.config.org.organization_id == "splinter"
+    assert [role.id for role in delegate.config.org.roles] == ["role_0"]
+    assert delegate.org_engine.config is delegate.config
+    delegate.org_engine.reload_from_config.assert_called_once_with()
+    delegate._ensure_attachment_store.assert_called_once_with()
+
+
 def test_org_service_rejects_corporate_write_operations(tmp_path):
     from opc.core.config import OPCConfig
     from opc.plugins.office_ui.services.context import ModeState, OfficeServiceContext

@@ -530,6 +530,22 @@ class WSHandler:
         self.engine = engine
         self.dispatcher = Dispatcher(engine, self.chat_store)
         self._active_project_id = self._normalize_project_id(project_id)
+        if (
+            str(getattr(self, "_exec_mode", "") or "").strip().lower() in {"org", "custom"}
+            and getattr(engine, "config", None) is not None
+            and getattr(engine, "org_engine", None) is not None
+        ):
+            config_dir = Path(getattr(engine, "opc_home", None) or Path.cwd() / ".opc") / "config"
+            try:
+                active_org_id = read_org_index(config_dir)
+            except Exception as exc:
+                active_org_id = None
+                logger.warning(f"Failed to read active org while switching projects: {exc}")
+            if active_org_id and not self._load_active_org_config_into_engine(active_org_id):
+                logger.warning(
+                    f"Failed to restore active org '{active_org_id}' for project "
+                    f"'{self._active_project_id}': {getattr(self, '_last_org_load_error', '')}"
+                )
         self._refresh_engine_attachment_store()
 
     def _ensure_office_services(self) -> OfficeServices:
