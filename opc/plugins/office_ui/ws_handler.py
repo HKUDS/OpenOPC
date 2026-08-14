@@ -6424,33 +6424,53 @@ class WSHandler:
 
         if background_pending_escalation:
             escalation_key = str(background_pending_escalation.get("escalation_id") or "").strip()
-            helper_text = (
-                "This approval is waiting for a card action. "
-                "Please use the approval card buttons to approve or deny."
-            )
-            if not _looks_like_escalation_reply(content):
-                allowed = [
-                    str(opt.get("label") or opt.get("id") or "").strip()
-                    for opt in background_pending_escalation.get("options", [])
-                    if str(opt.get("id", "")).strip()
-                ]
-                if allowed:
-                    helper_text = (
+            allowed = [
+                str(opt.get("label") or opt.get("id") or "").strip()
+                for opt in background_pending_escalation.get("options", [])
+                if str(opt.get("id", "")).strip()
+            ]
+            if allowed:
+                # The canonical card may have been mirrored into a different
+                # channel (e.g. the project activity feed) than the one the
+                # user is actually typing in. Render a live, clickable copy
+                # here too so "use the approval card buttons" is never a
+                # dead end — matching resolves by escalation_id, not channel.
+                helper = await self.chat_store.insert_message(
+                    channel_id=channel_id,
+                    sender="assistant",
+                    sender_name="OPC",
+                    content=(
                         "This task is waiting for an approval decision. "
                         f"Use the approval card buttons: {', '.join(allowed)}."
-                    )
-            helper = await self.chat_store.insert_message(
-                channel_id=channel_id,
-                sender="assistant",
-                sender_name="OPC",
-                content=helper_text,
-                project_id=pid,
-                metadata={
-                    "type": "system",
-                    "pending_checkpoint_type": "human_escalation",
-                    "pending_escalation_id": escalation_key,
-                },
-            )
+                    ),
+                    metadata={
+                        "checkpoint_type": "human_escalation",
+                        "checkpoint_id": escalation_key,
+                        "escalation_id": escalation_key,
+                        "escalation_type": background_pending_escalation.get("escalation_type"),
+                        "prompt": background_pending_escalation.get("message", ""),
+                        "summary": background_pending_escalation.get("message", ""),
+                        "options": background_pending_escalation.get("options", []),
+                        "default_action": background_pending_escalation.get("default_action"),
+                    },
+                    project_id=pid,
+                )
+            else:
+                helper = await self.chat_store.insert_message(
+                    channel_id=channel_id,
+                    sender="assistant",
+                    sender_name="OPC",
+                    content=(
+                        "This approval is waiting for a card action. "
+                        "Please use the approval card buttons to approve or deny."
+                    ),
+                    project_id=pid,
+                    metadata={
+                        "type": "system",
+                        "pending_checkpoint_type": "human_escalation",
+                        "pending_escalation_id": escalation_key,
+                    },
+                )
             await self.broadcast({"type": "session_message", "payload": helper})
             return
 

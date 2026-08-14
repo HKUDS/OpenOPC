@@ -6536,12 +6536,21 @@ class TestWSHandlerEscalationRouting(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(future.done())
         self.assertIsNotNone(self.handler._find_pending_escalation(task_id=origin_task_id))
         cursor = await self.chat_store._db.execute(
-            "SELECT sender, content FROM messages ORDER BY timestamp DESC LIMIT 1"
+            "SELECT sender, content, metadata FROM messages ORDER BY timestamp DESC LIMIT 1"
         )
         row = await cursor.fetchone()
         self.assertIsNotNone(row)
         self.assertEqual(row[0], "assistant")
         self.assertIn("approval card buttons", row[1])
+        metadata = json.loads(row[2]) if row[2] else {}
+        self.assertEqual(metadata.get("checkpoint_type"), "human_escalation")
+        self.assertEqual(metadata.get("checkpoint_id"), "esc-2")
+        self.assertEqual(metadata.get("escalation_id"), "esc-2")
+        self.assertEqual(
+            metadata.get("options"),
+            [{"id": "approve_once", "label": "Approve once"}],
+        )
+        self.assertEqual(metadata.get("default_action"), "approve_once")
         if not future.done():
             future.cancel()
         self.handler._pending_escalations.clear()
