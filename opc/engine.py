@@ -106,6 +106,7 @@ from opc.layer2_organization.company_runtime_identity import (
     load_company_runtime_identity_index,
 )
 from opc.layer2_organization.metadata_ownership import (
+    append_work_item_progress,
     build_company_resume_identity_restore,
     build_work_item_owner_execution_copy,
 )
@@ -11288,11 +11289,18 @@ class OPCEngine:
             if not checkpoint:
                 return None
             if self._checkpoint_awaits_approval_decision(checkpoint):
-                # A parked permission prompt is answered by its approval card
-                # (the card reply carries an explicit response_to_checkpoint_id).
-                # Deferred cards stay pending indefinitely, so a plain chat
-                # message must not be consumed as the approval answer — let it
-                # continue as a normal conversation turn instead.
+                # A parked permission prompt is normally answered by its
+                # approval card (the card reply carries an explicit
+                # response_to_checkpoint_id); ambiguous free text must not be
+                # consumed as the answer, so it continues as a normal
+                # conversation turn instead. But when the card failed to
+                # render (event-bus/mirroring hiccup) that guard leaves the
+                # task stuck forever with no way to unblock it. An unambiguous
+                # decision word (approve/deny/proceed/...) is a safe
+                # exception: it cannot be mistaken for ordinary task input, so
+                # it is applied the same way an explicit card click would be.
+                if normalize_escalation_reply(user_reply):
+                    return await self._resume_task_checkpoint(checkpoint, user_reply)
                 return None
         metadata_mode = str(dict(reply_metadata or {}).get("mode", "") or "").strip()
         inferred_mode = requested_mode or metadata_mode
@@ -11564,9 +11572,18 @@ class OPCEngine:
         task.status = TaskStatus.PENDING
         task.result = None
         task.metadata = dict(task.metadata)
-        progress = list(task.metadata.get("progress_log", []))
-        progress.append(f"Resumed with user input: {user_reply.strip()}")
-        task.metadata["progress_log"] = progress
+        resume_note = f"Resumed with user input: {user_reply.strip()}"
+        # progress_log is WorkItem-owned metadata (see metadata_ownership.py);
+        # writing it onto task.metadata directly for a work-item-linked task
+        # creates a permanent WorkItem/Task drift that the invariant checker
+        # re-flags on every subsequent load.
+        resume_work_item_id = linked_work_item_id_for_task(task)
+        if resume_work_item_id:
+            await append_work_item_progress(self.store, resume_work_item_id, resume_note)
+        else:
+            progress = list(task.metadata.get("progress_log", []))
+            progress.append(resume_note)
+            task.metadata["progress_log"] = progress
         await self.store.save_task(task)
 
         # Sibling ids persisted by older checkpoints can be work-item ids rather

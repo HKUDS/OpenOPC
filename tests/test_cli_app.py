@@ -23,6 +23,7 @@ from opc.cli.app import (
     ChatTurnController,
     QueuedChatInput,
     _CliRuntimeDisplay,
+    _ExecRuntimeEventCoalescer,
     _InteractiveChatState,
     _OPCSlashCompleter,
     _chat_bottom_toolbar_text,
@@ -3187,6 +3188,123 @@ class CliAutomationCommandTests(unittest.TestCase):
 
         self.assertEqual(result.exit_code, 2)
         self.assertIn("Use either --json or --stream-json", result.output)
+
+
+class CliExecRuntimeEventCoalescerTests(unittest.TestCase):
+    @staticmethod
+    def _runtime_event(event_type: str, **payload: object) -> OPCEvent:
+        return OPCEvent(
+            event_type="runtime_event",
+            payload={
+                "type": event_type,
+                "runtime_session_id": "runtime-1",
+                **payload,
+            },
+        )
+
+    def test_coalesces_text_deltas_until_runtime_boundary(self) -> None:
+        coalescer = _ExecRuntimeEventCoalescer()
+
+        self.assertEqual(
+            coalescer.push(
+                self._runtime_event(
+                    "thinking_delta",
+                    iteration=1,
+                    stream_id="turn-1:thinking",
+                    seq=1,
+                    text="hel",
+                )
+            ),
+            [],
+        )
+        self.assertEqual(
+            coalescer.push(
+                self._runtime_event(
+                    "thinking_delta",
+                    iteration=1,
+                    stream_id="turn-1:thinking",
+                    seq=2,
+                    text="lo",
+                )
+            ),
+            [],
+        )
+
+        emitted = coalescer.push(self._runtime_event("message_stop", iteration=1))
+
+        self.assertEqual([row["payload"]["type"] for row in emitted], ["thinking_delta", "message_stop"])
+        delta = emitted[0]["payload"]
+        self.assertEqual(delta["text"], "hello")
+        self.assertEqual(delta["seq"], 2)
+        self.assertEqual(delta["fragment_count"], 2)
+        self.assertTrue(delta["coalesced"])
+
+    def test_coalesces_partial_tool_call_arguments(self) -> None:
+        coalescer = _ExecRuntimeEventCoalescer()
+
+        coalescer.push(
+            self._runtime_event(
+                "tool_call_delta",
+                iteration=2,
+                index=0,
+                id="call-1",
+                name="shell",
+                arguments='{"cmd":',
+            )
+        )
+        coalescer.push(
+            self._runtime_event(
+                "tool_call_delta",
+                iteration=2,
+                index=0,
+                id="",
+                name="",
+                arguments='"pwd"}',
+            )
+        )
+
+        emitted = coalescer.push(self._runtime_event("tool_started", iteration=2, index=0))
+
+        self.assertEqual([row["payload"]["type"] for row in emitted], ["tool_call_delta", "tool_started"])
+        delta = emitted[0]["payload"]
+        self.assertEqual(delta["id"], "call-1")
+        self.assertEqual(delta["name"], "shell")
+        self.assertEqual(delta["arguments"], '{"cmd":"pwd"}')
+        self.assertEqual(delta["fragment_count"], 2)
+
+    def test_keeps_iterations_and_streams_separate(self) -> None:
+        coalescer = _ExecRuntimeEventCoalescer()
+        coalescer.push(
+            self._runtime_event(
+                "assistant_delta",
+                iteration=1,
+                stream_id="turn-1:assistant",
+                seq=1,
+                text="first",
+            )
+        )
+        coalescer.push(
+            self._runtime_event(
+                "assistant_delta",
+                iteration=2,
+                stream_id="turn-2:assistant",
+                seq=1,
+                text="second",
+            )
+        )
+
+        emitted = coalescer.flush()
+
+        self.assertEqual([row["payload"]["text"] for row in emitted], ["first", "second"])
+        self.assertEqual([row["payload"]["iteration"] for row in emitted], [1, 2])
+
+    def test_passes_non_runtime_and_non_delta_events_through(self) -> None:
+        coalescer = _ExecRuntimeEventCoalescer()
+        status = self._runtime_event("status_snapshot", status="running")
+        progress = {"event_type": "progress", "payload": {"text": "working"}}
+
+        self.assertEqual(coalescer.push(status)[0]["payload"]["type"], "status_snapshot")
+        self.assertEqual(coalescer.push(progress), [progress])
 
 
 class CliTalentCommandTests(unittest.TestCase):
