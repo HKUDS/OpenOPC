@@ -530,6 +530,22 @@ class WSHandler:
         self.engine = engine
         self.dispatcher = Dispatcher(engine, self.chat_store)
         self._active_project_id = self._normalize_project_id(project_id)
+        if (
+            str(getattr(self, "_exec_mode", "") or "").strip().lower() in {"org", "custom"}
+            and getattr(engine, "config", None) is not None
+            and getattr(engine, "org_engine", None) is not None
+        ):
+            config_dir = Path(getattr(engine, "opc_home", None) or Path.cwd() / ".opc") / "config"
+            try:
+                active_org_id = read_org_index(config_dir)
+            except Exception as exc:
+                active_org_id = None
+                logger.warning(f"Failed to read active org while switching projects: {exc}")
+            if active_org_id and not self._load_active_org_config_into_engine(active_org_id):
+                logger.warning(
+                    f"Failed to restore active org '{active_org_id}' for project "
+                    f"'{self._active_project_id}': {getattr(self, '_last_org_load_error', '')}"
+                )
         self._refresh_engine_attachment_store()
 
     def _ensure_office_services(self) -> OfficeServices:
@@ -5277,7 +5293,19 @@ class WSHandler:
         engine: Any | None = None,
         project_id: str | None = None,
     ) -> None:
-        """Mirror escalation_created events into session channel or activity."""
+        """Mirror escalation_created events into session channel or activity.
+
+        This is invoked from ``EventBus.publish``, which awaits every listener
+        through ``asyncio.gather(..., return_exceptions=True)`` — an exception
+        raised anywhere below is swallowed with no log line, no card, and no
+        pending-escalation record, which permanently strands the task: the
+        checkpoint still parks correctly (a separate, durable path), but there
+        is no card to click and no live future for ``_handle_ui_escalation``
+        to resolve. Every resolution step here therefore degrades to a safe
+        default instead of raising, so a card (at worst a plain one in the
+        activity channel) and the pending-escalation record always get
+        created.
+        """
         runtime_engine = engine or self.engine
         pid = self._normalize_project_id(project_id or getattr(runtime_engine, "project_id", None))
         p = event.payload or {}
@@ -5292,14 +5320,31 @@ class WSHandler:
                 except Exception:
                     source_task = None
         source_metadata = dict(getattr(source_task, "metadata", {}) or {}) if source_task is not None else {}
-        is_task_mode = self._runtime_payload_is_task_mode(source_metadata)
-        current_turn_title = str(
-            source_metadata.get("original_message")
-            or getattr(source_task, "description", "")
-            or ""
-        ).strip()
-        display_message = self._task_mode_permission_prompt(message, current_turn_title) if is_task_mode else message
-        session_task_id = await self._resolve_escalation_session_task_id(source_task_id, engine=runtime_engine)
+        try:
+            is_task_mode = self._runtime_payload_is_task_mode(source_metadata)
+            current_turn_title = str(
+                source_metadata.get("original_message")
+                or getattr(source_task, "description", "")
+                or ""
+            ).strip()
+            display_message = (
+                self._task_mode_permission_prompt(message, current_turn_title) if is_task_mode else message
+            )
+        except Exception:
+            logger.opt(exception=True).warning(
+                f"Escalation display formatting failed for task {source_task_id!r}; using the raw message"
+            )
+            is_task_mode = False
+            current_turn_title = ""
+            display_message = message
+        try:
+            session_task_id = await self._resolve_escalation_session_task_id(source_task_id, engine=runtime_engine)
+        except Exception:
+            logger.opt(exception=True).warning(
+                f"Escalation session routing failed for task {source_task_id!r}; "
+                "falling back to the project activity channel so the card is not lost"
+            )
+            session_task_id = None
         target_channel = f"session:{session_task_id}" if session_task_id else f"activity:{pid}"
         options = p.get("options", []) or []
         esc_record = self._remember_pending_escalation({
@@ -5342,16 +5387,33 @@ class WSHandler:
             esc_meta["task_id"] = session_task_id
         if source_task_id and source_task_id != session_task_id:
             esc_meta["source_task_id"] = source_task_id
-        msg = await self.chat_store.insert_message(
-            channel_id=target_channel,
-            sender="assistant",
-            sender_name="OPC",
-            content=display_message,
-            metadata=esc_meta or None,
-            message_id=f"escalation::{esc_record.get('escalation_id')}",
-            project_id=pid,
-        )
-        await self.broadcast({"type": "session_message", "payload": msg})
+        try:
+            msg = await self.chat_store.insert_message(
+                channel_id=target_channel,
+                sender="assistant",
+                sender_name="OPC",
+                content=display_message,
+                metadata=esc_meta or None,
+                message_id=f"escalation::{esc_record.get('escalation_id')}",
+                project_id=pid,
+            )
+        except Exception:
+            # The pending-escalation future (registered above) is what lets a
+            # later card click or chat reply resume the parked task, so it
+            # must survive even when the card itself fails to persist — loudly
+            # logged instead of silently dropped by the event-bus gather.
+            logger.opt(exception=True).error(
+                f"Failed to persist escalation card for task {source_task_id!r} in "
+                f"channel {target_channel!r}; the task is parked with no visible card"
+            )
+            return
+        try:
+            await self.broadcast({"type": "session_message", "payload": msg})
+        except Exception:
+            logger.opt(exception=True).warning(
+                f"Failed to broadcast escalation card {msg.get('message_id')!r}; "
+                "it is persisted and will appear on the next session sync"
+            )
 
     async def _recent_identical_helper_exists(
         self,
@@ -6424,33 +6486,53 @@ class WSHandler:
 
         if background_pending_escalation:
             escalation_key = str(background_pending_escalation.get("escalation_id") or "").strip()
-            helper_text = (
-                "This approval is waiting for a card action. "
-                "Please use the approval card buttons to approve or deny."
-            )
-            if not _looks_like_escalation_reply(content):
-                allowed = [
-                    str(opt.get("label") or opt.get("id") or "").strip()
-                    for opt in background_pending_escalation.get("options", [])
-                    if str(opt.get("id", "")).strip()
-                ]
-                if allowed:
-                    helper_text = (
+            allowed = [
+                str(opt.get("label") or opt.get("id") or "").strip()
+                for opt in background_pending_escalation.get("options", [])
+                if str(opt.get("id", "")).strip()
+            ]
+            if allowed:
+                # The canonical card may have been mirrored into a different
+                # channel (e.g. the project activity feed) than the one the
+                # user is actually typing in. Render a live, clickable copy
+                # here too so "use the approval card buttons" is never a
+                # dead end — matching resolves by escalation_id, not channel.
+                helper = await self.chat_store.insert_message(
+                    channel_id=channel_id,
+                    sender="assistant",
+                    sender_name="OPC",
+                    content=(
                         "This task is waiting for an approval decision. "
                         f"Use the approval card buttons: {', '.join(allowed)}."
-                    )
-            helper = await self.chat_store.insert_message(
-                channel_id=channel_id,
-                sender="assistant",
-                sender_name="OPC",
-                content=helper_text,
-                project_id=pid,
-                metadata={
-                    "type": "system",
-                    "pending_checkpoint_type": "human_escalation",
-                    "pending_escalation_id": escalation_key,
-                },
-            )
+                    ),
+                    metadata={
+                        "checkpoint_type": "human_escalation",
+                        "checkpoint_id": escalation_key,
+                        "escalation_id": escalation_key,
+                        "escalation_type": background_pending_escalation.get("escalation_type"),
+                        "prompt": background_pending_escalation.get("message", ""),
+                        "summary": background_pending_escalation.get("message", ""),
+                        "options": background_pending_escalation.get("options", []),
+                        "default_action": background_pending_escalation.get("default_action"),
+                    },
+                    project_id=pid,
+                )
+            else:
+                helper = await self.chat_store.insert_message(
+                    channel_id=channel_id,
+                    sender="assistant",
+                    sender_name="OPC",
+                    content=(
+                        "This approval is waiting for a card action. "
+                        "Please use the approval card buttons to approve or deny."
+                    ),
+                    project_id=pid,
+                    metadata={
+                        "type": "system",
+                        "pending_checkpoint_type": "human_escalation",
+                        "pending_escalation_id": escalation_key,
+                    },
+                )
             await self.broadcast({"type": "session_message", "payload": helper})
             return
 

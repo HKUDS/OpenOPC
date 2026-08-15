@@ -58,6 +58,74 @@ class ChannelRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sent[0].content, "hello")
         self.assertEqual(sent[0].metadata["chat_id"], "c1")
 
+    async def test_blocking_send_does_not_stall_dispatch_loop(self) -> None:
+        """Regression: a single blocking send must not freeze the shared outbound consumer.
+
+        The _dispatch_outbound loop is the only outbound consumer for every channel.
+        Before the timeout guard, an awaited send that never returns would stall the
+        whole loop, so messages for every other chat would never be delivered. The guard
+        bounds a single send and lets the loop move on, so later messages still arrive.
+        """
+        import asyncio
+
+        config = OPCConfig()
+        config.channels.slack.enabled = True
+        config.channels.slack.allow_from = ["*"]
+        # Use a small timeout so the test runs quickly.
+        config.channels.dispatch_timeout_seconds = 0.05
+        config.channels.telegram.enabled = True
+        config.channels.telegram.allow_from = ["*"]
+        bus = MessageBus()
+        delivered: list[SystemMessage] = []
+
+        class _BlockingChannel:
+            def __init__(self, cfg, bus):
+                self.cfg = cfg
+                self.bus = bus
+                self._running = False
+
+            async def start(self):
+                self._running = True
+
+            async def stop(self):
+                self._running = False
+
+            async def send(self, message: SystemMessage):
+                delivered.append(message)
+
+        # A channel whose send() blocks forever until cancelled by the timeout guard.
+        class _HangingChannel(_BlockingChannel):
+            async def send(self, message: SystemMessage):
+                delivered.append(message)
+                await asyncio.Event().wait()  # never completes on its own
+
+        real_import = __import__
+        with patch("builtins.__import__") as mocked_import:
+            def fake_import(name, globals=None, locals=None, fromlist=(), level=0):
+                if name == "opc.channels.slack":
+                    return SimpleNamespace(SlackChannel=_HangingChannel)
+                if name == "opc.channels.telegram":
+                    return SimpleNamespace(TelegramChannel=_BlockingChannel)
+                return real_import(name, globals, locals, fromlist, level)
+            mocked_import.side_effect = fake_import
+            manager = ChannelManager(config, bus)
+
+        self.assertEqual(sorted(manager.enabled_channels), ["slack", "telegram"])
+        await manager.start_all()  # also starts the internal _dispatch_outbound loop
+
+        try:
+            # The slate's message blocks; the guard times it out, then the loop must
+            # keep running so the subsequent (healthy) telegram message still arrives.
+            await bus.publish_outbound(SystemMessage(channel="slack", user_id="u", session_id="s", content="blocked", metadata={"chat_id": "c1"}))
+            await bus.publish_outbound(SystemMessage(channel="telegram", user_id="u", session_id="s", content="healthy", metadata={"chat_id": "c2"}))
+            await asyncio.sleep(0.3)  # allow the blocking send to time out and the healthy one to flow
+        finally:
+            await manager.stop_all()  # cancels the internal dispatch loop
+
+        contents = [m.content for m in delivered]
+        self.assertIn("blocked", contents, "the blocking send should still be attempted")
+        self.assertIn("healthy", contents, "healthy send after a blocking send must still be delivered")
+
     def test_config_load_save_roundtrip_includes_channels(self) -> None:
         config = OPCConfig()
         config.channels.feishu.enabled = True

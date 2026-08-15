@@ -351,7 +351,13 @@ def _sed_segment_read_only(tokens: list[str]) -> bool:
         index += 1
     if not scripts:
         return False
-    return all(re.fullmatch(r"[0-9,$; ]*p", script.strip()) for script in scripts)
+    numeric_addr = r"[0-9,$; ]*p"
+    pattern_addr = r"/(?:\\.|[^/\\])+/"
+    regex_addr = rf"(?:{pattern_addr},)?{pattern_addr}p"
+    return all(
+        re.fullmatch(numeric_addr, script.strip()) or re.fullmatch(regex_addr, script.strip())
+        for script in scripts
+    )
 
 
 def _awk_segment_read_only(tokens: list[str]) -> bool:

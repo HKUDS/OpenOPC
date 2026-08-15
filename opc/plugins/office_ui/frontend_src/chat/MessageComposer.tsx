@@ -369,7 +369,8 @@ export function MessageComposer({
   }, [])
 
   const handleSend = useCallback(() => {
-    if (disabled || isWorking) return
+    // Not gated on isWorking: the backend already queues/routes mid-turn sends (mirrors CLI /queue).
+    if (disabled) return
     const content = text.trim()
     const preparing = pending.filter(attachment => !attachment.error && attachment.transfer_state === 'reading')
     const ready = pending.filter(attachment => !attachment.error && !!attachment.base64_data)
@@ -388,7 +389,7 @@ export function MessageComposer({
       if (attachment.preview_url) URL.revokeObjectURL(attachment.preview_url)
     })
     setPending([])
-  }, [disabled, isWorking, text, pending, onSend])
+  }, [disabled, text, pending, onSend])
 
   const handlePaste = useCallback((event: React.ClipboardEvent) => {
     const files = event.clipboardData?.files
@@ -797,7 +798,9 @@ export function MessageComposer({
             <button
               className="composer-send-btn"
               onClick={handleSend}
-              disabled={disabled || preparingAttachmentCount > 0 || (!text.trim() && readyAttachmentCount === 0) || isWorking}
+              // Deliberately not gated on isWorking — see handleSend's note.
+              disabled={disabled || preparingAttachmentCount > 0 || (!text.trim() && readyAttachmentCount === 0)}
+              title={isWorking ? 'Send — will queue behind the current turn' : undefined}
             >
               <IconSend />
             </button>

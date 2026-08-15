@@ -117,7 +117,8 @@ _ESCALATION_DECISION_TOKENS: frozenset[str] = frozenset({
 })
 
 _ESCALATION_APPROVE_SYNONYMS: frozenset[str] = frozenset({
-    "approve", "approved", "yes", "y", "ok", "allow", "同意", "批准", "允许",
+    "approve", "approved", "yes", "y", "ok", "okay", "allow",
+    "proceed", "go ahead", "continue", "同意", "批准", "允许",
 })
 
 _ESCALATION_DENY_SYNONYMS: frozenset[str] = frozenset({

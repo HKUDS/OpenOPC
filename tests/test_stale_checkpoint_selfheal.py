@@ -244,6 +244,32 @@ class StaleCheckpointSelfHealTest(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(result)  # message continues as a normal turn
         self.assertEqual(await self._checkpoint_status(checkpoint.checkpoint_id), "pending")
 
+    async def test_unambiguous_decision_word_resumes_parked_approval_without_a_card(self) -> None:
+        """An unambiguous decision word answers a parked approval even with no card click.
+
+        The approval card is the normal way to answer, but if it failed to
+        render (event-bus/mirroring hiccup) the task must not stay stuck
+        forever: a reply that unambiguously normalizes to a decision (e.g.
+        "proceed") is safe to apply the same way an explicit card click
+        would be, because it can never be mistaken for ordinary chat.
+        """
+        session_id = str(uuid.uuid4())
+        task = await self._save_task(TaskStatus.AWAITING_HUMAN, session_id)
+        checkpoint = await self._save_wait_checkpoint(
+            task,
+            session_id,
+            runtime_v2=self._approval_runtime_payload(),
+        )
+
+        self.engine._execute_single_agent = AsyncMock(return_value="approved and resumed")
+        self.engine._execute_multi_agent = AsyncMock(return_value="")
+        self.engine._execute_company_mode = AsyncMock(return_value="")
+
+        result = await self.engine._maybe_resume_checkpoint("proceed", session_id=session_id)
+
+        self.assertEqual(result, "approved and resumed")
+        self.assertEqual(await self._checkpoint_status(checkpoint.checkpoint_id), "resolved")
+
     async def test_plain_chat_still_answers_agent_question_checkpoint(self) -> None:
         """Waits without a permission request (agent asked the user a question)
         keep accepting typed answers."""

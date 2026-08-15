@@ -47,6 +47,20 @@ class ReadOnlyClassifierTests(unittest.TestCase):
         ):
             self._assert_safe(command)
 
+    def test_sed_pattern_addresses_are_read_only(self) -> None:
+        for command in (
+            "sed -n '/def load(/,/return /p' opc/core/config.py",
+            "sed -n '/needle/p' file.txt",
+            r"sed -n '/path\/with\/slashes/p' file.txt",
+        ):
+            self._assert_safe(command)
+
+        for command in (
+            "sed -n '/needle/d' file.txt",
+            "sed -n '/needle/,/done/w output.txt' file.txt",
+        ):
+            self._assert_unsafe(command)
+
     def test_flag_audit_blocks_write_capable_variants(self) -> None:
         for command in (
             "find . -name x -delete",

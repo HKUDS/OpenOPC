@@ -59,7 +59,7 @@ class NormalizeEscalationReplyTests(unittest.TestCase):
             self.assertEqual(normalize_escalation_reply(token), token)
 
     def test_approve_synonyms_map_to_approve_once(self) -> None:
-        for text in ("approve", "Yes", " y ", "同意", "允许"):
+        for text in ("approve", "Yes", " y ", "同意", "允许", "Proceed", "go ahead", "continue"):
             self.assertEqual(normalize_escalation_reply(text), "approve_once")
 
     def test_deny_synonyms_map_to_deny(self) -> None:

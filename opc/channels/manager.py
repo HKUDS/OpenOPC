@@ -109,11 +109,19 @@ class ChannelManager:
             message = await self.bus.get_response(timeout=1.0)
             if message is None:
                 continue
-            # A single failing send (network reset, malformed chat id, etc.) must not
-            # terminate this loop — it is the only outbound consumer for every channel,
-            # so one exception would silently stop all message delivery until restart.
+            # This loop is the only outbound consumer for every channel, so
+            # neither a failing send NOR a blocking/hanging send may stall it.
+            # A single call that never returns would otherwise freeze all message
+            # delivery across all channels until restart.
+            timeout = float(getattr(self.config.channels, "dispatch_timeout_seconds", 30.0))
             try:
-                await self.dispatch_outbound(message)
+                await asyncio.wait_for(self.dispatch_outbound(message), timeout=timeout)
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "Outbound dispatch timed out after {:.1f}s (channel={}) — skipped to keep delivering other messages",
+                    timeout,
+                    message.channel,
+                )
             except Exception as exc:  # noqa: BLE001 - resilience of the dispatch loop
                 logger.exception("Failed to dispatch outbound message: {}", exc)
 

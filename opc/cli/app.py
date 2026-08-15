@@ -1433,6 +1433,83 @@ def _exec_event_payload(value: Any) -> Any:
     return _json_safe(value)
 
 
+class _ExecRuntimeEventCoalescer:
+    """Collapse token-sized runtime deltas for the NDJSON CLI stream.
+
+    The runtime event bus deliberately keeps fine-grained deltas for live UI
+    consumers. Writing and flushing each of those fragments to stdout makes
+    ``opc exec --stream-json`` a synchronous bottleneck, though, so the CLI
+    combines adjacent fragments until the next meaningful runtime boundary.
+    """
+
+    _DELTA_TYPES = frozenset({"assistant_delta", "thinking_delta", "tool_call_delta"})
+
+    def __init__(self) -> None:
+        self._pending: dict[tuple[Any, ...], dict[str, Any]] = {}
+
+    @staticmethod
+    def _delta_key(payload: dict[str, Any]) -> tuple[Any, ...]:
+        event_type = str(payload.get("type", "") or "")
+        common = (
+            event_type,
+            str(payload.get("runtime_session_id", "") or ""),
+            int(payload.get("iteration", 0) or 0),
+        )
+        if event_type == "tool_call_delta":
+            return (*common, int(payload.get("index", 0) or 0))
+        stream_id = (
+            payload.get("stream_id")
+            or payload.get("execution_turn_id")
+            or payload.get("item_id")
+            or payload.get("turn_id")
+            or ""
+        )
+        return (*common, str(stream_id))
+
+    def _buffer_delta(self, wrapper: dict[str, Any], payload: dict[str, Any]) -> None:
+        key = self._delta_key(payload)
+        buffered = self._pending.get(key)
+        if buffered is None:
+            copied_payload = dict(payload)
+            copied_payload["fragment_count"] = 1
+            self._pending[key] = {**wrapper, "payload": copied_payload}
+            return
+
+        combined = buffered["payload"]
+        combined["fragment_count"] = int(combined.get("fragment_count", 1) or 1) + 1
+        fragment_field = "arguments" if payload.get("type") == "tool_call_delta" else "text"
+        combined[fragment_field] = (
+            str(combined.get(fragment_field, "") or "")
+            + str(payload.get(fragment_field, "") or "")
+        )
+        for name, value in payload.items():
+            if name not in {fragment_field, "fragment_count"} and value is not None and value != "":
+                combined[name] = value
+
+    def push(self, value: Any) -> list[Any]:
+        encoded = _exec_event_payload(value)
+        if not isinstance(encoded, dict):
+            return [*self.flush(), encoded]
+
+        runtime_payload = encoded.get("payload")
+        is_runtime_event = encoded.get("event_type") == "runtime_event" and isinstance(runtime_payload, dict)
+        runtime_type = str(runtime_payload.get("type", "") or "") if is_runtime_event else ""
+        if runtime_type in self._DELTA_TYPES:
+            self._buffer_delta(encoded, runtime_payload)
+            return []
+
+        return [*self.flush(), encoded]
+
+    def flush(self) -> list[dict[str, Any]]:
+        emitted = list(self._pending.values())
+        self._pending.clear()
+        for wrapper in emitted:
+            payload = wrapper.get("payload")
+            if isinstance(payload, dict):
+                payload["coalesced"] = True
+        return emitted
+
+
 def _print_exec_event(
     event_state: dict[str, Any],
     event_type: str,
@@ -1549,10 +1626,26 @@ async def _exec_message(
 
     project_id = str(project or "default").strip() or "default"
     event_state: dict[str, Any] = {"seq": 0, "task_id": "", "session_id": ""}
+    runtime_event_coalescer = _ExecRuntimeEventCoalescer()
+
+    def emit_runtime_payloads(payloads: list[Any]) -> None:
+        for payload in payloads:
+            _print_exec_event(
+                event_state,
+                "runtime_update",
+                project_id=project_id,
+                task_id=str(event_state.get("task_id", "") or ""),
+                session_id=str(event_state.get("session_id", "") or ""),
+                payload=payload,
+            )
+
+    def flush_runtime_payloads() -> None:
+        emit_runtime_payloads(runtime_event_coalescer.flush())
 
     async def on_progress(*args: Any, **kwargs: Any) -> None:
         if not stream_json:
             return
+        flush_runtime_payloads()
         _print_exec_event(
             event_state,
             "runtime_update",
@@ -1565,14 +1658,7 @@ async def _exec_message(
     async def on_runtime_event(event: Any) -> None:
         if not stream_json:
             return
-        _print_exec_event(
-            event_state,
-            "runtime_update",
-            project_id=project_id,
-            task_id=str(event_state.get("task_id", "") or ""),
-            session_id=str(event_state.get("session_id", "") or ""),
-            payload=_exec_event_payload(event),
-        )
+        emit_runtime_payloads(runtime_event_coalescer.push(event))
 
     try:
         async with OfficeServiceFactory(
@@ -1622,6 +1708,7 @@ async def _exec_message(
                 )
                 response = str(sent.payload.get("response", "") or "")
                 if stream_json:
+                    flush_runtime_payloads()
                     _print_exec_event(
                         event_state,
                         "message",
@@ -1641,6 +1728,7 @@ async def _exec_message(
                 "response": response,
             }
             if stream_json:
+                flush_runtime_payloads()
                 _print_exec_event(
                     event_state,
                     "final",
@@ -1660,6 +1748,7 @@ async def _exec_message(
     except ServiceError as exc:
         payload = {"ok": False, **exc.to_payload()}
         if stream_json:
+            flush_runtime_payloads()
             _print_exec_event(event_state, "error", project_id=project_id, payload=payload)
         elif json_output:
             console.print(json.dumps(payload, ensure_ascii=False, indent=2, default=_json_safe))
@@ -1669,6 +1758,7 @@ async def _exec_message(
     except ValueError as exc:
         payload = {"ok": False, "code": "invalid_argument", "error": str(exc)}
         if stream_json:
+            flush_runtime_payloads()
             _print_exec_event(event_state, "error", project_id=project_id, payload=payload)
         elif json_output:
             console.print(json.dumps(payload, ensure_ascii=False, indent=2, default=_json_safe))

@@ -6490,6 +6490,57 @@ class TestWSHandlerEscalationRouting(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(pending_from_exec)
         self.assertEqual(pending_from_origin, pending_from_exec)
 
+    async def test_escalation_survives_session_routing_failure(self) -> None:
+        """A card must still appear even when session-routing resolution blows up.
+
+        Reproduces the production failure where an escalation was silently
+        lost: ``EventBus.publish`` awaits every ``escalation_created``
+        listener through ``asyncio.gather(..., return_exceptions=True)``, so
+        an unhandled exception anywhere in ``_mirror_escalation`` produced no
+        log, no card in any channel, and no pending-escalation future — the
+        task still parked (a separate, durable path) but nothing could ever
+        answer it. Any failure here must degrade to the activity channel
+        instead of losing the card outright.
+        """
+        exec_task_id = "exec-task-routing-failure"
+        session_id = "sess-routing-failure"
+
+        await self.store.save_task(Task(
+            id=exec_task_id,
+            title="Execution Task",
+            project_id="test-project",
+            session_id=session_id,
+        ))
+
+        self.handler._resolve_escalation_session_task_id = AsyncMock(
+            side_effect=RuntimeError("boom: identity resolution blew up")
+        )
+
+        event = MagicMock()
+        event.payload = {
+            "escalation_id": "esc-routing-failure",
+            "task_id": exec_task_id,
+            "type": "decision_needed",
+            "message": "Approve tool 'shell_exec'?",
+            "options": [{"id": "approve_once", "label": "Approve once"}],
+            "default_action": None,
+        }
+
+        await self.handler._mirror_escalation(event)
+
+        cursor = await self.chat_store._db.execute(
+            "SELECT channel_id, metadata FROM messages ORDER BY timestamp DESC LIMIT 1"
+        )
+        row = await cursor.fetchone()
+        self.assertIsNotNone(row)
+        self.assertEqual(row[0], "activity:test-project")
+        metadata = json.loads(row[1]) if row[1] else {}
+        self.assertEqual(metadata.get("checkpoint_type"), "human_escalation")
+
+        pending = self.handler._find_pending_escalation(task_id=exec_task_id)
+        self.assertIsNotNone(pending)
+        self.assertFalse(pending["future"].done())
+
     async def test_origin_session_plain_approval_requires_card_click(self) -> None:
         origin_task_id = "session-task-2"
         exec_task_id = "exec-task-2"
@@ -6536,12 +6587,21 @@ class TestWSHandlerEscalationRouting(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(future.done())
         self.assertIsNotNone(self.handler._find_pending_escalation(task_id=origin_task_id))
         cursor = await self.chat_store._db.execute(
-            "SELECT sender, content FROM messages ORDER BY timestamp DESC LIMIT 1"
+            "SELECT sender, content, metadata FROM messages ORDER BY timestamp DESC LIMIT 1"
         )
         row = await cursor.fetchone()
         self.assertIsNotNone(row)
         self.assertEqual(row[0], "assistant")
         self.assertIn("approval card buttons", row[1])
+        metadata = json.loads(row[2]) if row[2] else {}
+        self.assertEqual(metadata.get("checkpoint_type"), "human_escalation")
+        self.assertEqual(metadata.get("checkpoint_id"), "esc-2")
+        self.assertEqual(metadata.get("escalation_id"), "esc-2")
+        self.assertEqual(
+            metadata.get("options"),
+            [{"id": "approve_once", "label": "Approve once"}],
+        )
+        self.assertEqual(metadata.get("default_action"), "approve_once")
         if not future.done():
             future.cancel()
         self.handler._pending_escalations.clear()

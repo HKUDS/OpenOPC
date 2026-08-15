@@ -1109,6 +1109,12 @@ class MatrixChannelConfig(BaseChannelConfig):
 class ChannelsConfig(BaseModel):
     send_progress: bool = True
     send_tool_hints: bool = False
+    # Upper bound (seconds) for a single outbound dispatch send across all
+    # channels. The outbound consumer is shared, so a send that blocks forever
+    # would stall message delivery for every channel; this guard bounds that
+    # risk. Overridable at the root of the channels config (like send_progress
+    # and send_tool_hints above).
+    dispatch_timeout_seconds: float = 30.0
     telegram: TelegramChannelConfig = Field(default_factory=TelegramChannelConfig)
     whatsapp: WhatsAppChannelConfig = Field(default_factory=WhatsAppChannelConfig)
     discord: DiscordChannelConfig = Field(default_factory=DiscordChannelConfig)
