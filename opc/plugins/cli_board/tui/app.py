@@ -513,6 +513,16 @@ class CliBoardApp(App[None]):
         if task is None:
             self.status_widget.set_message("No task selected.")
             return
+        if (
+            task.pending_checkpoint is not None
+            and task.pending_checkpoint.checkpoint_type
+            in {"tool_permission", "action_permission"}
+        ):
+            self.status_widget.set_message(
+                "Exact tool/action approval is disabled in the CLI board; "
+                "review the complete payload in Office UI. Deny remains available."
+            )
+            return
         actions = self._require_actions()
         if actions is None:
             return
@@ -615,6 +625,15 @@ class CliBoardApp(App[None]):
             return
         if not task.pending_checkpoint:
             self.status_widget.set_message("No pending checkpoint on this task.")
+            return
+        if task.pending_checkpoint.checkpoint_type in {
+            "tool_permission",
+            "action_permission",
+        }:
+            self.status_widget.set_message(
+                "Exact tool/action approval with feedback is disabled in the "
+                "CLI board; deny it here or review the complete payload in Office UI."
+            )
             return
         result = await self.push_screen_wait(
             PromptScreen(

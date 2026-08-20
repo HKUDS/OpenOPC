@@ -33,7 +33,7 @@ from typing import Any, Awaitable, Callable
 
 from loguru import logger
 
-from opc.llm.provider import LLMProvider
+from opc.llm.provider import LLMProvider, ProviderQuotaExhaustedError
 
 
 Validator = Callable[[Any], "str | None"]
@@ -90,6 +90,43 @@ def _compose_prompt(
     return text
 
 
+def _provider_quota_error(
+    llm: LLMProvider,
+    error: Exception,
+) -> ProviderQuotaExhaustedError | None:
+    """Return the typed quota error represented by a transport failure."""
+    chain: list[Exception] = []
+    pending: list[BaseException] = [error]
+    seen: set[int] = set()
+    while pending:
+        current = pending.pop(0)
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        if isinstance(current, Exception):
+            chain.append(current)
+        if current.__cause__ is not None:
+            pending.append(current.__cause__)
+        if current.__context__ is not None:
+            pending.append(current.__context__)
+
+    for current in chain:
+        if isinstance(current, ProviderQuotaExhaustedError):
+            if current is error:
+                return current
+            # A fresh boundary error preserves the wrapper -> nested chain.
+            # Re-raising the nested instance *from* its own wrapper would
+            # mutate it into the cycle wrapper -> nested -> wrapper.
+            return ProviderQuotaExhaustedError(str(current))
+
+    rate_limit_checker = getattr(llm, "is_rate_limit_error", None)
+    if callable(rate_limit_checker):
+        for current in chain:
+            if rate_limit_checker(current):
+                return ProviderQuotaExhaustedError(str(current))
+    return None
+
+
 async def call_llm_json_with_retry(
     llm: LLMProvider,
     *,
@@ -123,6 +160,9 @@ async def call_llm_json_with_retry(
         The parsed, validated JSON value.
 
     Raises:
+        ProviderQuotaExhaustedError: when the provider rejects the request for
+            quota/rate-limit reasons. These failures must be parked by the
+            caller rather than consumed by the JSON correction retry loop.
         LLMRetryError: when all attempts fail. Callers typically catch this
             and fall back to their heuristic default so the orchestration
             stays alive.
@@ -140,6 +180,11 @@ async def call_llm_json_with_retry(
                 task_type=task_type,
             )
         except Exception as exc:
+            quota_error = _provider_quota_error(llm, exc)
+            if quota_error is not None:
+                if quota_error is exc:
+                    raise
+                raise quota_error from exc
             last_error = f"LLM transport error: {exc}"
             last_raw = None
             logger.warning(

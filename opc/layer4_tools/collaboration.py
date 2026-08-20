@@ -31,7 +31,6 @@ from opc.core.models import (
 from opc.layer2_organization.company_runtime import canonical_role_session_id
 from opc.layer2_organization.phase import (
     DONE_PHASES,
-    IN_REVIEW_PHASES,
     InvalidPhaseTransition,
     kanban_column,
 )
@@ -51,7 +50,7 @@ from opc.layer2_organization.work_item_transition import (
     transition_work_item,
 )
 from opc.layer4_tools.output_budget import clip_text
-from opc.layer4_tools.registry import ToolDefinition
+from opc.layer4_tools.registry import COMPANY_EFFECT_RUNTIME_INTERNAL, ToolDefinition
 
 EXTERNAL_COLLABORATION_TOOL_NAMES = COMPANY_COLLABORATION_TOOL_NAMES
 
@@ -348,24 +347,56 @@ async def _resolve_manager_board_parent_work_item_id(store: Any, task: Task | No
 
 
 def _normalize_dependency_specs(value: Any) -> list[dict[str, str]]:
+    reference_kinds = {
+        "work_item_id": "work_item_id",
+        "scope_key": "scope_key",
+        "role_id": "role_id",
+        "work_item_ref": "work_item_ref",
+        "ref": "work_item_ref",
+        "id": "id",
+        "projection_id": "projection_id",
+        "work_item_projection_id": "projection_id",
+    }
     raw_items = value if isinstance(value, list) else [value] if value not in (None, "") else []
     specs: list[dict[str, str]] = []
     for raw in raw_items:
         if isinstance(raw, dict):
-            for key in ("work_item_id", "scope_key", "role_id", "ref", "id"):
-                rendered = str(raw.get(key, "") or "").strip()
-                if rendered:
-                    kind = "work_item_id" if key == "id" else "work_item_ref" if key == "ref" else key
-                    specs.append({
-                        "kind": kind,
-                        "value": rendered,
-                        "raw": json.dumps(raw, ensure_ascii=False, sort_keys=True),
-                    })
-                    break
+            unknown_fields = sorted(str(key) for key in raw if str(key) not in reference_kinds)
+            if unknown_fields:
+                raise ValueError(
+                    "delegate_work depends_on reference contains unsupported field(s): "
+                    + ", ".join(f"`{field}`" for field in unknown_fields)
+                )
+            populated = [
+                (reference_kinds[str(key)], str(raw.get(key, "") or "").strip())
+                for key in raw
+                if str(raw.get(key, "") or "").strip()
+            ]
+            if len(populated) != 1:
+                raise ValueError(
+                    "delegate_work depends_on object must contain exactly one non-empty reference field"
+                )
+            kind, rendered = populated[0]
+            specs.append({
+                "kind": kind,
+                "value": rendered,
+                "raw": json.dumps(raw, ensure_ascii=False, sort_keys=True),
+            })
             continue
         rendered = str(raw or "").strip()
         if rendered:
-            specs.append({"kind": "ref", "value": rendered, "raw": rendered})
+            prefix, separator, referenced_value = rendered.partition(":")
+            normalized_prefix = str(prefix or "").strip().lower()
+            kind = reference_kinds.get(normalized_prefix) if separator else None
+            if kind:
+                referenced_value = str(referenced_value or "").strip()
+                if not referenced_value:
+                    raise ValueError(
+                        f"delegate_work depends_on reference `{rendered}` has an empty value"
+                    )
+                specs.append({"kind": kind, "value": referenced_value, "raw": rendered})
+            else:
+                specs.append({"kind": "ref", "value": rendered, "raw": rendered})
     return specs
 
 
@@ -410,7 +441,9 @@ def _validate_delegate_work_items(items: Any) -> None:
 def _resolve_dependency_specs(
     dependency_specs: list[dict[str, str]],
     *,
-    ref_index: dict[str, str],
+    item_id_index: dict[str, list[str]],
+    work_item_ref_index: dict[str, list[str]],
+    projection_index: dict[str, list[str]],
     work_item_ids: set[str],
     scope_index: dict[str, list[str]],
     role_index: dict[str, list[str]],
@@ -430,15 +463,21 @@ def _resolve_dependency_specs(
         elif kind == "role_id":
             candidates.extend((item, "role_id") for item in role_index.get(value, []))
         elif kind == "work_item_ref":
-            if value in ref_index:
-                candidates.append((ref_index[value], "work_item_ref"))
+            candidates.extend((item, "work_item_ref") for item in work_item_ref_index.get(value, []))
+        elif kind == "id":
+            candidates.extend((item, "id") for item in item_id_index.get(value, []))
+            if value in work_item_ids:
+                candidates.append((value, "work_item_id"))
+        elif kind == "projection_id":
+            candidates.extend((item, "projection_id") for item in projection_index.get(value, []))
         else:
             if value in work_item_ids:
                 candidates.append((value, "work_item_id"))
             candidates.extend((item, "scope_key") for item in _lookup_scope_aliases(scope_index, value))
             candidates.extend((item, "role_id") for item in role_index.get(value, []))
-            if value in ref_index:
-                candidates.append((ref_index[value], "work_item_ref"))
+            candidates.extend((item, "work_item_ref") for item in work_item_ref_index.get(value, []))
+            candidates.extend((item, "id") for item in item_id_index.get(value, []))
+            candidates.extend((item, "projection_id") for item in projection_index.get(value, []))
         deduped = list(dict.fromkeys(candidates))
         ids = list(dict.fromkeys(item for item, _source in deduped))
         if not ids:
@@ -455,6 +494,54 @@ def _resolve_dependency_specs(
             "resolved_by": source,
         })
     return resolved
+
+
+def _index_exact_dependency_reference(
+    index: dict[str, list[str]],
+    value: Any,
+    work_item_id: str,
+) -> None:
+    rendered = str(value or "").strip()
+    normalized_work_item_id = str(work_item_id or "").strip()
+    if rendered and normalized_work_item_id:
+        index.setdefault(rendered, []).append(normalized_work_item_id)
+
+
+def _validate_delegate_dependency_dag(
+    dependencies_by_work_item_id: dict[str, list[str]],
+    *,
+    labels_by_work_item_id: dict[str, str],
+) -> None:
+    """Reject cycles among work items created by one delegate_work call."""
+
+    pending_ids = set(dependencies_by_work_item_id)
+    state: dict[str, int] = {}
+    stack: list[str] = []
+
+    def visit(work_item_id: str) -> None:
+        current_state = state.get(work_item_id, 0)
+        if current_state == 2:
+            return
+        if current_state == 1:
+            cycle_start = stack.index(work_item_id)
+            cycle_ids = [*stack[cycle_start:], work_item_id]
+            cycle = " -> ".join(
+                labels_by_work_item_id.get(item_id, item_id)
+                for item_id in cycle_ids
+            )
+            raise ValueError(
+                f"delegate_work dependency cycle detected within batch: {cycle}"
+            )
+        state[work_item_id] = 1
+        stack.append(work_item_id)
+        for dependency_id in dependencies_by_work_item_id.get(work_item_id, []):
+            if dependency_id in pending_ids:
+                visit(dependency_id)
+        stack.pop()
+        state[work_item_id] = 2
+
+    for work_item_id in dependencies_by_work_item_id:
+        visit(work_item_id)
 
 
 def _current_turn_mode(task: Task | None) -> str:
@@ -754,6 +841,16 @@ def _serialize_board_item(item: DelegationWorkItem, *, include_full_summaries: b
         "title": str(item.title or "").strip(),
         "summary": str(item.summary or "").strip(),
         "kind": str(item.kind or "").strip(),
+        "batch_id": str(item.batch_id or "").strip(),
+        "batch_index": int(item.batch_index or 0),
+        "created_by_delegate_work": bool(
+            metadata.get("created_by_delegate_work", False)
+        ),
+        "delegate_invocation_id": str(
+            metadata.get("delegate_invocation_id", "") or ""
+        ).strip(),
+        "delegate_invocation_index": metadata.get("delegate_invocation_index"),
+        "delegate_sequence_index": metadata.get("delegate_sequence_index"),
         "phase": item.phase.value,
         "kanban_column": kanban_column(item.phase),
         "deliverable_summary": deliverable_preview.text,
@@ -901,7 +998,8 @@ _EXTERNAL_BRIDGE_ARGUMENT_NOTES: dict[str, tuple[str, ...]] = {
         "Prefer stable sibling `scope_key` or `work_item_ref` values in `depends_on`; use raw work_item_id UUIDs only when copied from `manager_board_read` output.",
         "Do not invent item field names: any unsupported item field makes the whole `delegate_work` call fail before creating work items.",
         "`scope_key` is optional but idempotent on a manager board; reusing an existing scope_key returns the existing work item instead of creating a duplicate.",
-        "`depends_on` may reference a sibling role_id, scope_key, work_item_ref, or work_item_id.",
+        "`id` is only an optional same-call alias for a newly created item; never put an existing durable WorkItem ID there. Use `manager_board_read`, then `modify_work_item(work_item_id=..., reset_to_ready=true)` to revise and rerun an existing child.",
+        "`depends_on` may reference siblings from the same call by role_id, scope_key, id, work_item_ref, projection_id, or work_item_id; typed strings such as `scope_key:target-role-prep` are accepted.",
         "Planning/research/checklist items are allowed as supporting work, but if the user asked for actual outputs, delegate actual production work too.",
     ),
     "modify_work_item": (
@@ -1016,6 +1114,7 @@ def build_external_cli_tool_contract_lines(
                     "Natural-language dependency wording is ignored; if an item must wait, set `depends_on` using a sibling `scope_key`/`work_item_ref`.",
                     "Unsupported item fields make the whole call fail atomically; use `depends_on`, not invented dependency key names.",
                     "`scope_key` is optional but idempotent on a manager board; reusing an existing scope_key returns the existing work item instead of creating a duplicate.",
+                    "`id` is only a same-call alias for a newly created item; for an existing child use `manager_board_read`, then `modify_work_item(work_item_id=..., reset_to_ready=true)`.",
                     "On follow-up boards, use `modify_work_item`/`delete_work_item` for existing same-role children before adding a new same-role scope.",
                 )
             elif tool_name == "modify_work_item":
@@ -1334,11 +1433,22 @@ def create_collaboration_tools(
             task_id=task.id,
         )
         proposal = result["proposal"]
+        persisted_task = None
+        reorg_store = getattr(reorg_manager, "store", None)
+        if reorg_store is not None and hasattr(reorg_store, "get_task"):
+            persisted_task = await reorg_store.get_task(task.id)
+        if persisted_task is not None:
+            task.status = persisted_task.status
+            task.result = persisted_task.result
+            task.assigned_to = persisted_task.assigned_to
+            task.context_snapshot = dict(persisted_task.context_snapshot or {})
+            task.metadata = dict(persisted_task.metadata or {})
         if result.get("auto_applied"):
-            task.metadata = dict(task.metadata)
-            task.metadata["reorg_proposal_id"] = proposal.proposal_id
-            task.metadata.pop("pending_reorg_proposal_id", None)
-            task.metadata.pop("pending_reorg_scope", None)
+            if persisted_task is None:
+                task.metadata = dict(task.metadata)
+                task.metadata["reorg_proposal_id"] = proposal.proposal_id
+                task.metadata.pop("pending_reorg_proposal_id", None)
+                task.metadata.pop("pending_reorg_scope", None)
             return {
                 "proposal_id": proposal.proposal_id,
                 "scope": proposal.scope.value,
@@ -1346,13 +1456,29 @@ def create_collaboration_tools(
                 "auto_applied": True,
                 "result": result.get("result", {}),
             }
-        task.metadata = dict(task.metadata)
-        task.metadata["pending_reorg_proposal_id"] = proposal.proposal_id
-        task.metadata["pending_reorg_scope"] = proposal.scope.value
+        if persisted_task is None:
+            task.metadata = dict(task.metadata)
+            task.metadata["pending_reorg_proposal_id"] = proposal.proposal_id
+            task.metadata["pending_reorg_scope"] = proposal.scope.value
+        proposal_status = str(
+            getattr(proposal.status, "value", proposal.status) or ""
+        ).strip()
+        if proposal_status != "proposed":
+            return {
+                "proposal_id": proposal.proposal_id,
+                "scope": proposal.scope.value,
+                "status": proposal_status,
+                "auto_applied": False,
+                "requires_user_input": False,
+                "reason": (
+                    f"Runtime adjustment `{proposal.proposal_id}` was already "
+                    f"decided with status `{proposal_status}`."
+                ),
+            }
         return {
             "proposal_id": proposal.proposal_id,
             "scope": proposal.scope.value,
-            "status": proposal.status.value,
+            "status": proposal_status,
             "auto_applied": False,
             "requires_user_input": True,
             "reason": (
@@ -1562,60 +1688,11 @@ def create_collaboration_tools(
                     }
                     await store.save_delegation_run(run)
 
-        closed_checkpoint_ids: list[str] = []
-        checkpoint_id = str(task.metadata.get("human_review_checkpoint_id", "") or "").strip()
-        if hasattr(store, "get_pending_checkpoints"):
-            try:
-                pending_checkpoints = await store.get_pending_checkpoints(
-                    project_id=task.project_id,
-                    checkpoint_types=["company_delivery_feedback"],
-                )
-            except TypeError:
-                pending_checkpoints = await store.get_pending_checkpoints(task.project_id)
-            for checkpoint in list(pending_checkpoints or []):
-                payload = dict(getattr(checkpoint, "payload", {}) or {})
-                payload_task_id = str(
-                    payload.get("waiting_task_id")
-                    or payload.get("task_id")
-                    or getattr(checkpoint, "task_id", "")
-                    or ""
-                ).strip()
-                payload_task_ids = {
-                    str(item).strip()
-                    for item in list(payload.get("task_ids", []) or [])
-                    if str(item).strip()
-                }
-                matches = (
-                    bool(checkpoint_id and checkpoint.checkpoint_id == checkpoint_id)
-                    or bool(review_task_id and payload_task_id == review_task_id)
-                    or bool(review_task_id and review_task_id in payload_task_ids)
-                    or bool(review_work_item_id and str(payload.get("work_item_id", "") or "").strip() == review_work_item_id)
-                )
-                if not matches:
-                    continue
-                payload.update({
-                    "human_review_closed": True,
-                    "human_review_closed_at": now,
-                    "human_review_closed_by_role": role_id,
-                    "feedback_resolution": "accepted_by_final_decider",
-                    "feedback_close_summary": close_summary,
-                    "feedback_close_user_message": close_user_message,
-                })
-                checkpoint.payload = payload
-                checkpoint.status = "resolved"
-                checkpoint.updated_at = datetime.now()
-                if hasattr(store, "save_execution_checkpoint"):
-                    await store.save_execution_checkpoint(checkpoint)
-                elif hasattr(store, "resolve_execution_checkpoint"):
-                    await store.resolve_execution_checkpoint(checkpoint.checkpoint_id, status="resolved")
-                closed_checkpoint_ids.append(checkpoint.checkpoint_id)
-
         return {
             "action": "close_human_review",
             "closed": True,
             "task_id": review_task.id,
             "work_item_id": review_work_item_id,
-            "closed_checkpoint_ids": closed_checkpoint_ids,
             "summary": close_summary,
             "user_message": close_user_message,
         }
@@ -1674,7 +1751,10 @@ def create_collaboration_tools(
         if not task or not role_id:
             raise ValueError("delegate_work requires an active assigned task")
         store = getattr(communication, "store", None)
-        if store is None or not hasattr(store, "save_delegation_work_item"):
+        if store is None or not hasattr(
+            store,
+            "append_delegated_work_items_atomically",
+        ):
             raise RuntimeError("delegate_work requires delegation persistence")
         run_id = str(task.metadata.get("delegation_run_id", "") or "").strip()
         parent_work_item_id, attention_work_item_id = await _resolve_manager_board_parent_work_item_id(store, task)
@@ -1714,7 +1794,6 @@ def create_collaboration_tools(
                 "delegate_work: planning_context was empty in dispatch_required mode — "
                 "auto-filled a placeholder. The calling agent should provide an explicit planning_context."
             )
-        runtime_topology = dict(task.metadata.get("runtime_topology", {}) or {})
         playbook = dict(task.metadata.get("delegation_playbook", {}) or {})
         direct_report_role_ids = {
             str(item).strip()
@@ -1783,11 +1862,54 @@ def create_collaboration_tools(
                 existing_scope_aliases.update(aliases)
                 for alias in aliases:
                     existing_child_by_scope_alias.setdefault(alias, []).append(child)
-        ref_to_work_item_id: dict[str, str] = {}
+        current_board_ids = {
+            str(getattr(child, "work_item_id", "") or "").strip()
+            for child in existing_children
+            if str(getattr(child, "work_item_id", "") or "").strip()
+        }
+        durable_id_conflicts: list[tuple[int, str, bool]] = []
+        for index, item in enumerate(items):
+            requested_item_id = str(item.get("id", "") or "").strip()
+            if requested_item_id and requested_item_id in work_item_by_id:
+                durable_id_conflicts.append(
+                    (
+                        index,
+                        requested_item_id,
+                        requested_item_id in current_board_ids,
+                    )
+                )
+        if durable_id_conflicts:
+            conflict_notes: list[str] = []
+            for index, requested_item_id, on_current_board in durable_id_conflicts:
+                if on_current_board:
+                    recovery = (
+                        "Use `manager_board_read`, then "
+                        f"`modify_work_item(work_item_id={requested_item_id}, "
+                        "reset_to_ready=true)` to revise and rerun that existing "
+                        "child."
+                    )
+                else:
+                    recovery = (
+                        "That WorkItem is outside the current manager board; ask "
+                        "its owning manager to modify the existing WorkItem."
+                    )
+                conflict_notes.append(
+                    f"items[{index}].id=`{requested_item_id}` matches an existing "
+                    f"durable WorkItem. {recovery}"
+                )
+            raise ValueError(
+                "delegate_work rejected the request before creating any work "
+                "items: `id` is only a same-call alias for a newly created item "
+                "and cannot select an existing durable WorkItem. "
+                + " ".join(conflict_notes)
+            )
+        item_id_index: dict[str, list[str]] = {}
+        work_item_ref_index: dict[str, list[str]] = {}
         pending_items: list[tuple[DelegationWorkItem, list[dict[str, str]], bool]] = []
         delegated_payloads: list[dict[str, Any]] = []
         pending_scope_keys: set[str] = set()
         pending_scope_aliases: set[str] = set()
+        delegate_invocation_id = str(uuid.uuid4())
         for index, item in enumerate(items):
             if not isinstance(item, dict):
                 continue
@@ -1892,7 +2014,13 @@ def create_collaboration_tools(
                         ", ".join(missing_fields),
                     )
             requested_scope_key = str(item.get("scope_key", "") or "").strip()
-            ref_key = str(item.get("work_item_ref", "") or item.get("id", "") or "").strip() or f"item_{index + 1}"
+            requested_item_id = str(item.get("id", "") or "").strip()
+            requested_work_item_ref = str(item.get("work_item_ref", "") or "").strip()
+            implicit_work_item_ref = (
+                f"item_{index + 1}"
+                if not requested_item_id and not requested_work_item_ref
+                else ""
+            )
             if requested_scope_key:
                 existing_matches = _lookup_scope_aliases(existing_child_by_scope_alias, requested_scope_key)
             else:
@@ -1911,7 +2039,19 @@ def create_collaboration_tools(
                 )
             if requested_scope_key and len(existing_matches) == 1:
                 existing_item = existing_matches[0]
-                ref_to_work_item_id[ref_key] = str(getattr(existing_item, "work_item_id", "") or "").strip()
+                existing_work_item_id = str(
+                    getattr(existing_item, "work_item_id", "") or ""
+                ).strip()
+                _index_exact_dependency_reference(
+                    item_id_index,
+                    requested_item_id,
+                    existing_work_item_id,
+                )
+                _index_exact_dependency_reference(
+                    work_item_ref_index,
+                    requested_work_item_ref or implicit_work_item_ref,
+                    existing_work_item_id,
+                )
                 reused_payload = _serialize_board_item(existing_item)
                 reused_payload.update({
                     "reused": True,
@@ -2110,10 +2250,15 @@ def create_collaboration_tools(
                     "dependency_specs": [dict(spec) for spec in dependency_specs],
                     "scope_key": scope_key,
                     **({"requested_scope_key": requested_scope_key} if requested_scope_key else {}),
+                    **({"delegate_item_id": requested_item_id} if requested_item_id else {}),
+                    **({"work_item_ref": requested_work_item_ref} if requested_work_item_ref else {}),
                     "scope_key_aliases": list(
                         dict.fromkeys([*_scope_key_aliases(scope_key), *_scope_key_aliases(requested_scope_key)])
                     ),
                     "generated_scope_key": generated_scope_key,
+                    "created_by_delegate_work": True,
+                    "delegate_invocation_id": delegate_invocation_id,
+                    "delegate_invocation_index": len(pending_items),
                     "created_by_seat_id": seat_id,
                     "assigned_role_runtime_id": role_runtime_session_id,
                     "delegation_playbook": playbook,
@@ -2161,16 +2306,21 @@ def create_collaboration_tools(
                     "owned_outcome_kind": "execute" if manager_outcome_dispatch else work_kind,
                 }), projection_id=work_item_projection_id, turn_type=work_kind),
             )
-            ref_to_work_item_id[ref_key] = work_item.work_item_id
-            if requested_scope_key:
-                for alias in _scope_key_aliases(requested_scope_key):
-                    ref_to_work_item_id.setdefault(alias, work_item.work_item_id)
-            for alias in _scope_key_aliases(scope_key):
-                ref_to_work_item_id.setdefault(alias, work_item.work_item_id)
+            _index_exact_dependency_reference(
+                item_id_index,
+                requested_item_id,
+                work_item.work_item_id,
+            )
+            _index_exact_dependency_reference(
+                work_item_ref_index,
+                requested_work_item_ref or implicit_work_item_ref,
+                work_item.work_item_id,
+            )
             pending_items.append((work_item, dependency_specs, generated_scope_key))
         work_item_ids: set[str] = set()
         scope_index: dict[str, list[str]] = {}
         role_index: dict[str, list[str]] = {}
+        projection_index: dict[str, list[str]] = {}
         for existing in existing_children:
             if is_prunable_dependency_work_item(existing):
                 continue
@@ -2179,6 +2329,25 @@ def create_collaboration_tools(
                 continue
             work_item_ids.add(existing_id)
             existing_meta = dict(getattr(existing, "metadata", {}) or {})
+            _index_exact_dependency_reference(
+                item_id_index,
+                existing_meta.get("delegate_item_id", existing_meta.get("id", "")),
+                existing_id,
+            )
+            _index_exact_dependency_reference(
+                work_item_ref_index,
+                existing_meta.get("work_item_ref", ""),
+                existing_id,
+            )
+            for projection_value in (
+                getattr(existing, "projection_id", ""),
+                existing_meta.get("work_item_projection_id", ""),
+            ):
+                _index_exact_dependency_reference(
+                    projection_index,
+                    projection_value,
+                    existing_id,
+                )
             existing_scope = str(existing_meta.get("scope_key", "") or "").strip()
             if existing_scope:
                 _index_scope_aliases(scope_index, existing_scope, existing_id)
@@ -2190,6 +2359,25 @@ def create_collaboration_tools(
         for work_item, _dependency_specs, _generated_scope_key in pending_items:
             work_item_ids.add(work_item.work_item_id)
             pending_meta = dict(work_item.metadata or {})
+            _index_exact_dependency_reference(
+                item_id_index,
+                pending_meta.get("delegate_item_id", ""),
+                work_item.work_item_id,
+            )
+            _index_exact_dependency_reference(
+                work_item_ref_index,
+                pending_meta.get("work_item_ref", ""),
+                work_item.work_item_id,
+            )
+            for projection_value in (
+                work_item.projection_id,
+                pending_meta.get("work_item_projection_id", ""),
+            ):
+                _index_exact_dependency_reference(
+                    projection_index,
+                    projection_value,
+                    work_item.work_item_id,
+                )
             pending_scope = str(pending_meta.get("scope_key", "") or "").strip()
             if pending_scope:
                 _index_scope_aliases(scope_index, pending_scope, work_item.work_item_id)
@@ -2204,12 +2392,16 @@ def create_collaboration_tools(
         for work_item, dependency_specs, generated_scope_key in pending_items:
             resolved_dependency_records = _resolve_dependency_specs(
                 dependency_specs,
-                ref_index=ref_to_work_item_id,
+                item_id_index=item_id_index,
+                work_item_ref_index=work_item_ref_index,
+                projection_index=projection_index,
                 work_item_ids=work_item_ids,
                 scope_index=scope_index,
                 role_index=role_index,
             )
-            resolved_dependencies = [record["work_item_id"] for record in resolved_dependency_records]
+            resolved_dependencies = list(
+                dict.fromkeys(record["work_item_id"] for record in resolved_dependency_records)
+            )
             work_item.metadata = {
                 **dict(work_item.metadata or {}),
                 "dependency_work_item_ids": resolved_dependencies,
@@ -2218,12 +2410,61 @@ def create_collaboration_tools(
             resolved_pending_items.append(
                 (work_item, dependency_specs, generated_scope_key, resolved_dependency_records, resolved_dependencies)
             )
-        for work_item, dependency_specs, generated_scope_key, resolved_dependency_records, resolved_dependencies in resolved_pending_items:
+        _validate_delegate_dependency_dag(
+            {
+                work_item.work_item_id: list(resolved_dependencies)
+                for work_item, _specs, _generated, _records, resolved_dependencies in resolved_pending_items
+            },
+            labels_by_work_item_id={
+                work_item.work_item_id: str(
+                    (work_item.metadata or {}).get("scope_key", "")
+                    or work_item.projection_id
+                    or work_item.work_item_id
+                ).strip()
+                for work_item, _specs, _generated, _records, _dependencies in resolved_pending_items
+            },
+        )
+        pending_evidence = {
+            work_item.work_item_id: (
+                dependency_specs,
+                generated_scope_key,
+                resolved_dependency_records,
+                resolved_dependencies,
+            )
+            for (
+                work_item,
+                dependency_specs,
+                generated_scope_key,
+                resolved_dependency_records,
+                resolved_dependencies,
+            ) in resolved_pending_items
+        }
+        persisted_items = await store.append_delegated_work_items_atomically(
+            [
+                work_item
+                for work_item, _specs, _generated, _records, _dependencies
+                in resolved_pending_items
+            ]
+        )
+        if [item.work_item_id for item in persisted_items] != [
+            item.work_item_id
+            for item, _specs, _generated, _records, _dependencies
+            in resolved_pending_items
+        ]:
+            raise RuntimeError(
+                "delegate_work atomic persistence returned a different item order"
+            )
+        for work_item in persisted_items:
+            (
+                dependency_specs,
+                generated_scope_key,
+                resolved_dependency_records,
+                resolved_dependencies,
+            ) = pending_evidence[work_item.work_item_id]
             # initial_phase upstream already accounted for the presence of
-            # dependencies (READY vs WAITING_DEPENDENCIES vs QUEUED) so no
-            # phase mutation is needed here — only the resolved dependency
-            # IDs get persisted.
-            await store.save_delegation_work_item(work_item)
+            # dependencies (READY vs WAITING_DEPENDENCIES vs QUEUED). The
+            # Store has atomically assigned the manager-board sibling sequence
+            # and persisted the whole call before auxiliary events are emitted.
             work_item_by_id[work_item.work_item_id] = work_item
             if hasattr(store, "save_delegation_event"):
                 await store.save_delegation_event(
@@ -2238,6 +2479,20 @@ def create_collaboration_tools(
                             "seat_id": work_item.seat_id,
                             "team_id": work_item.team_id,
                             "batch_id": work_item.batch_id,
+                            "batch_index": work_item.batch_index,
+                            "delegate_invocation_id": str(
+                                work_item.metadata.get(
+                                    "delegate_invocation_id",
+                                    "",
+                                )
+                                or ""
+                            ),
+                            "delegate_invocation_index": work_item.metadata.get(
+                                "delegate_invocation_index"
+                            ),
+                            "delegate_sequence_index": work_item.metadata.get(
+                                "delegate_sequence_index"
+                            ),
                             "dependency_work_item_ids": resolved_dependencies,
                             "dependency_specs": [dict(spec) for spec in dependency_specs],
                             "resolved_dependencies": resolved_dependency_records,
@@ -2255,6 +2510,18 @@ def create_collaboration_tools(
                     "role_id": work_item.role_id,
                     "seat_id": work_item.seat_id,
                     "team_id": work_item.team_id,
+                    "batch_id": work_item.batch_id,
+                    "batch_index": work_item.batch_index,
+                    "delegate_invocation_id": str(
+                        work_item.metadata.get("delegate_invocation_id", "")
+                        or ""
+                    ),
+                    "delegate_invocation_index": work_item.metadata.get(
+                        "delegate_invocation_index"
+                    ),
+                    "delegate_sequence_index": work_item.metadata.get(
+                        "delegate_sequence_index"
+                    ),
                     "phase": work_item.phase.value,
                     "kanban_column": kanban_column(work_item.phase),
                     "work_kind": work_item.kind,
@@ -2931,8 +3198,14 @@ def create_collaboration_tools(
             result["requested_parent_work_item_id"] = requested_parent_work_item_id
         return result
 
+    def _runtime_internal_tool(**kwargs: Any) -> ToolDefinition:
+        return ToolDefinition(
+            **kwargs,
+            company_effect_kind=COMPANY_EFFECT_RUNTIME_INTERNAL,
+        )
+
     return [
-        ToolDefinition(
+        _runtime_internal_tool(
             name="inbox",
             description="Check or acknowledge your company-mode mailbox without implicitly marking messages read.",
             parameters={
@@ -2954,7 +3227,7 @@ def create_collaboration_tools(
             func=inbox,
             category="collaboration",
         ),
-        ToolDefinition(
+        _runtime_internal_tool(
             name="send_dm",
             description="Send an async direct message to another company-mode agent.",
             parameters={
@@ -2975,7 +3248,7 @@ def create_collaboration_tools(
             func=send_dm,
             category="collaboration",
         ),
-        ToolDefinition(
+        _runtime_internal_tool(
             name="ask_peer_and_wait",
             description="Send a lightweight blocking peer question and pause until a reply or timeout policy fires.",
             parameters={
@@ -2997,7 +3270,7 @@ def create_collaboration_tools(
             func=ask_peer_and_wait,
             category="collaboration",
         ),
-        ToolDefinition(
+        _runtime_internal_tool(
             name="reply_message",
             description="Reply to a collaboration message and unblock a waiting peer.",
             parameters={
@@ -3012,7 +3285,7 @@ def create_collaboration_tools(
             func=reply_message,
             category="collaboration",
         ),
-        ToolDefinition(
+        _runtime_internal_tool(
             name="broadcast_issue",
             description="Broadcast an async issue to multiple company-mode agents.",
             parameters={
@@ -3033,7 +3306,7 @@ def create_collaboration_tools(
             func=broadcast_issue,
             category="collaboration",
         ),
-        ToolDefinition(
+        _runtime_internal_tool(
             name="start_meeting",
             description="Start a company-mode meeting and pause until outcome is available.",
             parameters={
@@ -3056,7 +3329,7 @@ def create_collaboration_tools(
             func=start_meeting,
             category="collaboration",
         ),
-        ToolDefinition(
+        _runtime_internal_tool(
             name="respond_meeting",
             description="Respond to an active meeting room or finalize it as decision owner.",
             parameters={
@@ -3071,7 +3344,7 @@ def create_collaboration_tools(
             func=respond_meeting,
             category="collaboration",
         ),
-        ToolDefinition(
+        _runtime_internal_tool(
             name="propose_task_adjustment",
             description="Propose a targeted runtime task adjustment and auto-apply safe low-risk changes when allowed.",
             parameters={
@@ -3085,7 +3358,7 @@ def create_collaboration_tools(
             func=propose_task_adjustment,
             category="collaboration",
         ),
-        ToolDefinition(
+        _runtime_internal_tool(
             name="route_work",
             description=(
                 "Route work as a coordinator: send_followup (high-priority nudge to a target role), "
@@ -3109,12 +3382,13 @@ def create_collaboration_tools(
             func=route_work,
             category="collaboration",
         ),
-        ToolDefinition(
+        _runtime_internal_tool(
             name="close_human_review",
             description=(
                 "Close the current owner-facing company delivery review when you decide the user's latest directive "
                 "means no further internal work is needed. This records the review as resolved, clears the delivery "
-                "feedback wait, and closes matching delivery-feedback checkpoints. Do not call it for requested changes."
+                "feedback wait, and lets the active owner-decision consumer settle its checkpoint. "
+                "Do not call it for requested changes."
             ),
             parameters={
                 "type": "object",
@@ -3127,7 +3401,7 @@ def create_collaboration_tools(
             func=close_human_review,
             category="collaboration",
         ),
-        ToolDefinition(
+        _runtime_internal_tool(
             name="submit_self_evolution_patches",
             description=(
                 "Record employee experience patches for the current self-evolution work item. "
@@ -3161,7 +3435,7 @@ def create_collaboration_tools(
             func=submit_self_evolution_patches,
             category="collaboration",
         ),
-        ToolDefinition(
+        _runtime_internal_tool(
             name="delegate_work",
             description=(
                 "Create child runtime work items for direct-report seats/roles using optional semantic scope keys and dependencies. "
@@ -3173,7 +3447,9 @@ def create_collaboration_tools(
                 "scope_key is idempotent per manager board: an existing scope_key is reused, not duplicated. "
                 "Dependencies must be expressed in structured depends_on; text in brief/task_brief/coordination_notes is never treated as a dependency. "
                 "Prefer stable sibling scope_key or work_item_ref references in depends_on; use raw work_item_id UUIDs only when copied from manager_board_read. "
-                "depends_on may reference sibling role_id, scope_key, work_item_ref, or work_item_id; the tool resolves these to work-item IDs. "
+                "depends_on may reference siblings in the same call by role_id, scope_key, id, work_item_ref, projection_id, or work_item_id; "
+                "typed strings such as scope_key:target-role-prep are accepted and resolved to work-item IDs before the batch is saved. "
+                "id is only a same-call alias for a newly created item; revise existing children with modify_work_item and their exact work_item_id. "
                 "Unsupported item fields reject the whole call before any work item is created."
             ),
             parameters={
@@ -3208,14 +3484,23 @@ def create_collaboration_tools(
                                     "type": "array",
                                     "items": {},
                                     "description": (
-                                        "Structured hard dependencies. Use sibling scope_key or work_item_ref values when possible; "
+                                        "Structured hard dependencies. Same-call siblings are supported. Use a sibling scope_key or work_item_ref when possible; "
+                                        "typed strings such as scope_key:target-role-prep are accepted. "
                                         "role_id is allowed only when unambiguous, and raw work_item_id UUIDs should only be copied from manager_board_read. "
                                         "Dependency wording in brief/task_brief/coordination_notes is ignored."
                                     ),
                                 },
                                 "dependency_work_item_ids": {"type": "array", "items": {"type": "string"}},
                                 "work_item_ref": {"type": "string"},
-                                "id": {"type": "string"},
+                                "id": {
+                                    "type": "string",
+                                    "description": (
+                                        "Optional same-call alias for a newly created item. "
+                                        "Never pass an existing durable WorkItem ID here; use "
+                                        "manager_board_read followed by modify_work_item with "
+                                        "the exact work_item_id instead."
+                                    ),
+                                },
                                 "team_id": {"type": "string"},
                                 "batch_id": {"type": "string"},
                                 "batch_index": {"type": "integer"},
@@ -3244,7 +3529,7 @@ def create_collaboration_tools(
             func=delegate_work,
             category="collaboration",
         ),
-        ToolDefinition(
+        _runtime_internal_tool(
             name="modify_work_item",
             description=(
                 "Revise an existing child WorkItem on the current manager board. "
@@ -3279,7 +3564,7 @@ def create_collaboration_tools(
             func=modify_work_item,
             category="collaboration",
         ),
-        ToolDefinition(
+        _runtime_internal_tool(
             name="delete_work_item",
             description=(
                 "Cancel or hide an obsolete/wrong child WorkItem on the current manager board. "
@@ -3302,7 +3587,7 @@ def create_collaboration_tools(
             func=delete_work_item,
             category="collaboration",
         ),
-        ToolDefinition(
+        _runtime_internal_tool(
             name="manager_board_read",
             description=(
                 "READ-ONLY. List your direct reports' child work items with "

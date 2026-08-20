@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
+from html import unescape
 from html.parser import HTMLParser
 from typing import Any
+from urllib.parse import parse_qs, urljoin, urlsplit
 
 import httpx
 
 from opc.layer4_tools.output_budget import clip_text, persist_tool_result
-from opc.layer4_tools.registry import ToolDefinition
+from opc.layer4_tools.registry import COMPANY_EFFECT_RUNTIME_INTERNAL, ToolDefinition
 
 
 class _ReadableHTMLParser(HTMLParser):
@@ -52,6 +54,141 @@ def _html_to_text(value: str) -> str:
     return parser.text() or value
 
 
+class _DuckDuckGoResultsParser(HTMLParser):
+    """Collect DuckDuckGo result titles and snippets without regexing nested HTML."""
+
+    _VOID_TAGS = {
+        "area",
+        "base",
+        "br",
+        "col",
+        "embed",
+        "hr",
+        "img",
+        "input",
+        "link",
+        "meta",
+        "param",
+        "source",
+        "track",
+        "wbr",
+    }
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.links: list[tuple[str, str]] = []
+        self.snippets: list[str] = []
+        self._capture_kind = ""
+        self._capture_depth = 0
+        self._capture_href = ""
+        self._capture_parts: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if self._capture_kind:
+            if tag in self._VOID_TAGS:
+                self._capture_parts.append(" ")
+            else:
+                self._capture_depth += 1
+            return
+
+        attributes = {name.lower(): value or "" for name, value in attrs}
+        classes = set(attributes.get("class", "").split())
+        if "result__a" in classes:
+            self._start_capture("title", href=attributes.get("href", ""))
+        elif "result__snippet" in classes:
+            self._start_capture("snippet")
+
+    def handle_startendtag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if self._capture_kind:
+            self._capture_parts.append(" ")
+            return
+        self.handle_starttag(tag, attrs)
+        if self._capture_kind:
+            self.handle_endtag(tag)
+
+    def handle_endtag(self, tag: str) -> None:
+        _ = tag
+        if not self._capture_kind:
+            return
+        self._capture_depth -= 1
+        if self._capture_depth > 0:
+            return
+
+        value = " ".join(unescape("".join(self._capture_parts)).split())
+        if self._capture_kind == "title":
+            self.links.append((self._capture_href, value))
+        else:
+            self.snippets.append(value)
+        self._capture_kind = ""
+        self._capture_depth = 0
+        self._capture_href = ""
+        self._capture_parts = []
+
+    def handle_data(self, data: str) -> None:
+        if self._capture_kind:
+            self._capture_parts.append(data)
+
+    def _start_capture(self, kind: str, *, href: str = "") -> None:
+        self._capture_kind = kind
+        self._capture_depth = 1
+        self._capture_href = href
+        self._capture_parts = []
+
+
+def _normalize_duckduckgo_url(value: str) -> str:
+    """Return a direct result URL, retaining a safe DDG URL when decoding fails."""
+    href = unescape(str(value or "").strip())
+    if not href:
+        return ""
+
+    if href.startswith("//"):
+        safe_fallback = f"https:{href}"
+    else:
+        safe_fallback = urljoin("https://duckduckgo.com/", href)
+
+    try:
+        parsed = urlsplit(safe_fallback)
+    except ValueError:
+        return ""
+    if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
+        return ""
+
+    hostname = (parsed.hostname or "").lower()
+    is_duckduckgo_redirect = (
+        (hostname == "duckduckgo.com" or hostname.endswith(".duckduckgo.com"))
+        and parsed.path.rstrip("/") == "/l"
+    )
+    if not is_duckduckgo_redirect:
+        return safe_fallback
+
+    try:
+        target = unescape(parse_qs(parsed.query).get("uddg", [""])[0]).strip()
+        target_parts = urlsplit(target)
+    except (ValueError, UnicodeError):
+        return safe_fallback
+    if target_parts.scheme.lower() in {"http", "https"} and target_parts.netloc:
+        return target
+    return safe_fallback
+
+
+def _parse_duckduckgo_results(text: str, max_results: int) -> list[dict[str, str]]:
+    parser = _DuckDuckGoResultsParser()
+    parser.feed(text)
+    parser.close()
+
+    results: list[dict[str, str]] = []
+    for index, (url, title) in enumerate(parser.links[: max(0, int(max_results))]):
+        snippet = parser.snippets[index] if index < len(parser.snippets) else ""
+        results.append(
+            {
+                "title": title,
+                "url": _normalize_duckduckgo_url(url),
+                "snippet": snippet,
+            }
+        )
+    return results
+
+
 async def web_search(query: str, max_results: int = 5) -> dict[str, Any]:
     """Search the web using DuckDuckGo HTML scraping (no API key needed)."""
     try:
@@ -63,18 +200,7 @@ async def web_search(query: str, max_results: int = 5) -> dict[str, Any]:
             )
             resp.raise_for_status()
             text = resp.text
-
-            results: list[dict[str, str]] = []
-            import re
-            links = re.findall(r'class="result__a"[^>]*href="([^"]*)"[^>]*>(.*?)</a>', text)
-            snippets = re.findall(r'class="result__snippet"[^>]*>(.*?)</[^>]+>', text, re.DOTALL)
-            for i, (url, title) in enumerate(links[:max_results]):
-                snippet = snippets[i].strip() if i < len(snippets) else ""
-                snippet = re.sub(r"<[^>]+>", "", snippet).strip()
-                title = re.sub(r"<[^>]+>", "", title).strip()
-                results.append({"title": title, "url": url, "snippet": snippet})
-
-            return {"results": results, "query": query}
+            return {"results": _parse_duckduckgo_results(text, max_results), "query": query}
     except Exception as e:
         return {"error": str(e), "query": query}
 
@@ -143,6 +269,7 @@ def create_web_tools() -> list[ToolDefinition]:
             },
             func=web_search,
             category="search",
+            company_effect_kind=COMPANY_EFFECT_RUNTIME_INTERNAL,
         ),
         ToolDefinition(
             name="web_fetch",
@@ -161,5 +288,6 @@ def create_web_tools() -> list[ToolDefinition]:
             category="search",
             self_bounded_output=True,
             max_result_chars=80_000,
+            company_effect_kind=COMPANY_EFFECT_RUNTIME_INTERNAL,
         ),
     ]

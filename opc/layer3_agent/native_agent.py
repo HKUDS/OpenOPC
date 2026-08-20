@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 from dataclasses import dataclass, field
 from typing import Any, Callable, Coroutine
 
@@ -19,8 +21,10 @@ from opc.core.models import AgentInfo, AgentStatus, ExecutionMode, Task, TaskRes
 from opc.core.events import EventBus
 from opc.core.models import OPCEvent
 from opc.core.worker_envelope import classify_worker_message
-from opc.llm.provider import LLMProvider
+from opc.llm.provider import LLMProvider, ProviderQuotaExhaustedError
 from opc.layer1_perception.context_assembler import ContextAssembler
+from opc.layer2_organization.work_item_links import linked_work_item_id_for_task
+from opc.layer0_interaction.coordinator import InteractionCoordinator
 from opc.layer3_agent.company_runtime_contract import build_company_work_item_contract
 from opc.layer3_agent.runtime_v2 import NativeRuntimeV2
 from opc.layer3_agent.prompt_harness import PromptHarnessBuilder
@@ -286,6 +290,7 @@ class NativeAgent:
         communication: Any | None = None,
         approval_callback: Any = None,
         permission_policy: Any = None,
+        interaction_coordinator: InteractionCoordinator | None = None,
     ) -> None:
         self.role = role
         self.llm = llm
@@ -300,6 +305,7 @@ class NativeAgent:
         self.communication = communication
         self.approval_callback = approval_callback
         self.permission_policy = permission_policy
+        self.interaction_coordinator = interaction_coordinator
         self.prompt_profiles = PromptProfileManager(role, self.config)
         max_iter = self.config.system.max_agent_iterations
         comp_threshold = self.config.system.context_compression_threshold
@@ -317,6 +323,7 @@ class NativeAgent:
             approval_callback=approval_callback,
             permission_policy=permission_policy,
             prefetch_provider=self._build_runtime_prefetch_payload,
+            interaction_coordinator=interaction_coordinator,
         )
 
     def _is_task_mode_task(self, task: Task) -> bool:
@@ -340,7 +347,6 @@ class NativeAgent:
             payload={"role_id": self.role.role_id, "status": "running", "task_id": task.id},
         ))
 
-        is_task_mode = self._is_task_mode_task(task)
         allowed = self._resolve_allowed_tools(task)
         inbox_interrupt_provider = None
         if (
@@ -353,6 +359,7 @@ class NativeAgent:
         if runtime_inbox_queue is not None:
             inbox_interrupt_provider = self._create_runtime_inbox_provider(runtime_inbox_queue, task)
 
+        provider_quota_in_flight = False
         try:
             system_prompt = await self._build_system_prompt(task)
             user_message = await self._build_user_message(task)
@@ -371,6 +378,15 @@ class NativeAgent:
 
             return result
 
+        except ProviderQuotaExhaustedError:
+            # Quota exhaustion is an environment-level outage with a
+            # dedicated company-dispatcher recovery path.  Preserve the
+            # typed signal so a claimed WorkItem is returned to READY with
+            # backoff instead of being committed as a terminal FAILED
+            # TaskResult.  RuntimeV2 has already joined its tool/permission
+            # abort cleanup before this exception reaches us.
+            provider_quota_in_flight = True
+            raise
         except Exception as e:
             logger.error(f"Agent {self.role.role_id} failed on task {task.id}: {e}")
             return TaskResult(status=TaskStatus.FAILED, content=str(e))
@@ -378,10 +394,22 @@ class NativeAgent:
         finally:
             self.role.status = AgentStatus.IDLE
             self.role.current_task_id = None
-            await self.event_bus.publish(OPCEvent(
-                event_type="agent_status_changed",
-                payload={"role_id": self.role.role_id, "status": "idle"},
-            ))
+            try:
+                await self.event_bus.publish(OPCEvent(
+                    event_type="agent_status_changed",
+                    payload={"role_id": self.role.role_id, "status": "idle"},
+                ))
+            except Exception:
+                if not provider_quota_in_flight:
+                    raise
+                # Telemetry cleanup must not replace the typed recovery
+                # signal that the company dispatcher needs in order to park
+                # the claimed WorkItem.  Preserve the old propagation
+                # semantics for every non-quota path.
+                logger.opt(exception=True).warning(
+                    "Failed to publish idle agent status while provider quota "
+                    "exhaustion was propagating"
+                )
 
     async def _build_native_prompt_bundle(self, task: Task) -> NativePromptBundle:
         override = str(task.metadata.get("_runtime_system_prompt_override", "") or "").strip()
@@ -401,14 +429,118 @@ class NativeAgent:
         return bundle.stable_system_prompt
 
     async def _build_user_message(self, task: Task) -> str:
-        return self.context_assembler.build_task_brief(task)
+        task_brief = self.context_assembler.build_task_brief(task)
+        rework_feedback = await self.context_assembler.build_rework_feedback_context(
+            task,
+            include_previous_submission=False,
+        )
+        if not rework_feedback:
+            task.metadata.pop("_runtime_v2_attempt_user_seed_required", None)
+            task.metadata.pop("_runtime_v2_attempt_user_seed_revision", None)
+            return task_brief
+
+        # A WorkItem re-dispatch is a new business attempt even when it resumes
+        # the same Native runtime session.  Put the authoritative correction in
+        # the user turn, not only in a replaceable system-prefix message.  The
+        # runtime uses the stable revision below to persist exactly one such
+        # turn per attempt across provider retries, permission continuations,
+        # and process restarts.
+        turn_mode = await self.context_assembler.build_turn_mode_context(task)
+        work_item_id = linked_work_item_id_for_task(task)
+        try:
+            attempt_seq = int(
+                (task.metadata or {}).get("claimed_work_item_attempt_seq", 0)
+                or 0
+            )
+        except (TypeError, ValueError):
+            attempt_seq = 0
+        try:
+            rework_round = int(
+                (task.metadata or {}).get("gate_harness_rework_count", 0)
+                or 0
+            )
+        except (TypeError, ValueError):
+            rework_round = 0
+        attempt_identity = (
+            "### Durable Attempt Identity\n"
+            f"- WorkItem: `{work_item_id}`\n"
+            f"- Attempt sequence: `{attempt_seq}`\n"
+            f"- Deterministic rework round: `{rework_round}`"
+        )
+        correction = "\n\n".join(
+            part
+            for part in (
+                "## Current WorkItem Attempt — Correction Required",
+                attempt_identity,
+                turn_mode,
+                rework_feedback,
+                (
+                    "Apply the correction now using the available tools. Do not "
+                    "resubmit an unchanged artifact."
+                ),
+            )
+            if str(part or "").strip()
+        ).strip()
+        revision_payload = {
+            "task_id": str(task.id or ""),
+            "work_item_id": work_item_id,
+            "claimed_work_item_attempt_seq": attempt_seq,
+            "gate_harness_rework_count": rework_round,
+            "gate_harness_rework_request": (
+                task.metadata or {}
+            ).get("gate_harness_rework_request", {}),
+            "correction": correction,
+        }
+        revision = hashlib.sha256(
+            json.dumps(
+                revision_payload,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            ).encode("utf-8")
+        ).hexdigest()
+        task.metadata["_runtime_v2_attempt_user_seed_required"] = True
+        task.metadata["_runtime_v2_attempt_user_seed_revision"] = revision
+        # The original assignment is already durable in the restored
+        # transcript and remains available in the dynamic system context.
+        # Seed only the authoritative correction delta.  In particular, this
+        # path excludes the best-effort live Task.result excerpt: Engine writes
+        # a provider failure into that field before a same-attempt retry, which
+        # must not mutate the durable business-attempt prompt.
+        return correction
 
     async def _build_context_messages(self, task: Task) -> list[dict[str, Any]]:
         fork_messages = list(task.metadata.get("_fork_context_messages", []) or [])
         if fork_messages:
             return fork_messages
 
-        harness_output = await self._build_prompt_harness(task)
+        # The full correction delta is carried by the per-attempt user turn.
+        # Keep the generic Turn Mode and all other runtime context in the
+        # system prefix, but avoid duplicating the same blocker block there.
+        suppress_rework = bool(
+            (task.metadata or {}).get(
+                "_runtime_v2_attempt_user_seed_required", False
+            )
+        )
+        marker = object()
+        previous_suppression = task.metadata.get(
+            "suppress_company_rework_feedback_context", marker
+        )
+        if suppress_rework:
+            task.metadata["suppress_company_rework_feedback_context"] = True
+        try:
+            harness_output = await self._build_prompt_harness(task)
+        finally:
+            if suppress_rework:
+                if previous_suppression is marker:
+                    task.metadata.pop(
+                        "suppress_company_rework_feedback_context", None
+                    )
+                else:
+                    task.metadata[
+                        "suppress_company_rework_feedback_context"
+                    ] = previous_suppression
         dynamic_messages = [
             *harness_output.runtime_policy_messages,
             *harness_output.workspace_context_messages,
@@ -746,4 +878,5 @@ class NativeAgent:
             communication=self.communication,
             approval_callback=self.approval_callback,
             permission_policy=self.permission_policy,
+            interaction_coordinator=self.interaction_coordinator,
         )

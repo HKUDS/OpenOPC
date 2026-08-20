@@ -10,7 +10,11 @@ from typing import Any, Callable
 
 from opc.core.config import OPCConfig, get_opc_home
 from opc.layer4_tools.output_budget import clip_text
-from opc.layer4_tools.registry import ToolDefinition
+from opc.layer4_tools.registry import (
+    COMPANY_EFFECT_FORBIDDEN,
+    COMPANY_EFFECT_NO_LOCAL_FS,
+    ToolDefinition,
+)
 
 try:
     from playwright.async_api import Error as PlaywrightError
@@ -568,6 +572,7 @@ def create_browser_tools() -> list[ToolDefinition]:
             },
             func=browser_navigate,
             category="browser",
+            company_effect_kind=COMPANY_EFFECT_NO_LOCAL_FS,
         ),
         ToolDefinition(
             name="browser_snapshot",
@@ -588,6 +593,7 @@ def create_browser_tools() -> list[ToolDefinition]:
             },
             func=browser_snapshot,
             category="browser",
+            company_effect_kind=COMPANY_EFFECT_FORBIDDEN,
         ),
         ToolDefinition(
             name="browser_click",
@@ -601,6 +607,7 @@ def create_browser_tools() -> list[ToolDefinition]:
             },
             func=browser_click,
             category="browser",
+            company_effect_kind=COMPANY_EFFECT_NO_LOCAL_FS,
         ),
         ToolDefinition(
             name="browser_type",
@@ -625,6 +632,7 @@ def create_browser_tools() -> list[ToolDefinition]:
             },
             func=browser_type,
             category="browser",
+            company_effect_kind=COMPANY_EFFECT_NO_LOCAL_FS,
         ),
         ToolDefinition(
             name="browser_take_screenshot",
@@ -642,6 +650,7 @@ def create_browser_tools() -> list[ToolDefinition]:
             },
             func=browser_take_screenshot,
             category="browser",
+            company_effect_kind=COMPANY_EFFECT_FORBIDDEN,
         ),
         ToolDefinition(
             name="browser_wait_for",
@@ -667,6 +676,7 @@ def create_browser_tools() -> list[ToolDefinition]:
             },
             func=browser_wait_for,
             category="browser",
+            company_effect_kind=COMPANY_EFFECT_NO_LOCAL_FS,
         ),
         ToolDefinition(
             name="browser_scroll",
@@ -693,6 +703,7 @@ def create_browser_tools() -> list[ToolDefinition]:
             },
             func=browser_scroll,
             category="browser",
+            company_effect_kind=COMPANY_EFFECT_NO_LOCAL_FS,
         ),
         ToolDefinition(
             name="browser_select_option",
@@ -709,6 +720,7 @@ def create_browser_tools() -> list[ToolDefinition]:
             },
             func=browser_select_option,
             category="browser",
+            company_effect_kind=COMPANY_EFFECT_NO_LOCAL_FS,
         ),
         ToolDefinition(
             name="browser_navigate_back",
@@ -716,6 +728,7 @@ def create_browser_tools() -> list[ToolDefinition]:
             parameters={"type": "object", "properties": {}},
             func=browser_navigate_back,
             category="browser",
+            company_effect_kind=COMPANY_EFFECT_NO_LOCAL_FS,
         ),
         ToolDefinition(
             name="browser_close",
@@ -723,5 +736,6 @@ def create_browser_tools() -> list[ToolDefinition]:
             parameters={"type": "object", "properties": {}},
             func=browser_close,
             category="browser",
+            company_effect_kind=COMPANY_EFFECT_NO_LOCAL_FS,
         ),
     ]

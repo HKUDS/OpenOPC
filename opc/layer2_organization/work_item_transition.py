@@ -29,12 +29,13 @@ from typing import Any
 
 from loguru import logger
 
+from opc.core.company_controller import CompanyRunControllerLeaseLost
 from opc.core.models import DelegationEvent, DelegationWorkItem, Phase, Task, TaskStatus
 from opc.layer2_organization.phase import (
     DONE_PHASES,
     InvalidPhaseTransition,
+    build_attempt_settlement_updates,
     coerce_phase,
-    has_open_attempt,
     phase_for_task_status,
     task_status_for_phase,
     validate_transition,
@@ -42,54 +43,6 @@ from opc.layer2_organization.phase import (
 from opc.layer2_organization.work_item_links import linked_work_item_id_for_task
 from opc.layer2_organization.work_item_identity import work_item_identity_payload
 from opc.layer2_organization.work_item_runtime import is_work_item_runtime_metadata
-
-
-def build_attempt_settlement_updates(
-    current_metadata: dict[str, Any] | None,
-    *,
-    outcome: str,
-) -> dict[str, Any]:
-    """Compute the metadata delta that settles the currently-open attempt.
-
-    ``outcome`` semantics:
-      * ``"crashed"`` — the attempt died on an exception/timeout; increments
-        ``attempt_crash_streak`` (consecutive crashes).
-      * ``"interrupted"`` — the owning process/coroutine went away without a
-        verdict (kill, cancel-before-harvest); increments
-        ``attempt_interrupted_streak``.
-      * anything else — a clean turn boundary (approved/failed-by-review/
-        waiting/park/...); resets both streaks.
-
-    Returns ``{}`` when there is no open attempt to settle, so callers can
-    merge unconditionally.
-    """
-    metadata = dict(current_metadata or {})
-    if not has_open_attempt(metadata):
-        return {}
-
-    def _streak(key: str) -> int:
-        try:
-            return int(metadata.get(key, 0) or 0)
-        except (TypeError, ValueError):
-            return 0
-
-    outcome_clean = str(outcome or "").strip() or "settled"
-    if outcome_clean == "crashed":
-        crash_streak = _streak("attempt_crash_streak") + 1
-        interrupted_streak = _streak("attempt_interrupted_streak")
-    elif outcome_clean == "interrupted":
-        crash_streak = _streak("attempt_crash_streak")
-        interrupted_streak = _streak("attempt_interrupted_streak") + 1
-    else:
-        crash_streak = 0
-        interrupted_streak = 0
-    return {
-        "attempt_settled": True,
-        "attempt_outcome": outcome_clean,
-        "attempt_settled_at": datetime.now().isoformat(),
-        "attempt_crash_streak": crash_streak,
-        "attempt_interrupted_streak": interrupted_streak,
-    }
 
 
 async def transition_work_item(
@@ -285,6 +238,8 @@ async def transition_work_item_from_task(
     release_claim: bool = False,
     require_work_item: bool = False,
     attempt_outcome: str | None = None,
+    release_role_session_id: str = "",
+    release_role_session_metadata_updates: dict[str, Any] | None = None,
 ) -> bool:
     """Task bridge helper: transition a work item when the caller holds a Task.
 
@@ -391,6 +346,7 @@ async def transition_work_item_from_task(
     # in ALLOWED_TRANSITIONS. This keeps shared role-session callbacks
     # crash-free when a late writer observes stale task state.
     persisted_phase: Phase | None = None
+    persisted_item = None
     if hasattr(store, "get_delegation_work_item"):
         try:
             persisted_item = await store.get_delegation_work_item(work_item_id)
@@ -398,7 +354,15 @@ async def transition_work_item_from_task(
             persisted_item = None
         if persisted_item is not None:
             persisted_phase = getattr(persisted_item, "phase", None)
-    if target_phase != persisted_phase and persisted_phase is not None:
+    controller_token = str(
+        (task.metadata or {}).get("company_run_controller_owner_token", "")
+        or ""
+    ).strip()
+    if (
+        not controller_token
+        and target_phase != persisted_phase
+        and persisted_phase is not None
+    ):
         try:
             validate_transition(persisted_phase, target_phase)
         except InvalidPhaseTransition:
@@ -421,16 +385,48 @@ async def transition_work_item_from_task(
     if metadata_updates:
         back_ref.update(metadata_updates)
     try:
-        await transition_work_item(
-            store,
-            work_item_id,
-            target_phase=target_phase,
-            reason=reason,
-            summary=summary,
-            metadata_updates=back_ref,
-            release_claim=release_claim,
-            attempt_outcome=attempt_outcome,
-        )
+        if controller_token:
+            fenced_transition = getattr(
+                store,
+                "transition_claimed_work_item_and_task_for_controller",
+                None,
+            )
+            if not callable(fenced_transition):
+                raise CompanyRunControllerLeaseLost(
+                    "Store lacks the atomic company controller transition API"
+                )
+            fenced_kwargs: dict[str, Any] = {}
+            if release_role_session_id:
+                fenced_kwargs.update(
+                    {
+                        "release_role_session_id": release_role_session_id,
+                        "release_role_session_metadata_updates": dict(
+                            release_role_session_metadata_updates or {}
+                        ),
+                    }
+                )
+            await fenced_transition(
+                work_item_id,
+                task=task,
+                target_phase=target_phase,
+                reason=reason,
+                summary=summary,
+                metadata_updates=back_ref,
+                release_claim=release_claim,
+                attempt_outcome=attempt_outcome,
+                **fenced_kwargs,
+            )
+        else:
+            await transition_work_item(
+                store,
+                work_item_id,
+                target_phase=target_phase,
+                reason=reason,
+                summary=summary,
+                metadata_updates=back_ref,
+                release_claim=release_claim,
+                attempt_outcome=attempt_outcome,
+            )
     except InvalidPhaseTransition:
         # Defensive: state-machine validation at the store layer can also
         # raise. Degrade the same way the pre-check does, for the race
@@ -910,6 +906,78 @@ async def refresh_dependents_for_run(
     source_role_id: str | None = None,
     source_cell_id: str | None = None,
 ) -> bool:
+    """Refresh a dependency frontier for non-controller/admin callers."""
+
+    return await _refresh_dependents_for_run(
+        store,
+        run_id=run_id,
+        source_work_item_id=source_work_item_id,
+        source_task_id=source_task_id,
+        source_role_id=source_role_id,
+        source_cell_id=source_cell_id,
+        controller_credential=None,
+    )
+
+
+async def refresh_dependents_for_controller(
+    store: Any,
+    *,
+    run_id: str,
+    project_id: str,
+    controller_owner_token: str,
+    controller_lease_generation: int,
+    source_work_item_id: str | None = None,
+    source_task_id: str | None = None,
+    source_role_id: str | None = None,
+    source_cell_id: str | None = None,
+) -> bool:
+    """Refresh a dependency frontier using mandatory generation fencing.
+
+    This is intentionally a separate entry point from the generic admin/
+    recovery refresh.  A company controller cannot accidentally fall back to
+    an unfenced write: every mutation is routed through the Store's atomic
+    owner-token/generation CAS.
+    """
+
+    clean_run_id = str(run_id or "").strip()
+    clean_project_id = str(project_id or "default").strip() or "default"
+    owner_token = str(controller_owner_token or "").strip()
+    generation = int(controller_lease_generation or 0)
+    if not clean_run_id or not owner_token or generation <= 0:
+        raise CompanyRunControllerLeaseLost(
+            "dependency frontier refresh lacks an exact controller lease"
+        )
+    if not callable(
+        getattr(
+            store,
+            "update_delegation_work_item_dependency_frontier_for_controller",
+            None,
+        )
+    ):
+        raise CompanyRunControllerLeaseLost(
+            "Store lacks the atomic controller dependency-frontier API"
+        )
+    return await _refresh_dependents_for_run(
+        store,
+        run_id=clean_run_id,
+        source_work_item_id=source_work_item_id,
+        source_task_id=source_task_id,
+        source_role_id=source_role_id,
+        source_cell_id=source_cell_id,
+        controller_credential=(clean_project_id, owner_token, generation),
+    )
+
+
+async def _refresh_dependents_for_run(
+    store: Any,
+    *,
+    run_id: str,
+    source_work_item_id: str | None,
+    source_task_id: str | None,
+    source_role_id: str | None,
+    source_cell_id: str | None,
+    controller_credential: tuple[str, str, int] | None,
+) -> bool:
     """Walk all work items in ``run_id`` and propagate dependency state
     to parent phases.
 
@@ -951,14 +1019,47 @@ async def refresh_dependents_for_run(
         store, "update_delegation_work_item"
     ):
         return False
+
+    async def apply_frontier_update(
+        expected_item: DelegationWorkItem,
+        **kwargs: Any,
+    ) -> tuple[bool, DelegationWorkItem | None]:
+        if controller_credential is None:
+            updated = await store.update_delegation_work_item(
+                expected_item.work_item_id,
+                **kwargs,
+            )
+            # Preserve the historical generic-store contract: lightweight
+            # test/admin stores sometimes return None after a successful
+            # write. Controller writes, by contrast, require a positive CAS
+            # result and never infer success from a method return convention.
+            return True, updated
+        project_id, owner_token, generation = controller_credential
+        updated = (
+            await store.update_delegation_work_item_dependency_frontier_for_controller(
+                expected_item,
+                project_id=project_id,
+                controller_owner_token=owner_token,
+                controller_lease_generation=generation,
+                **kwargs,
+            )
+        )
+        return updated is not None, updated
+
     in_flight = _REFRESH_IN_FLIGHT.get()
     if run_id in in_flight:
+        if controller_credential is not None:
+            raise RuntimeError(
+                "controller dependency refresh is already in flight"
+            )
         return False
     token = _REFRESH_IN_FLIGHT.set(in_flight | {run_id})
     try:
         try:
             work_items = await store.list_delegation_work_items(run_id)
         except Exception:
+            if controller_credential is not None:
+                raise
             logger.opt(exception=True).debug(
                 f"refresh_dependents_for_run: list_delegation_work_items failed run={run_id}"
             )
@@ -1161,8 +1262,8 @@ async def refresh_dependents_for_run(
                 metadata_updates["claimed_task_id"] = ""
             if target_phase != work_item.phase or metadata_updates:
                 try:
-                    await store.update_delegation_work_item(
-                        work_item.work_item_id,
+                    did_update, updated_item = await apply_frontier_update(
+                        work_item,
                         phase=target_phase if target_phase != work_item.phase else None,
                         blocked_reason="" if (all_approved or settlement_release) else None,
                         metadata_updates=metadata_updates or None,
@@ -1170,8 +1271,19 @@ async def refresh_dependents_for_run(
                         claimed_by_role_runtime_session_id="" if clear_claim_on_wake else None,
                         claimed_by_seat_id="" if clear_claim_on_wake else None,
                     )
-                    changed = True
+                    changed = changed or did_update
+                    if controller_credential is not None and not did_update:
+                        raise RuntimeError(
+                            "controller dependency frontier CAS lost for "
+                            f"{work_item.work_item_id}"
+                        )
+                    if updated_item is not None:
+                        work_item_by_id[work_item.work_item_id] = updated_item
+                except CompanyRunControllerLeaseLost:
+                    raise
                 except Exception:
+                    if controller_credential is not None:
+                        raise
                     logger.opt(exception=True).debug(
                         "refresh_dependents_for_run: update_delegation_work_item failed "
                         f"wid={work_item.work_item_id}"
@@ -1245,27 +1357,69 @@ async def refresh_dependents_for_run(
             cascade_complete = True
             for cancel_id in sorted(cancel_ids):
                 try:
-                    await transition_work_item(
-                        store,
-                        cancel_id,
-                        target_phase=Phase.CANCELLED,
-                        reason="upstream_dependency_failed_parent_settled",
-                        release_claim=True,
-                    )
-                    changed = True
+                    if controller_credential is None:
+                        await transition_work_item(
+                            store,
+                            cancel_id,
+                            target_phase=Phase.CANCELLED,
+                            reason="upstream_dependency_failed_parent_settled",
+                            release_claim=True,
+                        )
+                        changed = True
+                    else:
+                        cancel_item = work_item_by_id[cancel_id]
+                        cancel_metadata = {
+                            **build_attempt_settlement_updates(
+                                dict(cancel_item.metadata or {}),
+                                outcome=Phase.CANCELLED.value,
+                            ),
+                            "last_transition_reason": (
+                                "upstream_dependency_failed_parent_settled"
+                            ),
+                            "claimed_by_role_session_id": "",
+                            "claimed_task_id": "",
+                        }
+                        did_update, updated_item = await apply_frontier_update(
+                            cancel_item,
+                            phase=Phase.CANCELLED,
+                            metadata_updates=cancel_metadata,
+                            claimed_by_role_runtime_session_id="",
+                            claimed_by_seat_id="",
+                        )
+                        cascade_complete = cascade_complete and did_update
+                        if not did_update:
+                            raise RuntimeError(
+                                "controller settlement cascade CAS lost for "
+                                f"{cancel_id}"
+                            )
+                        changed = changed or did_update
+                        if updated_item is not None:
+                            work_item_by_id[cancel_id] = updated_item
+                except CompanyRunControllerLeaseLost:
+                    raise
                 except Exception:
+                    if controller_credential is not None:
+                        raise
                     cascade_complete = False
                     logger.opt(exception=True).debug(
                         "refresh_dependents_for_run: settlement cascade cancel failed "
                         f"wid={cancel_id}"
                     )
             if not cascade_complete:
+                if controller_credential is not None:
+                    raise RuntimeError(
+                        "controller dependency settlement cascade incomplete"
+                    )
                 # Leave cascaded_at unset so the next refresh retries the
                 # leftover cancels instead of permanently orphaning them.
                 continue
             try:
-                await store.update_delegation_work_item(
+                cascade_owner = work_item_by_id.get(
                     work_item.work_item_id,
+                    work_item,
+                )
+                did_update, updated_item = await apply_frontier_update(
+                    cascade_owner,
                     metadata_updates={
                         "dependency_settlement": {
                             **settlement,
@@ -1273,12 +1427,28 @@ async def refresh_dependents_for_run(
                         }
                     },
                 )
+                changed = changed or did_update
+                if controller_credential is not None and not did_update:
+                    raise RuntimeError(
+                        "controller settlement cascade stamp CAS lost for "
+                        f"{work_item.work_item_id}"
+                    )
+                if updated_item is not None:
+                    work_item_by_id[work_item.work_item_id] = updated_item
+            except CompanyRunControllerLeaseLost:
+                raise
             except Exception:
+                if controller_credential is not None:
+                    raise
                 logger.opt(exception=True).debug(
                     "refresh_dependents_for_run: settlement cascade stamp failed "
                     f"wid={work_item.work_item_id}"
                 )
-        if changed and hasattr(store, "save_delegation_event"):
+        if (
+            changed
+            and controller_credential is None
+            and hasattr(store, "save_delegation_event")
+        ):
             try:
                 await store.save_delegation_event(
                     DelegationEvent(

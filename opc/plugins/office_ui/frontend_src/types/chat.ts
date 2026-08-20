@@ -201,7 +201,7 @@ export interface ReorgCheckpointMeta {
   user_confirmation_required: boolean
 }
 
-export interface HumanEscalationOption {
+export interface InteractionOption {
   id: string
   label: string
   description?: string
@@ -234,7 +234,6 @@ export interface TaskUserInputAnswer {
 export interface CheckpointReplyMetadata {
   response_to_checkpoint_id?: string
   response_to_checkpoint_type?: string
-  response_to_escalation_id?: string
   ui_message_id?: string
   checkpoint_reply_kind?: 'approve' | 'deny' | 'feedback' | 'ignore'
   self_evolution_trigger?: boolean
@@ -244,17 +243,64 @@ export interface CheckpointReplyMetadata {
   staffing_action?: 'manual_approve' | 'auto_recruit' | 'deny'
   staffing_selections?: Record<string, StaffingSelectionValue>
   user_input_answers?: Record<string, TaskUserInputAnswer>
+  interaction_option_id?: string
+  interaction_option_label?: string
+  interaction_requester_task_id?: string
+  interaction_requester_session_id?: string
 }
 
-export interface HumanEscalationMeta {
-  checkpoint_type: 'human_escalation'
+/** Metadata accepted by the ordinary chat composer transport. */
+export interface SessionSendMetadata {
+  ui_message_id?: string
+}
+
+export interface InteractionDecision {
+  text: string
+  option_id?: string
+  option_label?: string
+  checkpoint_reply_kind?: CheckpointReplyMetadata['checkpoint_reply_kind']
+  self_evolution_trigger?: boolean
+  human_feedback_text?: string
+  recruitment_role_agents?: Record<string, TaskPreferredAgent>
+  recruitment_agent?: TaskPreferredAgent
+  staffing_action?: CheckpointReplyMetadata['staffing_action']
+  staffing_selections?: Record<string, StaffingSelectionValue>
+  user_input_answers?: Record<string, TaskUserInputAnswer>
+}
+
+export interface InteractionReplyRequest {
+  checkpointId: string
+  checkpointType: string
+  clientRequestId: string
+  requesterTaskId?: string
+  requesterSessionId?: string
+  decision: InteractionDecision
+}
+
+export interface InteractionReplyReceipt {
+  ok: boolean
+  accepted: boolean
+  deduplicated?: boolean
+  status?: string
+  reason?: string
+  error?: string
   checkpoint_id: string
-  escalation_id: string
-  escalation_type: string
+  checkpoint_type: string
+  client_request_id: string
+}
+
+export interface PermissionCheckpointMeta {
+  checkpoint_type: 'tool_permission' | 'action_permission'
+  checkpoint_id: string
   prompt: string
   summary: string
-  options: HumanEscalationOption[]
+  options: InteractionOption[]
   default_action?: string
+  tool_call_id?: string
+  tool_name?: string
+  tool_risk_level?: string
+  action_kind?: string
+  action_name?: string
 }
 
 export interface CompanyWorkItemGateMeta {
@@ -266,13 +312,20 @@ export interface CompanyWorkItemGateMeta {
   company_profile?: string
   summary?: string
   prompt?: string
-  options?: HumanEscalationOption[]
+  options?: InteractionOption[]
   default_action?: string
   runtime_session_id?: string
   resume_cursor?: number
   active_subagents?: Array<Record<string, unknown>>
   permission_requests?: Array<Record<string, unknown>>
   worktree_path?: string
+  tool_call_id?: string
+  tool_name?: string
+  tool_risk_level?: string
+  action_kind?: string
+  action_name?: string
+  interaction_requester_task_id?: string
+  interaction_requester_session_id?: string
 }
 
 export interface CompanyDeliveryFeedbackMeta {
@@ -285,7 +338,7 @@ export interface CompanyDeliveryFeedbackMeta {
   feedback_scope?: string
   summary?: string
   prompt?: string
-  options?: HumanEscalationOption[]
+  options?: InteractionOption[]
   runtime_session_id?: string
   resume_cursor?: number
   active_subagents?: Array<Record<string, unknown>>
@@ -324,7 +377,7 @@ export type CheckpointMeta =
   | ReorgCheckpointMeta
   | CompanyWorkItemGateMeta
   | CompanyDeliveryFeedbackMeta
-  | HumanEscalationMeta
+  | PermissionCheckpointMeta
   | TaskUserInputCheckpointMeta
 
 // ── General message metadata ──────────────────────────────────────────────
@@ -390,11 +443,11 @@ export interface ChatMessageMeta {
   work_item_projection_changes?: ReorgWorkItemProjectionChange[]
   impact_summary?: Record<string, any>
   user_confirmation_required?: boolean
-  // Human escalation fields
+  // Typed owner-interaction fields
   escalation_id?: string
   escalation_type?: string
   prompt?: string
-  options?: HumanEscalationOption[]
+  options?: InteractionOption[]
   default_action?: string
   // Generic task user input checkpoint fields
   questions?: string[]
@@ -415,6 +468,14 @@ export interface ChatMessageMeta {
   active_subagents?: Array<Record<string, unknown>>
   permission_requests?: Array<Record<string, unknown>>
   worktree_path?: string
+  // Typed tool/external-action permission fields
+  tool_call_id?: string
+  tool_name?: string
+  tool_risk_level?: string
+  action_kind?: string
+  action_name?: string
+  interaction_requester_task_id?: string
+  interaction_requester_session_id?: string
   // User reply linkage for checkpoint panels
   response_to_checkpoint_id?: string
   response_to_checkpoint_type?: string

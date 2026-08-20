@@ -7,12 +7,23 @@ import type { ChatMessage } from '../types/chat'
 import { progressEntryKey } from '../lib/progressEntryKey'
 
 const messageListSource = readFileSync(new URL('./MessageList.tsx', import.meta.url), 'utf8')
+const workspacePageSource = readFileSync(new URL('../workspace/WorkspacePage.tsx', import.meta.url), 'utf8')
 const supportedScrollPolicies: MessageScrollPolicy[] = ['follow', 'initial-bottom', 'manual']
 assert.deepEqual(supportedScrollPolicies, ['follow', 'initial-bottom', 'manual'])
 assert.match(
   messageListSource,
   /export type MessageScrollPolicy = 'follow' \| 'initial-bottom' \| 'manual'/,
   'MessageList must expose one unambiguous three-state scroll policy',
+)
+assert.doesNotMatch(
+  workspacePageSource,
+  /latestPendingReplyMetadata|checkpointReplyMetadataForComposer/,
+  'ordinary composer sends must never inherit an owner checkpoint decision',
+)
+assert.match(
+  workspacePageSource,
+  /checkpointRequesterSessionId[\s\S]*requesterSessionId/,
+  'taskless interaction cards must submit their durable UI-anchor session actor',
 )
 assert.match(messageListSource, /scrollPolicy = 'follow'/, 'main transcript behavior should default to follow mode')
 assert.doesNotMatch(messageListSource, /useVirtualizer/, 'chat transcript must use stable normal DOM rows')
@@ -21,6 +32,11 @@ assert.doesNotMatch(
   messageListSource,
   /seenNarrativeMessages|seenProjectUpdates/,
   'MessageList must not independently remove durable rows using rendered content',
+)
+assert.match(
+  messageListSource,
+  /\['tool_permission', 'action_permission'\]\.includes\(checkpointType\)/,
+  'tool and external-action permissions must share the typed approval panel',
 )
 assert.match(
   messageListSource,

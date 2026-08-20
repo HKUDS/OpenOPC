@@ -12,6 +12,7 @@ import sys
 import tempfile
 import unittest
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import AsyncMock, patch
 
 from opc.core.config import ExternalAgentConfig
@@ -626,65 +627,71 @@ class ExternalAgentMonitoringTests(unittest.IsolatedAsyncioTestCase):
                 "sys.stdout.flush()\n"
                 "time.sleep(30)\n"
             )
-            run_task = asyncio.create_task(broker.run(adapter, task, tmpdir))
-            role_state = None
-            for _ in range(200):
-                role_state = await store.get_role_session_adapter_state(
-                    role_session_id,
-                    "script_agent",
-                )
-                if role_state and role_state.get("resume_session_id"):
-                    break
-                await asyncio.sleep(0.01)
-            self.assertIsNotNone(role_state)
-            assert role_state is not None
-            self.assertEqual(
-                role_state["resume_session_id"],
-                "provider-live-thread",
+            result = await broker.run(adapter, task, tmpdir)
+            self.assertEqual(result.status, TaskStatus.FAILED)
+            self.assertTrue(
+                result.artifacts["company_native_execution_required"]
             )
-            self.assertFalse(run_task.done())
+            self.assertFalse(result.artifacts["external_process_started"])
+            role_state = await store.get_role_session_adapter_state(
+                role_session_id,
+                "script_agent",
+            )
+            self.assertIsNone(role_state)
+            await store.close()
 
-            engine = OPCEngine()
-            engine.project_id = "proj1"
-            engine.store = store
-            await engine.suspend_company_runtime(
-                origin_task_id="ui-live",
-                session_id=parent_session_id,
-                reason="user_stop",
+    async def test_external_launch_reloads_task_after_approval_wait(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = OPCStore(Path(tmpdir) / "tasks.db")
+            await store.initialize()
+            task = Task(
+                id="ordinary-converted-during-approval",
+                title="ordinary before approval",
+                project_id="proj1",
+                metadata={"execution_mode": "task_mode"},
             )
-            checkpoint = (
-                await store.get_pending_checkpoints(
-                    project_id="proj1",
-                    session_id=parent_session_id,
-                    checkpoint_types=["company_runtime_suspended"],
-                )
-            )[0]
-            captured = checkpoint.payload["external_sessions"][task.id]
-            self.assertEqual(
-                captured["resume_session_id"],
-                "provider-live-thread",
-            )
-            self.assertEqual(
-                captured["provider_session_id"],
-                "provider-live-thread",
-            )
+            await store.save_task(task)
 
-            run_task.cancel()
-            with self.assertRaises(asyncio.CancelledError):
-                await run_task
+            class ConvertingApproval(_ApprovalStub):
+                async def authorize_external_action(
+                    self,
+                    task,
+                    agent_name,
+                    metadata,
+                    on_progress=None,
+                ):
+                    _ = agent_name, metadata, on_progress
+                    durable = await store.get_task(task.id)
+                    assert durable is not None
+                    durable.metadata = {
+                        **dict(durable.metadata or {}),
+                        "execution_mode": "company_mode",
+                        "company_profile": "corporate",
+                    }
+                    await store.save_task(durable)
+                    return await super().authorize_external_action(
+                        task,
+                        "script_agent",
+                        {},
+                    )
 
-            resumed_task = await store.get_task(task.id)
-            assert resumed_task is not None
-            resume_adapter = _ScriptAdapter("print('unused')")
-            resume_adapter.config.resume_session_flag = "--resume"
-            await broker._restore_session_resume_from_store(
-                resume_adapter,
-                resumed_task,
+            adapter = _ScriptAdapter("print('must not start')")
+            adapter.start_process = AsyncMock(
+                side_effect=AssertionError("external process started")
             )
-            self.assertEqual(resume_adapter.config.session_mode, "resume")
+            broker = ExternalAgentBroker(store, ConvertingApproval())
+
+            result = await broker.run(adapter, task, tmpdir)
+
+            self.assertEqual(result.status, TaskStatus.FAILED)
+            self.assertTrue(
+                result.artifacts["company_native_execution_required"]
+            )
+            self.assertFalse(result.artifacts["external_process_started"])
+            adapter.start_process.assert_not_awaited()
             self.assertEqual(
-                resume_adapter.config.session_id,
-                "provider-live-thread",
+                await store.list_external_sessions(project_id="proj1"),
+                [],
             )
             await store.close()
 
@@ -711,7 +718,6 @@ class ExternalAgentMonitoringTests(unittest.IsolatedAsyncioTestCase):
                 assigned_external_agent="codex",
                 status=TaskStatus.RUNNING,
                 metadata={
-                    "work_item_runtime": True,
                     "delegation_role_session_id": role_session_id,
                     "delegation_seat_id": "seat-codex-live",
                 },
@@ -734,7 +740,7 @@ class ExternalAgentMonitoringTests(unittest.IsolatedAsyncioTestCase):
                             "import json,sys,time\n"
                             "print(json.dumps({'type':'thread.started','thread_id':'thread-real-codex'}))\n"
                             "sys.stdout.flush()\n"
-                            "time.sleep(30)\n"
+                            "time.sleep(.1)\n"
                         ),
                         stdout=asyncio.subprocess.PIPE,
                         stderr=asyncio.subprocess.PIPE,
@@ -759,9 +765,11 @@ class ExternalAgentMonitoringTests(unittest.IsolatedAsyncioTestCase):
             assert state is not None
             self.assertEqual(state["resume_session_id"], "thread-real-codex")
 
-            run_task.cancel()
-            with self.assertRaises(asyncio.CancelledError):
-                await run_task
+            # A provider-stream token is not resumable while its producing
+            # invocation is still running.  Let the ordinary invocation exit
+            # cleanly and durably settle before cross-invocation restore.
+            completed = await run_task
+            self.assertEqual(completed.status, TaskStatus.DONE)
 
             resume_adapter = CodexAdapter()
             resumed_task = await store.get_task(task.id)
@@ -2229,6 +2237,58 @@ class ExternalAgentMonitoringTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(prompt["action_name"], "shell_exec")
             self.assertTrue(prompt["approved"])
             self.assertEqual(prompt["human_reply"], "always_global")
+            invocation_id = str(result.artifacts["external_invocation_id"])
+            self.assertTrue(invocation_id)
+            self.assertEqual(
+                approval.external_calls[0]["metadata"]["source_event_id"],
+                f"external-agent-invocation:{task.id}:{invocation_id}",
+            )
+            self.assertEqual(
+                approval.tool_calls[0]["metadata"]["source_event_id"],
+                f"external-prompt:{invocation_id}:stdout:1",
+            )
+            await store.close()
+
+    async def test_new_external_process_gets_new_approval_event_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = _SessionStoreStub()
+            approval = _ApprovalPromptStub(allow_tool=True)
+            broker = ExternalAgentBroker(store, approval)
+            task = Task(title="repeated provider prompt", project_id="proj1")
+
+            def adapter() -> _PromptScriptAdapter:
+                return _PromptScriptAdapter(
+                    "import sys\n"
+                    "print('PROMPT shell_exec')\n"
+                    "sys.stdout.flush()\n"
+                    "sys.stdin.readline()\n",
+                    request_line="PROMPT shell_exec",
+                    approval_request=ExternalApprovalRequest(
+                        approval_scope="tool",
+                        action_name="shell_exec",
+                        prompt_text="Allow validation?",
+                        arguments={"command": "python3 -m json.tool report.json"},
+                    ),
+                )
+
+            first = await broker.run(adapter(), task, tmpdir)
+            second = await broker.run(adapter(), task, tmpdir)
+
+            first_invocation = str(first.artifacts["external_invocation_id"])
+            second_invocation = str(second.artifacts["external_invocation_id"])
+            self.assertNotEqual(first_invocation, second_invocation)
+            prompt_event_ids = [
+                str(call["metadata"]["source_event_id"])
+                for call in approval.tool_calls
+            ]
+            self.assertEqual(
+                prompt_event_ids,
+                [
+                    f"external-prompt:{first_invocation}:stdout:1",
+                    f"external-prompt:{second_invocation}:stdout:1",
+                ],
+            )
+            self.assertEqual(len(set(prompt_event_ids)), 2)
             await store.close()
 
     async def test_broker_skips_approval_prompts_when_adapter_bridge_is_disabled(self) -> None:
@@ -4812,7 +4872,6 @@ class ExternalAgentMonitoringTests(unittest.IsolatedAsyncioTestCase):
                 metadata={
                     "mode": "task",
                     "execution_mode": ExecutionMode.TASK_MODE.value,
-                    "work_item_role_id": "task_generalist",
                     "workspace_root": tmpdir,
                     "comms_workspace_root": tmpdir,
                     "comms_root": os.path.join(tmpdir, ".opc-comms"),
@@ -5063,33 +5122,11 @@ class ExternalAgentMonitoringTests(unittest.IsolatedAsyncioTestCase):
             ):
                 result = await broker.run(adapter, task, tmpdir)
 
-            self.assertEqual(result.status, TaskStatus.DONE)
-            env = adapter.started_envs[-1]
-            self.assertEqual(env["OPC_COLLAB_PROFILE"], "manager_default")
-            self.assertEqual(env["OPC_MAILBOX_MODE"], "runtime_owned")
-            self.assertEqual(env["OPC_WORK_ITEM_ID"], "wi-cto-current")
-            self.assertEqual(env["OPC_RUNTIME_TASK_ID"], task.id)
-            allowed = set(json.loads(env["OPC_ALLOWED_COLLAB_TOOLS"]))
-            self.assertIn("delegate_work", allowed)
-            self.assertIn("modify_work_item", allowed)
-            self.assertIn("delete_work_item", allowed)
-            self.assertIn("manager_board_read", allowed)
-            self.assertNotIn("read_inbox", allowed)
-            self.assertEqual(env["OPC_COLLAB_CLI"], str(fake_cli))
-            self.assertTrue(env["PATH"].startswith(str(fake_bin) + os.pathsep))
-            self.assertIn("OPC_COLLAB_RPC_TRANSPORT", env)
-            self.assertIn("OPC_COLLAB_RPC_TOKEN", env)
-            if env["OPC_COLLAB_RPC_TRANSPORT"] == "tcp":
-                self.assertEqual(env["OPC_COLLAB_RPC_HOST"], "127.0.0.1")
-                self.assertTrue(int(env["OPC_COLLAB_RPC_PORT"]) > 0)
-                self.assertNotIn("OPC_COLLAB_RPC_PATH", env)
-            else:
-                self.assertEqual(env["OPC_COLLAB_RPC_TRANSPORT"], "fifo")
-                self.assertIn("OPC_COLLAB_RPC_PATH", env)
-            self.assertIn("OPC_MEMORY_ROOT", env)
-            self.assertIn("OPC_GLOBAL_MEMORY_PATH", env)
-            self.assertIn("OPC_PROJECT_MEMORY_PATH", env)
-            self.assertEqual(Path(env["OPC_PROJECT_MEMORY_PATH"]).name, "proj1.md")
+            self.assertEqual(result.status, TaskStatus.FAILED)
+            self.assertTrue(
+                result.artifacts["company_native_execution_required"]
+            )
+            self.assertEqual(adapter.started_envs, [])
 
     async def test_external_broker_reports_collaboration_rpc_setup_failure_cleanly(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -5129,10 +5166,11 @@ class ExternalAgentMonitoringTests(unittest.IsolatedAsyncioTestCase):
                 result = await broker.run(adapter, task, tmpdir)
 
             self.assertEqual(result.status, TaskStatus.FAILED)
-            self.assertIn("Company collaboration RPC setup failed", result.content)
+            self.assertIn("requires the native runtime", result.content)
             self.assertEqual(adapter.started_envs, [])
-            self.assertFalse(result.artifacts["collaboration_rpc"]["enabled"])
-            self.assertIn("FIFO collaboration RPC is unavailable", result.artifacts["collaboration_rpc"]["error"])
+            self.assertTrue(
+                result.artifacts["company_native_execution_required"]
+            )
 
     async def test_collab_cli_routes_all_tools_through_broker_rpc_when_available(self) -> None:
         from opc import cli_collab
@@ -5367,18 +5405,18 @@ class ExternalAgentMonitoringTests(unittest.IsolatedAsyncioTestCase):
             ):
                 result = await broker.run(adapter, task, tmpdir)
 
-            self.assertEqual(result.status, TaskStatus.DONE, result.content)
-            self.assertIn('"parent_board_scope"', result.content)
-            self.assertIn('"delegated"', result.content)
+            self.assertEqual(result.status, TaskStatus.FAILED, result.content)
+            self.assertTrue(
+                result.artifacts["company_native_execution_required"]
+            )
+            self.assertEqual(adapter.started_envs, [])
             children = await store.list_manager_board(
                 "run-1",
                 manager_seat_id="seat::team::ceo::ceo",
                 parent_work_item_id="parent-item",
             )
-            self.assertEqual(len(children), 1)
-            self.assertEqual(children[0].role_id, "cto")
-            self.assertIn("wake", hook_calls)
-            self.assertIn("kanban", hook_calls)
+            self.assertEqual(children, [])
+            self.assertEqual(hook_calls, [])
             await store.close()
 
     async def test_collab_runtime_client_open_does_not_sweep_claims(self) -> None:
@@ -5489,16 +5527,11 @@ class ExternalAgentMonitoringTests(unittest.IsolatedAsyncioTestCase):
 
             result = await broker.run(adapter, task, tmpdir)
 
-            self.assertEqual(result.status, TaskStatus.DONE)
-            env = adapter.started_envs[-1]
-            allowed = set(json.loads(env["OPC_ALLOWED_COLLAB_TOOLS"]))
-            self.assertIn("delegate_work", allowed)
-            self.assertIn("manager_board_read", allowed)
-            self.assertNotIn("route_work", allowed)
-            self.assertNotIn("propose_runtime_replan", allowed)
-            self.assertNotIn("propose_task_adjustment", allowed)
-            self.assertNotIn("find_and_ask_expert", allowed)
-            self.assertNotIn("ask_peer_and_wait", allowed)
+            self.assertEqual(result.status, TaskStatus.FAILED)
+            self.assertTrue(
+                result.artifacts["company_native_execution_required"]
+            )
+            self.assertEqual(adapter.started_envs, [])
 
     async def test_execute_task_preserves_task_result_when_retry_is_cancelled(self) -> None:
         engine = OPCEngine()

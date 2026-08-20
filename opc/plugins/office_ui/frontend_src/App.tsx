@@ -714,6 +714,7 @@ export default function App() {
     setExecutionPanelTaskId(null)
     setCommsState(null)
     setCommsMessage(null)
+    setReorgProposals([])
   }, [boardStore, chatStore, clearPendingSessionCreate, clearPendingSessionDetailRefreshes, normalizeProjectId, sessionStore])
 
   const beginProjectSwitch = useCallback((projectId: string): string => {
@@ -1827,6 +1828,7 @@ export default function App() {
         setEmployeeDetail(payload)
       },
       onReorgList: (payload) => {
+        if (!payloadMatchesActiveProject(payload as unknown as Record<string, unknown>, false)) return
         setReorgProposals(payload.proposals ?? [])
       },
       onOrgConfigExport: (payload) => {
@@ -2512,7 +2514,11 @@ export default function App() {
             const { project_id: _ignoredProjectId, ...scopedOpts } = opts ?? {}
             clientRef.current?.commsState(getActiveProjectId(), scopedOpts)
           }}
-          onCommsReadMessage={(path) => clientRef.current?.commsReadMessage(getActiveProjectId(), path)}
+          onCommsReadMessage={(path) => clientRef.current?.commsReadMessage(
+            getActiveProjectId(),
+            path,
+            commsState,
+          )}
           onRunTask={(taskId, title, desc, mode, profile) => {
             clientRef.current?.send({ type: 'run_task', project_id: getActiveProjectId(), task_id: taskId, title, description: desc, mode, profile })
           }}
@@ -2536,6 +2542,20 @@ export default function App() {
             )
           }}
           onSessionSend={(taskId, content, attachments, metadata) => clientRef.current?.sessionSend(getActiveProjectId(), taskId, content, attachments, metadata)}
+          onInteractionReply={(request) => {
+            const client = clientRef.current
+            if (!client) {
+              return Promise.resolve({
+                ok: false,
+                accepted: false,
+                error: 'socket_unavailable',
+                checkpoint_id: request.checkpointId,
+                checkpoint_type: request.checkpointType,
+                client_request_id: request.clientRequestId,
+              })
+            }
+            return client.interactionReply(getActiveProjectId(), request)
+          }}
           onSecretarySend={(content) => clientRef.current?.secretarySend(getActiveProjectId(), content)}
           onDeleteSession={(taskId) => clientRef.current?.deleteSession(getActiveProjectId(), taskId)}
           onTitleChange={(taskId, title) => clientRef.current?.sessionUpdateTitle(getActiveProjectId(), taskId, title)}
@@ -2588,8 +2608,50 @@ export default function App() {
             }}
             hiringTemplateId={hiringTemplateId}
             onImportEmployee={(empId) => clientRef.current?.importEmployeeAsAgent(empId)}
-            onRequestReorgList={() => clientRef.current?.reorgList()}
-            onReorgDecide={(pid, approved, notes) => clientRef.current?.reorgDecide(pid, approved, notes)}
+            onRequestReorgList={() => {
+              const projectId = getActiveProjectId()
+              clientRef.current?.reorgList(projectId)
+            }}
+            onReorgDecide={(proposal, approved, notes) => {
+              const client = clientRef.current
+              const activeProjectId = getActiveProjectId()
+              const checkpointType = proposal.checkpoint_type || 'company_reorg_pending'
+              const clientRequestId = [
+                'org-reorg',
+                proposal.proposal_id,
+                Date.now().toString(36),
+                Math.random().toString(36).slice(2),
+              ].join('-')
+              if (
+                !client
+                || !proposal.checkpoint_id
+                || proposal.checkpoint_status !== 'pending'
+                || proposal.project_id !== activeProjectId
+              ) {
+                return Promise.resolve({
+                  ok: false,
+                  accepted: false,
+                  error: 'reorg_checkpoint_unavailable',
+                  checkpoint_id: proposal.checkpoint_id,
+                  checkpoint_type: checkpointType,
+                  client_request_id: clientRequestId,
+                })
+              }
+              return client.interactionReply(activeProjectId, {
+                checkpointId: proposal.checkpoint_id,
+                checkpointType,
+                clientRequestId,
+                requesterTaskId: proposal.requester_task_id || undefined,
+                requesterSessionId: proposal.requester_session_id || undefined,
+                decision: {
+                  text: notes?.trim() || (approved ? 'approve' : 'deny'),
+                  option_id: approved ? 'approve' : 'deny',
+                },
+              }).then((receipt) => {
+                if (receipt.accepted) client.reorgList(activeProjectId)
+                return receipt
+              })
+            }}
             onMarketExport={(data) => clientRef.current?.marketExport(data)}
             onMarketInstall={(path, strategy) => clientRef.current?.marketInstall(path, strategy)}
             onMarketUninstall={(pkgId) => clientRef.current?.marketUninstall(pkgId)}

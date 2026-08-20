@@ -10,6 +10,7 @@ work items skip the report step (they don't need one).
 
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -736,11 +737,24 @@ class ReviewChainRecoveryTests(unittest.IsolatedAsyncioTestCase):
                 "followups": [],
             }
         )
-        await self.store.update_delegation_work_item(
-            "wi-child",
-            phase=Phase.AWAITING_HUMAN,
-            metadata_updates={"human_checkpoint_sentinel": "must-survive"},
+        # Model a concurrently-persisted owner gate without teaching the
+        # public state machine the retired manager-review -> human edge.
+        # Imported databases can still contain this phase, and a late normal
+        # manager verdict must never overwrite it.
+        parent_before = await self.store.get_delegation_work_item("wi-child")
+        self.assertIsNotNone(parent_before)
+        legacy_metadata = dict(parent_before.metadata or {})
+        legacy_metadata["human_checkpoint_sentinel"] = "must-survive"
+        await self.store._db.execute(  # noqa: SLF001 - deliberate legacy DB fixture
+            "UPDATE delegation_work_items SET phase = ?, metadata = ? "
+            "WHERE work_item_id = ?",
+            (
+                Phase.AWAITING_HUMAN.value,
+                json.dumps(legacy_metadata),
+                "wi-child",
+            ),
         )
+        await self.store._db.commit()  # noqa: SLF001 - deliberate legacy DB fixture
 
         await self.executor._finalize_review_work_item(review_task)
 

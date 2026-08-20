@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import tempfile
 import unittest
@@ -19,6 +20,7 @@ from opc.core.models import (
 )
 from opc.database.store import OPCStore
 from opc.engine import OPCEngine
+from opc.layer0_interaction.coordinator import InteractionCoordinator
 from opc.layer2_organization.company_mode import CompanyRuntimeSpecBuilder
 from opc.layer2_organization.org_engine import (
     OrgEngine,
@@ -334,6 +336,13 @@ class CompanyRecruiterFlowTests(unittest.IsolatedAsyncioTestCase):
         await store.initialize()
         engine = OPCEngine(config=config, opc_home=root, project_id="proj1")
         engine.store = store
+        engine.interaction_coordinator = InteractionCoordinator(
+            store=store,
+            project_id="proj1",
+            checkpoint_changed_callback=engine._interaction_checkpoint_changed,
+            orphaned_answer_callback=engine._schedule_interaction_consumption,
+        )
+        self.addAsyncCleanup(engine.interaction_coordinator.shutdown)
         engine.memory = MemoryManager(root, "proj1", store=store)
         engine.org_engine = OrgEngine(config, root)
         engine.talent_market = TalentMarket(root, config)
@@ -740,6 +749,44 @@ class CompanyRecruiterFlowTests(unittest.IsolatedAsyncioTestCase):
             )
 
             self.assertIn("runtime executed", result)
+            runtime_root_task = engine.company_executor.calls[-1][1][0]
+            origin_interaction = dict(
+                runtime_root_task.metadata.get(
+                    "origin_owner_interaction", {}
+                )
+                or {}
+            )
+            self.assertEqual(
+                origin_interaction["checkpoint_type"],
+                "company_staffing_selection",
+            )
+            runs = await store.list_delegation_runs(
+                project_id="proj1",
+                session_id="sess-defaults-1",
+            )
+            self.assertEqual(len(runs), 1)
+            self.assertEqual(
+                runs[0].metadata["origin_owner_interaction"],
+                origin_interaction,
+            )
+            origin_checkpoint = await store.get_execution_checkpoint(
+                origin_interaction["checkpoint_id"],
+                project_id="proj1",
+                checkpoint_type="company_staffing_selection",
+            )
+            self.assertIsNotNone(origin_checkpoint)
+            assert origin_checkpoint is not None
+            completion = dict(
+                origin_checkpoint.payload["interaction"]["completion"]
+            )
+            self.assertEqual(origin_checkpoint.status, "resolved")
+            self.assertEqual(
+                completion["claim_id"], origin_interaction["claim_id"]
+            )
+            self.assertEqual(
+                completion["consumer_id"],
+                origin_interaction["consumer_id"],
+            )
             defaults_path = root / "projects" / "proj1" / "company_staffing_defaults.json"
             self.assertTrue(defaults_path.exists())
             runtime_spec = engine.company_runtime_spec_builder.build_spec(
@@ -1108,8 +1155,13 @@ class CompanyRecruiterFlowTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertIn("Recruiter feedback so far", revised)
             self.assertNotEqual(checkpoint.checkpoint_id, old_checkpoint.checkpoint_id)
-            self.assertEqual(statuses[old_checkpoint.checkpoint_id], "superseded")
+            self.assertEqual(statuses[old_checkpoint.checkpoint_id], "resolved")
             self.assertEqual(statuses[checkpoint.checkpoint_id], "pending")
+            revised_interaction = dict(checkpoint.payload.get("interaction", {}) or {})
+            self.assertFalse(
+                {"decision", "claim", "execution", "completion"}
+                & set(revised_interaction)
+            )
             self.assertEqual(checkpoint.payload["previous_checkpoint_id"], old_checkpoint.checkpoint_id)
             self.assertEqual(checkpoint.payload["recruitment_revision"], 2)
             testing_proposals = [
@@ -1132,6 +1184,105 @@ class CompanyRecruiterFlowTests(unittest.IsolatedAsyncioTestCase):
                 testing_proposals[0].candidate.template_id,
             )
             self.assertTrue(meta["recruitment_rationales"][0]["rationale"])
+            await store.close()
+
+    async def test_duplicate_recruitment_feedback_creates_one_clean_revision(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            config = OPCConfig()
+            config.org.talent_templates = [
+                self._make_template(
+                    template_id="engineering-backend-architect",
+                    name="Backend Architect",
+                    category="engineering",
+                    domains=["backend", "api"],
+                    description="Backend architecture specialist.",
+                )
+            ]
+            engine, store = await self._build_engine(root, config, DummyRecruiterLLM())
+            await engine._execute_decision(
+                self._company_decision(),
+                "Build the backend API",
+                context=SimpleNamespace(
+                    default_channel="cli",
+                    origin_chat_id="",
+                    origin_thread_id="",
+                ),
+                session_id="sess-feedback-dedup",
+            )
+            await engine._maybe_resume_checkpoint(
+                "auto recruit",
+                "sess-feedback-dedup",
+                reply_metadata={"staffing_action": "auto_recruit"},
+            )
+            revision_one = await store.get_latest_pending_checkpoint(
+                "proj1",
+                "sess-feedback-dedup",
+            )
+            assert revision_one is not None
+            decision = {
+                "text": "Prefer stronger validation experience",
+                "checkpoint_reply_kind": "feedback",
+            }
+            receipts = await asyncio.gather(
+                engine.submit_checkpoint_decision(
+                    checkpoint_id=revision_one.checkpoint_id,
+                    checkpoint_type=revision_one.checkpoint_type,
+                    decision=decision,
+                    client_request_id="feedback-duplicate-a",
+                    requester_session_id="sess-feedback-dedup",
+                ),
+                engine.submit_checkpoint_decision(
+                    checkpoint_id=revision_one.checkpoint_id,
+                    checkpoint_type=revision_one.checkpoint_type,
+                    decision=decision,
+                    client_request_id="feedback-duplicate-b",
+                    requester_session_id="sess-feedback-dedup",
+                ),
+            )
+            self.assertTrue(all(receipt["accepted"] for receipt in receipts))
+            self.assertTrue(any(receipt["deduplicated"] for receipt in receipts))
+            for _ in range(100):
+                rows = await store.get_execution_checkpoints(
+                    project_id="proj1",
+                    session_id="sess-feedback-dedup",
+                    checkpoint_types=["company_recruitment_confirmation"],
+                )
+                revision_two = [
+                    row
+                    for row in rows
+                    if int(row.payload.get("recruitment_revision", 0) or 0) == 2
+                ]
+                revision_one_status = next(
+                    (
+                        row.status
+                        for row in rows
+                        if row.checkpoint_id == revision_one.checkpoint_id
+                    ),
+                    "",
+                )
+                if (
+                    revision_two
+                    and revision_two[0].status == "pending"
+                    and revision_one_status == "resolved"
+                ):
+                    break
+                await asyncio.sleep(0.01)
+            self.assertEqual(len(revision_two), 1)
+            self.assertEqual(revision_two[0].status, "pending")
+            self.assertEqual(
+                [
+                    row.status
+                    for row in rows
+                    if row.checkpoint_id == revision_one.checkpoint_id
+                ],
+                ["resolved"],
+            )
+            interaction = dict(revision_two[0].payload.get("interaction", {}) or {})
+            self.assertFalse(
+                {"decision", "claim", "execution", "completion"}
+                & set(interaction)
+            )
             await store.close()
 
     async def test_approve_recruitment_persists_hires_and_executes(self) -> None:
@@ -1193,6 +1344,12 @@ class CompanyRecruiterFlowTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(
                 tasks[0].metadata["delegation_playbook"]["recruitment_role_agent_overrides"]["senior_engineer"],
                 "codex",
+            )
+            self.assertEqual(
+                tasks[0].metadata["origin_owner_interaction"][
+                    "checkpoint_type"
+                ],
+                "company_recruitment_confirmation",
             )
             session = await store.get_session("sess-3")
             self.assertTrue(dict(session.metadata).get("recruitment_confirmation_completed"))
@@ -1589,7 +1746,12 @@ class CompanyRecruiterFlowTests(unittest.IsolatedAsyncioTestCase):
             statuses = {item.checkpoint_id: item.status for item in checkpoints}
             self.assertIn("Recruiter feedback so far", result)
             self.assertNotEqual(checkpoint.checkpoint_id, old_checkpoint.checkpoint_id)
-            self.assertEqual(statuses[old_checkpoint.checkpoint_id], "superseded")
+            self.assertEqual(statuses[old_checkpoint.checkpoint_id], "resolved")
+            revised_interaction = dict(checkpoint.payload.get("interaction", {}) or {})
+            self.assertFalse(
+                {"decision", "claim", "execution", "completion"}
+                & set(revised_interaction)
+            )
             self.assertEqual(checkpoint.payload["previous_checkpoint_id"], old_checkpoint.checkpoint_id)
             self.assertEqual(checkpoint.payload["recruitment_revision"], 2)
             self.assertEqual(

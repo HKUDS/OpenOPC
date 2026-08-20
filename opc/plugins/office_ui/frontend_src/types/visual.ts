@@ -534,6 +534,7 @@ export interface ReorgChangesetSummary {
 }
 
 export interface ReorgProposalInfo {
+  project_id: string
   proposal_id: string
   title: string
   summary: string
@@ -544,10 +545,17 @@ export interface ReorgProposalInfo {
   initiated_by: string
   changeset: ReorgChangesetSummary
   impact_summary: Record<string, unknown>
+  user_confirmation_required: boolean
+  checkpoint_id: string
+  checkpoint_type: string
+  checkpoint_status: string
+  requester_task_id: string
+  requester_session_id: string
   created_at: number
   updated_at: number
 }
 
 export interface ReorgListPayload {
+  project_id: string
   proposals: ReorgProposalInfo[]
 }

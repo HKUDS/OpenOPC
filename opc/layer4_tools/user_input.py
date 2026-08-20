@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
-from opc.layer4_tools.registry import ToolDefinition
+from opc.layer4_tools.registry import COMPANY_EFFECT_RUNTIME_INTERNAL, ToolDefinition
 
 
 _OPTION_IDS: tuple[str, ...] = ("a", "b", "c")
@@ -253,6 +253,7 @@ def create_user_input_tool() -> ToolDefinition:
             "required": ["reason"],
         },
         func=request_user_input,
+        company_effect_kind=COMPANY_EFFECT_RUNTIME_INTERNAL,
         category="interaction",
         requires_confirmation=False,
     )

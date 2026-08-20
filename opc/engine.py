@@ -7,16 +7,16 @@ import copy
 import hashlib
 import inspect
 import json
-import os
 import re
 import shutil
 import time
 import uuid
 from contextlib import nullcontext
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Callable, Coroutine
+from typing import Any, Awaitable, Callable, Coroutine, Mapping
 
 from loguru import logger
 
@@ -69,11 +69,33 @@ from opc.core.models import (
     WorkItemExecutionStrategy,
     CompanyProfile,
 )
-from opc.database.store import OPCStore
+from opc.database.store import (
+    OPCStore,
+    company_controller_task_preimage_hash,
+)
 from opc.project_id import is_valid_project_id
 from opc.llm.provider import LLMProvider
 from opc.layer0_interaction.message_bus import MessageBus
+from opc.layer0_interaction.coordinator import (
+    OWNER_INTERACTION_CHECKPOINT_TYPES,
+    InteractionCoordinator,
+    InteractionDecisionLease,
+    InteractionEffectFailed,
+    InteractionLeaseLost,
+)
 from opc.channels import ChannelManager
+from opc.core.company_controller import (
+    CompanyControllerAttemptContext,
+    CompanyRunControllerBusy,
+    CompanyRunControllerLeaseLost,
+)
+from opc.core.interaction_protocol import (
+    CompanyWorkItemGateDecisionCommand,
+    OriginOwnerInteractionLease,
+    PreparedOwnerInteractionPublication,
+    canonical_company_work_item_gate_decision,
+    company_work_item_gate_decision_feedback,
+)
 from opc.layer1_perception.context_assembler import ContextAssembler, ExternalContextLayers
 from opc.layer1_perception.context_loader import ContextLoader
 from opc.layer1_perception.task_router import TaskRouter
@@ -83,12 +105,12 @@ from opc.layer2_organization.org_engine import (
 )
 from opc.layer2_organization.task_graph import TaskGraphScheduler
 from opc.layer2_organization.approval import ApprovalEngine, normalize_escalation_reply
-from opc.layer2_organization.escalation import EscalationEngine
 from opc.layer2_organization.communication import CommunicationManager
 from opc.layer2_organization.collaboration_policy import ownership_guard_violation
 from opc.layer2_organization.secretary import SecretaryService
 from opc.layer2_organization.company_mode import (
     CompanyExecutorDriverOwnership,
+    CompanyRunControllerAdmission,
     CompanyRuntimeSpec,
     CompanyRuntimeSpecBuilder,
     CompanyWorkItemExecutor,
@@ -103,7 +125,10 @@ from opc.layer2_organization.company_runtime_identity import (
     build_company_runtime_identity_index,
     is_company_runtime_task,
     is_pure_company_ui_anchor,
+    is_runtime_auxiliary_task,
+    requires_native_company_execution,
     load_company_runtime_identity_index,
+    resolve_company_interaction_ownership,
 )
 from opc.layer2_organization.metadata_ownership import (
     build_company_resume_identity_restore,
@@ -124,7 +149,6 @@ from opc.layer2_organization.prompt_contract import (
 )
 from opc.layer2_organization.org_work_item_planner import (
     CompanyWorkItemRuntimePlan,
-    WorkItemProjectionSpec,
 )
 from opc.layer2_organization.reactivation_sweeper import CommsReactivationSweeper
 from opc.layer2_organization.session_scoping import (
@@ -143,11 +167,9 @@ from opc.layer2_organization.work_item_runtime_invariants import (
 )
 from opc.layer2_organization.work_item_identity import (
     canonical_work_item_turn_type_for_kind,
-    mark_projected_work_item_task,
     mark_work_item_projection,
     projection_id_for_task,
     projection_id_for_work_item,
-    rework_projection_id_for_gate,
     result_delivery_identity_payload_for_task,
     turn_type_for_task,
     turn_type_for_work_item,
@@ -188,13 +210,14 @@ from opc.layer3_agent.external_session_identity import (
     select_best_external_resume_session,
 )
 from opc.layer4_tools.registry import ToolRegistry, ToolDefinition
-from opc.layer4_tools.shell import create_shell_tool, create_shell_tools
+from opc.layer4_tools.shell import create_shell_tools
 from opc.layer4_tools.file_ops import create_file_tools
 from opc.layer4_tools.user_input import create_user_input_tool
 from opc.layer4_tools.web_search import create_web_tools
-from opc.layer4_tools.browser import browser_snapshot, create_browser_tools
+from opc.layer4_tools.browser import create_browser_tools
 from opc.layer4_tools.git_ops import create_git_tools
 from opc.layer4_tools.python_exec import create_python_tool
+from opc.layer4_tools.opaque_execution import exact_tool_call_fingerprint
 from opc.layer4_tools.collaboration import (
     build_external_cli_tool_contract_lines,
     create_collaboration_tools,
@@ -204,6 +227,13 @@ from opc.layer4_tools.agent_runtime import create_agent_runtime_tools
 from opc.layer2_organization.heartbeat import HeartbeatScheduler
 from opc.mcp_client import MCPManager
 from opc.layer5_memory.memory_manager import MemoryManager
+from opc.layer5_memory.history_compactor import HistoryCompactor
+from opc.layer5_memory.preference import PreferenceManager
+from opc.layer5_memory.secretary_policy import SecretaryPolicyManager
+from opc.layer5_memory.capability_manager import CapabilityManager
+from opc.layer5_memory.skill_library import SkillLibrary
+from opc.layer6_observability.cost_tracker import CostTracker
+from opc.layer6_observability.opc_logger import setup_logging
 
 
 _REVIEW_WAITING_STATUSES = {
@@ -219,6 +249,27 @@ _COMPANY_RUNTIME_SUSPEND_CHECKPOINT_TYPES = {
     "company_runtime_suspended",
     "company_runtime_interrupted",
 }
+@dataclass(frozen=True)
+class _InteractionDispatchOutcome:
+    """Result of applying a claimed owner decision.
+
+    ``runtime_owns_completion`` is used by exact tool continuation: the
+    checkpoint must remain ``consuming`` until the original ToolCall result is
+    durable, so the generic domain consumer must not finish it early.
+    """
+
+    message: str
+    runtime_owns_completion: bool = False
+
+
+class _PermanentInteractionError(ValueError):
+    """A claimed decision that cannot become valid by retrying it."""
+
+
+class _RetryableInteractionConflict(RuntimeError):
+    """A zero-write claim/controller/CAS race safe to replay with backoff."""
+
+
 _COMPANY_RUNTIME_CONTROL_METADATA_KEYS = (
     "dispatch_hold",
     "company_runtime_stop_state",
@@ -227,13 +278,6 @@ _COMPANY_RUNTIME_CONTROL_METADATA_KEYS = (
     "company_runtime_suspend_checkpoint_type",
     "company_runtime_suspended_at",
 )
-from opc.layer5_memory.history_compactor import HistoryCompactor
-from opc.layer5_memory.preference import PreferenceManager
-from opc.layer5_memory.secretary_policy import SecretaryPolicyManager
-from opc.layer5_memory.capability_manager import CapabilityManager
-from opc.layer5_memory.skill_library import SkillLibrary
-from opc.layer6_observability.cost_tracker import CostTracker
-from opc.layer6_observability.opc_logger import setup_logging
 
 AGENT_SELECTION_PROMPT = """\
 You are the task execution-agent selector for an AI orchestration system.
@@ -369,6 +413,8 @@ class ExternalRecruiterLLMAdapter:
 class OPCEngine:
     """Central orchestrator — initializes and coordinates all layers."""
 
+    _INTERACTION_LEASE_SECONDS = 300.0
+
     def __init__(
         self,
         config: OPCConfig | None = None,
@@ -382,6 +428,11 @@ class OPCEngine:
         on_progress: Callable[[str], Coroutine[Any, Any, None]] | None = None,
         on_runtime_event: Callable[[OPCEvent], Coroutine[Any, Any, None]] | None = None,
         on_escalation: Callable[[str, list[dict]], Coroutine[Any, Any, str | None]] | None = None,
+        interaction_coordinator: InteractionCoordinator | None = None,
+        pre_delivery_validator: Callable[
+            [Task, CompanyWorkItemRuntimePlan, list[Task], dict[str, Any]],
+            Awaitable[Mapping[str, Any]],
+        ] | None = None,
     ) -> None:
         self.config = config or OPCConfig()
         self.opc_home = opc_home or get_opc_home()
@@ -389,6 +440,10 @@ class OPCEngine:
         self.on_progress = on_progress
         self.on_runtime_event = on_runtime_event
         self.on_escalation = on_escalation
+        self.pre_delivery_validator = pre_delivery_validator
+        self._project_owner_actor_token = uuid.uuid4().hex
+        self.interaction_coordinator = interaction_coordinator
+        self._owns_interaction_coordinator = interaction_coordinator is None
         # Called with (parent_task_id, [child_task_id, ...]) when company mode creates work items.
         self.on_company_runtime_children: Callable[[str, list[str]], None] | None = None
         self.on_company_kanban_callback_factory: Callable[[Any], Callable[[], Coroutine[Any, Any, None]]] | None = None
@@ -424,7 +479,6 @@ class OPCEngine:
         self.adapter_registry: AdapterRegistry | None = None
         self.org_engine: OrgEngine | None = None
         self.task_scheduler: TaskGraphScheduler | None = None
-        self.escalation: EscalationEngine | None = None
         self.communication: CommunicationManager | None = None
         self.company_runtime_spec_builder: CompanyRuntimeSpecBuilder | None = None
         self.company_recruiter: CompanyRecruiter | None = None
@@ -450,6 +504,141 @@ class OPCEngine:
         self._runtime_config_signature: tuple[tuple[str, float], ...] | None = None
         self._project_delegate_lock: asyncio.Lock | None = None
         self._project_engine_delegates: dict[str, OPCEngine] = {}
+        self._project_delegate_candidates: dict[str, OPCEngine] = {}
+        self._project_delegate_construction_tasks: set[asyncio.Task[Any]] = set()
+        self._interaction_consumer_tasks: set[asyncio.Task[Any]] = set()
+        self._interaction_retry_consumptions: set[str] = set()
+        self._interaction_retry_attempts: dict[str, int] = {}
+        self._company_gate_continuation_recoveries: set[str] = set()
+        # CustomRuntimeRunner engines borrow this Engine's Store, interaction
+        # coordinator, and execution registry.  They are nevertheless the
+        # only holders of their exact company-controller credentials, so the
+        # owning Engine must retain them as explicit shutdown participants.
+        self._runtime_child_engines: set[OPCEngine] = set()
+        self._runtime_child_ingress_tasks: set[asyncio.Task[Any]] = set()
+        self._interaction_consumer_failures: list[BaseException] = []
+        self._shutdown_lock = asyncio.Lock()
+        self._shutdown_complete = False
+
+    def _register_runtime_child(
+        self,
+        runtime: OPCEngine,
+    ) -> asyncio.Task[Any] | None:
+        """Register one shared-Store runtime before its first await boundary."""
+
+        if bool(getattr(self, "_shutting_down", False)) or bool(
+            getattr(self._active_task_run_registry, "admission_closed", False)
+        ):
+            raise ActiveTaskRunAdmissionClosed(
+                "custom runtime admission is closed for controller shutdown"
+            )
+        owner_task = asyncio.current_task()
+        runtime_children = getattr(self, "_runtime_child_engines", None)
+        if runtime_children is None:
+            runtime_children = set()
+            self._runtime_child_engines = runtime_children
+        ingress_tasks = getattr(self, "_runtime_child_ingress_tasks", None)
+        if ingress_tasks is None:
+            ingress_tasks = set()
+            self._runtime_child_ingress_tasks = ingress_tasks
+        runtime_children.add(runtime)
+        if owner_task is not None:
+            ingress_tasks.add(owner_task)
+            owner_task.add_done_callback(ingress_tasks.discard)
+        return owner_task
+
+    def _unregister_runtime_child(
+        self,
+        runtime: OPCEngine,
+        owner_task: asyncio.Task[Any] | None,
+    ) -> None:
+        """Forget a child only after its idempotent local teardown completed."""
+
+        getattr(self, "_runtime_child_engines", set()).discard(runtime)
+        if owner_task is not None:
+            getattr(self, "_runtime_child_ingress_tasks", set()).discard(owner_task)
+
+    async def _cancel_and_join_runtime_activity(
+        self,
+        *,
+        cancel_registry_project_id: str | None = None,
+        cancel_all_registry_projects: bool = False,
+    ) -> None:
+        """Drain all controller-local execution before closing the Store.
+
+        Durable company suspension is deliberately performed by
+        ``prepare_active_company_runtimes_for_shutdown`` first.  This method
+        only unwinds local coroutine owners and therefore must never be moved
+        ahead of that transaction boundary.
+        """
+
+        current = asyncio.current_task()
+        while True:
+            prior_failures = list(
+                getattr(self, "_interaction_consumer_failures", ())
+            )
+            if prior_failures:
+                self._interaction_consumer_failures.clear()
+                raise prior_failures[0]
+            ingress = {
+                task
+                for task in (
+                    set(self._interaction_consumer_tasks)
+                    | set(self._runtime_child_ingress_tasks)
+                    | set(
+                        getattr(
+                            self,
+                            "_project_delegate_construction_tasks",
+                            (),
+                        )
+                    )
+                )
+                if task is not current and not task.done()
+            }
+            if not ingress:
+                break
+            for task in ingress:
+                task.cancel()
+            results = await asyncio.gather(*ingress, return_exceptions=True)
+            failures = [
+                result
+                for result in results
+                if isinstance(result, BaseException)
+                and not isinstance(result, asyncio.CancelledError)
+            ]
+            if failures:
+                # Done callbacks also retain background-consumer exceptions so
+                # a task which finishes just before the shutdown snapshot
+                # cannot disappear silently.  This gather already observed
+                # these failures, so consume the retained copies for retry.
+                getattr(
+                    self,
+                    "_interaction_consumer_failures",
+                    [],
+                ).clear()
+                raise failures[0]
+
+        if cancel_all_registry_projects:
+            await self._active_task_run_registry.cancel_and_wait_for_owner_tasks()
+        elif cancel_registry_project_id is not None:
+            await self._active_task_run_registry.cancel_and_wait_for_owner_tasks(
+                cancel_registry_project_id
+            )
+        else:
+            return
+        lingering = {
+            task
+            for task in self._active_task_run_registry.active_owner_tasks(
+                None
+                if cancel_all_registry_projects
+                else cancel_registry_project_id
+            )
+            if task is not current and not task.done()
+        }
+        if lingering:
+            raise RuntimeError(
+                "controller shutdown could not drain active execution owners"
+            )
 
     def bind_store(self, store: OPCStore, *, owns_store: bool | None = None) -> None:
         """Rebind the active store across components that cache it."""
@@ -471,6 +660,8 @@ class OPCEngine:
             self.context_assembler.store = store
         if self.approval_engine:
             self.approval_engine.store = store
+        if self.interaction_coordinator:
+            self.interaction_coordinator.store = store
         if self.external_broker:
             self.external_broker.store = store
         if self.secretary:
@@ -642,23 +833,19 @@ class OPCEngine:
         self.org_engine = OrgEngine(self.config, self.opc_home, store=self.store)
         self.talent_market = TalentMarket(self.opc_home, self.config)
         self.task_scheduler = TaskGraphScheduler(self.store, self.event_bus)
-        escalation_timeout_seconds = self.config.system.escalation_timeout_seconds
-        # Test/ops override: lets a harness shrink the inline approval wait
-        # (e.g. to seconds) so the late-click park/resume cycle can be
-        # exercised without waiting out the production timeout.
-        raw_escalation_timeout = str(os.environ.get("OPC_ESCALATION_TIMEOUT_SECONDS", "") or "").strip()
-        if raw_escalation_timeout:
-            try:
-                escalation_timeout_seconds = max(1, int(raw_escalation_timeout))
-            except ValueError:
-                logger.warning(
-                    f"Ignoring invalid OPC_ESCALATION_TIMEOUT_SECONDS={raw_escalation_timeout!r}"
-                )
-        self.escalation = EscalationEngine(
-            self.event_bus,
-            timeout_seconds=escalation_timeout_seconds,
-            user_reply_callback=self.on_escalation,
-        )
+        if self.interaction_coordinator is None:
+            self.interaction_coordinator = InteractionCoordinator(
+                store=self.store,
+                project_id=self.project_id or "default",
+                presentation_callback=self.on_escalation,
+                checkpoint_changed_callback=self._interaction_checkpoint_changed,
+                orphaned_answer_callback=self._schedule_interaction_consumption,
+            )
+            self._owns_interaction_coordinator = True
+        else:
+            # Custom/org child engines share the parent's coordinator and Store;
+            # only the parent publishes/owns the user interaction control plane.
+            self.interaction_coordinator.store = self.store
         self.communication = CommunicationManager(self.store, self.event_bus, self.llm, self.org_engine)
         await self.communication.rehydrate_queues()
         self.channel_manager = ChannelManager(self.config, self.message_bus)
@@ -672,9 +859,9 @@ class OPCEngine:
             store=self.store,
             preferences=self.preferences,
             memory=self.memory,
-            escalation=self.escalation,
             config=self.config.autonomy,
             secretary_policies=self.secretary_policies,
+            interaction_coordinator=self.interaction_coordinator,
         )
         self.external_broker = ExternalAgentBroker(
             self.store,
@@ -706,19 +893,26 @@ class OPCEngine:
             save_runtime_session=self.store.save_runtime_session,
             progress_callback=self.on_progress,
             checkpoint_callback=self._save_execution_checkpoint,
+            checkpoint_prepare_callback=self._prepare_execution_checkpoint_publication,
+            checkpoint_notify_callback=(
+                self.interaction_coordinator.notify_persisted_owner_checkpoint
+                if self.interaction_coordinator is not None
+                else None
+            ),
             agent_selector=self._assign_task_execution_agent,
             emit_runtime_event=self._emit_company_runtime_event,
             work_item_timeout=self.config.system.task_mode.sub_agent_timeout_sec,
             role_prompt_runner=self._run_role_prompt_via_task_execution_agent,
             active_task_run_registry=self._active_task_run_registry,
+            pre_delivery_validator=self.pre_delivery_validator,
         )
         self.communication.set_meeting_turn_runner(self._run_meeting_turn)
         self.reorg_manager = ReorgManager(
             store=self.store,
             org_engine=self.org_engine,
-            approval_engine=self.approval_engine,
             communication=self.communication,
             progress_callback=self.on_progress,
+            interaction_coordinator=self.interaction_coordinator,
         )
         if self.communication is not None:
             self.communication.task_adjustment_suggester = self.reorg_manager.suggest_task_adjustment
@@ -792,6 +986,10 @@ class OPCEngine:
         if self.comms_reactivation_sweeper is not None:
             await self.comms_reactivation_sweeper.start()
         self._initialized = True
+        await self._reconcile_active_owner_interaction_ownership()
+        if self._run_startup_reconcile:
+            await self._recover_interaction_consumers()
+            await self._recover_company_work_item_gate_continuations()
         logger.info("OPC Engine initialized successfully")
         if reconciled:
             logger.warning(
@@ -1254,9 +1452,15 @@ class OPCEngine:
         origin_task_id: str | None = None,
         attachment_refs: list[dict[str, Any]] | None = None,
         force_manual_preflight: bool = False,
+        conversation_turn_id: str | None = None,
+        conversation_turn_sequence: int | None = None,
     ) -> dict[str, Any] | None:
         if not self.org_engine or not self.talent_market:
             return None
+        execution_scope = self._staffing_checkpoint_execution_scope(
+            decision,
+            runtime_spec,
+        )
         employees = [
             employee
             for employee in self.org_engine.list_employees()
@@ -1415,7 +1619,10 @@ class OPCEngine:
             "origin_thread_id": origin_thread_id,
             "origin_task_id": origin_task_id,
             "attachment_refs": self._normalize_attachment_refs(attachment_refs),
-            "company_profile": str(runtime_spec.profile or "corporate"),
+            "conversation_turn_id": str(conversation_turn_id or "").strip(),
+            "conversation_turn_sequence": int(conversation_turn_sequence or 0),
+            "company_profile": execution_scope["company_profile"],
+            "org_id": execution_scope["org_id"],
             "summary": summary,
             "staffing_strategy": staffing_strategy,
             "recommended_action": recommended_action,
@@ -1435,6 +1642,60 @@ class OPCEngine:
                 "employees": employee_payloads,
                 "templates": template_payloads,
             },
+        }
+
+    @staticmethod
+    def _staffing_checkpoint_execution_scope(
+        decision: RouterDecision,
+        runtime_spec: CompanyRuntimeSpec,
+    ) -> dict[str, str]:
+        """Resolve the taskless staffing card's durable runtime identity.
+
+        Staffing is published before a Task exists, so neither Task metadata
+        nor the process-wide active organization can repair a missing scope
+        later.  Its identity must come from the immutable routing decision and
+        runtime spec that produced the card.
+        """
+
+        runtime_metadata = dict(runtime_spec.metadata or {})
+        profiles = {
+            str(value or "").strip().lower()
+            for value in (
+                getattr(decision, "company_profile", None),
+                runtime_spec.profile,
+                runtime_metadata.get("company_profile"),
+            )
+            if str(value or "").strip()
+        }
+        if len(profiles) > 1:
+            raise ValueError("staffing checkpoint company profile is inconsistent")
+        company_profile = next(
+            iter(profiles),
+            CompanyProfile.CORPORATE.value,
+        )
+
+        decision_org_id = str(getattr(decision, "org_id", "") or "").strip()
+        runtime_org_values = [runtime_metadata.get("org_id")]
+        if company_profile == CompanyProfile.CUSTOM.value:
+            runtime_org_values.append(runtime_metadata.get("organization_id"))
+        org_ids = {
+            str(value or "").strip()
+            for value in (decision_org_id, *runtime_org_values)
+            if str(value or "").strip()
+        }
+        if len(org_ids) > 1:
+            raise ValueError("staffing checkpoint organization identity is inconsistent")
+        org_id = next(iter(org_ids), "")
+        if company_profile == CompanyProfile.CUSTOM.value:
+            if not org_id:
+                raise ValueError(
+                    "custom staffing checkpoint requires a durable org_id"
+                )
+            org_id = validate_organization_id(org_id)
+
+        return {
+            "company_profile": company_profile,
+            "org_id": org_id,
         }
 
     def _render_manual_staffing_summary(self, payload: dict[str, Any]) -> str:
@@ -1488,6 +1749,8 @@ class OPCEngine:
         origin_task_id: str | None = None,
         attachment_refs: list[dict[str, Any]] | None = None,
         force_manual_preflight: bool = False,
+        conversation_turn_id: str | None = None,
+        conversation_turn_sequence: int | None = None,
     ) -> str:
         session_confirmed = await self._session_has_completed_recruitment_confirmation(session_id)
         if not session_confirmed:
@@ -1502,6 +1765,8 @@ class OPCEngine:
                 origin_task_id=origin_task_id,
                 attachment_refs=attachment_refs,
                 force_manual_preflight=force_manual_preflight,
+                conversation_turn_id=conversation_turn_id,
+                conversation_turn_sequence=conversation_turn_sequence,
             )
             if payload is not None:
                 await self._save_execution_checkpoint(
@@ -1539,6 +1804,8 @@ class OPCEngine:
                     fallback_role_ids=fallback_role_ids,
                     role_agent_overrides=role_agent_overrides,
                     attachment_refs=attachment_refs,
+                    conversation_turn_id=conversation_turn_id,
+                    conversation_turn_sequence=conversation_turn_sequence,
                 )
         return await self._begin_company_recruitment_loop(
             decision,
@@ -1550,6 +1817,8 @@ class OPCEngine:
             origin_thread_id=origin_thread_id,
             origin_task_id=origin_task_id,
             attachment_refs=attachment_refs,
+            conversation_turn_id=conversation_turn_id,
+            conversation_turn_sequence=conversation_turn_sequence,
         )
 
     @staticmethod
@@ -1949,8 +2218,50 @@ class OPCEngine:
         arguments: dict[str, Any],
         task: Task | None,
         on_progress: Callable[[str], Coroutine[Any, Any, None]] | None = None,
+        call_context: dict[str, Any] | None = None,
     ) -> tuple[bool, Any]:
         assert self.approval_engine
+        task_metadata = dict(getattr(task, "metadata", {}) or {}) if task is not None else {}
+        controller_token = str(
+            task_metadata.get("company_run_controller_owner_token", "") or ""
+        ).strip()
+        if controller_token:
+            run_id = str(task_metadata.get("delegation_run_id", "") or "").strip()
+            try:
+                controller_generation = int(
+                    task_metadata.get("company_run_controller_lease_generation", 0)
+                    or 0
+                )
+            except (TypeError, ValueError):
+                controller_generation = 0
+            validate_controller = getattr(
+                self.store,
+                "delegation_run_controller_lease_is_current",
+                None,
+            )
+            controller_current = bool(
+                run_id
+                and controller_generation > 0
+                and callable(validate_controller)
+                and await validate_controller(
+                    run_id,
+                    project_id=str(getattr(task, "project_id", "") or self.project_id or "default"),
+                    owner_token=controller_token,
+                    generation=controller_generation,
+                )
+            )
+            if not controller_current:
+                return False, ApprovalDecision(
+                    action=ApprovalAction.REJECT,
+                    risk_level=RiskLevel.HIGH,
+                    rationale=(
+                        "The company-run controller lease changed before this "
+                        "tool effect. The stale execution was fenced."
+                    ),
+                    confidence=1.0,
+                    policy_source="company_run_controller_lease",
+                    metadata={"tool_name": tool.name, "delegation_run_id": run_id},
+                )
         violation = ownership_guard_violation(
             task=task,
             tool_name=tool.name,
@@ -1973,6 +2284,7 @@ class OPCEngine:
                 arguments=arguments,
                 approval_engine=self.approval_engine,
                 on_progress=on_progress,
+                call_context=call_context,
             )
         metadata = {
             "category": tool.category,
@@ -1985,6 +2297,7 @@ class OPCEngine:
             arguments=arguments,
             metadata=metadata,
             on_progress=on_progress,
+            call_context=call_context,
         )
 
     @staticmethod
@@ -2014,6 +2327,7 @@ class OPCEngine:
             "attachment_refs": attachment_refs,
             "conversation_turn_id": conversation_turn_id,
         }
+        conversation_turn_sequence = 0
         requested_mode = self._normalize_requested_mode(message.metadata.get("mode", "task"))
         origin_task_id = message.metadata.get("origin_task_id")
         preferred_agent = message.metadata.get("preferred_agent")
@@ -2037,6 +2351,18 @@ class OPCEngine:
             )
 
         await self._ensure_primary_session(message.session_id, message.content)
+        allocate_source_sequence = getattr(
+            self.store,
+            "allocate_owner_interaction_source_sequence",
+            None,
+        )
+        if callable(allocate_source_sequence):
+            conversation_turn_sequence = await allocate_source_sequence(
+                project_id=self.project_id or "default",
+                scope_id=str(message.session_id or "").strip() or "primary",
+                source_event_id=conversation_turn_id,
+            )
+            response_metadata["conversation_turn_sequence"] = conversation_turn_sequence
         if self.memory:
             user_turn_metadata: dict[str, Any] = {"kind": "top_level_user_turn"}
             for key in ("ui_message_id", "ui_created_at"):
@@ -2046,11 +2372,29 @@ class OPCEngine:
             user_turn_metadata["conversation_turn_id"] = conversation_turn_id
             user_turn_metadata["canonical_turn_id"] = conversation_turn_id
             user_turn_metadata["turn_id"] = conversation_turn_id
+            if conversation_turn_sequence:
+                user_turn_metadata["conversation_turn_sequence"] = (
+                    conversation_turn_sequence
+                )
             await self.memory.record_user_turn(
                 session_id=message.session_id,
                 content=message.content,
                 project_id=self.project_id or "default",
                 metadata=user_turn_metadata,
+            )
+
+        explicit_checkpoint_id, _ = self._explicit_checkpoint_reply(message.metadata)
+        if (
+            requested_mode == "company"
+            and not explicit_checkpoint_id
+            and str(message.content or "").strip()
+        ):
+            # A new owner turn starts a new delivery revision.  It is not an
+            # answer to the prior self-evolution card: close that stale review
+            # at the company-domain boundary before routing the new request.
+            await self.supersede_delivery_feedback_for_new_company_turn(
+                root_session_id=message.session_id,
+                conversation_turn_id=conversation_turn_id,
             )
 
         resumed = await self._maybe_resume_checkpoint(
@@ -2132,6 +2476,7 @@ class OPCEngine:
             origin_task_id=origin_task_id,
             attachment_refs=attachment_refs,
             conversation_turn_id=conversation_turn_id,
+            conversation_turn_sequence=conversation_turn_sequence,
         )
         await self._record_primary_exchange(
             message.session_id,
@@ -2218,13 +2563,12 @@ class OPCEngine:
         return normalized
 
     def _resolve_recruitment_llm(self, recruitment_agent: str | None) -> tuple[Any | None, str]:
-        normalized = normalize_recruitment_agent_choice(
-            recruitment_agent,
-            default="native",
-        ) or "native"
-        if normalized == "native":
-            return self.llm, normalized
-        return ExternalRecruiterLLMAdapter(self, normalized), normalized
+        # Recruitment is itself company execution.  Until external providers
+        # have a durable isolated-workspace capability, normalize even an
+        # explicit external override before any broker preparation can write
+        # into the shared project workplace.
+        _ = recruitment_agent
+        return self.llm, "native"
 
     async def _begin_company_recruitment_loop(
         self,
@@ -2241,6 +2585,9 @@ class OPCEngine:
         force_confirmation: bool = False,
         role_agent_overrides: dict[str, str] | None = None,
         recruitment_agent: str | None = None,
+        conversation_turn_id: str | None = None,
+        conversation_turn_sequence: int | None = None,
+        origin_interaction_lease: OriginOwnerInteractionLease | None = None,
     ) -> str:
         assert self.company_recruiter
         recruitment_llm, selected_recruitment_agent = self._resolve_recruitment_llm(recruitment_agent)
@@ -2292,6 +2639,9 @@ class OPCEngine:
                     fallback_role_ids=fallback_role_ids,
                     role_agent_overrides=role_agent_overrides,
                     attachment_refs=attachment_refs,
+                    conversation_turn_id=conversation_turn_id,
+                    conversation_turn_sequence=conversation_turn_sequence,
+                    origin_interaction_lease=origin_interaction_lease,
                 )
             return await self._continue_task_mode_execution(
                 decision,
@@ -2307,6 +2657,8 @@ class OPCEngine:
                 fallback_role_ids=fallback_role_ids,
                 role_agent_overrides=role_agent_overrides,
                 attachment_refs=attachment_refs,
+                conversation_turn_id=conversation_turn_id,
+                conversation_turn_sequence=conversation_turn_sequence,
             )
         await self._save_execution_checkpoint(
             {
@@ -2325,6 +2677,8 @@ class OPCEngine:
                     "origin_thread_id": origin_thread_id,
                     "origin_task_id": origin_task_id,
                     "attachment_refs": self._normalize_attachment_refs(attachment_refs),
+                    "conversation_turn_id": str(conversation_turn_id or "").strip(),
+                    "conversation_turn_sequence": int(conversation_turn_sequence or 0),
                     "recruitment_role_agents": role_agent_overrides,
                     "recruitment_agent": selected_recruitment_agent,
                 },
@@ -2411,6 +2765,7 @@ class OPCEngine:
         role_agent_overrides: dict[str, str] | None = None,
         attachment_refs: list[dict[str, Any]] | None = None,
         conversation_turn_id: str | None = None,
+        conversation_turn_sequence: int | None = None,
     ) -> str:
         assert self.task_scheduler and self.store and self.org_engine
         project_id = self.project_id or "default"
@@ -2719,6 +3074,9 @@ class OPCEngine:
         fallback_role_ids: set[str] | None = None,
         role_agent_overrides: dict[str, str] | None = None,
         attachment_refs: list[dict[str, Any]] | None = None,
+        conversation_turn_id: str | None = None,
+        conversation_turn_sequence: int | None = None,
+        origin_interaction_lease: OriginOwnerInteractionLease | None = None,
     ) -> str:
         assert self.store and self.memory
         project_id = self.project_id or "default"
@@ -2726,7 +3084,6 @@ class OPCEngine:
         attachment_context = self._build_attachment_context(attachment_refs)
         workspace_contract = await self._resolve_workspace_contract(original_message, session_id)
         target_output_dir = str(workspace_contract.get("output_root") or "").strip() or None
-        force_native_execution = decision.preferred_agent == "native"
         await self._sync_origin_task_execution_context(
             origin_task_id,
             session_id=session_id,
@@ -2795,6 +3152,11 @@ class OPCEngine:
             if isinstance(seat, dict)
         ]
         runtime_force_native_execution = bool(seat_force_native_flags) and all(seat_force_native_flags)
+        origin_interaction = (
+            origin_interaction_lease.to_payload()
+            if origin_interaction_lease is not None
+            else {}
+        )
         delegation_run_id, root_work_item = await self._bootstrap_runtime_delegation_run(
             session_id=session_id,
             project_id=project_id,
@@ -2806,6 +3168,7 @@ class OPCEngine:
             target_output_dir=target_output_dir,
             comms_workspace_root=str(workspace_contract.get("comms_workspace_root") or "").strip(),
             force_native_execution=runtime_force_native_execution,
+            origin_interaction=origin_interaction,
         )
         root_task = await self._ensure_runtime_work_item_task(
             work_item=root_work_item,
@@ -2824,8 +3187,17 @@ class OPCEngine:
             attachment_context=attachment_context,
             force_native_execution=runtime_force_native_execution,
             root_session=True,
+            origin_interaction=origin_interaction,
         )
         root_task.metadata["delegation_run_id"] = delegation_run_id
+        if conversation_turn_id:
+            root_task.metadata["conversation_turn_id"] = str(
+                conversation_turn_id
+            ).strip()
+        if conversation_turn_sequence:
+            root_task.metadata["conversation_turn_sequence"] = int(
+                conversation_turn_sequence
+            )
         await self.store.save_task(root_task)
         if self.on_company_runtime_children:
             self.on_company_runtime_children(session_id, [root_task.id])
@@ -3108,6 +3480,20 @@ class OPCEngine:
             return lead_seat
         return seats[0]
 
+    def _organization_execution_model(self) -> str:
+        """Return the public execution contract for the active organization."""
+
+        getter = getattr(self.org_engine, "get_execution_model", None)
+        if callable(getter):
+            value = str(getter() or "").strip()
+            if value:
+                return value
+        org_config = getattr(self.config, "org", None)
+        return (
+            str(getattr(org_config, "execution_model", "") or "").strip()
+            or "actor_runtime"
+        )
+
     async def _bootstrap_runtime_delegation_run(
         self,
         *,
@@ -3121,6 +3507,7 @@ class OPCEngine:
         target_output_dir: str | None,
         comms_workspace_root: str,
         force_native_execution: bool,
+        origin_interaction: dict[str, str] | None = None,
     ) -> tuple[str, DelegationWorkItem]:
         assert self.store and self.org_engine
         final_decider_role_id = str(runtime_topology.get("final_decider_role_id", "") or "").strip()
@@ -3136,7 +3523,7 @@ class OPCEngine:
                 or (runtime_spec.profile if runtime_spec is not None else "")
                 or getattr(self.config.org, "company_profile", "corporate")
             ),
-            execution_model="multi_team_org",
+            execution_model=self._organization_execution_model(),
             final_decider_role_id=final_decider_role_id,
             top_level_role_ids=list(runtime_topology.get("top_level_role_ids", []) or self.org_engine.get_top_level_role_ids()),
             status="running",
@@ -3163,6 +3550,15 @@ class OPCEngine:
                 "continuation_of_run_id": str(getattr(previous_run, "run_id", "") or "").strip(),
                 "continuation_of_session_id": str(getattr(previous_run, "session_id", "") or "").strip(),
                 "loaded_from_dossier": bool(project_dossier),
+                **(
+                    {
+                        "origin_owner_interaction": dict(
+                            origin_interaction or {}
+                        )
+                    }
+                    if origin_interaction
+                    else {}
+                ),
             }),
         )
         await self.store.save_delegation_run(run)
@@ -3492,6 +3888,15 @@ class OPCEngine:
                 "comms_workspace_root": comms_workspace_root,
                 "authoritative_output": True,
                 "user_visible": True,
+                **(
+                    {
+                        "origin_owner_interaction": dict(
+                            origin_interaction or {}
+                        )
+                    }
+                    if origin_interaction
+                    else {}
+                ),
             }), turn_type="intake"),
         )
         root_projection_id = str(
@@ -3634,6 +4039,7 @@ class OPCEngine:
         attachment_context: str,
         force_native_execution: bool,
         root_session: bool = False,
+        origin_interaction: dict[str, str] | None = None,
     ) -> Task:
         assert self.store and self.memory
         runtime_company_profile = str(
@@ -3649,7 +4055,6 @@ class OPCEngine:
         )
         role_id = str(work_item.role_id or "").strip()
         seat_id = str((work_item.metadata or {}).get("seat_id", "") or "").strip()
-        team_id = str((work_item.metadata or {}).get("team_id", "") or work_item.cell_id or "").strip()
         work_kind = str((work_item.metadata or {}).get("work_kind", "") or work_item.kind or "execute").strip().lower() or "execute"
         work_item_projection_id = projection_id_for_work_item(work_item)
         legacy_turn_type = turn_type_for_work_item(work_item, fallback="")
@@ -3699,6 +4104,22 @@ class OPCEngine:
             set_linked_work_item_id(existing, work_item.work_item_id)
             existing.session_id = session_id
             existing.metadata = dict(existing.metadata or {})
+            existing_origin_interaction = dict(
+                existing.metadata.get("origin_owner_interaction", {}) or {}
+            )
+            incoming_origin_interaction = dict(origin_interaction or {})
+            if (
+                existing_origin_interaction
+                and incoming_origin_interaction
+                and existing_origin_interaction != incoming_origin_interaction
+            ):
+                raise RuntimeError(
+                    "existing runtime Task has a conflicting origin owner interaction"
+                )
+            if incoming_origin_interaction:
+                existing.metadata["origin_owner_interaction"] = (
+                    incoming_origin_interaction
+                )
             if runtime_company_profile == "custom":
                 persisted_org_id = self._normalize_durable_org_id(getattr(existing, "org_id", None))
                 incoming_org_id = self._normalize_durable_org_id(runtime_org_id)
@@ -3938,6 +4359,15 @@ class OPCEngine:
                 "shared_role_session": True,
                 "shared_role_id": role_id,
                 "company_runtime_root_session_id": parent_session_id,
+                **(
+                    {
+                        "origin_owner_interaction": dict(
+                            origin_interaction or {}
+                        )
+                    }
+                    if origin_interaction
+                    else {}
+                ),
             }), projection_id=work_item_projection_id, turn_type=work_item_turn_type),
         )
         set_linked_work_item_id(task, work_item.work_item_id)
@@ -4003,11 +4433,11 @@ class OPCEngine:
         origin_task_id: str | None = None,
         attachment_refs: list[dict[str, Any]] | None = None,
         conversation_turn_id: str | None = None,
+        conversation_turn_sequence: int | None = None,
     ) -> str:
         """Build tasks and run them based on mode selection (project / company)."""
         assert self.task_scheduler and self.store
 
-        project_id = self.project_id or "default"
         primary_session_id = session_id or str(uuid.uuid4())
         await self._ensure_primary_session(primary_session_id, original_message)
         workspace_contract = await self._resolve_workspace_contract(original_message, primary_session_id)
@@ -4056,6 +4486,8 @@ class OPCEngine:
                 origin_task_id=origin_task_id,
                 attachment_refs=attachment_refs,
                 force_manual_preflight=force_manual_preflight,
+                conversation_turn_id=conversation_turn_id,
+                conversation_turn_sequence=conversation_turn_sequence,
             )
         return await self._continue_task_mode_execution(
             decision,
@@ -4068,6 +4500,7 @@ class OPCEngine:
             origin_task_id=origin_task_id,
             attachment_refs=attachment_refs,
             conversation_turn_id=conversation_turn_id,
+            conversation_turn_sequence=conversation_turn_sequence,
         )
 
     async def _emit_external_agent_audit(
@@ -4187,6 +4620,8 @@ class OPCEngine:
         self,
         task: Task,
     ) -> Callable[[str], Coroutine[Any, Any, None]] | None:
+        if is_runtime_auxiliary_task(task):
+            return None
         base_cb = self.on_progress
         if not base_cb:
             return None
@@ -4528,7 +4963,38 @@ class OPCEngine:
         checkpoint.payload = payload
         checkpoint.updated_at = datetime.now()
         if self.store:
-            await self.store.save_execution_checkpoint(checkpoint)
+            if checkpoint.checkpoint_type in OWNER_INTERACTION_CHECKPOINT_TYPES:
+                if self.interaction_coordinator is None:
+                    raise RuntimeError("owner interaction coordinator is unavailable")
+                persisted, applied = await self.interaction_coordinator.enrich_owner_checkpoint(
+                    checkpoint.checkpoint_id,
+                    checkpoint_type=checkpoint.checkpoint_type,
+                    expected_statuses={checkpoint.status},
+                    payload_patch={
+                        "runtime_v2": runtime_state,
+                        "runtime_session_id": runtime_state.get("runtime_session_id", ""),
+                        "resume_cursor": runtime_state.get("resume_cursor"),
+                        "active_subagents": list(runtime_state.get("active_subagents", []) or []),
+                        "permission_requests": list(runtime_state.get("permission_requests", []) or []),
+                        "compaction_boundaries": list(runtime_state.get("compaction_boundaries", []) or []),
+                        "worktree_path": runtime_state.get("worktree_path", ""),
+                        "migrated_to_runtime_v2": True,
+                    },
+                )
+                if persisted is not None:
+                    checkpoint = persisted
+                if not applied:
+                    # A concurrent answer/claim won the state transition; use
+                    # its row rather than writing our stale migration payload.
+                    current = await self.store.get_execution_checkpoint(
+                        checkpoint.checkpoint_id,
+                        project_id=checkpoint.project_id,
+                        checkpoint_type=checkpoint.checkpoint_type,
+                    )
+                    if current is not None:
+                        checkpoint = current
+            else:
+                await self.store.save_execution_checkpoint(checkpoint)
         return checkpoint
 
     def _estimate_task_complexity(self, task: Task, role: Any | None = None) -> tuple[int, list[str]]:
@@ -4856,6 +5322,38 @@ class OPCEngine:
     async def _assign_task_execution_agent(self, task: Task, role: Any | None = None) -> str | None:
         assert self.org_engine
         task.metadata = dict(task.metadata)
+        if requires_native_company_execution(task):
+            task.assigned_external_agent = None
+            task.metadata.update(
+                {
+                    "force_native_execution": True,
+                    "selected_execution_agent": "native",
+                    "preferred_external_agent": None,
+                    "work_item_execution_strategy": WorkItemExecutionStrategy.NATIVE.value,
+                    "execution_agent_locked": True,
+                    "selected_execution_agent_source": "company_isolation_boundary",
+                    "company_native_execution_enforced": True,
+                    "agent_selection": {
+                        "selected": "native",
+                        "strategy": WorkItemExecutionStrategy.NATIVE.value,
+                        "role_id": task.assigned_to
+                        or task.metadata.get("work_item_role_id", ""),
+                        "decision_reason": "company_external_execution_forbidden",
+                        "available_external_agents": [],
+                        "selection_source": "company_isolation_boundary",
+                    },
+                }
+            )
+            for key in (
+                "_company_runtime_resume_execution_agent_pin",
+                "external_resume_session_id",
+                "external_resume_session_scope_id",
+                "external_resume_agent_type",
+                "__external_resume_session",
+            ):
+                task.metadata.pop(key, None)
+            await self.store.save_task(task)
+            return None
         resume_pin = dict(
             task.metadata.get("_company_runtime_resume_execution_agent_pin", {})
             or {}
@@ -4994,7 +5492,11 @@ class OPCEngine:
         return bool(agent and agent != "native")
 
     def _get_external_candidates(self, task: Task) -> list[tuple[str, Any]]:
-        if not self.adapter_registry or not self._should_use_external_pool(task):
+        if (
+            requires_native_company_execution(task)
+            or not self.adapter_registry
+            or not self._should_use_external_pool(task)
+        ):
             return []
         preferred = task.assigned_external_agent
         ordered = self.adapter_registry.get_ordered_available()
@@ -5364,9 +5866,17 @@ class OPCEngine:
         if plan is None:
             return False
         metadata = dict(getattr(plan, "metadata", {}) or {})
+        runtime_model = str(metadata.get("runtime_model") or "").strip()
+        legacy_runtime_model = (
+            "multi_team_org"
+            if not runtime_model
+            and str(metadata.get("execution_model") or "").strip()
+            == "multi_team_org"
+            else ""
+        )
         return (
-            str(metadata.get("execution_model", "") or "").strip() == "multi_team_org"
-            or str(metadata.get("runtime_model", "") or "").strip() == "multi_team_org"
+            runtime_model == "multi_team_org"
+            or legacy_runtime_model == "multi_team_org"
             or bool(getattr(plan, "projections", []) or [])
         )
 
@@ -5375,9 +5885,17 @@ class OPCEngine:
         if task is None:
             return False
         metadata = dict(task.metadata or {})
+        runtime_model = str(metadata.get("runtime_model") or "").strip()
+        legacy_runtime_model = (
+            "multi_team_org"
+            if not runtime_model
+            and str(metadata.get("execution_model") or "").strip()
+            == "multi_team_org"
+            else ""
+        )
         return (
-            str(metadata.get("execution_model", "") or "").strip() == "multi_team_org"
-            or str(metadata.get("runtime_model", "") or "").strip() == "multi_team_org"
+            runtime_model == "multi_team_org"
+            or legacy_runtime_model == "multi_team_org"
             or is_work_item_runtime_metadata(metadata)
         )
 
@@ -6004,7 +6522,11 @@ class OPCEngine:
         plan: CompanyWorkItemRuntimePlan,
         tasks: list[Task],
         stop_intent_id: str | None = None,
-    ) -> tuple[ExecutionCheckpoint, bool, list[str]]:
+        controller_run_id: str = "",
+        controller_owner_token: str = "",
+        controller_lease_generation: int = 0,
+        checkpoint_payload_updates: dict[str, Any] | None = None,
+    ) -> tuple[ExecutionCheckpoint | None, bool, list[str]]:
         """Install durable holds before publishing a resumable checkpoint.
 
         A pending checkpoint is an execution capability, so exposing it before
@@ -6023,7 +6545,45 @@ class OPCEngine:
             plan=plan,
             tasks=tasks,
             stop_intent_id=stop_intent_id,
+            payload_updates=checkpoint_payload_updates,
         )
+        if controller_run_id:
+            suspend_for_controller = getattr(
+                self.store,
+                "suspend_company_runtime_scope_for_controller",
+                None,
+            )
+            if not callable(suspend_for_controller):
+                raise RuntimeError(
+                    "company controller shutdown requires an atomic Store command"
+                )
+            receipt = await suspend_for_controller(
+                run_id=controller_run_id,
+                project_id=str(self.project_id or "default").strip() or "default",
+                root_session_id=parent_session_id,
+                owner_token=controller_owner_token,
+                generation=controller_lease_generation,
+                checkpoint=candidate,
+                checkpoint_types=_COMPANY_RUNTIME_SUSPEND_CHECKPOINT_TYPES,
+                task_ids=[task.id for task in tasks],
+                checkpoint_payload_updates=checkpoint_payload_updates,
+            )
+            if bool(getattr(receipt, "skipped", False)):
+                return None, False, []
+            if not bool(getattr(receipt, "applied", False)):
+                raise CompanyRunControllerLeaseLost(
+                    "stale company controller cannot suspend its runtime scope"
+                )
+            persisted_checkpoint = getattr(receipt, "checkpoint", None)
+            if persisted_checkpoint is None:
+                raise RuntimeError(
+                    "atomic company runtime suspension returned no checkpoint"
+                )
+            return (
+                persisted_checkpoint,
+                bool(getattr(receipt, "checkpoint_created", False)),
+                list(getattr(receipt, "affected_task_ids", ()) or ()),
+            )
         existing = await self.get_active_company_runtime_suspend_checkpoint(
             parent_session_id
         )
@@ -6156,6 +6716,68 @@ class OPCEngine:
             if not tasks:
                 return None
 
+            run_id = next(
+                (
+                    str(
+                        (task.metadata or {}).get("delegation_run_id", "") or ""
+                    ).strip()
+                    for task in tasks
+                    if str(
+                        (task.metadata or {}).get("delegation_run_id", "") or ""
+                    ).strip()
+                ),
+                "",
+            )
+            persisted_run = (
+                await self.store.get_delegation_run(run_id)
+                if run_id and hasattr(self.store, "get_delegation_run")
+                else None
+            )
+            lease_protocol_active = bool(
+                int(
+                    getattr(
+                        persisted_run,
+                        "controller_lease_generation",
+                        0,
+                    )
+                    or 0
+                )
+            )
+            credential: dict[str, Any] | None = None
+            if lease_protocol_active:
+                credential_getter = getattr(
+                    self.company_executor,
+                    "controller_lease_credential",
+                    None,
+                )
+                credential = (
+                    credential_getter(run_id)
+                    if callable(credential_getter)
+                    else None
+                )
+                if not credential:
+                    lease_is_current = getattr(
+                        self.store,
+                        "delegation_run_controller_lease_is_current",
+                        None,
+                    )
+                    remotely_owned = bool(
+                        callable(lease_is_current)
+                        and await lease_is_current(
+                            run_id,
+                            project_id=project_id,
+                            root_session_id=parent_session_id,
+                        )
+                    )
+                    if remotely_owned:
+                        raise CompanyRunControllerBusy(
+                            "company run already has a live remote controller "
+                            f"(run_id={run_id})"
+                        )
+                    raise CompanyRunControllerLeaseLost(
+                        "company runtime stop has no live local controller lease"
+                    )
+
             checkpoint, created, affected_ids = (
                 await self._checkpoint_and_suspend_company_runtime_scope(
                     checkpoint_type=checkpoint_type,
@@ -6165,8 +6787,21 @@ class OPCEngine:
                     plan=plan,
                     tasks=tasks,
                     stop_intent_id=stop_intent_id,
+                    controller_run_id=(run_id if lease_protocol_active else ""),
+                    controller_owner_token=(
+                        str(credential.get("owner_token", "") or "")
+                        if credential
+                        else ""
+                    ),
+                    controller_lease_generation=(
+                        int(credential.get("generation", 0) or 0)
+                        if credential
+                        else 0
+                    ),
                 )
             )
+            if checkpoint is None:
+                return None
             idempotent = not created
 
             payload = dict(checkpoint.payload or {})
@@ -6493,6 +7128,8 @@ class OPCEngine:
         payload: dict[str, Any],
         *,
         resume_task_ids: set[str] | None = None,
+        authoritative_core_prepared_task_ids: set[str] | None = None,
+        controller_admission: CompanyRunControllerAdmission | None = None,
     ) -> list[Task]:
         assert self.store
 
@@ -6506,12 +7143,51 @@ class OPCEngine:
             for item in list(payload.get("active_work_items", []) or [])
             if isinstance(item, dict) and str(item.get("work_item_id", "") or "").strip()
         }
+        core_prepared_task_ids = {
+            str(task_id or "").strip()
+            for task_id in set(authoritative_core_prepared_task_ids or set())
+            if str(task_id or "").strip()
+        }
         refreshed: list[Task] = []
         get_work_item = getattr(self.store, "get_delegation_work_item", None)
         get_role_session = getattr(self.store, "get_delegation_role_session", None)
         list_work_items = getattr(self.store, "list_delegation_work_items", None)
         update_role_session = getattr(self.store, "update_delegation_role_session", None)
         update_work_item = getattr(self.store, "update_delegation_work_item", None)
+
+        async def persist_resume_projection(task: Task) -> None:
+            if controller_admission is None:
+                await self.store.save_task(task)
+                return
+            save_projection = getattr(
+                self.store,
+                "save_company_runtime_resume_projection_for_controller",
+                None,
+            )
+            if not callable(save_projection):
+                raise CompanyRunControllerLeaseLost(
+                    "company controller resume requires fenced Task projections"
+                )
+            receipt = await save_projection(
+                task,
+                run_id=controller_admission.run_id,
+                project_id=controller_admission.project_id,
+                root_session_id=controller_admission.root_session_id,
+                owner_token=controller_admission.owner_token,
+                generation=controller_admission.generation,
+                checkpoint_id=str(payload.get("checkpoint_id", "") or "").strip(),
+                checkpoint_types=_COMPANY_RUNTIME_SUSPEND_CHECKPOINT_TYPES,
+            )
+            outcome = str(getattr(receipt, "outcome", "") or "")
+            if outcome == "stale":
+                raise CompanyRunControllerLeaseLost(
+                    "company controller lease changed during resume projection"
+                )
+            if not bool(getattr(receipt, "applied", False)):
+                raise RuntimeError(
+                    "company runtime resume projection lost its checkpoint/claim boundary"
+                )
+
         work_item_by_id: dict[str, DelegationWorkItem] = {}
         run_ids = {
             str((getattr(task, "metadata", {}) or {}).get("delegation_run_id", "") or "").strip()
@@ -6531,6 +7207,13 @@ class OPCEngine:
             if resume_task_ids is not None and task.id not in resume_task_ids:
                 refreshed.append(task)
                 continue
+            if (
+                controller_admission is not None
+                and task.id not in core_prepared_task_ids
+            ):
+                raise RuntimeError(
+                    "company controller resume projection was not atomically reopened"
+                )
             work_item_id = linked_work_item_id_for_task(task)
             work_item = work_item_by_id.get(work_item_id)
             if work_item_id and (
@@ -6650,6 +7333,8 @@ class OPCEngine:
                     f"Re-enable '{pinned_agent}' in the config and restart to run it, "
                     "or re-issue the work as a new request."
                 )
+                if controller_admission is not None:
+                    raise RuntimeError(diagnostic)
                 task.metadata = dict(task.metadata or {})
                 for key in _COMPANY_RUNTIME_CONTROL_METADATA_KEYS:
                     task.metadata.pop(key, None)
@@ -6786,7 +7471,7 @@ class OPCEngine:
                     task.metadata.pop(key, None)
                 task.metadata["company_runtime_resume_checkpoint_id"] = str(payload.get("checkpoint_id", "") or "")
                 task.metadata["company_runtime_resume_requested_at"] = datetime.now().isoformat()
-                await self.store.save_task(task)
+                await persist_resume_projection(task)
                 fresh = await self.store.get_task(task.id)
                 refreshed.append(fresh or task)
                 continue
@@ -6819,7 +7504,7 @@ class OPCEngine:
             progress.append("Resumed from company runtime suspend checkpoint.")
             task.metadata["progress_log"] = progress[-20:]
 
-            if work_item_id:
+            if work_item_id and task.id not in core_prepared_task_ids:
                 if work_item is None:
                     try:
                         work_item = await get_work_item(work_item_id)
@@ -6870,7 +7555,11 @@ class OPCEngine:
                             raise
 
             role_session_id = str(task.metadata.get("delegation_role_session_id", "") or "").strip()
-            if role_session_id and callable(update_role_session):
+            if (
+                controller_admission is None
+                and role_session_id
+                and callable(update_role_session)
+            ):
                 try:
                     await update_role_session(
                         role_session_id,
@@ -6883,7 +7572,7 @@ class OPCEngine:
                     )
                 except Exception:
                     logger.opt(exception=True).debug("company runtime resume: role session update failed")
-            await self.store.save_task(task)
+            await persist_resume_projection(task)
             fresh = await self.store.get_task(task.id)
             refreshed.append(fresh or task)
         return refreshed
@@ -6892,6 +7581,8 @@ class OPCEngine:
         self,
         parent_session_id: str,
         payload: dict[str, Any],
+        *,
+        controller_admission: CompanyRunControllerAdmission | None = None,
     ) -> None:
         if not self.store:
             return
@@ -6925,7 +7616,37 @@ class OPCEngine:
         task.metadata = metadata
         task.execution_lock = False
         task.execution_locked_at = None
-        await self.store.save_task(task)
+        if controller_admission is None:
+            await self.store.save_task(task)
+            return
+        save_anchor = getattr(
+            self.store,
+            "save_company_runtime_ui_anchor_for_controller",
+            None,
+        )
+        if not callable(save_anchor):
+            raise CompanyRunControllerLeaseLost(
+                "company controller resume requires a fenced UI projection"
+            )
+        receipt = await save_anchor(
+            task,
+            run_id=controller_admission.run_id,
+            project_id=controller_admission.project_id,
+            root_session_id=controller_admission.root_session_id,
+            owner_token=controller_admission.owner_token,
+            generation=controller_admission.generation,
+            checkpoint_id=checkpoint_id,
+            checkpoint_types=_COMPANY_RUNTIME_SUSPEND_CHECKPOINT_TYPES,
+        )
+        outcome = str(getattr(receipt, "outcome", "") or "")
+        if outcome == "stale":
+            raise CompanyRunControllerLeaseLost(
+                "company controller lease changed during UI projection"
+            )
+        if not bool(getattr(receipt, "applied", False)):
+            raise RuntimeError(
+                "company runtime UI projection lost its checkpoint boundary"
+            )
 
     @staticmethod
     def _clear_pending_reorg_marker(task: Task) -> None:
@@ -7450,6 +8171,7 @@ class OPCEngine:
         reason: str,
         plan: CompanyWorkItemRuntimePlan,
         tasks: list[Task],
+        controller_credential: Mapping[str, Any] | None = None,
     ) -> bool:
         """Keep durable review/human waiting states intact during startup.
 
@@ -7459,6 +8181,95 @@ class OPCEngine:
         """
         if not self.store:
             return False
+        validation_required = bool(
+            getattr(self, "pre_delivery_validator", None)
+        )
+        if (
+            validation_required
+            and self._is_company_feedback_waiting_task(task)
+        ):
+            # A validator pass precedes the CEO assessment.  Startup may not
+            # infer that all pre-final gates completed merely from a passed
+            # record, nor publish a card after a crash before validation.  The
+            # controller-fenced recovery path reopens the unpublished card so
+            # the complete validator+CEO sequence runs again.
+            credential = dict(controller_credential or {})
+            work_item_id = linked_work_item_id_for_task(task)
+            requeue = getattr(
+                self.store,
+                "requeue_unpublished_delivery_for_controller",
+                None,
+            )
+            if not work_item_id or not callable(requeue) or not credential:
+                return False
+            project_id = str(
+                credential.get("project_id", "default") or "default"
+            ).strip() or "default"
+
+            # A harmless same-controller metadata write may win the first
+            # preimage CAS.  Retry from a fresh durable snapshot; never turn a
+            # CAS miss into a silent, card-less AWAITING_HUMAN state.
+            for _attempt in range(3):
+                durable_task = await self.store.get_task(task.id)
+                durable_work_item = await self.store.get_delegation_work_item(
+                    work_item_id
+                )
+                if durable_task is None or durable_work_item is None:
+                    raise RuntimeError(
+                        "unpublished delivery disappeared during startup recovery"
+                    )
+                if (
+                    durable_work_item.phase
+                    in {Phase.READY, Phase.READY_FOR_REWORK}
+                    and durable_task.status == TaskStatus.PENDING
+                ):
+                    task.__dict__.update(copy.deepcopy(durable_task.__dict__))
+                    return True
+                try:
+                    audit_result = await requeue(
+                        run_id=str(
+                            credential.get("run_id", "") or ""
+                        ).strip(),
+                        project_id=project_id,
+                        root_session_id=str(
+                            credential.get("root_session_id", "") or ""
+                        ).strip(),
+                        owner_token=str(
+                            credential.get("owner_token", "") or ""
+                        ).strip(),
+                        generation=int(
+                            credential.get("generation", 0) or 0
+                        ),
+                        task_id=task.id,
+                        work_item_id=work_item_id,
+                        expected_task_preimage_hash=(
+                            company_controller_task_preimage_hash(durable_task)
+                        ),
+                        expected_work_item_updated_at=(
+                            durable_work_item.updated_at
+                        ),
+                    )
+                except Exception:
+                    logger.opt(exception=True).warning(
+                        "Failed to requeue unpublished validated delivery {}",
+                        task.id,
+                    )
+                    raise
+                audit_outcome = str(
+                    getattr(audit_result, "outcome", "") or ""
+                ).strip()
+                if audit_outcome == "preserved":
+                    return False
+                if audit_outcome == "requeued":
+                    refreshed = await self.store.get_task(task.id)
+                    if refreshed is not None:
+                        task.__dict__.update(
+                            copy.deepcopy(refreshed.__dict__)
+                        )
+                    return True
+            raise RuntimeError(
+                "unpublished delivery kept changing during startup recovery"
+            )
         task.metadata = dict(task.metadata or {})
         status_value = getattr(task.status, "value", str(task.status))
         existing_preserved = dict(
@@ -7630,11 +8441,77 @@ class OPCEngine:
         parent_session_id: str,
         plan: CompanyWorkItemRuntimePlan,
         tasks: list[Task],
+        *,
+        controller_credential: Mapping[str, Any] | None = None,
     ) -> int:
         if not self.store:
             return 0
         project_id = self.project_id or "default"
+        orphan_repairs: tuple[ExecutionCheckpoint, ...] = ()
+        credential = dict(controller_credential or {})
+        credential_run_id = str(credential.get("run_id", "") or "").strip()
+        if (
+            credential_run_id
+            and str(credential.get("project_id", "") or "").strip()
+            == project_id
+            and str(credential.get("owner_token", "") or "").strip()
+            and int(credential.get("generation", 0) or 0) > 0
+        ):
+            orphan_repairs = (
+                await self.store.reconcile_orphaned_company_work_item_gate_waits_for_controller(
+                    credential_run_id,
+                    project_id=project_id,
+                    owner_token=str(
+                        credential.get("owner_token", "") or ""
+                    ).strip(),
+                    generation=int(credential.get("generation", 0) or 0),
+                )
+            )
+            repaired_task_ids = {
+                str(
+                    dict(checkpoint.payload or {}).get(
+                        "waiting_task_id", ""
+                    )
+                    or checkpoint.task_id
+                    or ""
+                ).strip()
+                for checkpoint in orphan_repairs
+            }
+            for task in tasks:
+                if task.id not in repaired_task_ids:
+                    continue
+                refreshed = await self.store.get_task(task.id)
+                if refreshed is not None:
+                    task.__dict__.update(copy.deepcopy(refreshed.__dict__))
         pending_checkpoints = await self.store.get_pending_checkpoints(project_id=project_id)
+        resolved_gate_checkpoints = await self.store.get_execution_checkpoints(
+            project_id=project_id,
+            checkpoint_types=["company_work_item_gate"],
+            statuses=["resolved", "invalid"],
+        )
+        resolved_gate_continuations: dict[str, tuple[str, str]] = {}
+        for resolved_gate in resolved_gate_checkpoints:
+            resolved_payload = dict(resolved_gate.payload or {})
+            completion = dict(
+                resolved_payload.get(
+                    "company_work_item_gate_decision_completion", {}
+                )
+                or {}
+            )
+            continuation_task_id = str(
+                completion.get("task_id", "") or ""
+            ).strip()
+            continuation_kind = str(
+                completion.get("continuation", "") or ""
+            ).strip()
+            if continuation_task_id and continuation_kind:
+                resolved_gate_continuations.setdefault(
+                    continuation_task_id,
+                    (
+                        str(resolved_gate.checkpoint_id or "").strip(),
+                        continuation_kind,
+                    ),
+                )
         legacy_provenance: list[dict[str, Any]] = []
         for task in tasks:
             provenance = await self._normalize_legacy_company_interruption(task)
@@ -7663,6 +8540,67 @@ class OPCEngine:
         if pending_suspend_checkpoint is not None:
             payload = dict(pending_suspend_checkpoint.payload or {})
             checkpoint_status = str(getattr(pending_suspend_checkpoint, "status", "") or "").strip()
+            credential = dict(controller_credential or {})
+            controller_run_id = str(
+                credential.get("run_id", "") or ""
+            ).strip()
+            if controller_run_id:
+                checkpoint, _created, affected = (
+                    await self._checkpoint_and_suspend_company_runtime_scope(
+                        checkpoint_type=str(
+                            pending_suspend_checkpoint.checkpoint_type
+                            or "company_runtime_interrupted"
+                        ),
+                        reason=str(
+                            payload.get("reason", "") or "startup_recovery"
+                        ),
+                        parent_session_id=parent_session_id,
+                        origin_task_id=(
+                            str(
+                                pending_suspend_checkpoint.task_id
+                                or payload.get("origin_task_id")
+                                or ""
+                            ).strip()
+                            or None
+                        ),
+                        plan=plan,
+                        tasks=tasks,
+                        stop_intent_id=str(
+                            payload.get("stop_intent_id", "") or ""
+                        ),
+                        controller_run_id=controller_run_id,
+                        controller_owner_token=str(
+                            credential.get("owner_token", "") or ""
+                        ).strip(),
+                        controller_lease_generation=int(
+                            credential.get("generation", 0) or 0
+                        ),
+                        checkpoint_payload_updates={
+                            **(
+                                {
+                                    "resume_state": "interrupted",
+                                    "resume_interrupted_at": (
+                                        datetime.now().isoformat()
+                                    ),
+                                }
+                                if checkpoint_status == "resuming"
+                                else {}
+                            ),
+                            **(
+                                {
+                                    "legacy_interrupted_recovery": (
+                                        legacy_provenance
+                                    )
+                                }
+                                if legacy_provenance
+                                else {}
+                            ),
+                        },
+                    )
+                )
+                if checkpoint is None:
+                    return 0
+                return len(affected)
             if checkpoint_status == "resuming" or legacy_provenance:
                 payload_updates: dict[str, Any] = {}
                 if checkpoint_status == "resuming":
@@ -7716,7 +8654,8 @@ class OPCEngine:
                 ).strip() in group_task_ids
             )
         }
-        updated = 0
+
+        updated = len(orphan_repairs)
         interrupted_tasks: list[Task] = []
         get_work_item = getattr(
             self.store,
@@ -7725,6 +8664,31 @@ class OPCEngine:
         )
         for task in tasks:
             task_metadata = dict(getattr(task, "metadata", {}) or {})
+            gate_continuation_marker = dict(
+                task_metadata.get("company_work_item_gate_continuation", {})
+                or {}
+            )
+            expected_gate_continuation = resolved_gate_continuations.get(
+                str(task.id or "").strip()
+            )
+            if (
+                expected_gate_continuation is not None
+                and str(gate_continuation_marker.get("status", "") or "").strip()
+                == "pending"
+                and str(
+                    gate_continuation_marker.get("checkpoint_id", "") or ""
+                ).strip()
+                == expected_gate_continuation[0]
+                and str(
+                    gate_continuation_marker.get("kind", "") or ""
+                ).strip()
+                == expected_gate_continuation[1]
+            ):
+                # The gate transaction already settled the worker attempt and
+                # recorded an exact post-commit continuation.  Startup must not
+                # overlay a generic interruption checkpoint before the typed
+                # continuation recovery obtains a fresh controller generation.
+                continue
             work_item_id = linked_work_item_id_for_task(task)
             work_item = (
                 await get_work_item(work_item_id)
@@ -7774,7 +8738,15 @@ class OPCEngine:
                 else task.status in _REVIEW_WAITING_STATUSES
             )
             if stable_review_wait:
-                if task.id not in checkpoint_task_ids:
+                recovered_for_retry = False
+                validator_final_wait = bool(
+                    getattr(self, "pre_delivery_validator", None)
+                    and self._is_company_feedback_waiting_task(task)
+                )
+                if (
+                    task.id not in checkpoint_task_ids
+                    or validator_final_wait
+                ):
                     waiting_label = (
                         work_item_phase.value
                         if isinstance(work_item_phase, Phase)
@@ -7785,13 +8757,26 @@ class OPCEngine:
                         f"`{waiting_label}` but no pending checkpoint could be found after restart. "
                         "Preserving stable waiting state."
                     )
-                    if await self._preserve_stable_waiting_task_after_restart(
+                    recovered_for_retry = (
+                        await self._preserve_stable_waiting_task_after_restart(
                         task,
                         reason=reason,
                         plan=plan,
                         tasks=tasks,
-                    ):
+                        controller_credential=controller_credential,
+                        )
+                    )
+                    if recovered_for_retry:
                         updated += 1
+                if (
+                    recovered_for_retry
+                    and getattr(self, "pre_delivery_validator", None)
+                ):
+                    # Route the freshly re-opened delivery through the normal
+                    # interrupted-runtime checkpoint/resume pipeline.  Merely
+                    # leaving READY_FOR_REWORK behind while releasing the
+                    # startup controller would strand it without a dispatcher.
+                    interrupted_tasks.append(task)
                 continue
             if task.id in checkpoint_task_ids and (
                 task.status in _WAITING_TASK_STATUSES
@@ -7823,6 +8808,53 @@ class OPCEngine:
             task_by_id = {task.id: task for task in tasks}
             interrupted_task_objects = [task_by_id[task_id] for task_id in interrupted_task_ids]
             origin_task_id = str(getattr(interrupted_task_objects[0], "id", "") or "").strip()
+            credential = dict(controller_credential or {})
+            controller_run_id = str(
+                credential.get("run_id", "") or ""
+            ).strip()
+            if controller_run_id:
+                # Startup owns a live controller lease here.  Publishing an
+                # interruption checkpoint and then installing WorkItem holds
+                # with the legacy multi-step helpers leaves a crash/takeover
+                # window (and, after a validation requeue, the first hold
+                # causes the subsequent broad Task save to fail its fence).
+                # Reuse the production shutdown transaction so the checkpoint,
+                # all holds, Task projections and role/runtime projections are
+                # one authoritative commit.
+                checkpoint, _created, affected = (
+                    await self._checkpoint_and_suspend_company_runtime_scope(
+                        checkpoint_type="company_runtime_interrupted",
+                        reason="startup_recovery",
+                        parent_session_id=parent_session_id,
+                        origin_task_id=origin_task_id or None,
+                        plan=plan,
+                        tasks=tasks,
+                        controller_run_id=controller_run_id,
+                        controller_owner_token=str(
+                            credential.get("owner_token", "") or ""
+                        ).strip(),
+                        controller_lease_generation=int(
+                            credential.get("generation", 0) or 0
+                        ),
+                        checkpoint_payload_updates=(
+                            {
+                                "legacy_interrupted_recovery": legacy_provenance
+                            }
+                            if legacy_provenance
+                            else None
+                        ),
+                    )
+                )
+                if checkpoint is None:
+                    return updated
+                for candidate in tasks:
+                    refreshed = await self.store.get_task(candidate.id)
+                    if refreshed is not None:
+                        candidate.__dict__.update(
+                            copy.deepcopy(refreshed.__dict__)
+                        )
+                updated += len(affected) or len(interrupted_task_objects)
+                return updated
             checkpoint, _created = await self._save_company_runtime_suspend_checkpoint(
                 checkpoint_type="company_runtime_interrupted",
                 reason="startup_recovery",
@@ -7872,9 +8904,24 @@ class OPCEngine:
         if not self.store:
             return 0
         project_id = self.project_id or "default"
+        settle_generic_auxiliary = getattr(
+            self.store,
+            "settle_interrupted_generic_runtime_auxiliary_tasks",
+            None,
+        )
+        updated = (
+            int(
+                await settle_generic_auxiliary(
+                    project_id=project_id,
+                )
+                or 0
+            )
+            if callable(settle_generic_auxiliary)
+            else 0
+        )
         tasks = await self.store.get_tasks(project_id=project_id)
         if not tasks:
-            return 0
+            return updated
 
         checkpoint_getter = getattr(self.store, "get_execution_checkpoints", None)
         active_company_checkpoints = (
@@ -7892,8 +8939,16 @@ class OPCEngine:
         )
         task_by_id = {task.id: task for task in tasks}
         runtime_groups: dict[str, list[Task]] = {}
+        runtime_group_run_ids: dict[str, str] = {}
+        runtime_group_anchor_ids: dict[str, str] = {}
         runtime_task_ids: set[str] = set()
         ui_anchor_task_ids: set[str] = set()
+        lease_protected_anchor_task_ids: set[str] = set()
+        controller_lease_is_current = getattr(
+            self.store,
+            "delegation_run_controller_lease_is_current",
+            None,
+        )
         for identity in identity_index.identities:
             if identity.ui_anchor_task_id:
                 ui_anchor_task_ids.add(identity.ui_anchor_task_id)
@@ -7905,11 +8960,55 @@ class OPCEngine:
                 and is_company_runtime_task(task_by_id[task_id])
             ]
             if group:
-                runtime_groups[identity.runtime_session_id] = group
                 runtime_task_ids.update(task.id for task in group)
+                run_ids = {
+                    str((task.metadata or {}).get("delegation_run_id", "") or "").strip()
+                    for task in group
+                    if str((task.metadata or {}).get("delegation_run_id", "") or "").strip()
+                }
+                lease_protected = False
+                if callable(controller_lease_is_current):
+                    for run_id in run_ids:
+                        if await controller_lease_is_current(
+                            run_id,
+                            project_id=project_id,
+                            root_session_id=identity.runtime_session_id,
+                        ):
+                            lease_protected = True
+                            break
+                if lease_protected:
+                    if identity.ui_anchor_task_id:
+                        lease_protected_anchor_task_ids.add(
+                            identity.ui_anchor_task_id
+                        )
+                    logger.info(
+                        "Startup reconcile skipped live company controller scope: "
+                        "project={} session={} runs={}",
+                        project_id,
+                        identity.runtime_session_id,
+                        sorted(run_ids),
+                    )
+                    continue
+                runtime_groups[identity.runtime_session_id] = group
+                runtime_group_run_ids[identity.runtime_session_id] = next(
+                    iter(sorted(run_ids)),
+                    "",
+                )
+                runtime_group_anchor_ids[identity.runtime_session_id] = str(
+                    identity.ui_anchor_task_id or ""
+                ).strip()
 
-        updated = 0
+        deferred_anchor_task_ids = {
+            anchor_id
+            for anchor_id in runtime_group_anchor_ids.values()
+            if anchor_id
+        }
         for anchor_task_id in ui_anchor_task_ids:
+            if (
+                anchor_task_id in lease_protected_anchor_task_ids
+                or anchor_task_id in deferred_anchor_task_ids
+            ):
+                continue
             anchor = task_by_id.get(anchor_task_id)
             if anchor is not None and anchor.status == TaskStatus.RUNNING:
                 if await self._clear_stale_company_session_anchor(anchor):
@@ -7942,11 +9041,100 @@ class OPCEngine:
                 project_id,
                 parent_session_id,
             ):
-                updated += await self._reconcile_company_runtime_state(
-                    parent_session_id,
-                    self._company_runtime_plan_for_tasks(group),
-                    group,
+                run_id = runtime_group_run_ids.get(parent_session_id, "")
+                owner_token = (
+                    f"startup:{self._project_owner_actor_token}:"
+                    f"{uuid.uuid4().hex}"
                 )
+                acquire_controller = getattr(
+                    self.store,
+                    "acquire_delegation_run_controller_lease",
+                    None,
+                )
+                release_controller = getattr(
+                    self.store,
+                    "release_delegation_run_controller_lease",
+                    None,
+                )
+                receipt = None
+                acquired_controller = False
+                if run_id and callable(acquire_controller):
+                    receipt = await acquire_controller(
+                        run_id,
+                        project_id=project_id,
+                        root_session_id=parent_session_id,
+                        owner_token=owner_token,
+                        lease_seconds=120.0,
+                    )
+                    receipt_outcome = str(
+                        getattr(receipt, "outcome", "") or ""
+                    )
+                    if receipt_outcome == "busy":
+                        logger.info(
+                            "Startup reconcile lost company controller CAS; "
+                            "scope left untouched: project={} session={} run={}",
+                            project_id,
+                            parent_session_id,
+                            run_id,
+                        )
+                        continue
+                    acquired_controller = bool(
+                        getattr(receipt, "acquired", False)
+                    )
+                try:
+                    if acquired_controller:
+                        settle_claims = getattr(
+                            self.store,
+                            "settle_stale_delegation_run_claims_for_controller",
+                            None,
+                        )
+                        if callable(settle_claims):
+                            await settle_claims(
+                                run_id,
+                                project_id=project_id,
+                                root_session_id=parent_session_id,
+                                owner_token=owner_token,
+                                generation=int(
+                                    getattr(receipt, "generation", 0) or 0
+                                ),
+                            )
+                    anchor_id = runtime_group_anchor_ids.get(
+                        parent_session_id,
+                        "",
+                    )
+                    anchor = task_by_id.get(anchor_id)
+                    if anchor is not None and anchor.status == TaskStatus.RUNNING:
+                        if await self._clear_stale_company_session_anchor(anchor):
+                            updated += 1
+                    updated += await self._reconcile_company_runtime_state(
+                        parent_session_id,
+                        self._company_runtime_plan_for_tasks(group),
+                        group,
+                        controller_credential=(
+                            {
+                                "run_id": run_id,
+                                "project_id": project_id,
+                                "root_session_id": parent_session_id,
+                                "owner_token": owner_token,
+                                "generation": int(
+                                    getattr(receipt, "generation", 0) or 0
+                                ),
+                            }
+                            if acquired_controller
+                            else None
+                        ),
+                    )
+                finally:
+                    if acquired_controller and callable(release_controller):
+                        await release_controller(
+                            run_id,
+                            project_id=project_id,
+                            root_session_id=parent_session_id,
+                            owner_token=owner_token,
+                            generation=int(
+                                getattr(receipt, "generation", 0) or 0
+                            ),
+                        )
         return updated
 
     async def prepare_active_company_runtimes_for_shutdown(
@@ -7971,6 +9159,16 @@ class OPCEngine:
         project_id = str(self.project_id or "default").strip() or "default"
         active_task_ids = self._active_task_run_registry.active_task_ids(project_id)
         delegate_prepared: list[dict[str, Any]] = []
+        # A custom child owns the exact run-generation credential even though
+        # it borrows this controller's registry and Store.  Let each child
+        # perform its own fenced, atomic suspend before any coroutine is
+        # cancelled; the root executor cannot safely impersonate it.
+        for runtime_child in list(getattr(self, "_runtime_child_engines", ())):
+            delegate_prepared.extend(
+                await runtime_child.prepare_active_company_runtimes_for_shutdown(
+                    _controller_shutdown=True,
+                )
+            )
         for delegate in list(self._project_engine_delegates.values()):
             delegate_prepared.extend(
                 await delegate.prepare_active_company_runtimes_for_shutdown(
@@ -8010,17 +9208,109 @@ class OPCEngine:
                     plan = self._company_runtime_plan_for_tasks(tasks)
                 else:
                     plan, tasks = snapshot
-                origin_task_id = str(active_scope_tasks[0].id or "").strip() or None
-                checkpoint, created, affected_task_ids = (
-                    await self._checkpoint_and_suspend_company_runtime_scope(
-                        checkpoint_type="company_runtime_interrupted",
-                        reason="service_shutdown",
-                        parent_session_id=parent_session_id,
-                        origin_task_id=origin_task_id,
-                        plan=plan,
-                        tasks=tasks,
+                run_id = next(
+                    (
+                        str((task.metadata or {}).get("delegation_run_id", "") or "").strip()
+                        for task in tasks
+                        if str((task.metadata or {}).get("delegation_run_id", "") or "").strip()
+                    ),
+                    "",
+                )
+                credential_getter = getattr(
+                    self.company_executor,
+                    "controller_lease_credential",
+                    None,
+                )
+                credential = (
+                    credential_getter(run_id)
+                    if run_id and callable(credential_getter)
+                    else None
+                )
+                validate_controller = getattr(
+                    self.store,
+                    "delegation_run_controller_lease_is_current",
+                    None,
+                )
+                persisted_run = (
+                    await self.store.get_delegation_run(run_id)
+                    if run_id and hasattr(self.store, "get_delegation_run")
+                    else None
+                )
+                lease_protocol_active = bool(
+                    int(
+                        getattr(
+                            persisted_run,
+                            "controller_lease_generation",
+                            0,
+                        )
+                        or 0
                     )
                 )
+                owns_scope = not lease_protocol_active
+                if lease_protocol_active:
+                    owns_scope = bool(
+                        credential
+                        and callable(validate_controller)
+                        and await validate_controller(
+                            run_id,
+                            project_id=project_id,
+                            root_session_id=parent_session_id,
+                            owner_token=str(credential.get("owner_token", "") or ""),
+                            generation=int(credential.get("generation", 0) or 0),
+                        )
+                    )
+                if run_id and not owns_scope:
+                    logger.info(
+                        "Shutdown skipped company scope not owned by this "
+                        "controller generation: project={} session={} run={}",
+                        project_id,
+                        parent_session_id,
+                        run_id,
+                    )
+                    continue
+                origin_task_id = str(active_scope_tasks[0].id or "").strip() or None
+                try:
+                    checkpoint, created, affected_task_ids = (
+                        await self._checkpoint_and_suspend_company_runtime_scope(
+                            checkpoint_type="company_runtime_interrupted",
+                            reason="service_shutdown",
+                            parent_session_id=parent_session_id,
+                            origin_task_id=origin_task_id,
+                            plan=plan,
+                            tasks=tasks,
+                            controller_run_id=(
+                                run_id if lease_protocol_active else ""
+                            ),
+                            controller_owner_token=(
+                                str(credential.get("owner_token", "") or "")
+                                if lease_protocol_active and credential
+                                else ""
+                            ),
+                            controller_lease_generation=(
+                                int(credential.get("generation", 0) or 0)
+                                if lease_protocol_active and credential
+                                else 0
+                            ),
+                        )
+                    )
+                    if checkpoint is None:
+                        logger.info(
+                            "Shutdown skipped company scope already awaiting owner "
+                            "or terminal: project={} session={} run={}",
+                            project_id,
+                            parent_session_id,
+                            run_id,
+                        )
+                        continue
+                except CompanyRunControllerLeaseLost:
+                    logger.info(
+                        "Shutdown lost company controller lease before its "
+                        "atomic scope checkpoint: project={} session={} run={}",
+                        project_id,
+                        parent_session_id,
+                        run_id,
+                    )
+                    continue
                 idempotent = not created
                 prepared.append(
                     {
@@ -8501,6 +9791,8 @@ class OPCEngine:
         context_updates: dict[str, Any] | None = None,
         metadata_updates: dict[str, Any] | None = None,
         degrade_to_plain_resume_on_missing_target: bool = False,
+        controller_admission: CompanyRunControllerAdmission | None = None,
+        release_controller_admission_on_exit: bool = True,
     ) -> str | None:
         assert self.company_executor
         reply = str(user_reply or "").strip()
@@ -8514,7 +9806,12 @@ class OPCEngine:
             # checkpoint drains, instead of parking the checkpoint pending
             # forever and dead-ending every follow-up.
             if degrade_to_plain_resume_on_missing_target:
-                result = await self.company_executor.execute(plan, tasks)
+                result = await self._execute_with_company_controller_admission(
+                    plan,
+                    tasks,
+                    controller_admission,
+                    retain_admission=not release_controller_admission_on_exit,
+                )
                 note = (
                     "The final-decider work item for this run is no longer active "
                     "(failed or cancelled), so the follow-up could not be routed to it. "
@@ -8539,7 +9836,12 @@ class OPCEngine:
         )
         if self.on_company_runtime_children and session_id and tasks:
             self.on_company_runtime_children(session_id, [t.id for t in tasks])
-        result = await self.company_executor.execute(plan, tasks)
+        result = await self._execute_with_company_controller_admission(
+            plan,
+            tasks,
+            controller_admission,
+            retain_admission=not release_controller_admission_on_exit,
+        )
         refreshed_target = target_task
         if self.store:
             try:
@@ -8592,29 +9894,43 @@ class OPCEngine:
         if not self.store:
             return
         now = str(closed_at or datetime.now().isoformat())
-        task.metadata = dict(task.metadata or {})
-        if metadata_updates:
-            task.metadata.update(copy.deepcopy(dict(metadata_updates)))
-        if checkpoint_id:
-            task.metadata["human_review_checkpoint_id"] = checkpoint_id
-        progress = list(task.metadata.get("progress_log", []) or [])
-        progress.append(f"Delivery human review closed: {resolution}.")
-        close_updates = {
-            "requires_user_feedback": False,
-            "human_review_closed": True,
-            "human_review_closed_at": now,
-            "human_review_resolution": resolution,
-            "feedback_closed": True,
-            "feedback_resolved": True,
-            "feedback_resolution": resolution,
-            "feedback_closed_at": now,
-            "progress_log": progress[-50:],
-        }
-        task.metadata.update(close_updates)
-        task.status = TaskStatus.DONE
-        task.execution_lock = False
-        task.execution_locked_at = None
-        await self.store.save_task(task)
+        close_task = getattr(
+            self.store,
+            "close_company_delivery_review_task",
+            None,
+        )
+        if not callable(close_task):
+            raise RuntimeError(
+                "store does not support the typed delivery-review close transition"
+            )
+        task, close_updates = await close_task(
+            task_id=task.id,
+            project_id=task.project_id or self.project_id or "default",
+            resolution=resolution,
+            closed_at=now,
+            checkpoint_id=checkpoint_id,
+            metadata_updates=metadata_updates,
+        )
+        if task is None:
+            return
+        hydrated_task = await self.store.get_task(task.id)
+        await self._project_closed_delivery_review_work_item(
+            hydrated_task or task,
+            resolution=resolution,
+            close_updates=close_updates,
+        )
+
+    async def _project_closed_delivery_review_work_item(
+        self,
+        task: Task,
+        *,
+        resolution: str,
+        close_updates: dict[str, Any],
+    ) -> None:
+        """Best-effort projection after the Task's core closure is durable."""
+
+        if not self.store:
+            return
 
         work_item_id = str(linked_work_item_id_for_task(task) or "").strip()
         if not work_item_id or not hasattr(self.store, "update_delegation_work_item"):
@@ -8664,6 +9980,112 @@ class OPCEngine:
                 work_item_id,
             )
 
+    async def supersede_delivery_feedback_for_new_company_turn(
+        self,
+        *,
+        root_session_id: str,
+        conversation_turn_id: str,
+    ) -> list[str]:
+        """Atomically retire stale final-review interactions for a new turn.
+
+        This is a company-domain transition, not an interaction decision.  A
+        concurrent card answer and the new turn race only on the checkpoint's
+        ``pending`` status; exactly one transition wins and this method never
+        starts self-evolution.
+        """
+
+        if not self.store:
+            return []
+        root_session_id = str(root_session_id or "").strip()
+        conversation_turn_id = str(conversation_turn_id or "").strip()
+        if not root_session_id or not conversation_turn_id:
+            return []
+        project_id = str(self.project_id or "default").strip() or "default"
+        transition = getattr(
+            self.store,
+            "supersede_pending_delivery_review_for_company_turn",
+            None,
+        )
+        if not callable(transition):
+            raise RuntimeError(
+                "store does not support atomic delivery-review supersession"
+            )
+        checkpoints = await self.store.get_execution_checkpoints(
+            project_id=project_id,
+            checkpoint_types=["company_delivery_feedback"],
+            statuses=["pending"],
+        )
+        if not checkpoints:
+            return []
+        try:
+            identity_index = await load_company_runtime_identity_index(
+                self.store,
+                project_id,
+            )
+        except Exception:
+            logger.opt(exception=True).warning(
+                "Could not build company identity index while superseding delivery reviews"
+            )
+            identity_index = None
+
+        superseded_ids: list[str] = []
+        for checkpoint in checkpoints:
+            payload = dict(checkpoint.payload or {})
+            interaction = dict(payload.get("interaction", {}) or {})
+            ownership = dict(interaction.get("ownership", {}) or {})
+            waiting_task_id = str(
+                payload.get("waiting_task_id")
+                or payload.get("task_id")
+                or checkpoint.task_id
+                or ""
+            ).strip()
+            waiting_task = (
+                await self.store.get_task(waiting_task_id)
+                if waiting_task_id
+                else None
+            )
+            checkpoint_root_session_id = str(
+                ownership.get("root_session_id")
+                or ownership.get("company_runtime_session_id")
+                or payload.get("parent_session_id")
+                or ""
+            ).strip()
+            if not checkpoint_root_session_id and identity_index is not None and waiting_task_id:
+                identity = identity_index.resolve(task_id=waiting_task_id)
+                checkpoint_root_session_id = str(
+                    getattr(identity, "runtime_session_id", "") or ""
+                ).strip()
+            if not checkpoint_root_session_id and waiting_task is not None:
+                checkpoint_root_session_id = str(
+                    waiting_task.parent_session_id
+                    or waiting_task.metadata.get("parent_session_id")
+                    or ""
+                ).strip()
+            if not checkpoint_root_session_id:
+                checkpoint_root_session_id = str(checkpoint.session_id or "").strip()
+            if checkpoint_root_session_id != root_session_id:
+                continue
+
+            receipt = await transition(
+                checkpoint.checkpoint_id,
+                project_id=project_id,
+                root_session_id=root_session_id,
+                conversation_turn_id=conversation_turn_id,
+            )
+            if not receipt.applied or receipt.checkpoint is None:
+                continue
+            await self._interaction_checkpoint_changed(receipt.checkpoint)
+            closed_task = receipt.task
+            if closed_task is not None:
+                hydrated_task = await self.store.get_task(closed_task.id)
+                await self._project_closed_delivery_review_work_item(
+                    hydrated_task or closed_task,
+                    resolution="new_company_turn_started",
+                    close_updates=dict(receipt.task_close_updates or {}),
+                )
+            superseded_ids.append(checkpoint.checkpoint_id)
+        return superseded_ids
+
     async def _terminalize_company_delivery_feedback_checkpoint(
         self,
         checkpoint: ExecutionCheckpoint,
@@ -8700,23 +10122,16 @@ class OPCEngine:
                     checkpoint_id=str(getattr(checkpoint, "checkpoint_id", "") or "").strip(),
                     metadata_updates=task_metadata_updates,
                 )
-        await self._mark_company_runtime_checkpoint_status(
-            checkpoint,
-            status=status,
-            payload_updates=payload,
-        )
+        checkpoint.payload = payload
+        checkpoint.status = status
 
-    async def ignore_company_delivery_feedback_checkpoint(
+    async def _ignore_company_delivery_feedback_consumed(
         self,
         checkpoint: ExecutionCheckpoint,
         *,
         reply_metadata: dict[str, Any] | None = None,
     ) -> str:
-        assert self.store
-        checkpoint = await self._ensure_checkpoint_runtime_v2_payload(checkpoint)
-        status = str(getattr(checkpoint, "status", "") or "").strip().lower()
-        if status and status != "pending":
-            return "This self-evolution review is no longer active."
+        """Apply ignore after the unified interaction lease is already held."""
 
         payload = dict(checkpoint.payload or {})
         waiting_task_id = str(
@@ -8726,11 +10141,11 @@ class OPCEngine:
             or ""
         ).strip()
         if not waiting_task_id:
-            await self._mark_company_runtime_checkpoint_status(checkpoint, status="invalid")
+            checkpoint.status = "invalid"
             return "Could not ignore self-evolution because the delivery task reference is missing."
         waiting_task = await self.store.get_task(waiting_task_id)
         if not waiting_task:
-            await self._mark_company_runtime_checkpoint_status(checkpoint, status="invalid")
+            checkpoint.status = "invalid"
             return "Could not ignore self-evolution because the delivery task no longer exists."
 
         ignored_at = datetime.now().isoformat()
@@ -8760,6 +10175,12 @@ class OPCEngine:
         tasks: list[Task],
     ) -> None:
         if not self.store:
+            return
+        if getattr(self, "pre_delivery_validator", None):
+            # Validator-enabled recovery never manufactures a final card from
+            # an AWAITING_HUMAN snapshot.  Startup requeues any unpublished
+            # delivery under its controller lease; an atomically published
+            # card already exists durably and needs no reconstruction.
             return
         open_delivery_tasks = [
             task
@@ -9162,6 +10583,11 @@ class OPCEngine:
         return decision
 
     def _resolve_external_workspace(self, task: Task) -> str:
+        if requires_native_company_execution(task):
+            raise RuntimeError(
+                "company-owned execution cannot prepare an unisolated "
+                "external workspace"
+            )
         workspace_root = (
             str(task.metadata.get("workspace_root", "") or "").strip()
             or str(task.metadata.get("comms_workspace_root", "") or "").strip()
@@ -9180,6 +10606,8 @@ class OPCEngine:
         return str(workspace.resolve())
 
     def _resolved_execution_agent_name_for_task(self, task: Task) -> str:
+        if requires_native_company_execution(task):
+            return "native"
         role_id = str(task.assigned_to or task.metadata.get("work_item_role_id", "") or "").strip()
         role = self.org_engine.get_agent(role_id) if self.org_engine and role_id else None
         preferred_external = (
@@ -9222,7 +10650,20 @@ class OPCEngine:
         force_new_session: bool = True,
     ) -> Task:
         role_id = str(source_task.assigned_to or source_task.metadata.get("work_item_role_id", "") or "").strip()
-        session_id = str(source_task.session_id or source_task.parent_session_id or "").strip() or None
+        auxiliary_suffix = uuid.uuid4().hex
+        source_session_id = str(
+            source_task.session_id
+            or source_task.parent_session_id
+            or source_task.id
+            or "task"
+        ).strip()
+        auxiliary_task_id = (
+            f"{str(source_task.id or 'task').strip() or 'task'}::"
+            f"{prompt_kind}::{auxiliary_suffix}"
+        )
+        session_id = (
+            f"{source_session_id}:aux:{prompt_kind}:{auxiliary_suffix}"
+        )
         metadata = {
             "prompt_kind": prompt_kind,
             "source_task_id": str(source_task.id or "").strip(),
@@ -9232,8 +10673,62 @@ class OPCEngine:
             "comms_workspace_root": str(source_task.metadata.get("comms_workspace_root", "") or "").strip(),
             "target_output_dir": str(source_task.metadata.get("target_output_dir", "") or "").strip(),
             "_disable_live_inbox_interrupts": True,
+            # A non-empty sentinel deliberately resolves to zero registered
+            # schemas.  Empty lists historically mean "inherit all tools".
+            "_fork_allowed_tools": ["__opc_runtime_auxiliary_no_tools__"],
             "attachment_refs": [],
+            "runtime_auxiliary_task": True,
+            "runtime_auxiliary_kind": "role_prompt",
+            "runtime_auxiliary_source_task_id": str(source_task.id or "").strip(),
         }
+        source_metadata = dict(source_task.metadata or {})
+        # Generated role prompts (notably the CEO pre-delivery assessment) are
+        # durable auxiliary Tasks.  Carry the exact source attempt/controller
+        # identity so Store can fence them beneath the owning WorkItem without
+        # pretending that the assessment is a second business WorkItem.
+        controller_run_id = str(
+            source_metadata.get("delegation_run_id", "") or ""
+        ).strip()
+        if controller_run_id:
+            try:
+                source_attempt_seq = int(
+                    source_metadata.get("claimed_work_item_attempt_seq", 0) or 0
+                )
+            except (TypeError, ValueError):
+                source_attempt_seq = 0
+            metadata.update(
+                {
+                    "delegation_run_id": controller_run_id,
+                    "company_runtime_auxiliary_task": True,
+                    "runtime_auxiliary_kind": "role_prompt",
+                    "runtime_auxiliary_source_task_id": str(
+                        source_task.id or ""
+                    ).strip(),
+                    "runtime_auxiliary_source_attempt_seq": source_attempt_seq,
+                }
+            )
+            controller_owner_token = str(
+                source_metadata.get(
+                    "company_run_controller_owner_token", ""
+                )
+                or ""
+            ).strip()
+            try:
+                controller_generation = int(
+                    source_metadata.get(
+                        "company_run_controller_lease_generation", 0
+                    )
+                    or 0
+                )
+            except (TypeError, ValueError):
+                controller_generation = 0
+            if controller_owner_token or controller_generation:
+                metadata["company_run_controller_owner_token"] = (
+                    controller_owner_token
+                )
+                metadata["company_run_controller_lease_generation"] = (
+                    controller_generation
+                )
         if execution_agent != "native":
             metadata["preferred_external_agent"] = execution_agent
         if system_prompt:
@@ -9243,7 +10738,6 @@ class OPCEngine:
             metadata.pop("external_resume_session_scope_id", None)
             metadata.pop("external_resume_agent_type", None)
         else:
-            source_metadata = dict(source_task.metadata or {})
             for key in (
                 "work_item_runtime",
                 "work_item_runtime_version",
@@ -9265,9 +10759,12 @@ class OPCEngine:
                     metadata[key] = copy.deepcopy(source_metadata[key])
             metadata.setdefault("work_item_runtime", bool(source_metadata.get("work_item_runtime", False)))
         return Task(
-            id=f"{str(source_task.id or 'task').strip() or 'task'}::{prompt_kind}::{uuid.uuid4().hex}",
+            id=auxiliary_task_id,
             session_id=session_id,
-            parent_session_id=str(source_task.parent_session_id or "").strip() or None,
+            parent_session_id=str(
+                source_task.session_id or source_task.parent_session_id or ""
+            ).strip()
+            or None,
             title=prompt_kind.replace("_", " ").title(),
             description=description,
             assigned_to=role_id,
@@ -9278,7 +10775,290 @@ class OPCEngine:
             context_snapshot={"skip_session_history": True},
             metadata=metadata,
             org_id=source_task.org_id,
+            parent_id=str(source_task.id or "").strip() or None,
+            max_retries=0,
         )
+
+    async def _save_runtime_auxiliary_terminal_task(
+        self,
+        task: Task,
+        *,
+        status: TaskStatus,
+        content: str,
+        artifacts: dict[str, Any] | None = None,
+        reason: str,
+    ) -> Task:
+        """Commit an auxiliary terminal state without letting a stale tail win."""
+
+        fresh = await self.store.get_task(task.id)
+        terminal = {TaskStatus.DONE, TaskStatus.FAILED, TaskStatus.CANCELLED}
+        if fresh is not None and fresh.status in terminal:
+            return fresh
+        # ``task`` is the live runtime envelope: NativeRuntime updates its
+        # metadata with the canonical runtime id/status before returning.
+        # ``fresh`` is consulted only for an authoritative competing terminal
+        # write; using it as the save payload would drop that runtime audit.
+        target = task
+        target.status = status
+        target.result = {
+            "content": str(content or ""),
+            "artifacts": dict(artifacts or {}),
+        }
+        target.metadata = dict(target.metadata or {})
+        target.metadata.update(
+            {
+                "runtime_auxiliary_terminal_reason": str(reason or status.value),
+                "runtime_auxiliary_terminalized_at": datetime.now().isoformat(),
+            }
+        )
+        try:
+            await self.store.save_task(target)
+        except CompanyRunControllerLeaseLost:
+            # Shutdown/takeover owns the only legal competing terminal write.
+            authoritative = await self.store.get_task(task.id)
+            if authoritative is not None and authoritative.status in terminal:
+                return authoritative
+            raise
+        return target
+
+    async def _terminalize_nonterminal_auxiliary_runtime(
+        self,
+        task: Task,
+        result: TaskResult,
+    ) -> None:
+        """Do not leave an internal runtime awaiting an owner interaction."""
+
+        self._apply_runtime_state_to_auxiliary_task(task, result)
+        runtime_state = self._extract_runtime_state_from_artifacts(result.artifacts)
+        runtime_session_id = str(
+            runtime_state.get("runtime_session_id", "") or ""
+        ).strip()
+        if not runtime_session_id:
+            return
+        persisted = await self.store.get_runtime_session(runtime_session_id)
+        if persisted is None:
+            return
+        persisted_status = str(persisted.get("status", "") or "").strip().lower()
+        if persisted_status in {"completed", "failed", "cancelled", "suspended"}:
+            return
+        metadata = {
+            **dict(persisted.get("metadata", {}) or {}),
+            "status": "failed",
+            "runtime_auxiliary_terminal_reason": "nonterminal_result",
+            "runtime_auxiliary_terminalized_at": datetime.now().isoformat(),
+        }
+        task_metadata = dict(task.metadata or {})
+        await self.store.save_runtime_session(
+            runtime_session_id=runtime_session_id,
+            project_id=str(task.project_id or self.project_id or "default"),
+            session_id=task.session_id,
+            task_id=task.id,
+            status="failed",
+            metadata=metadata,
+            controller_run_id=str(
+                task_metadata.get("delegation_run_id", "") or ""
+            ).strip(),
+            controller_owner_token=str(
+                task_metadata.get("company_run_controller_owner_token", "") or ""
+            ).strip(),
+            controller_lease_generation=int(
+                task_metadata.get("company_run_controller_lease_generation", 0)
+                or 0
+            ),
+        )
+        task_runtime_state = dict(task.metadata.get("runtime_v2", {}) or {})
+        task_runtime_state["status"] = "failed"
+        task.metadata["runtime_v2"] = task_runtime_state
+
+    def _apply_runtime_state_to_auxiliary_task(
+        self,
+        task: Task,
+        result: TaskResult,
+    ) -> None:
+        """Merge result artifacts without discarding Runtime's live status."""
+
+        prior_metadata_state = dict(task.metadata.get("runtime_v2", {}) or {})
+        prior_context_state = dict(
+            task.context_snapshot.get("runtime_v2", {}) or {}
+        )
+        self._apply_runtime_state_to_task(task, result)
+        current_state = dict(task.metadata.get("runtime_v2", {}) or {})
+        merged = {**prior_context_state, **prior_metadata_state, **current_state}
+        if merged:
+            task.metadata["runtime_v2"] = merged
+            task.context_snapshot["runtime_v2"] = dict(merged)
+
+    async def _ensure_runtime_auxiliary_session_terminal(
+        self,
+        task: Task,
+        *,
+        status: str,
+        reason: str,
+    ) -> None:
+        """Converge a runtime row when failure occurs outside RuntimeV2.run."""
+
+        runtime_state = dict(task.metadata.get("runtime_v2", {}) or {})
+        runtime_resume = dict(
+            task.context_snapshot.get("runtime_resume", {}) or {}
+        )
+        runtime_session_id = str(
+            runtime_state.get("runtime_session_id")
+            or runtime_resume.get("runtime_session_id")
+            or ""
+        ).strip()
+        if not runtime_session_id:
+            return
+        persisted = await self.store.get_runtime_session(runtime_session_id)
+        if persisted is None:
+            return
+        terminal_statuses = {"cancelled", "completed", "failed", "suspended"}
+        current_status = str(persisted.get("status", "") or "").strip().lower()
+        if current_status in terminal_statuses:
+            runtime_state["status"] = current_status
+            task.metadata["runtime_v2"] = runtime_state
+            return
+        task_metadata = dict(task.metadata or {})
+        payload = {
+            **dict(persisted.get("metadata", {}) or {}),
+            "status": status,
+            "runtime_auxiliary_terminal_reason": reason,
+            "runtime_auxiliary_terminalized_at": datetime.now().isoformat(),
+        }
+        try:
+            await self.store.save_runtime_session(
+                runtime_session_id=runtime_session_id,
+                project_id=str(task.project_id or self.project_id or "default"),
+                session_id=task.session_id,
+                task_id=task.id,
+                status=status,
+                metadata=payload,
+                controller_run_id=str(
+                    task_metadata.get("delegation_run_id", "") or ""
+                ).strip(),
+                controller_owner_token=str(
+                    task_metadata.get(
+                        "company_run_controller_owner_token", ""
+                    )
+                    or ""
+                ).strip(),
+                controller_lease_generation=int(
+                    task_metadata.get(
+                        "company_run_controller_lease_generation", 0
+                    )
+                    or 0
+                ),
+            )
+        except CompanyRunControllerLeaseLost:
+            authoritative = await self.store.get_runtime_session(runtime_session_id)
+            authoritative_status = str(
+                dict(authoritative or {}).get("status", "") or ""
+            ).strip().lower()
+            if authoritative is None or authoritative_status not in terminal_statuses:
+                raise
+            status = authoritative_status
+        runtime_state["status"] = status
+        task.metadata["runtime_v2"] = runtime_state
+        task.context_snapshot["runtime_v2"] = dict(runtime_state)
+
+    async def _run_native_runtime_auxiliary_task(self, task: Task) -> TaskResult:
+        """Run one durable private Native turn with a closed lifecycle."""
+
+        if not is_runtime_auxiliary_task(task):
+            raise ValueError("internal Native execution requires an auxiliary Task")
+        project_id = str(task.project_id or self.project_id or "default").strip() or "default"
+        registry = getattr(self, "_active_task_run_registry", None)
+        if registry is None:
+            registry = ActiveTaskRunRegistry()
+            self._active_task_run_registry = registry
+        try:
+            attempt_token = registry.register(
+                project_id,
+                task.id,
+                owner_task=asyncio.current_task(),
+            )
+        except ActiveTaskRunAdmissionClosed as exc:
+            raise asyncio.CancelledError(str(exc)) from exc
+        try:
+            try:
+                task.status = TaskStatus.RUNNING
+                await self.store.save_task(task)
+                result = await self._run_native_agent(task)
+            except asyncio.CancelledError:
+                await self._ensure_runtime_auxiliary_session_terminal(
+                    task,
+                    status="suspended",
+                    reason="runtime_owner_cancelled",
+                )
+                await self._save_runtime_auxiliary_terminal_task(
+                    task,
+                    status=TaskStatus.CANCELLED,
+                    content="Native auxiliary execution cancelled",
+                    reason="runtime_owner_cancelled",
+                )
+                raise
+            except CompanyRunControllerLeaseLost:
+                # The typed Store fence proves this attempt never became (or
+                # is no longer) the authoritative auxiliary owner.
+                raise
+            except BaseException as exc:
+                await self._ensure_runtime_auxiliary_session_terminal(
+                    task,
+                    status="failed",
+                    reason=type(exc).__name__,
+                )
+                await self._save_runtime_auxiliary_terminal_task(
+                    task,
+                    status=TaskStatus.FAILED,
+                    content=str(exc),
+                    reason=type(exc).__name__,
+                )
+                raise
+
+            terminal_status = result.status
+            if terminal_status not in {
+                TaskStatus.DONE,
+                TaskStatus.FAILED,
+                TaskStatus.CANCELLED,
+            }:
+                await self._terminalize_nonterminal_auxiliary_runtime(task, result)
+                result = TaskResult(
+                    status=TaskStatus.FAILED,
+                    content=(
+                        str(result.content or "").strip()
+                        or "Internal native turn returned a nonterminal status"
+                    ),
+                    artifacts=dict(result.artifacts or {}),
+                    escalation=result.escalation,
+                    cost=result.cost,
+                    token_usage=dict(result.token_usage or {}),
+                )
+            else:
+                self._apply_runtime_state_to_auxiliary_task(task, result)
+                await self._ensure_runtime_auxiliary_session_terminal(
+                    task,
+                    status=(
+                        "completed"
+                        if result.status == TaskStatus.DONE
+                        else "suspended"
+                        if result.status == TaskStatus.CANCELLED
+                        else "failed"
+                    ),
+                    reason=f"native_result_{result.status.value}",
+                )
+            await self._save_runtime_auxiliary_terminal_task(
+                task,
+                status=result.status,
+                content=result.content,
+                artifacts=result.artifacts,
+                reason=f"native_result_{result.status.value}",
+            )
+            return result
+        finally:
+            registry.unregister(
+                project_id,
+                task.id,
+                attempt_token,
+            )
 
     async def _run_role_prompt_via_task_execution_agent(
         self,
@@ -9298,7 +11078,7 @@ class OPCEngine:
                 system_prompt=system_prompt,
                 force_new_session=force_new_session,
             )
-            result = await self._run_native_agent(prompt_task)
+            result = await self._run_native_runtime_auxiliary_task(prompt_task)
             return str(result.content or "").strip() if result.status == TaskStatus.DONE else None
 
         if not self.adapter_registry or not self.external_broker:
@@ -9510,7 +11290,11 @@ class OPCEngine:
     async def _execute_task(self, task: Task) -> TaskResult:
         project_id = str(task.project_id or self.project_id or "default").strip() or "default"
         try:
-            attempt_token = self._active_task_run_registry.register(project_id, task.id)
+            attempt_token = self._active_task_run_registry.register(
+                project_id,
+                task.id,
+                owner_task=asyncio.current_task(),
+            )
         except ActiveTaskRunAdmissionClosed as exc:
             raise asyncio.CancelledError(str(exc)) from exc
         try:
@@ -9887,6 +11671,7 @@ class OPCEngine:
             communication=self.communication,
             approval_callback=self._tool_approval_callback,
             permission_policy=self.approval_engine,
+            interaction_coordinator=self.interaction_coordinator,
         )
 
         scoped_progress = self._make_task_progress_callback(task)
@@ -9914,27 +11699,82 @@ class OPCEngine:
             "web_fetch",
             "probe",
         ]
+        source_task_id = str(getattr(source_task, "id", "") or "").strip()
+        auxiliary_suffix = uuid.uuid4().hex
+        auxiliary_prefix = source_task_id or f"meeting::{meeting.room_id}"
+        auxiliary_task_id = (
+            f"{auxiliary_prefix}::meeting_turn::{auxiliary_suffix}"
+        )
+        source_session_id = str(
+            getattr(source_task, "session_id", "")
+            or getattr(source_task, "parent_session_id", "")
+            or meeting.task_id
+            or meeting.room_id
+        ).strip()
+        auxiliary_metadata: dict[str, Any] = {
+            "execution_mode": "company_mode",
+            "original_message": str(request.get("task_brief", "") or "").strip(),
+            "_subagent_profile_prompt": str(request.get("system_addendum", "") or "").strip(),
+            "_fork_allowed_tools": list(read_only_tools),
+            "_disable_live_inbox_interrupts": True,
+            "execution_task_ids": execution_scope_ids,
+            "meeting_room_id": meeting.room_id,
+            "meeting_consultation": True,
+            "meeting_turn_mode": str(request.get("mode", "participant") or "participant"),
+            "runtime_auxiliary_task": True,
+            "runtime_auxiliary_kind": "meeting_turn",
+            "runtime_auxiliary_source_task_id": source_task_id,
+            "runtime_auxiliary_projection_id": (
+                f"meeting::{meeting.room_id}::{participant}::"
+                f"round{int(request.get('round', 1) or 1)}"
+            ),
+        }
+        source_metadata = dict(getattr(source_task, "metadata", {}) or {})
+        run_id = str(source_metadata.get("delegation_run_id", "") or "").strip()
+        if source_task_id and run_id:
+            auxiliary_metadata.update(
+                {
+                    "delegation_run_id": run_id,
+                    "company_runtime_auxiliary_task": True,
+                    "runtime_auxiliary_source_attempt_seq": int(
+                        source_metadata.get("claimed_work_item_attempt_seq", 0)
+                        or 0
+                    ),
+                    "company_run_controller_owner_token": str(
+                        source_metadata.get(
+                            "company_run_controller_owner_token", ""
+                        )
+                        or ""
+                    ).strip(),
+                    "company_run_controller_lease_generation": int(
+                        source_metadata.get(
+                            "company_run_controller_lease_generation", 0
+                        )
+                        or 0
+                    ),
+                }
+            )
         temp_task = Task(
+            id=auxiliary_task_id,
+            session_id=(
+                f"{source_session_id}:aux:meeting_turn:{auxiliary_suffix}"
+                if source_session_id
+                else f"aux:meeting_turn:{auxiliary_suffix}"
+            ),
+            parent_session_id=source_session_id or None,
+            parent_id=source_task_id or None,
             title=f"Meeting Consultation: {meeting.topic}",
             description=str(request.get("task_brief", "") or "").strip() or f"Meeting turn for {participant}",
             assigned_to=participant,
             status=TaskStatus.PENDING,
             project_id=str(getattr(source_task, "project_id", "") or self.project_id or "default"),
             tags=list(getattr(source_task, "tags", []) or []),
-            metadata=mark_projected_work_item_task({
-                "execution_mode": "company_mode",
-                "original_message": str(request.get("task_brief", "") or "").strip(),
-                "_subagent_profile_prompt": str(request.get("system_addendum", "") or "").strip(),
-                "_fork_allowed_tools": list(read_only_tools),
-                "_disable_live_inbox_interrupts": True,
-                "execution_task_ids": execution_scope_ids,
-                "meeting_room_id": meeting.room_id,
-                "meeting_consultation": True,
-                "meeting_turn_mode": str(request.get("mode", "participant") or "participant"),
-            }, projection_id=f"meeting::{meeting.room_id}::{participant}::round{int(request.get('round', 1) or 1)}", turn_type="plan"),
+            metadata=auxiliary_metadata,
             context_snapshot={
                 "meeting_turn_context": dict(request.get("meeting_context", {}) or {}),
+                "skip_session_history": True,
             },
+            max_retries=0,
         )
         member_sessions = getattr(self.company_executor.runtime, "member_sessions", {}) if self.company_executor else {}
         session = next(
@@ -9945,12 +11785,12 @@ class OPCEngine:
             session_payload = self.company_executor.runtime._serialize_session(session)
             temp_task.metadata["member_session_state"] = session_payload
             temp_task.context_snapshot["member_session"] = session_payload
-        result = await self._run_native_agent(temp_task)
+        result = await self._run_native_runtime_auxiliary_task(temp_task)
         content = str(result.content or "").strip()
         if content:
             return content
         if str(request.get("mode", "") or "") == "decision_owner":
-            return '{"decision":"","action_items":[],"reasoning":"No structured owner decision was produced.","requires_human_input":true,"follow_up_questions":[]}'
+            return '{"decision":"","action_items":[],"reasoning":"No structured owner decision was produced; return the unresolved evidence to the owning agent for an internal retry.","follow_up_questions":[]}'
         return '{"stance":"abstain","proposal":"","support_level":0.5,"vote":"abstain","reasoning":"No structured meeting response was produced.","blocking_issues":["Missing structured participant response."],"assumptions":[],"questions_for_others":[]}'
 
     async def _ensure_company_prompt_contract_for_external_task(self, task: Task) -> Task:
@@ -10688,15 +12528,54 @@ class OPCEngine:
         """
         if not task_id or not self.store:
             return
-        supersede = getattr(self.store, "supersede_pending_checkpoints", None)
-        if not callable(supersede):
-            return
         try:
-            superseded = await supersede(
+            candidates = await self.store.get_execution_checkpoints(
                 project_id=self.project_id or "default",
-                task_id=task_id,
                 checkpoint_types=list(self._TASK_WAIT_CHECKPOINT_TYPES),
+                statuses=["pending"],
             )
+            matching = [
+                checkpoint
+                for checkpoint in candidates
+                if str(
+                    checkpoint.task_id
+                    or dict(checkpoint.payload or {}).get("task_id")
+                    or dict(checkpoint.payload or {}).get("waiting_task_id")
+                    or ""
+                ).strip()
+                == str(task_id).strip()
+            ]
+            superseded: list[str] = []
+            for checkpoint in matching:
+                if checkpoint.checkpoint_type in OWNER_INTERACTION_CHECKPOINT_TYPES:
+                    if self.interaction_coordinator is None:
+                        raise RuntimeError(
+                            "owner interaction coordinator is unavailable"
+                        )
+                    _persisted, applied = (
+                        await self.interaction_coordinator.close_pending_owner_checkpoint(
+                            checkpoint.checkpoint_id,
+                            checkpoint_type=checkpoint.checkpoint_type,
+                            status="superseded",
+                            payload_patch={
+                                "administrative_reason": reason,
+                                "administrative_closed_at": datetime.now().isoformat(),
+                            },
+                        )
+                    )
+                else:
+                    applied = await self.store.compare_and_set_execution_checkpoint(
+                        checkpoint.checkpoint_id,
+                        expected_statuses={"pending"},
+                        status="superseded",
+                        payload={
+                            **dict(checkpoint.payload or {}),
+                            "superseded_reason": reason,
+                            "superseded_at": datetime.now().isoformat(),
+                        },
+                    )
+                if applied:
+                    superseded.append(checkpoint.checkpoint_id)
         except Exception:
             logger.opt(exception=True).warning(
                 f"Failed to supersede stale task-wait checkpoints for task {task_id}"
@@ -10762,11 +12641,34 @@ class OPCEngine:
         if not stale_reason:
             return True
         try:
-            await self.store.resolve_execution_checkpoint(checkpoint.checkpoint_id, status="stale")
-            logger.info(
-                f"Resolved stale {checkpoint.checkpoint_type} checkpoint "
-                f"{checkpoint.checkpoint_id} ({stale_reason})"
-            )
+            resolved = True
+            if checkpoint.checkpoint_type in OWNER_INTERACTION_CHECKPOINT_TYPES:
+                if self.interaction_coordinator is None:
+                    raise RuntimeError("owner interaction coordinator is unavailable")
+                _, resolved = await self.interaction_coordinator.close_pending_owner_checkpoint(
+                    checkpoint.checkpoint_id,
+                    checkpoint_type=checkpoint.checkpoint_type,
+                    payload_patch={
+                        "stale_reason": stale_reason,
+                        "stale_at": datetime.now().isoformat(),
+                    },
+                    status="stale",
+                )
+            else:
+                await self.store.resolve_execution_checkpoint(
+                    checkpoint.checkpoint_id,
+                    status="stale",
+                )
+            if resolved:
+                logger.info(
+                    f"Resolved stale {checkpoint.checkpoint_type} checkpoint "
+                    f"{checkpoint.checkpoint_id} ({stale_reason})"
+                )
+            else:
+                logger.info(
+                    f"Skipped stale cleanup for answered owner checkpoint "
+                    f"{checkpoint.checkpoint_id}"
+                )
         except Exception:
             logger.opt(exception=True).warning(
                 f"Failed to resolve stale checkpoint {checkpoint.checkpoint_id}"
@@ -10800,21 +12702,275 @@ class OPCEngine:
             return f"work item {work_item_id} closed with phase={phase}"
         return ""
 
-    async def _save_execution_checkpoint(self, data: dict[str, Any]) -> None:
+    async def _prepare_execution_checkpoint_publication(
+        self,
+        data: dict[str, Any],
+    ) -> PreparedOwnerInteractionPublication:
+        prepared = await self._save_execution_checkpoint(data, prepare_only=True)
+        if not isinstance(prepared, PreparedOwnerInteractionPublication):
+            raise RuntimeError("checkpoint preparation did not produce an owner publication")
+        return prepared
+
+    async def _save_execution_checkpoint(
+        self,
+        data: dict[str, Any],
+        *,
+        prepare_only: bool = False,
+    ) -> PreparedOwnerInteractionPublication | None:
         assert self.store
         payload = dict(data.get("payload", {}))
         if not str(payload.get("basis_hash", "") or "").strip():
             payload["basis_hash"] = self._checkpoint_basis_hash(payload)
+        project_id = str(
+            data.get("project_id", self.project_id or "default") or "default"
+        ).strip() or "default"
+        checkpoint_type = str(data.get("checkpoint_type", "generic") or "generic")
+        owner_interaction = checkpoint_type in OWNER_INTERACTION_CHECKPOINT_TYPES
+        interaction_key = ""
+        supersession_key = ""
+        supersession_order: list[int] = [0, 0]
+        if owner_interaction:
+            interaction = dict(payload.get("interaction", {}) or {})
+            interaction.setdefault("kind", checkpoint_type)
+            interaction.setdefault(
+                "prompt",
+                str(payload.get("prompt") or payload.get("reason") or "").strip(),
+            )
+            ownership = dict(interaction.get("ownership", {}) or {})
+            task_id = str(
+                data.get("task_id")
+                or payload.get("waiting_task_id")
+                or payload.get("task_id")
+                or ""
+            ).strip()
+            get_task = getattr(self.store, "get_task", None)
+            execution_task = (
+                await get_task(task_id)
+                if task_id and callable(get_task)
+                else None
+            )
+            execution_task_metadata = dict(
+                getattr(execution_task, "metadata", {}) or {}
+            )
+            ownership = await resolve_company_interaction_ownership(
+                self.store,
+                project_id,
+                waiting_task_id=task_id,
+                waiting_session_id=str(
+                    data.get("session_id")
+                    or payload.get("session_id")
+                    or ""
+                ).strip(),
+                execution_parent_task_id=str(
+                    ownership.get("execution_parent_task_id")
+                    or payload.get("parent_task_id")
+                    or ""
+                ).strip(),
+                execution_parent_session_id=str(
+                    ownership.get("execution_parent_session_id")
+                    or payload.get("parent_session_id")
+                    or ""
+                ).strip(),
+                origin_task_id=str(
+                    payload.get("origin_task_id") or ""
+                ).strip(),
+                root_session_id_hint=str(
+                    ownership.get("root_session_id")
+                    or ownership.get("company_runtime_session_id")
+                    or payload.get("root_session_id")
+                    or payload.get("parent_session_id")
+                    or ""
+                ).strip(),
+                existing_ownership=ownership,
+            )
+            interaction["ownership"] = ownership
+            root_session_id = str(
+                ownership.get("root_session_id")
+                or ownership.get("ui_anchor_session_id")
+                or data.get("session_id")
+                or payload.get("session_id")
+                or ""
+            ).strip()
+            company_profile = str(
+                payload.get("company_profile")
+                or execution_task_metadata.get("company_profile")
+                or (
+                    "custom"
+                    if str(execution_task_metadata.get("exec_mode", "") or "").lower()
+                    in {"org", "custom"}
+                    else ""
+                )
+                or ""
+            ).strip().lower()
+            org_id = str(
+                payload.get("org_id")
+                or payload.get("organization_id")
+                or getattr(execution_task, "org_id", None)
+                or execution_task_metadata.get("org_id")
+                or execution_task_metadata.get("organization_id")
+                or ""
+            ).strip()
+            if (
+                checkpoint_type == "company_staffing_selection"
+                and company_profile == CompanyProfile.CUSTOM.value
+            ):
+                if not org_id:
+                    raise ValueError(
+                        "custom staffing checkpoint requires a durable org_id"
+                    )
+                org_id = validate_organization_id(org_id)
+            if company_profile or org_id:
+                interaction["execution_scope"] = {
+                    "company_profile": company_profile,
+                    "org_id": org_id,
+                }
+            work_item_id = str(
+                payload.get("waiting_work_item_id")
+                or payload.get("work_item_id")
+                or ""
+            ).strip()
+            if checkpoint_type == "company_reorg_pending":
+                supersession_scope = {
+                    "proposal_id": str(payload.get("proposal_id", "") or "").strip()
+                }
+            elif checkpoint_type in {
+                "route_clarification",
+                "company_runtime_selection",
+                "company_staffing_selection",
+                "company_recruitment_confirmation",
+                "company_run_failure_review",
+            }:
+                supersession_scope = {"root_session_id": root_session_id}
+            else:
+                supersession_scope = {
+                    "root_session_id": root_session_id,
+                    "domain_owner_id": task_id or work_item_id or root_session_id,
+                }
+            supersession_key = hashlib.sha256(
+                json.dumps(
+                    {
+                        "project_id": project_id,
+                        "checkpoint_type": checkpoint_type,
+                        "scope": supersession_scope,
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    default=str,
+                ).encode("utf-8")
+            ).hexdigest()
+            interaction_key_basis = {
+                "project_id": project_id,
+                "checkpoint_type": checkpoint_type,
+                "task_id": str(
+                    data.get("task_id")
+                    or payload.get("waiting_task_id")
+                    or payload.get("task_id")
+                    or ""
+                ).strip(),
+                "session_id": str(data.get("session_id") or payload.get("session_id") or "").strip(),
+                "basis_hash": str(payload.get("basis_hash", "") or "").strip(),
+                "run_id": str(payload.get("run_id", "") or "").strip(),
+                "proposal_id": str(payload.get("proposal_id", "") or "").strip(),
+                "waiting_work_item_id": str(
+                    payload.get("waiting_work_item_id", "") or ""
+                ).strip(),
+                "work_item_projection_id": str(
+                    payload.get("work_item_projection_id", "") or ""
+                ).strip(),
+                "original_message": str(
+                    payload.get("original_message", "") or ""
+                ).strip(),
+                "recruitment_revision": payload.get("recruitment_revision"),
+                "delivery_revision": payload.get("delivery_revision"),
+                "work_item_attempt_seq": payload.get(
+                    "work_item_attempt_seq"
+                ),
+                "delivery_package_sha256": str(
+                    payload.get("delivery_package_sha256", "") or ""
+                ).strip(),
+                "gate_attempt": payload.get("gate_attempt"),
+                "review_feedback_version": payload.get("review_feedback_version"),
+                "source_event_id": str(
+                    payload.get("source_event_id")
+                    or payload.get("conversation_turn_id")
+                    or payload.get("canonical_turn_id")
+                    or payload.get("proposal_id")
+                    or payload.get("recruitment_revision")
+                    or payload.get("delivery_revision")
+                    or ""
+                ).strip(),
+            }
+            interaction_key = hashlib.sha256(
+                json.dumps(
+                    interaction_key_basis,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    default=str,
+                ).encode("utf-8")
+            ).hexdigest()
+            def _order_component(*values: Any) -> int:
+                for value in values:
+                    try:
+                        if value not in (None, ""):
+                            return max(0, int(value))
+                    except (TypeError, ValueError):
+                        continue
+                return 0
+
+            supersession_order = [
+                _order_component(
+                    payload.get("conversation_turn_sequence"),
+                    payload.get("source_sequence"),
+                ),
+                _order_component(
+                    payload.get("recruitment_revision"),
+                    payload.get("delivery_revision"),
+                    payload.get("owner_directive_revision"),
+                    payload.get("work_item_attempt_seq"),
+                    payload.get("gate_attempt"),
+                    payload.get("review_feedback_version"),
+                    payload.get("revision"),
+                ),
+            ]
+            interaction["domain_key"] = interaction_key
+            interaction["supersession_key"] = supersession_key
+            interaction["supersession_order"] = supersession_order
+            payload["interaction"] = interaction
         checkpoint = ExecutionCheckpoint(
-            project_id=data.get("project_id", self.project_id or "default"),
+            project_id=project_id,
             session_id=data.get("session_id"),
-            checkpoint_type=data.get("checkpoint_type", "generic"),
+            checkpoint_type=checkpoint_type,
             task_id=data.get("task_id"),
             payload=payload,
         )
-        await self.store.save_execution_checkpoint(checkpoint)
+        if prepare_only:
+            if not owner_interaction:
+                raise ValueError("only owner interactions support prepare-only publication")
+            return PreparedOwnerInteractionPublication(
+                checkpoint=checkpoint,
+                interaction_key=interaction_key,
+                supersession_key=supersession_key,
+                supersession_order=tuple(supersession_order),
+            )
+        if owner_interaction:
+            if self.interaction_coordinator is None:
+                raise RuntimeError("owner interaction coordinator is unavailable")
+            checkpoint, _ = await self.interaction_coordinator.publish_owner_checkpoint(
+                checkpoint,
+                interaction_key=interaction_key,
+                supersession_key=supersession_key,
+                supersession_order=supersession_order,
+            )
+        else:
+            await self.store.save_execution_checkpoint(checkpoint)
+        # Non-owner runtime checkpoints retain their historical supersession
+        # helper.  Owner publication already creates/deduplicates and retires
+        # older pending cards in one Store transaction; a second transaction
+        # here would let concurrent producers supersede each other to zero.
         supersede = getattr(self.store, "supersede_pending_checkpoints", None)
-        if callable(supersede) and checkpoint.task_id:
+        if not owner_interaction and callable(supersede) and checkpoint.task_id:
             superseded_ids = await supersede(
                 project_id=checkpoint.project_id,
                 task_id=checkpoint.task_id,
@@ -10851,6 +13007,36 @@ class OPCEngine:
                 },
             ))
 
+    async def _interaction_checkpoint_changed(
+        self,
+        checkpoint: ExecutionCheckpoint,
+    ) -> None:
+        """Publish a refresh hint after the durable row exists.
+
+        Consumers always reload the checkpoint from the Store; this event is
+        deliberately not an approval transport and may be dropped safely.
+        """
+
+        payload = dict(checkpoint.payload or {})
+        interaction = dict(payload.get("interaction", {}) or {})
+        ownership = dict(interaction.get("ownership", {}) or {})
+        await self.event_bus.publish(OPCEvent(
+            event_type="runtime_event",
+            payload={
+                "type": "interaction_checkpoint_changed",
+                "checkpoint_id": checkpoint.checkpoint_id,
+                "checkpoint_type": checkpoint.checkpoint_type,
+                "status": checkpoint.status,
+                "project_id": checkpoint.project_id,
+                "task_id": checkpoint.task_id,
+                "session_id": checkpoint.session_id,
+                "runtime_session_id": ownership.get("company_runtime_session_id", ""),
+                "tool_runtime_session_id": ownership.get("tool_runtime_session_id", ""),
+                "ui_anchor_task_id": ownership.get("ui_anchor_task_id", ""),
+                "ui_anchor_session_id": ownership.get("ui_anchor_session_id", ""),
+            },
+        ))
+
     @staticmethod
     def _checkpoint_basis_hash(payload: dict[str, Any]) -> str:
         basis = {
@@ -10862,6 +13048,12 @@ class OPCEngine:
             ),
             "delivery_revision": str(payload.get("delivery_revision", "") or "").strip(),
             "owner_directive_revision": str(payload.get("owner_directive_revision", "") or "").strip(),
+            "work_item_attempt_seq": str(
+                payload.get("work_item_attempt_seq", "") or ""
+            ).strip(),
+            "delivery_package_sha256": str(
+                payload.get("delivery_package_sha256", "") or ""
+            ).strip(),
             "latest_user_directive": str(payload.get("latest_user_directive", "") or "").strip(),
             "prompt": str(payload.get("prompt", "") or "").strip(),
             "result_content": str(payload.get("result_content", "") or "").strip(),
@@ -10908,12 +13100,114 @@ class OPCEngine:
             return ExecutionMode.COMPANY_MODE.value
         return str(task.metadata.get("execution_mode", ExecutionMode.SINGLE_AGENT.value))
 
+    async def _ensure_canonical_reorg_pause_checkpoint(
+        self,
+        task: Task,
+        proposal_id: str,
+    ) -> ExecutionCheckpoint:
+        """Reuse or repair the proposal-owned reorg interaction.
+
+        ReorgManager atomically creates the proposal and its deterministic
+        owner checkpoint.  A later Task pause is only a projection of that
+        durable fact; it must never publish a second card with a different
+        interaction identity.  The only repair accepted here is replaying the
+        same atomic proposal/card operation for the legacy crash window where
+        the proposal exists but its card does not.
+        """
+
+        if self.store is None:
+            raise RuntimeError("reorg pause checkpoint requires an initialized store")
+        if self.reorg_manager is None or self.interaction_coordinator is None:
+            raise RuntimeError("reorg pause checkpoint coordinator is unavailable")
+        proposal = await self.store.get_reorg_proposal(proposal_id)
+        if proposal is None:
+            raise RuntimeError(f"pending reorg proposal {proposal_id!r} was not found")
+        if proposal.project_id != task.project_id:
+            raise RuntimeError("pending reorg proposal belongs to another project")
+        if str(proposal.task_id or "") != str(task.id or ""):
+            raise RuntimeError("pending reorg proposal belongs to another task")
+        if not proposal.user_confirmation_required:
+            raise RuntimeError("system-authorized reorg must not create an owner pause")
+
+        canonical = await self.reorg_manager.build_reorg_owner_checkpoint(proposal)
+        rows = await self.store.get_execution_checkpoints(
+            project_id=proposal.project_id,
+            checkpoint_types=["company_reorg_pending"],
+        )
+        matching = [
+            checkpoint
+            for checkpoint in rows
+            if str(dict(checkpoint.payload or {}).get("proposal_id", "") or "").strip()
+            == proposal_id
+        ]
+        if len(matching) > 1:
+            raise RuntimeError(
+                f"multiple reorg interactions exist for proposal {proposal_id}"
+            )
+        if matching:
+            persisted = matching[0]
+            if (
+                persisted.checkpoint_id != canonical.checkpoint_id
+                or persisted.project_id != canonical.project_id
+                or str(persisted.session_id or "")
+                != str(canonical.session_id or "")
+                or str(persisted.task_id or "") != str(canonical.task_id or "")
+            ):
+                raise RuntimeError(
+                    f"reorg interaction identity conflicts for proposal {proposal_id}"
+                )
+            persisted_interaction = dict(
+                dict(persisted.payload or {}).get("interaction", {}) or {}
+            )
+            canonical_interaction = dict(
+                dict(canonical.payload or {}).get("interaction", {}) or {}
+            )
+            if str(persisted_interaction.get("domain_key", "") or "") != str(
+                canonical_interaction.get("domain_key", "") or ""
+            ):
+                raise RuntimeError(
+                    f"reorg interaction domain conflicts for proposal {proposal_id}"
+                )
+            return persisted
+
+        if proposal.status != ReorgProposalStatus.PROPOSED:
+            raise RuntimeError(
+                f"reorg proposal {proposal_id} has status {proposal.status.value} "
+                "but no canonical owner interaction"
+            )
+        _proposal, _created, repaired, _checkpoint_created = (
+            await self.interaction_coordinator.publish_reorg_proposal(
+                proposal,
+                canonical,
+            )
+        )
+        if repaired.checkpoint_id != canonical.checkpoint_id:
+            raise RuntimeError(
+                f"reorg checkpoint repair conflicted for proposal {proposal_id}"
+            )
+        return repaired
+
     async def _save_task_pause_checkpoint(self, task: Task, result: TaskResult) -> None:
         pause_request = dict(result.artifacts.get("pause_request", {})) if result.artifacts else {}
         runtime_payload = self._build_runtime_checkpoint_payload(task, result)
+        review_revision = self._review_feedback_version_from_metadata(task.metadata)
+        try:
+            resume_cursor = int(runtime_payload.get("resume_cursor", 0) or 0)
+        except (TypeError, ValueError):
+            resume_cursor = 0
+        pause_source_event_id = str(
+            pause_request.get("request_id")
+            or pause_request.get("pause_request_id")
+            or pause_request.get("source_event_id")
+            or (
+                f"task-user-input:{task.id}:"
+                f"{runtime_payload.get('runtime_session_id', '')}:"
+                f"{resume_cursor}:{review_revision}"
+            )
+        ).strip()
         review_level = str(
             pause_request.get("review_level")
-            or ("manager" if result.status == TaskStatus.AWAITING_MANAGER_REVIEW else "human")
+            or ("human" if result.status == TaskStatus.AWAITING_HUMAN else "manager")
         ).strip().lower()
         review_target_role_id = str(
             pause_request.get("review_target_role_id")
@@ -10928,28 +13222,16 @@ class OPCEngine:
             )
             if str(item).strip()
         ]
+        if review_level == "manager":
+            # Manager review is represented by the company work-item state
+            # machine and manager inbox.  Publishing an owner checkpoint for
+            # the same wait leaks an internal decision into the UI.
+            return
         pending_reorg_id = str(task.metadata.get("pending_reorg_proposal_id", "") or "").strip()
         if pending_reorg_id:
-            await self._save_execution_checkpoint(
-                {
-                    "project_id": task.project_id,
-                    "session_id": task.session_id,
-                    "checkpoint_type": "company_reorg_pending",
-                    "task_id": task.id,
-                    "payload": {
-                        "proposal_id": pending_reorg_id,
-                        "waiting_task_id": task.id,
-                        "task_ids": list(task.metadata.get("execution_task_ids", [task.id])),
-                        "parent_session_id": task.parent_session_id or task.metadata.get("parent_session_id"),
-                        "org_version": task.metadata.get("org_version", 1),
-                        "runtime_topology_version": task.metadata.get("runtime_topology_version", 1),
-                        "company_work_item_plan": task.metadata.get("company_work_item_plan"),
-                        "review_level": review_level,
-                        "review_target_role_id": review_target_role_id,
-                        "review_chain_role_ids": review_chain_role_ids,
-                        **runtime_payload,
-                    },
-                }
+            await self._ensure_canonical_reorg_pause_checkpoint(
+                task,
+                pending_reorg_id,
             )
             return
         await self._save_execution_checkpoint(
@@ -10972,6 +13254,9 @@ class OPCEngine:
                     "review_level": review_level,
                     "review_target_role_id": review_target_role_id,
                     "review_chain_role_ids": review_chain_role_ids,
+                    "source_event_id": pause_source_event_id,
+                    "review_feedback_version": review_revision,
+                    "revision": max(resume_cursor, review_revision),
                     **runtime_payload,
                 },
             }
@@ -11255,6 +13540,2465 @@ class OPCEngine:
             or bool(checkpoint_task_id and checkpoint_task_id in visible_task_ids)
         )
 
+    def issue_project_owner_actor(self, *, interface: str) -> dict[str, str]:
+        """Issue an in-process capability for a trusted owner adapter.
+
+        The token is never accepted from client payloads.  Office uses the
+        dedicated ``office_org`` adapter only for taskless reorganization
+        checkpoints whose exact row was already resolved server-side.
+        """
+
+        normalized_interface = str(interface or "").strip()
+        if normalized_interface not in {"cli", "cli_board", "office_org"}:
+            raise ValueError(
+                "project owner actors are only available to trusted owner adapters"
+            )
+        token = str(getattr(self, "_project_owner_actor_token", "") or "")
+        if not token:
+            token = uuid.uuid4().hex
+            self._project_owner_actor_token = token
+        return {
+            "kind": "project_owner",
+            "project_id": str(self.project_id or "default").strip() or "default",
+            "interface": normalized_interface,
+            "capability": token,
+        }
+
+    async def can_answer_checkpoint(
+        self,
+        checkpoint: ExecutionCheckpoint,
+        *,
+        requester_task_id: str = "",
+        requester_session_id: str | None = None,
+        requester_actor: dict[str, Any] | None = None,
+    ) -> bool:
+        """Canonical authorization used by both checkpoint rendering and submit."""
+
+        if not self.store:
+            return False
+        checkpoint_type = str(checkpoint.checkpoint_type or "").strip()
+        if checkpoint_type not in OWNER_INTERACTION_CHECKPOINT_TYPES:
+            return False
+        if not self._checkpoint_is_user_visible(checkpoint):
+            return False
+        payload = dict(checkpoint.payload or {})
+        review_levels = {
+            str(container.get("review_level", "") or "").strip().lower()
+            for container in (
+                payload,
+                dict(payload.get("interaction", {}) or {}),
+                dict(payload.get("gate", {}) or {}),
+                dict(payload.get("approval", {}) or {}),
+                dict(payload.get("pause_request", {}) or {}),
+            )
+        }
+        if "manager" in review_levels:
+            # Manager review is an internal organization transition, never an
+            # owner-facing interaction even when a historical row used the
+            # task_user_input or work-item gate shape.
+            return False
+        project_id = str(checkpoint.project_id or "default").strip() or "default"
+        if project_id != (str(self.project_id or "default").strip() or "default"):
+            return False
+        requested_task_id = str(requester_task_id or "").strip()
+        requested_session_id = str(requester_session_id or "").strip()
+        actor = dict(requester_actor or {})
+        trusted_project_owner = bool(
+            actor.get("kind") == "project_owner"
+            and str(actor.get("project_id", "") or "").strip() == project_id
+            and str(actor.get("interface", "") or "").strip()
+            in {"cli", "cli_board", "office_org"}
+            and str(actor.get("capability", "") or "")
+            == str(getattr(self, "_project_owner_actor_token", "") or "")
+        )
+        if not requested_task_id and not requested_session_id and not trusted_project_owner:
+            return False
+
+        interaction = dict(payload.get("interaction", {}) or {})
+        ownership = dict(interaction.get("ownership", {}) or {})
+        waiting_task_id = str(
+            ownership.get("waiting_task_id")
+            or checkpoint.task_id
+            or payload.get("waiting_task_id")
+            or payload.get("task_id")
+            or ""
+        ).strip()
+        waiting_session_id = str(
+            ownership.get("waiting_session_id")
+            or checkpoint.session_id
+            or payload.get("session_id")
+            or ""
+        ).strip()
+        if trusted_project_owner and not waiting_task_id and not waiting_session_id:
+            return True
+
+        company_runtime_session_id = str(
+            ownership.get("company_runtime_session_id", "") or ""
+        ).strip()
+        if waiting_task_id or company_runtime_session_id:
+            identity_index = await load_company_runtime_identity_index(self.store, project_id)
+            identity = None
+            if company_runtime_session_id:
+                identity = identity_index.resolve(
+                    runtime_session_id=company_runtime_session_id,
+                )
+                parent_task_id = str(
+                    ownership.get("execution_parent_task_id", "") or ""
+                ).strip()
+                if identity is not None and parent_task_id:
+                    parent_identity = identity_index.resolve(task_id=parent_task_id)
+                    if parent_identity != identity:
+                        return False
+            elif waiting_task_id:
+                identity = identity_index.resolve(task_id=waiting_task_id)
+            if identity is not None:
+                recorded_anchor = str(
+                    ownership.get("ui_anchor_task_id", "") or ""
+                ).strip()
+                recorded_session = str(
+                    ownership.get("ui_anchor_session_id")
+                    or ownership.get("root_session_id")
+                    or ""
+                ).strip()
+                if recorded_anchor and recorded_anchor != identity.ui_anchor_task_id:
+                    return False
+                if recorded_session and recorded_session != identity.runtime_session_id:
+                    return False
+                if requested_task_id and requested_task_id != identity.ui_anchor_task_id:
+                    return False
+                if requested_session_id and requested_session_id != identity.runtime_session_id:
+                    return False
+                return bool(
+                    (requested_task_id and identity.ui_anchor_task_id)
+                    or (requested_session_id and identity.runtime_session_id)
+                )
+            # A checkpoint declaring company ownership must never fall back to
+            # coincidental child task/session equality when durable identity is
+            # missing or ambiguous.
+            if company_runtime_session_id:
+                return False
+
+        expected_task_id = str(
+            ownership.get("ui_anchor_task_id") or waiting_task_id or ""
+        ).strip()
+        expected_session_id = str(
+            ownership.get("ui_anchor_session_id")
+            or ownership.get("root_session_id")
+            or checkpoint.session_id
+            or ""
+        ).strip()
+        if requested_task_id and expected_task_id and requested_task_id != expected_task_id:
+            return False
+        if requested_session_id and expected_session_id and requested_session_id != expected_session_id:
+            return False
+        return bool(
+            (requested_task_id and expected_task_id)
+            or (requested_session_id and expected_session_id)
+        )
+
+    async def submit_checkpoint_decision(
+        self,
+        *,
+        checkpoint_id: str,
+        checkpoint_type: str,
+        decision: dict[str, Any],
+        client_request_id: str,
+        requester_task_id: str = "",
+        requester_session_id: str | None = None,
+        requester_actor: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Durably accept one explicit interaction reply without a task lock."""
+
+        if not self._initialized:
+            # A few embedded CLI/TUI controllers inject an already-open Store
+            # into an Engine before invoking the interaction adapter.  Do not
+            # re-run full Engine initialization (which would replace their
+            # active company executor/config); only create the missing durable
+            # coordinator.  A genuinely unopened engine still follows normal
+            # initialization.
+            if self.store is not None and getattr(self.store, "_db", None) is not None:
+                if self.interaction_coordinator is None:
+                    self.interaction_coordinator = InteractionCoordinator(
+                        store=self.store,
+                        project_id=self.project_id or "default",
+                        checkpoint_changed_callback=self._interaction_checkpoint_changed,
+                        orphaned_answer_callback=self._schedule_interaction_consumption,
+                    )
+            else:
+                await self.initialize()
+        assert self.store and self.interaction_coordinator
+        checkpoint_id = str(checkpoint_id or "").strip()
+        checkpoint_type = str(checkpoint_type or "").strip()
+        checkpoint = await self.store.get_execution_checkpoint(
+            checkpoint_id,
+            project_id=self.project_id or "default",
+            checkpoint_type=checkpoint_type,
+        )
+        if checkpoint is None:
+            return {
+                "accepted": False,
+                "deduplicated": False,
+                "status": "not_found",
+                "checkpoint_type": checkpoint_type,
+                "checkpoint_id": checkpoint_id,
+                "reason": "checkpoint_not_found",
+            }
+        if (
+            checkpoint_type in self._TASK_WAIT_CHECKPOINT_TYPES
+            and not await self._checkpoint_task_still_waiting(checkpoint)
+        ):
+            # Authorization alone is insufficient for a durable task wait:
+            # an explicit click can arrive after the Task or its linked work
+            # item has already settled.  Retire that stale card before the
+            # decision CAS so it can never reset/re-execute terminal work.
+            current = await self.store.get_execution_checkpoint(
+                checkpoint_id,
+                project_id=self.project_id or "default",
+                checkpoint_type=checkpoint_type,
+            )
+            return {
+                "accepted": False,
+                "deduplicated": False,
+                "status": str(getattr(current, "status", "stale") or "stale"),
+                "checkpoint_type": checkpoint_type,
+                "checkpoint_id": checkpoint_id,
+                "reason": "invalid_state",
+            }
+        if not await self.can_answer_checkpoint(
+            checkpoint,
+            requester_task_id=requester_task_id,
+            requester_session_id=requester_session_id,
+            requester_actor=requester_actor,
+        ):
+            return {
+                "accepted": False,
+                "deduplicated": False,
+                "status": str(checkpoint.status or ""),
+                "checkpoint_type": checkpoint_type,
+                "checkpoint_id": checkpoint_id,
+                "reason": "not_authorized",
+            }
+        receipt = await self.interaction_coordinator.submit(
+            checkpoint_id=checkpoint_id,
+            checkpoint_type=checkpoint_type,
+            decision=dict(decision or {}),
+            client_request_id=str(client_request_id or "").strip(),
+            checkpoint=checkpoint,
+        )
+        acknowledged = receipt.acknowledged
+        persisted = receipt.checkpoint or checkpoint
+        if acknowledged:
+            if (
+                not receipt.live_waiter_notified
+                and str(persisted.status or "").strip() == "answered"
+            ):
+                self._schedule_interaction_consumption(checkpoint_id, checkpoint_type)
+        return {
+            "accepted": acknowledged,
+            "deduplicated": receipt.outcome == "duplicate",
+            "status": str(getattr(persisted, "status", "") or receipt.outcome),
+            "checkpoint_type": checkpoint_type,
+            "checkpoint_id": checkpoint_id,
+            "reason": "" if acknowledged else receipt.outcome,
+        }
+
+    def _schedule_interaction_consumption(
+        self,
+        checkpoint_id: str,
+        checkpoint_type: str,
+    ) -> None:
+        # The answer is durable.  Once controller shutdown has closed
+        # admission, startup recovery is the only valid consumer; scheduling a
+        # new local task here would race Store.close().
+        if bool(getattr(self, "_shutting_down", False)):
+            return
+        task = asyncio.create_task(
+            self._consume_answered_interaction_if_controller_eligible(
+                checkpoint_id,
+                checkpoint_type,
+            ),
+            name=f"interaction:{checkpoint_type}:{checkpoint_id}",
+        )
+        consumer_tasks = getattr(self, "_interaction_consumer_tasks", None)
+        if consumer_tasks is None:
+            consumer_tasks = set()
+            self._interaction_consumer_tasks = consumer_tasks
+        consumer_tasks.add(task)
+        task.add_done_callback(self._interaction_consumer_finished)
+
+    def _schedule_interaction_consumption_retry(
+        self,
+        checkpoint_id: str,
+        checkpoint_type: str,
+        *,
+        delay_seconds: float | None = None,
+    ) -> None:
+        """Retry one durable ANSWERED owner interaction after a lease race.
+
+        ``InteractionCoordinator.release`` intentionally has no scheduling
+        side effect.  Without this monitor, a takeover after the winning
+        process completed its startup scan could leave the exact decision in
+        ANSWERED forever.  The key is discarded *before* the next consume so a
+        further busy/release result can schedule the following bounded pass.
+        """
+
+        clean_checkpoint_id = str(checkpoint_id or "").strip()
+        clean_checkpoint_type = str(checkpoint_type or "").strip()
+        if (
+            not clean_checkpoint_id
+            or not clean_checkpoint_type
+            or bool(getattr(self, "_shutting_down", False))
+        ):
+            return
+        retry_key = f"{clean_checkpoint_type}:{clean_checkpoint_id}"
+        retries = getattr(self, "_interaction_retry_consumptions", None)
+        if retries is None:
+            retries = set()
+            self._interaction_retry_consumptions = retries
+        if retry_key in retries:
+            return
+        retries.add(retry_key)
+        retry_attempts = getattr(self, "_interaction_retry_attempts", None)
+        if retry_attempts is None:
+            retry_attempts = {}
+            self._interaction_retry_attempts = retry_attempts
+        retry_attempt = int(retry_attempts.get(retry_key, 0) or 0) + 1
+        retry_attempts[retry_key] = retry_attempt
+        retry_delay = (
+            min(30.0, 0.5 * (2 ** min(retry_attempt - 1, 6)))
+            if delay_seconds is None
+            else max(0.05, min(30.0, float(delay_seconds)))
+        )
+
+        async def retry() -> None:
+            await asyncio.sleep(retry_delay)
+            retries.discard(retry_key)
+            if bool(getattr(self, "_shutting_down", False)):
+                return
+            await self._consume_answered_interaction_if_controller_eligible(
+                clean_checkpoint_id,
+                clean_checkpoint_type,
+            )
+
+        task = asyncio.create_task(
+            retry(),
+            name=(
+                f"interaction-retry:{clean_checkpoint_type}:"
+                f"{clean_checkpoint_id}"
+            ),
+        )
+        consumer_tasks = getattr(self, "_interaction_consumer_tasks", None)
+        if consumer_tasks is None:
+            consumer_tasks = set()
+            self._interaction_consumer_tasks = consumer_tasks
+        consumer_tasks.add(task)
+
+        def finished(retry_task: asyncio.Task[Any]) -> None:
+            retries.discard(retry_key)
+            self._interaction_consumer_finished(retry_task)
+
+        task.add_done_callback(finished)
+
+    def _interaction_consumer_finished(
+        self,
+        task: asyncio.Task[Any],
+    ) -> None:
+        """Retain background failures until ordered shutdown observes them."""
+
+        consumer_tasks = getattr(self, "_interaction_consumer_tasks", None)
+        if consumer_tasks is not None:
+            consumer_tasks.discard(task)
+        if task.cancelled():
+            return
+        try:
+            failure = task.exception()
+        except asyncio.CancelledError:
+            return
+        if failure is not None:
+            failures = getattr(self, "_interaction_consumer_failures", None)
+            if failures is None:
+                failures = []
+                self._interaction_consumer_failures = failures
+            failures.append(failure)
+
+    async def _consume_answered_interaction_if_controller_eligible(
+        self,
+        checkpoint_id: str,
+        checkpoint_type: str,
+    ) -> None:
+        """Atomically leave a live remote controller's answer unclaimed.
+
+        ``submit`` is durable and may arrive through any Office/CLI process.
+        This pre-read is used only to find a possible local credential.  The
+        Store resolves the checkpoint's canonical run and checks that
+        credential in the same transaction that claims the answer, so a
+        takeover between this read and the claim cannot park the interaction.
+        """
+
+        assert self.store
+        checkpoint = await self.store.get_execution_checkpoint(
+            checkpoint_id,
+            project_id=self.project_id or "default",
+            checkpoint_type=checkpoint_type,
+        )
+        if checkpoint is None:
+            return
+        payload = dict(checkpoint.payload or {})
+        interaction = dict(payload.get("interaction", {}) or {})
+        ownership = dict(interaction.get("ownership", {}) or {})
+        run_id = str(
+            payload.get("delegation_run_id")
+            or payload.get("company_run_id")
+            or payload.get("run_id")
+            or ownership.get("delegation_run_id")
+            or ownership.get("company_run_id")
+            or ownership.get("run_id")
+            or ""
+        ).strip()
+        candidate_task_ids = [
+            checkpoint.task_id,
+            payload.get("waiting_task_id"),
+            payload.get("task_id"),
+            payload.get("origin_task_id"),
+            ownership.get("waiting_task_id"),
+            *list(payload.get("task_ids", []) or []),
+        ]
+        if not run_id:
+            for raw_task_id in candidate_task_ids:
+                task_id = str(raw_task_id or "").strip()
+                if not task_id:
+                    continue
+                waiting_task = await self.store.get_task(task_id)
+                run_id = str(
+                    ((waiting_task.metadata if waiting_task else {}) or {}).get(
+                        "delegation_run_id",
+                        "",
+                    )
+                    or ""
+                ).strip()
+                if run_id:
+                    break
+        credential_getter = getattr(
+            getattr(self, "company_executor", None),
+            "controller_lease_credential",
+            None,
+        )
+        credential = (
+            credential_getter(run_id)
+            if run_id and callable(credential_getter)
+            else None
+        )
+        await self._consume_answered_interaction(
+            checkpoint_id,
+            checkpoint_type,
+            enforce_company_controller_eligibility=True,
+            controller_credential=credential,
+        )
+
+    async def _recover_interaction_consumers(self) -> None:
+        if not self.store:
+            return
+        checkpoints = await self.store.get_execution_checkpoints(
+            project_id=self.project_id or "default",
+            checkpoint_types=sorted(OWNER_INTERACTION_CHECKPOINT_TYPES),
+            statuses=["answered", "consuming"],
+        )
+        for checkpoint in checkpoints:
+            self._schedule_interaction_consumption(
+                checkpoint.checkpoint_id,
+                checkpoint.checkpoint_type,
+            )
+
+    async def _recover_company_work_item_gate_continuations(self) -> None:
+        """Start durable post-gate continuations left after a process crash.
+
+        The gate transaction resolves its interaction before notifications or
+        dispatcher wakeups.  Resolved checkpoints are therefore intentionally
+        outside normal interaction-consumer recovery; their exact pending Task
+        marker is the durable signal to admit a fresh run controller without
+        replaying the worker turn.
+        """
+
+        if not self.store or not self.company_executor or self._shutting_down:
+            return
+        checkpoints = await self.store.get_execution_checkpoints(
+            project_id=self.project_id or "default",
+            checkpoint_types=["company_work_item_gate"],
+            statuses=["resolved", "invalid"],
+        )
+        for checkpoint in checkpoints:
+            payload = dict(checkpoint.payload or {})
+            completion = dict(
+                payload.get("company_work_item_gate_decision_completion", {})
+                or {}
+            )
+            provenance = (
+                await self.store.get_company_work_item_gate_publication_provenance(
+                    checkpoint.checkpoint_id,
+                    project_id=checkpoint.project_id,
+                )
+            )
+            run_id = str(
+                completion.get("run_id")
+                or dict(provenance or {}).get("run_id")
+                or ""
+            ).strip()
+            task_id = str(
+                completion.get("task_id")
+                or dict(provenance or {}).get("task_id")
+                or ""
+            ).strip()
+            continuation = str(
+                completion.get("continuation", "") or ""
+            ).strip()
+            if str(
+                completion.get("continuation_status", "") or ""
+            ).strip() == "completed":
+                continue
+            try:
+                provenance_matches_completion = bool(
+                    provenance is not None
+                    and (
+                        not completion
+                        or (
+                            str(completion.get("run_id", "") or "").strip()
+                            == run_id
+                            and str(
+                                completion.get("task_id", "") or ""
+                            ).strip()
+                            == task_id
+                            and str(
+                                completion.get("work_item_id", "") or ""
+                            ).strip()
+                            == str(
+                                provenance.get("work_item_id", "") or ""
+                            ).strip()
+                            and int(completion.get("attempt_seq", 0) or 0)
+                            == int(provenance.get("attempt_seq", 0) or 0)
+                            and int(completion.get("gate_attempt", -1))
+                            == int(provenance.get("gate_attempt", -2))
+                            and str(
+                                completion.get("basis_hash", "") or ""
+                            ).strip()
+                            == str(
+                                provenance.get("basis_hash", "") or ""
+                            ).strip()
+                        )
+                    )
+                )
+            except (TypeError, ValueError):
+                provenance_matches_completion = False
+            if not run_id or not provenance_matches_completion:
+                continue
+            if checkpoint.status == "invalid" or (
+                checkpoint.status == "resolved"
+                and completion
+                and continuation
+            ):
+                self._schedule_company_work_item_gate_continuation(checkpoint)
+                continue
+
+    def _schedule_company_work_item_gate_continuation(
+        self,
+        checkpoint: ExecutionCheckpoint,
+    ) -> None:
+        """Schedule one durable continuation monitor, deduplicated by checkpoint."""
+
+        checkpoint_id = str(checkpoint.checkpoint_id or "").strip()
+        recoveries = getattr(
+            self,
+            "_company_gate_continuation_recoveries",
+            None,
+        )
+        if recoveries is None:
+            recoveries = set()
+            self._company_gate_continuation_recoveries = recoveries
+        if (
+            not checkpoint_id
+            or bool(getattr(self, "_shutting_down", False))
+            or checkpoint_id in recoveries
+        ):
+            return
+        payload = dict(checkpoint.payload or {})
+        completion = dict(
+            payload.get("company_work_item_gate_decision_completion", {}) or {}
+        )
+        publication_provenance = dict(
+            payload.get("company_work_item_gate_publication_provenance", {})
+            or {}
+        )
+        run_id = str(
+            completion.get("run_id")
+            or publication_provenance.get("run_id")
+            or ""
+        ).strip()
+        if not run_id:
+            return
+        recoveries.add(checkpoint_id)
+        recovery = asyncio.create_task(
+            self._resume_resolved_company_work_item_gate_continuation(checkpoint),
+            name=f"company-gate-continuation:{run_id}:{checkpoint_id}",
+        )
+        consumer_tasks = getattr(self, "_interaction_consumer_tasks", None)
+        if consumer_tasks is None:
+            consumer_tasks = set()
+            self._interaction_consumer_tasks = consumer_tasks
+        consumer_tasks.add(recovery)
+
+        def finished(task: asyncio.Task[Any]) -> None:
+            recoveries.discard(checkpoint_id)
+            self._interaction_consumer_finished(task)
+
+        recovery.add_done_callback(finished)
+
+    async def _resume_resolved_company_work_item_gate_continuation(
+        self,
+        checkpoint: ExecutionCheckpoint,
+    ) -> None:
+        """Drive one resolved gate marker under a newly admitted controller."""
+
+        assert self.store and self.company_executor
+        payload = dict(checkpoint.payload or {})
+        completion = dict(
+            payload.get("company_work_item_gate_decision_completion", {}) or {}
+        )
+        project_id = str(
+            checkpoint.project_id or self.project_id or "default"
+        ).strip() or "default"
+        publication_provenance = (
+            await self.store.get_company_work_item_gate_publication_provenance(
+                checkpoint.checkpoint_id,
+                project_id=project_id,
+            )
+        )
+        if publication_provenance is None:
+            return
+        run_id = str(
+            completion.get("run_id")
+            or publication_provenance.get("run_id")
+            or ""
+        ).strip()
+        if not run_id:
+            return
+        interaction = dict(payload.get("interaction", {}) or {})
+        ownership = dict(interaction.get("ownership", {}) or {})
+        root_session_id = str(
+            ownership.get("root_session_id")
+            or ownership.get("company_runtime_session_id")
+            or checkpoint.session_id
+            or ""
+        ).strip()
+        checkpoint_id = str(checkpoint.checkpoint_id or "").strip()
+        while not bool(getattr(self, "_shutting_down", False)):
+            current = await self.store.get_execution_checkpoint(
+                checkpoint_id,
+                project_id=project_id,
+                checkpoint_type="company_work_item_gate",
+            )
+            current_payload = dict((current.payload if current else {}) or {})
+            current_completion = dict(
+                current_payload.get(
+                    "company_work_item_gate_decision_completion", {}
+                )
+                or {}
+            )
+            if str(
+                current_completion.get("continuation_status", "") or ""
+            ).strip() == "completed":
+                return
+            current_provenance = (
+                await self.store.get_company_work_item_gate_publication_provenance(
+                    checkpoint_id,
+                    project_id=project_id,
+                )
+            )
+            if current is None or current_provenance is None:
+                return
+            current_task_id = str(
+                current_completion.get("task_id")
+                or current_provenance.get("task_id")
+                or ""
+            ).strip()
+            source_task = await self.store.get_task(
+                current_task_id
+            )
+            marker = dict(
+                ((source_task.metadata if source_task else {}) or {}).get(
+                    "company_work_item_gate_continuation", {}
+                )
+                or {}
+            )
+            raw_task_ids = payload.get("task_ids")
+            checkpoint_plan = payload.get("company_work_item_plan")
+            durable_plan = (
+                serialized_company_plan_from_metadata(
+                    dict(source_task.metadata or {})
+                )
+                if source_task is not None
+                else None
+            )
+            task_ids = (
+                [str(item or "").strip() for item in raw_task_ids]
+                if isinstance(raw_task_ids, list)
+                else []
+            )
+            parsed_plan = (
+                deserialize_company_work_item_runtime_plan(checkpoint_plan)
+                if isinstance(checkpoint_plan, dict) and checkpoint_plan
+                else None
+            )
+            runtime_scope_matches = (
+                await self.store.validate_company_work_item_gate_runtime_scope(
+                    checkpoint_id,
+                    project_id=project_id,
+                )
+            )
+            continuation_kind = str(
+                current_completion.get("continuation", "") or ""
+            ).strip()
+            requires_failure_settlement = bool(
+                current.status == "invalid"
+                or (
+                    current.status == "resolved"
+                    and current_completion
+                    and continuation_kind
+                    and not runtime_scope_matches
+                )
+            )
+            try:
+                marker_attempt = int(marker.get("attempt_seq", 0) or 0)
+                completion_attempt = int(
+                    completion.get("attempt_seq", 0) or 0
+                )
+                marker_gate_attempt = int(
+                    marker.get("gate_attempt", -1)
+                )
+                completion_gate_attempt = int(
+                    completion.get("gate_attempt", -2)
+                )
+            except (TypeError, ValueError):
+                return
+            normal_continuation_matches = bool(
+                current is not None
+                and (
+                    current.status == "resolved"
+                    or (
+                        current.status == "invalid"
+                        and str(
+                            current_completion.get("final_status", "") or ""
+                        ).strip()
+                        == "invalid"
+                        and str(
+                            current_completion.get("continuation", "") or ""
+                        ).strip()
+                        == "failure_settlement"
+                    )
+                )
+                and current_completion == completion
+                and str(marker.get("status", "") or "").strip() == "pending"
+                and str(marker.get("checkpoint_id", "") or "").strip()
+                == checkpoint_id
+                and str(marker.get("kind", "") or "").strip()
+                == str(completion.get("continuation", "") or "").strip()
+                and str(marker.get("action", "") or "").strip()
+                == str(completion.get("action", "") or "").strip()
+                and marker_attempt == completion_attempt
+                and marker_gate_attempt == completion_gate_attempt
+                and str(marker.get("basis_hash", "") or "").strip()
+                == str(completion.get("basis_hash", "") or "").strip()
+                and str(marker.get("target_phase", "") or "").strip()
+                == str(completion.get("target_phase", "") or "").strip()
+                and isinstance(checkpoint_plan, dict)
+                and checkpoint_plan == durable_plan
+                and parsed_plan is not None
+                and projection_id_for_task(source_task)
+                in parsed_plan.projection_by_id()
+                and task_ids
+                and all(task_ids)
+                and len(set(task_ids)) == len(task_ids)
+                and str(source_task.id or "").strip() in task_ids
+                and (
+                    runtime_scope_matches
+                    or str(
+                        completion.get("continuation", "") or ""
+                    ).strip()
+                    == "failure_settlement"
+                )
+            )
+            if not normal_continuation_matches and not requires_failure_settlement:
+                requires_failure_settlement = bool(
+                    current.status == "resolved"
+                    and current_completion
+                    and continuation_kind
+                )
+                if not requires_failure_settlement:
+                    return
+            try:
+                self.company_executor.wake_live_run_dispatcher(run_id)
+            except BaseException as error:
+                if isinstance(error, (KeyboardInterrupt, SystemExit)):
+                    raise
+                logger.opt(exception=True).warning(
+                    "gate continuation wake failed run_id={}",
+                    run_id,
+                )
+
+            admission: CompanyRunControllerAdmission | None = None
+            try:
+                admission = await self.company_executor.acquire_controller_admission_for_scope(
+                    run_id=run_id,
+                    project_id=project_id,
+                    root_session_id=root_session_id,
+                    retry_busy_at_observed_expiry=False,
+                )
+            except CompanyRunControllerBusy:
+                # The current generation may be between its final dispatcher
+                # scan and durable release.  Keep monitoring the exact marker;
+                # a wake event alone is not an acknowledgement.
+                await asyncio.sleep(0.1)
+                continue
+            if admission is None:
+                await asyncio.sleep(0.1)
+                continue
+            try:
+                current_scope_matches = (
+                    await self.store.validate_company_work_item_gate_runtime_scope(
+                        checkpoint_id,
+                        project_id=project_id,
+                    )
+                )
+                continuation_kind = str(
+                    current_completion.get("continuation", "") or ""
+                ).strip()
+                if requires_failure_settlement or not current_scope_matches:
+                    settled = await self.store.settle_company_work_item_gate_failure_for_controller(
+                        checkpoint_id,
+                        project_id=project_id,
+                        run_id=run_id,
+                        owner_token=admission.owner_token,
+                        generation=admission.generation,
+                        conflict_reason=(
+                            "invalid_company_work_item_gate"
+                            if current.status == "invalid"
+                            else (
+                                "postcommit_company_work_item_gate_"
+                                f"{continuation_kind or 'continuation'}_"
+                                + (
+                                    "scope_mismatch"
+                                    if not current_scope_matches
+                                    else "marker_identity_mismatch"
+                                )
+                            )
+                        ),
+                    )
+                    if settled:
+                        return
+                    # The named Store transaction found a newer attempt,
+                    # replacement owner card, or ambiguous provenance.  It is
+                    # unsafe to execute the old serialized scope or guess-write
+                    # another run; retain the durable audit row and stop.
+                    return
+                tasks: list[Task] = []
+                seen_task_ids: set[str] = set()
+                for task_id in task_ids:
+                    if task_id in seen_task_ids:
+                        continue
+                    seen_task_ids.add(task_id)
+                    task = await self.store.get_task(task_id)
+                    if (
+                        task is not None
+                        and str(
+                            dict(task.metadata or {}).get(
+                                "delegation_run_id", ""
+                            )
+                            or ""
+                        ).strip()
+                        == run_id
+                    ):
+                        tasks.append(task)
+                plan = parsed_plan
+                if len(tasks) != len(task_ids) or plan is None:
+                    raise RuntimeError(
+                        "resolved company gate continuation lost its runtime snapshot"
+                    )
+                await self.company_executor.execute(
+                    plan,
+                    tasks,
+                    controller_admission=admission,
+                    release_controller_admission_on_exit=True,
+                )
+            except CompanyRunControllerLeaseLost:
+                await asyncio.sleep(0.1)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.opt(exception=True).warning(
+                    "resolved company gate continuation attempt failed; "
+                    "durable marker retained checkpoint_id={}",
+                    checkpoint_id,
+                )
+                await asyncio.sleep(0.25)
+            finally:
+                if not admission.released:
+                    await self.company_executor.release_controller_admission(
+                        admission
+                    )
+
+    async def _reconcile_active_owner_interaction_ownership(self) -> None:
+        """Backfill only missing actors on pre-protocol active owner rows.
+
+        A recorded non-empty actor is immutable here.  In particular, an old
+        checkpoint that incorrectly named its waiting child remains
+        fail-closed rather than being silently re-authorized during startup.
+        """
+
+        if not self.store or not self.interaction_coordinator:
+            return
+        checkpoints = await self.store.get_execution_checkpoints(
+            project_id=self.project_id or "default",
+            checkpoint_types=sorted(OWNER_INTERACTION_CHECKPOINT_TYPES),
+            statuses=["pending", "answered", "consuming"],
+        )
+        actor_fields = {
+            "ui_anchor_task_id",
+            "ui_anchor_session_id",
+            "root_session_id",
+            "company_runtime_session_id",
+        }
+        for checkpoint in checkpoints:
+            payload = dict(checkpoint.payload or {})
+            interaction = dict(payload.get("interaction", {}) or {})
+            recorded = dict(interaction.get("ownership", {}) or {})
+            if any(
+                str(recorded.get(field, "") or "").strip()
+                for field in actor_fields
+            ):
+                continue
+            waiting_task_id = str(
+                recorded.get("waiting_task_id")
+                or checkpoint.task_id
+                or payload.get("waiting_task_id")
+                or payload.get("task_id")
+                or ""
+            ).strip()
+            waiting_session_id = str(
+                recorded.get("waiting_session_id")
+                or checkpoint.session_id
+                or payload.get("session_id")
+                or ""
+            ).strip()
+            try:
+                ownership = await resolve_company_interaction_ownership(
+                    self.store,
+                    checkpoint.project_id or self.project_id or "default",
+                    waiting_task_id=waiting_task_id,
+                    waiting_session_id=waiting_session_id,
+                    execution_parent_task_id=str(
+                        recorded.get("execution_parent_task_id")
+                        or payload.get("parent_task_id")
+                        or ""
+                    ).strip(),
+                    execution_parent_session_id=str(
+                        recorded.get("execution_parent_session_id")
+                        or payload.get("parent_session_id")
+                        or ""
+                    ).strip(),
+                    origin_task_id=str(
+                        payload.get("origin_task_id") or ""
+                    ).strip(),
+                    root_session_id_hint=str(
+                        payload.get("root_session_id")
+                        or payload.get("parent_session_id")
+                        or ""
+                    ).strip(),
+                    existing_ownership=recorded,
+                )
+                if not str(
+                    ownership.get("ui_anchor_session_id")
+                    or ownership.get("root_session_id")
+                    or ""
+                ).strip():
+                    continue
+                await self.interaction_coordinator.backfill_owner_checkpoint_ownership(
+                    checkpoint.checkpoint_id,
+                    checkpoint_type=checkpoint.checkpoint_type,
+                    expected_statuses={checkpoint.status},
+                    ownership=ownership,
+                )
+            except Exception:
+                logger.opt(exception=True).warning(
+                    "Could not reconcile missing owner identity for checkpoint {}",
+                    checkpoint.checkpoint_id,
+                )
+
+    async def _consume_answered_interaction(
+        self,
+        checkpoint_id: str,
+        checkpoint_type: str,
+        *,
+        enforce_company_controller_eligibility: bool = False,
+        controller_credential: dict[str, Any] | None = None,
+    ) -> None:
+        assert self.store and self.interaction_coordinator
+        credential = dict(controller_credential or {})
+        consumer_id = f"engine:{id(self)}:{uuid.uuid4().hex}"
+        while True:
+            claim = await self.interaction_coordinator.claim_answered(
+                checkpoint_id=checkpoint_id,
+                checkpoint_type=checkpoint_type,
+                consumer_id=consumer_id,
+                lease_seconds=self._INTERACTION_LEASE_SECONDS,
+                enforce_company_controller_eligibility=(
+                    enforce_company_controller_eligibility
+                ),
+                controller_run_id=str(credential.get("run_id", "") or ""),
+                controller_root_session_id=str(
+                    credential.get("root_session_id", "") or ""
+                ),
+                controller_owner_token=str(
+                    credential.get("owner_token", "") or ""
+                ),
+                controller_lease_generation=int(
+                    credential.get("generation", 0) or 0
+                ),
+            )
+            if not claim.acquired or claim.checkpoint is None:
+                if claim.outcome == "controller_busy":
+                    logger.info(
+                        "Interaction answer persisted for a live remote company "
+                        "controller; recovery consumer did not claim: checkpoint={}",
+                        checkpoint_id,
+                    )
+                    self._schedule_interaction_consumption_retry(
+                        checkpoint_id,
+                        checkpoint_type,
+                    )
+                    return
+                if claim.outcome != "busy" or claim.checkpoint is None:
+                    retry_attempts = getattr(
+                        self, "_interaction_retry_attempts", None
+                    )
+                    if retry_attempts is not None:
+                        retry_attempts.pop(
+                            f"{checkpoint_type}:{checkpoint_id}", None
+                        )
+                    return
+                # A crashed process leaves a valid lease until its expiry.  A
+                # startup recovery consumer waits in bounded, cancellable
+                # increments and then atomically reclaims it instead of giving
+                # up forever after the first busy receipt.
+                interaction = dict((claim.checkpoint.payload or {}).get("interaction", {}) or {})
+                prior_claim = dict(interaction.get("claim", {}) or {})
+                try:
+                    expires_at = datetime.fromisoformat(
+                        str(prior_claim.get("lease_expires_at", "") or "")
+                    )
+                    remaining = expires_at.timestamp() - datetime.now().timestamp()
+                except (TypeError, ValueError, OSError):
+                    remaining = 0.0
+                await asyncio.sleep(max(0.05, min(60.0, remaining + 0.05)))
+                continue
+
+            interaction = dict((claim.checkpoint.payload or {}).get("interaction", {}) or {})
+            decision_record = dict(interaction.get("decision", {}) or {})
+            raw_decision = decision_record.get("value")
+            decision = (
+                dict(raw_decision)
+                if isinstance(raw_decision, dict)
+                else {"text": str(raw_decision or "")}
+            )
+            lease = InteractionDecisionLease(
+                checkpoint=claim.checkpoint,
+                decision=decision,
+                consumer_id=consumer_id,
+                claim_id=claim.claim_id,
+            )
+            original_domain_payload = {
+                key: copy.deepcopy(value)
+                for key, value in dict(lease.checkpoint.payload or {}).items()
+                if key != "interaction"
+            }
+            try:
+                execution_scope = await self._interaction_execution_scope(
+                    lease.checkpoint
+                )
+                # ``claim_answered`` installs the coordinator's terminal-bound
+                # lease keeper.  It deliberately outlives this dispatch when
+                # exact runtime continuation owns completion (for example a
+                # slow ToolCall), and stops only on finish/release/terminal.
+                dispatch_result = await self.interaction_coordinator.run_while_claimed(
+                    lease,
+                    self._dispatch_interaction_decision(
+                        lease,
+                        execution_scope=execution_scope,
+                    ),
+                    begin_effect=checkpoint_type
+                    not in {
+                        "tool_permission",
+                        "action_permission",
+                        "company_work_item_gate",
+                        "company_reorg_pending",
+                    },
+                    lease_seconds=self._INTERACTION_LEASE_SECONDS,
+                )
+                if isinstance(dispatch_result, _InteractionDispatchOutcome):
+                    result_message = dispatch_result.message
+                    runtime_owns_completion = dispatch_result.runtime_owns_completion
+                else:
+                    result_message = str(dispatch_result or "")
+                    runtime_owns_completion = False
+                current = await self.store.get_execution_checkpoint(
+                    checkpoint_id,
+                    project_id=self.project_id or "default",
+                    checkpoint_type=checkpoint_type,
+                )
+                if (
+                    current is not None
+                    and str(current.status or "").strip() == "consuming"
+                    and not runtime_owns_completion
+                ):
+                    current_domain_payload = {
+                        key: copy.deepcopy(value)
+                        for key, value in dict(lease.checkpoint.payload or {}).items()
+                        if key != "interaction"
+                    }
+                    domain_patch = {
+                        key: value
+                        for key, value in current_domain_payload.items()
+                        if original_domain_payload.get(key) != value
+                    }
+                    requested_final_status = str(
+                        lease.checkpoint.status or "resolved"
+                    ).strip()
+                    if requested_final_status in {
+                        "pending",
+                        "answered",
+                        "consuming",
+                        "resuming",
+                    }:
+                        requested_final_status = "resolved"
+                    finished = await self.interaction_coordinator.finish(
+                        lease,
+                        final_status=requested_final_status,
+                        payload_patch={
+                            **domain_patch,
+                            "interaction_result": {"message": result_message[:4000]}
+                        },
+                    )
+                    if not finished.applied:
+                        raise InteractionLeaseLost(
+                            f"interaction finish fence failed: {finished.outcome}"
+                        )
+                    current = finished.checkpoint or current
+                elif current is not None and not runtime_owns_completion:
+                    current_interaction = dict(
+                        (current.payload or {}).get("interaction", {}) or {}
+                    )
+                    completion = dict(
+                        current_interaction.get("completion", {}) or {}
+                    )
+                    if (
+                        str(completion.get("claim_id", "") or "")
+                        == lease.claim_id
+                        and str(completion.get("consumer_id", "") or "")
+                        == lease.consumer_id
+                    ):
+                        # A company final-delivery transaction may have
+                        # completed this exact origin lease before publishing
+                        # the next owner card.  Stop the process-local keeper
+                        # immediately; the terminal Store row is authoritative.
+                        await self.interaction_coordinator.stop_lease_heartbeat(
+                            lease
+                        )
+                retry_attempts = getattr(
+                    self, "_interaction_retry_attempts", None
+                )
+                if retry_attempts is not None:
+                    retry_attempts.pop(
+                        f"{checkpoint_type}:{checkpoint_id}", None
+                    )
+                return
+            except (
+                CompanyRunControllerBusy,
+                CompanyRunControllerLeaseLost,
+                _RetryableInteractionConflict,
+            ):
+                # A controller race occurred before the named gate transaction
+                # committed.  Return the exact interaction claim to answered
+                # so the winning/new generation can consume it; never label a
+                # controller takeover as engine shutdown or outcome-unknown.
+                released = await asyncio.shield(
+                    self.interaction_coordinator.release(
+                        lease,
+                        reason="company_controller_unavailable",
+                    )
+                )
+                if bool(getattr(released, "applied", False)):
+                    self._schedule_interaction_consumption_retry(
+                        checkpoint_id,
+                        checkpoint_type,
+                    )
+                return
+            except asyncio.CancelledError as exc:
+                await asyncio.shield(self.interaction_coordinator.release(
+                    lease,
+                    reason="engine_shutdown",
+                ))
+                raise exc
+            except InteractionLeaseLost:
+                # The sole coordinator keeper already proved this claim can no
+                # longer be renewed.  Never settle through stale ownership;
+                # another controller may reclaim after the durable expiry.
+                return
+            except InteractionEffectFailed as exc:
+                failed = await self.interaction_coordinator.finish(
+                    lease,
+                    final_status="outcome_unknown",
+                    payload_patch={
+                        "interaction_error": {
+                            "kind": type(exc.__cause__ or exc).__name__,
+                            "message": str(exc.__cause__ or exc)[:1000],
+                            "retryable": False,
+                            "effect_started": True,
+                        }
+                    },
+                )
+                if not failed.applied:
+                    logger.error(
+                        "Could not terminalize failed interaction effect {}: {}",
+                        checkpoint_id,
+                        failed.outcome,
+                    )
+                return
+            except _PermanentInteractionError as exc:
+                failed = await self.interaction_coordinator.finish(
+                    lease,
+                    final_status="invalid",
+                    payload_patch={
+                        "interaction_error": {
+                            "kind": type(exc).__name__,
+                            "message": str(exc)[:1000],
+                            "retryable": False,
+                        }
+                    },
+                )
+                if not failed.applied:
+                    logger.error(
+                        "Could not terminalize invalid interaction {}: {}",
+                        checkpoint_id,
+                        failed.outcome,
+                    )
+                retry_attempts = getattr(
+                    self, "_interaction_retry_attempts", None
+                )
+                if retry_attempts is not None:
+                    retry_attempts.pop(
+                        f"{checkpoint_type}:{checkpoint_id}", None
+                    )
+                return
+            except Exception as exc:
+                retry_state = dict(
+                    (lease.checkpoint.payload or {}).get("interaction_retry", {}) or {}
+                )
+                attempts = int(retry_state.get("attempts", 0) or 0) + 1
+                logger.opt(exception=True).error(
+                    "Interaction consumer attempt {} failed for checkpoint {}",
+                    attempts,
+                    checkpoint_id,
+                )
+                retry_patch = {
+                    "interaction_retry": {
+                        "attempts": attempts,
+                        "last_error": str(exc)[:1000],
+                        "last_error_kind": type(exc).__name__,
+                        "updated_at": datetime.now().isoformat(),
+                    }
+                }
+                if attempts >= 3:
+                    failed = await self.interaction_coordinator.finish(
+                        lease,
+                        final_status="failed",
+                        payload_patch=retry_patch,
+                    )
+                    if not failed.applied:
+                        logger.error(
+                            "Could not terminalize failed interaction {}: {}",
+                            checkpoint_id,
+                            failed.outcome,
+                        )
+                    return
+                released = await self.interaction_coordinator.release(
+                    lease,
+                    reason=f"domain_consumer_failed:{type(exc).__name__}",
+                    payload_patch=retry_patch,
+                )
+                if not released.applied:
+                    logger.error(
+                        "Could not release interaction {} after failure: {}",
+                        checkpoint_id,
+                        released.outcome,
+                    )
+                    return
+                await asyncio.sleep(min(2.0, 0.1 * (2 ** (attempts - 1))))
+
+    @staticmethod
+    def _interaction_reply_text(decision: dict[str, Any]) -> str:
+        text = str(decision.get("text", "") or "").strip()
+        if text:
+            return text
+        answers = decision.get("user_input_answers")
+        if isinstance(answers, dict) and answers:
+            return "\n".join(
+                f"{question_id}: {answer}"
+                for question_id, answer in answers.items()
+            )
+        return str(
+            decision.get("option_id")
+            or decision.get("checkpoint_reply_kind")
+            or ""
+        ).strip()
+
+    async def _dispatch_interaction_decision(
+        self,
+        lease: InteractionDecisionLease,
+        *,
+        execution_scope: dict[str, str] | None = None,
+    ) -> str:
+        checkpoint = lease.checkpoint
+        if execution_scope is None:
+            execution_scope = await self._interaction_execution_scope(checkpoint)
+        if execution_scope.get("company_profile") == "custom":
+            target_org_id = str(execution_scope.get("org_id", "") or "").strip()
+            current_org_id = str(
+                getattr(
+                    getattr(getattr(self, "config", None), "org", None),
+                    "organization_id",
+                    "",
+                )
+                or ""
+            ).strip()
+            current_profile = str(
+                getattr(
+                    getattr(getattr(self, "config", None), "org", None),
+                    "company_profile",
+                    "",
+                )
+                or ""
+            ).strip().lower()
+            if current_profile != "custom" or current_org_id != target_org_id:
+                from opc.layer2_organization.custom_runtime import CustomRuntimeRunner
+
+                return await CustomRuntimeRunner(self).dispatch_interaction_decision(
+                    lease,
+                    org_id=target_org_id,
+                )
+        decision = dict(lease.decision or {})
+        checkpoint_type = str(checkpoint.checkpoint_type or "").strip()
+        reply = self._interaction_reply_text(decision)
+        reply_metadata = {
+            **decision,
+            "response_to_checkpoint_id": checkpoint.checkpoint_id,
+            "response_to_checkpoint_type": checkpoint_type,
+            "interaction_claim_id": lease.claim_id,
+            "interaction_consumer_id": lease.consumer_id,
+        }
+        origin_interaction_lease = (
+            OriginOwnerInteractionLease(
+                checkpoint_id=checkpoint.checkpoint_id,
+                checkpoint_type=checkpoint_type,
+                project_id=(
+                    checkpoint.project_id or self.project_id or "default"
+                ),
+                claim_id=lease.claim_id,
+                consumer_id=lease.consumer_id,
+            )
+            if checkpoint_type
+            in {
+                "company_staffing_selection",
+                "company_recruitment_confirmation",
+            }
+            else None
+        )
+        if checkpoint_type == "tool_permission":
+            return await self._resume_permission_checkpoint(lease)
+        if checkpoint_type == "action_permission":
+            return await self._resume_action_permission_checkpoint(lease)
+        if checkpoint_type in {"route_clarification", "company_runtime_selection"}:
+            return await self._resume_routing_checkpoint(
+                checkpoint,
+                reply,
+            )
+        if checkpoint_type == "task_user_input":
+            return await self._resume_task_checkpoint(
+                checkpoint,
+                reply,
+            )
+        if checkpoint_type == "company_work_item_gate":
+            return await self._resume_company_work_item_gate_decision(lease)
+        if checkpoint_type == "company_delivery_feedback":
+            action = str(
+                decision.get("checkpoint_reply_kind")
+                or decision.get("option_id")
+                or ""
+            ).strip().lower()
+            if action == "ignore":
+                return await self._ignore_company_delivery_feedback_consumed(
+                    checkpoint,
+                    reply_metadata=reply_metadata,
+                )
+            normalized_action = "feedback" if action == "feedback" else "approve"
+            return await self._run_company_delivery_self_evolution_consumed(
+                checkpoint,
+                action=normalized_action,
+                feedback=reply if normalized_action == "feedback" else "",
+            )
+        if checkpoint_type == "company_staffing_selection":
+            return await self._resume_staffing_selection_checkpoint(
+                checkpoint,
+                reply,
+                reply_metadata=reply_metadata,
+                origin_interaction_lease=origin_interaction_lease,
+            )
+        if checkpoint_type == "company_recruitment_confirmation":
+            return await self._resume_recruitment_checkpoint(
+                checkpoint,
+                reply,
+                reply_metadata=reply_metadata,
+                origin_interaction_lease=origin_interaction_lease,
+            )
+        if checkpoint_type == "company_reorg_pending":
+            return await self._resume_reorg_checkpoint(
+                lease,
+                reply,
+            )
+        if checkpoint_type == "company_run_failure_review":
+            return "Company run closure acknowledged."
+        raise ValueError(f"unsupported owner interaction type: {checkpoint_type}")
+
+    async def _interaction_execution_scope(
+        self,
+        checkpoint: ExecutionCheckpoint,
+    ) -> dict[str, str]:
+        """Resolve one durable execution scope, rejecting identity conflicts."""
+
+        payload = dict(checkpoint.payload or {})
+        interaction = dict(payload.get("interaction", {}) or {})
+        recorded_scope = dict(interaction.get("execution_scope", {}) or {})
+        task_id = str(
+            checkpoint.task_id
+            or payload.get("waiting_task_id")
+            or payload.get("task_id")
+            or ""
+        ).strip()
+        store = getattr(self, "store", None)
+        task = await store.get_task(task_id) if store is not None and task_id else None
+        task_metadata = dict(getattr(task, "metadata", {}) or {})
+        profiles = {
+            str(value or "").strip().lower()
+            for value in (
+                recorded_scope.get("company_profile"),
+                payload.get("company_profile"),
+                task_metadata.get("company_profile"),
+                (
+                    "custom"
+                    if str(task_metadata.get("exec_mode", "") or "").lower()
+                    in {"org", "custom"}
+                    else ""
+                ),
+            )
+            if str(value or "").strip()
+        }
+        org_ids = {
+            str(value or "").strip()
+            for value in (
+                recorded_scope.get("org_id"),
+                payload.get("org_id"),
+                payload.get("organization_id"),
+                getattr(task, "org_id", None),
+                task_metadata.get("org_id"),
+                task_metadata.get("organization_id"),
+            )
+            if str(value or "").strip()
+        }
+        if len(profiles) > 1:
+            raise _PermanentInteractionError(
+                "interaction company profile conflicts with its durable task"
+            )
+        if len(org_ids) > 1:
+            raise _PermanentInteractionError(
+                "interaction org_id conflicts with its durable task"
+            )
+        company_profile = next(iter(profiles), "")
+        org_id = next(iter(org_ids), "")
+        if company_profile == "custom" and not org_id:
+            raise _PermanentInteractionError(
+                "custom interaction is missing its durable org_id"
+            )
+        return {"company_profile": company_profile, "org_id": org_id}
+
+    @staticmethod
+    def _tool_call_fingerprint(
+        *,
+        tool_call_id: str,
+        tool_name: str,
+        arguments: dict[str, Any],
+        runtime_session_id: str,
+        execution_envelope: dict[str, Any] | None = None,
+        execution_identity: dict[str, Any] | None = None,
+    ) -> str:
+        return exact_tool_call_fingerprint(
+            tool_call_id=tool_call_id,
+            tool_name=tool_name,
+            arguments=arguments,
+            runtime_session_id=runtime_session_id,
+            execution_envelope=execution_envelope,
+            execution_identity=execution_identity,
+        )
+
+    async def _remove_task_tool_permission_permit(
+        self,
+        task: Task,
+        fingerprint: str,
+    ) -> None:
+        """Remove one terminal one-shot permit from both durable task views."""
+
+        fingerprint = str(fingerprint or "").strip()
+        ledger = await self.store.get_task_runtime_tool_ledger(
+            task.id,
+            project_id=task.project_id or self.project_id or "default",
+        )
+        if ledger is None:
+            raise _PermanentInteractionError(
+                "the task owning this exact ToolCall no longer exists"
+            )
+        permit = dict(ledger.permits.get(fingerprint, {}) or {})
+        runtime_session_id = str(
+            permit.get("runtime_session_id")
+            or ledger.runtime_session_id
+            or ""
+        ).strip()
+        if not runtime_session_id:
+            raise _PermanentInteractionError(
+                "the exact ToolCall ledger has no runtime session identity"
+            )
+        persisted = await self.store.update_task_runtime_tool_permit(
+            task.id,
+            runtime_session_id=runtime_session_id,
+            fingerprint=fingerprint,
+            permit=None,
+            expected_permit=permit,
+        )
+        task.context_snapshot = dict(persisted.context_snapshot or {})
+        task.metadata = dict(persisted.metadata or {})
+
+    async def _run_runtime_tool_continuation_singleflight(
+        self,
+        *,
+        task: Task,
+        runtime_session_id: str,
+        interaction_lease: InteractionDecisionLease,
+        run_once: Callable[[Task], Coroutine[Any, Any, str]],
+    ) -> tuple[bool, str]:
+        """Elect and supervise one runner for a persisted task/runtime pair.
+
+        Other permission consumers have already atomically merged their exact
+        permits into the Task ledger before they register here.  A busy caller
+        therefore only contributes work; it never starts a competing Native
+        Runtime or writes the shared transcript concurrently.
+        """
+
+        continuation_consumer = (
+            f"{interaction_lease.consumer_id}:{interaction_lease.claim_id}"
+        )
+        lease_seconds = float(self._INTERACTION_LEASE_SECONDS)
+        claim = await self.store.claim_runtime_tool_continuation(
+            project_id=task.project_id or self.project_id or "default",
+            task_id=task.id,
+            runtime_session_id=runtime_session_id,
+            consumer_id=continuation_consumer,
+            lease_seconds=lease_seconds,
+        )
+        if not claim.acquired:
+            if claim.outcome == "busy":
+                return False, ""
+            raise _PermanentInteractionError(
+                f"could not acquire exact runtime continuation: {claim.outcome}"
+            )
+
+        started = await self.store.begin_runtime_tool_continuation(
+            project_id=task.project_id or self.project_id or "default",
+            task_id=task.id,
+            runtime_session_id=runtime_session_id,
+            consumer_id=continuation_consumer,
+            claim_id=claim.claim_id,
+        )
+        if not started.acquired:
+            raise InteractionLeaseLost(
+                f"could not fence exact runtime continuation: {started.outcome}"
+            )
+
+        lost = asyncio.Event()
+        interval = max(0.05, min(30.0, lease_seconds / 3.0))
+
+        async def heartbeat() -> None:
+            try:
+                while True:
+                    await asyncio.sleep(interval)
+                    renewed = await self.store.renew_runtime_tool_continuation(
+                        project_id=task.project_id or self.project_id or "default",
+                        task_id=task.id,
+                        runtime_session_id=runtime_session_id,
+                        consumer_id=continuation_consumer,
+                        claim_id=claim.claim_id,
+                        lease_seconds=lease_seconds,
+                    )
+                    if not renewed.acquired:
+                        lost.set()
+                        return
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.opt(exception=True).error(
+                    "runtime ToolCall continuation heartbeat failed for task {}",
+                    task.id,
+                )
+                lost.set()
+
+        heartbeat_task = asyncio.create_task(
+            heartbeat(),
+            name=f"tool-continuation:{task.id}:{runtime_session_id}",
+        )
+        observed_generation = int(claim.request_generation or 0)
+        operation: asyncio.Task[str] | None = None
+        loss_wait: asyncio.Task[bool] | None = None
+        try:
+            while True:
+                current_task = await self.store.get_task(task.id)
+                if current_task is None:
+                    raise _PermanentInteractionError(
+                        "runtime continuation task disappeared"
+                    )
+                operation = asyncio.create_task(run_once(current_task))
+                loss_wait = asyncio.create_task(lost.wait())
+                try:
+                    done, _ = await asyncio.wait(
+                        {operation, loss_wait},
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    if loss_wait in done and lost.is_set():
+                        if not operation.done():
+                            operation.cancel()
+                        operation_results = await asyncio.gather(
+                            operation,
+                            return_exceptions=True,
+                        )
+                        cleanup_failure = next(
+                            (
+                                item
+                                for item in operation_results
+                                if isinstance(item, BaseException)
+                                and not isinstance(item, asyncio.CancelledError)
+                            ),
+                            None,
+                        )
+                        if cleanup_failure is not None:
+                            raise cleanup_failure
+                        raise InteractionLeaseLost(
+                            "runtime ToolCall continuation lease was lost"
+                        )
+                    if not loss_wait.done():
+                        loss_wait.cancel()
+                    loss_results = await asyncio.gather(
+                        loss_wait,
+                        return_exceptions=True,
+                    )
+                    cleanup_failure = next(
+                        (
+                            item
+                            for item in loss_results
+                            if isinstance(item, BaseException)
+                            and not isinstance(item, asyncio.CancelledError)
+                        ),
+                        None,
+                    )
+                    if cleanup_failure is not None:
+                        raise cleanup_failure
+                    result = await operation
+                finally:
+                    pending = [
+                        child
+                        for child in (operation, loss_wait)
+                        if child is not None and not child.done()
+                    ]
+                    for child in pending:
+                        child.cancel()
+                    if pending:
+                        cleanup_results = await asyncio.gather(
+                            *pending,
+                            return_exceptions=True,
+                        )
+                        cleanup_failure = next(
+                            (
+                                item
+                                for item in cleanup_results
+                                if isinstance(item, BaseException)
+                                and not isinstance(item, asyncio.CancelledError)
+                            ),
+                            None,
+                        )
+                        if cleanup_failure is not None:
+                            raise cleanup_failure
+                    operation = None
+                    loss_wait = None
+                fence = await self.store.renew_runtime_tool_continuation(
+                    project_id=task.project_id or self.project_id or "default",
+                    task_id=task.id,
+                    runtime_session_id=runtime_session_id,
+                    consumer_id=continuation_consumer,
+                    claim_id=claim.claim_id,
+                    lease_seconds=lease_seconds,
+                )
+                if not fence.acquired:
+                    raise InteractionLeaseLost(
+                        "runtime ToolCall continuation completion fence failed"
+                    )
+                finished = await self.store.finish_runtime_tool_continuation(
+                    project_id=task.project_id or self.project_id or "default",
+                    task_id=task.id,
+                    runtime_session_id=runtime_session_id,
+                    consumer_id=continuation_consumer,
+                    claim_id=claim.claim_id,
+                )
+                if finished.outcome == "more_work":
+                    # A permit landed after the runtime's final refresh.  Keep
+                    # the same durable owner and drain it serially.
+                    if int(finished.request_generation or 0) <= observed_generation:
+                        raise RuntimeError(
+                            "exact runtime continuation returned without draining "
+                            "its durable permit"
+                        )
+                    observed_generation = int(finished.request_generation or 0)
+                    continue
+                if finished.outcome != "finished":
+                    raise InteractionLeaseLost(
+                        f"runtime continuation release failed: {finished.outcome}"
+                    )
+                return True, result
+        finally:
+            pending = [
+                child
+                for child in (operation, loss_wait)
+                if child is not None and not child.done()
+            ]
+            for child in pending:
+                child.cancel()
+            cleanup_results: list[Any] = []
+            if pending:
+                cleanup_results.extend(
+                    await asyncio.gather(*pending, return_exceptions=True)
+                )
+            if not heartbeat_task.done():
+                heartbeat_task.cancel()
+            cleanup_results.extend(
+                await asyncio.gather(heartbeat_task, return_exceptions=True)
+            )
+            cleanup_failure = next(
+                (
+                    item
+                    for item in cleanup_results
+                    if isinstance(item, BaseException)
+                    and not isinstance(item, asyncio.CancelledError)
+                ),
+                None,
+            )
+            if cleanup_failure is not None:
+                raise cleanup_failure
+
+    async def _continue_exact_tool_runtime(
+        self,
+        *,
+        task: Task,
+        runtime_session_id: str,
+        payload: dict[str, Any],
+        interaction_lease: InteractionDecisionLease,
+    ) -> _InteractionDispatchOutcome:
+        """Continue one runtime after its exact ToolResult boundary is safe."""
+
+        try:
+            native_runtime_depth = int(
+                task.metadata.get("_native_runtime_depth", 0) or 0
+            )
+        except (TypeError, ValueError):
+            native_runtime_depth = 0
+        is_native_subagent = bool(
+            native_runtime_depth > 0
+            or str(task.metadata.get("_subagent_name", "") or "").strip()
+        )
+        is_work_item_task = bool(
+            is_work_item_runtime_metadata(task.metadata)
+            or linked_work_item_id_for_task(task)
+        )
+        if is_work_item_task:
+            await self._release_work_item_human_wait(
+                task, reason="tool_permission_answered"
+            )
+            run_id = str(task.metadata.get("delegation_run_id", "") or "").strip()
+            wake = getattr(
+                getattr(self, "company_executor", None),
+                "wake_live_run_dispatcher",
+                None,
+            )
+            if run_id and callable(wake) and wake(run_id):
+                return _InteractionDispatchOutcome(
+                    "Tool permission recorded; the live company runtime was resumed in place.",
+                    runtime_owns_completion=True,
+                )
+
+        async def resume_once(current_task: Task) -> str:
+            if is_native_subagent:
+                return await self._execute_single_agent(
+                    [current_task], current_task.assigned_external_agent
+                )
+            if not is_work_item_task:
+                return await self._execute_single_agent(
+                    [current_task], current_task.assigned_external_agent
+                )
+            ownership = dict(
+                dict(payload.get("interaction", {}) or {}).get("ownership", {})
+                or {}
+            )
+            root_session_id = str(
+                ownership.get("root_session_id")
+                or ownership.get("company_runtime_session_id")
+                or ""
+            ).strip()
+            if root_session_id:
+                suspend_rows = await self.store.get_execution_checkpoints(
+                    project_id=current_task.project_id,
+                    session_id=root_session_id,
+                    checkpoint_types=list(
+                        _COMPANY_RUNTIME_SUSPEND_CHECKPOINT_TYPES
+                    ),
+                    statuses=["pending"],
+                )
+                if suspend_rows:
+                    return await self._resume_company_suspend_checkpoint(
+                        suspend_rows[0], "resume"
+                    )
+                snapshot = await self._load_company_runtime_snapshot(root_session_id)
+                if snapshot is not None:
+                    plan, tasks = snapshot
+                    return await self._execute_company_mode(tasks, plan)
+            return await self._execute_single_agent(
+                [current_task], current_task.assigned_external_agent
+            )
+
+        owned, result = await self._run_runtime_tool_continuation_singleflight(
+            task=task,
+            runtime_session_id=runtime_session_id,
+            interaction_lease=interaction_lease,
+            run_once=resume_once,
+        )
+        if not owned:
+            result = (
+                "Tool permission recorded; the existing exact runtime "
+                "continuation will drain this call."
+            )
+        return _InteractionDispatchOutcome(result, runtime_owns_completion=True)
+
+    async def _resume_permission_checkpoint(
+        self,
+        lease: InteractionDecisionLease,
+    ) -> _InteractionDispatchOutcome:
+        """Restore the exact persisted ToolCall; never ask the LLM to recreate it."""
+
+        assert self.store and self.approval_engine and self.interaction_coordinator
+        checkpoint = lease.checkpoint
+        payload = dict(checkpoint.payload or {})
+        if checkpoint.checkpoint_type != "tool_permission":
+            raise _PermanentInteractionError(
+                "restart recovery for non-tool action approval is not supported"
+            )
+        tool_call = dict(payload.get("tool_call", {}) or {})
+        tool_call_id = str(tool_call.get("id", "") or "").strip()
+        tool_name = str(tool_call.get("name", "") or "").strip()
+        arguments = dict(tool_call.get("arguments", {}) or {})
+        execution_envelope = dict(
+            tool_call.get("execution_envelope", {}) or {}
+        )
+        execution_identity = dict(
+            tool_call.get("execution_identity", {}) or {}
+        )
+        runtime_session_id = str(tool_call.get("runtime_session_id", "") or "").strip()
+        expected_fingerprint = str(tool_call.get("fingerprint", "") or "").strip()
+        actual_fingerprint = self._tool_call_fingerprint(
+            tool_call_id=tool_call_id,
+            tool_name=tool_name,
+            arguments=arguments,
+            runtime_session_id=runtime_session_id,
+            execution_envelope=execution_envelope,
+            execution_identity=execution_identity,
+        )
+        if (
+            not tool_call_id
+            or not tool_name
+            or not runtime_session_id
+            or not expected_fingerprint
+            or expected_fingerprint != actual_fingerprint
+        ):
+            raise _PermanentInteractionError(
+                "tool permission checkpoint has an invalid immutable ToolCall reference"
+            )
+
+        calls = await self.store.list_runtime_tool_calls(runtime_session_id)
+        exact_call = next(
+            (
+                item for item in calls
+                if str(item.get("tool_call_id", "") or "") == tool_call_id
+                and str(item.get("tool_name", "") or "") == tool_name
+                and dict(item.get("arguments", {}) or {}) == arguments
+            ),
+            None,
+        )
+        if exact_call is None:
+            raise _PermanentInteractionError(
+                "persisted runtime ToolCall does not match the approval checkpoint"
+            )
+        task_id = str(
+            checkpoint.task_id
+            or dict(payload.get("interaction", {}) or {}).get("ownership", {}).get("waiting_task_id")
+            or ""
+        ).strip()
+        task = await self.store.get_task(task_id) if task_id else None
+        if task is None:
+            raise _PermanentInteractionError(
+                "the task waiting on this ToolCall no longer exists"
+            )
+        ownership = dict(dict(payload.get("interaction", {}) or {}).get("ownership", {}) or {})
+        if (
+            str(checkpoint.task_id or "").strip() != str(task.id or "").strip()
+            or str(ownership.get("waiting_task_id", "") or "").strip()
+            != str(task.id or "").strip()
+            or str(ownership.get("tool_runtime_session_id", "") or "").strip()
+            != runtime_session_id
+        ):
+            raise _PermanentInteractionError(
+                "tool permission checkpoint ownership does not match the execution task"
+            )
+
+        prior_results = await self.store.list_runtime_tool_results(runtime_session_id)
+        if any(str(item.get("tool_call_id", "") or "") == tool_call_id for item in prior_results):
+            await self._remove_task_tool_permission_permit(
+                task,
+                expected_fingerprint,
+            )
+            task = await self.store.set_task_runtime_continuation_marker(
+                task.id,
+                runtime_session_id=runtime_session_id,
+                enabled=True,
+            )
+            finished = await self.interaction_coordinator.finish(
+                lease,
+                final_status="resolved",
+                payload_patch={
+                    "approval_result": {
+                        "tool_call_id": tool_call_id,
+                        "tool_call_fingerprint": expected_fingerprint,
+                        "tool_result_persisted": True,
+                        "reconciled_after_restart": True,
+                    }
+                },
+            )
+            if not finished.applied:
+                raise InteractionLeaseLost(
+                    f"could not finish reconciled ToolResult: {finished.outcome}"
+                )
+            return await self._continue_exact_tool_runtime(
+                task=task,
+                runtime_session_id=runtime_session_id,
+                payload=payload,
+                interaction_lease=lease,
+            )
+
+        ledger = await self.store.get_task_runtime_tool_ledger(
+            task.id,
+            project_id=task.project_id or self.project_id or "default",
+        )
+        if ledger is None:
+            raise _PermanentInteractionError(
+                "the task waiting on this ToolCall no longer exists"
+            )
+        existing_call = dict(
+            ledger.permits.get(expected_fingerprint, {}) or {}
+        )
+        if existing_call and (
+            str(existing_call.get("task_id", "") or "") != str(task.id or "")
+            or str(existing_call.get("runtime_session_id", "") or "")
+            != runtime_session_id
+        ):
+            raise _PermanentInteractionError(
+                "persisted one-shot permit ownership does not match the ToolCall"
+            )
+        if (
+            str(existing_call.get("fingerprint", "") or "") == expected_fingerprint
+            and str(existing_call.get("state", "") or "") == "executing"
+            and str(existing_call.get("task_id", "") or "") == str(task.id or "")
+            and str(existing_call.get("runtime_session_id", "") or "") == runtime_session_id
+        ):
+            await self._remove_task_tool_permission_permit(
+                task,
+                expected_fingerprint,
+            )
+            receipt = await self.interaction_coordinator.finish(
+                lease,
+                final_status="outcome_unknown",
+                payload_patch={
+                    "approval_result": {
+                        "tool_call_id": tool_call_id,
+                        "tool_call_fingerprint": expected_fingerprint,
+                        "outcome": "unknown_after_interrupted_external_effect",
+                    }
+                },
+            )
+            if not receipt.applied:
+                raise InteractionLeaseLost(
+                    "could not terminalize interrupted ToolCall: "
+                    f"{receipt.outcome}"
+                )
+            return _InteractionDispatchOutcome(
+                "The ToolCall may have started before interruption; it was not replayed automatically."
+            )
+
+        decision_token = normalize_escalation_reply(
+            str(
+                lease.decision.get("option_id")
+                or lease.decision.get("text")
+                or ""
+            )
+        ) or "deny"
+        approval_context = dict(payload.get("approval", {}) or {})
+        outcome = self.approval_engine.apply_approval_scope_decision(
+            decision_token,
+            approval_context,
+        )
+        approved = bool(outcome.get("approved"))
+        permit = {
+            "id": tool_call_id,
+            "function": tool_name,
+            "arguments": arguments,
+            "execution_envelope": execution_envelope,
+            "execution_identity": execution_identity,
+            "fingerprint": expected_fingerprint,
+            "runtime_session_id": runtime_session_id,
+            "checkpoint_id": checkpoint.checkpoint_id,
+            "checkpoint_type": checkpoint.checkpoint_type,
+            "checkpoint_project_id": checkpoint.project_id,
+            "task_id": task.id,
+            "claim_id": lease.claim_id,
+            "consumer_id": lease.consumer_id,
+            "decision": decision_token,
+            "approved": approved,
+            "state": "ready",
+        }
+        task = await self.store.update_task_runtime_tool_permit(
+            task.id,
+            runtime_session_id=runtime_session_id,
+            fingerprint=expected_fingerprint,
+            permit=permit,
+            prepare_for_resume=True,
+        )
+
+        return await self._continue_exact_tool_runtime(
+            task=task,
+            runtime_session_id=runtime_session_id,
+            payload=payload,
+            interaction_lease=lease,
+        )
+
+    async def _resume_action_permission_checkpoint(
+        self,
+        lease: InteractionDecisionLease,
+    ) -> _InteractionDispatchOutcome:
+        """Fail closed when a non-tool action lost its live execution turn.
+
+        External actions do not yet have the ToolCall/result ledger needed for
+        exact replay.  Persist reusable scopes, but never infer that the action
+        is safe to rerun after a controller crash.
+        """
+
+        assert self.approval_engine and self.interaction_coordinator
+        checkpoint = lease.checkpoint
+        payload = dict(checkpoint.payload or {})
+        decision_token = normalize_escalation_reply(
+            str(
+                lease.decision.get("option_id")
+                or lease.decision.get("text")
+                or ""
+            )
+        ) or "deny"
+        approval_context = dict(payload.get("approval", {}) or {})
+        outcome = self.approval_engine.apply_approval_scope_decision(
+            decision_token,
+            approval_context,
+        )
+        approved = bool(outcome.get("approved"))
+        final_status = "stale_reissue_required" if approved else "resolved"
+        receipt = await self.interaction_coordinator.finish(
+            lease,
+            final_status=final_status,
+            payload_patch={
+                "approval_result": {
+                    "reply": decision_token,
+                    "approved": approved,
+                    "scope": outcome.get("scope") or "once",
+                    "action_replayed": False,
+                    "reason": (
+                        "live_action_turn_lost_reissue_required"
+                        if approved
+                        else "action_denied"
+                    ),
+                }
+            },
+        )
+        if not receipt.applied:
+            raise InteractionLeaseLost(
+                "could not terminalize lost external action: "
+                f"{receipt.outcome}"
+            )
+        if approved:
+            return _InteractionDispatchOutcome(
+                "The action approval was recorded, but its live execution turn was lost. "
+                "The action was not replayed; re-issue the request to run it safely."
+            )
+        return _InteractionDispatchOutcome("The action was denied and was not executed.")
+
+    @staticmethod
+    def build_compatibility_checkpoint_decision(
+        checkpoint: ExecutionCheckpoint,
+        user_reply: str,
+        reply_metadata: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        """Translate legacy CLI/TUI reply metadata into the typed protocol.
+
+        This adapter deliberately performs no validation or state transition;
+        the resulting value is submitted through ``submit_checkpoint_decision``
+        and therefore uses the same authorization, schema registry, durable
+        accept, claim lease, and single finalization path as Office.
+        """
+
+        metadata = dict(reply_metadata or {})
+        checkpoint_type = str(checkpoint.checkpoint_type or "").strip()
+        text = str(
+            metadata.get("text")
+            or metadata.get("human_feedback_text")
+            or user_reply
+            or ""
+        ).strip()
+        decision: dict[str, Any] = {}
+        for key in (
+            "option_id",
+            "option_label",
+            "checkpoint_reply_kind",
+            "user_input_answers",
+            "staffing_action",
+            "staffing_selections",
+            "recruitment_role_agents",
+            "recruitment_agent",
+            "self_evolution_trigger",
+            "human_feedback_text",
+        ):
+            value = metadata.get(key)
+            if value not in (None, "", [], {}):
+                decision[key] = value
+        if text:
+            decision["text"] = text
+
+        normalized = " ".join(text.lower().split())
+        if checkpoint_type in {"tool_permission", "action_permission"}:
+            option_id = str(decision.get("option_id", "") or "").strip()
+            if not option_id:
+                option_id = normalize_escalation_reply(text)
+            if option_id:
+                decision["option_id"] = option_id
+        elif checkpoint_type == "company_work_item_gate":
+            if not decision.get("option_id") and not decision.get(
+                "checkpoint_reply_kind"
+            ):
+                if normalized in {
+                    "approve",
+                    "approved",
+                    "yes",
+                    "y",
+                    "continue",
+                    "proceed",
+                }:
+                    decision["option_id"] = "approve"
+                elif normalized in {
+                    "deny",
+                    "denied",
+                    "no",
+                    "n",
+                    "reject",
+                    "stop",
+                }:
+                    decision["option_id"] = "deny"
+        elif checkpoint_type == "company_delivery_feedback":
+            if not decision.get("checkpoint_reply_kind") and not decision.get(
+                "option_id"
+            ):
+                if normalized in {
+                    "ignore", "ignored", "skip", "deny", "denied", "reject", "no"
+                }:
+                    decision["checkpoint_reply_kind"] = "ignore"
+                elif normalized in {
+                    "approve",
+                    "approved",
+                    "fully agree",
+                    "i approve this delivery.",
+                }:
+                    decision["checkpoint_reply_kind"] = "approve"
+                elif text:
+                    decision["checkpoint_reply_kind"] = "feedback"
+            if (
+                str(decision.get("checkpoint_reply_kind", "") or "").lower()
+                == "feedback"
+                and text
+            ):
+                decision["human_feedback_text"] = text
+        elif checkpoint_type == "company_staffing_selection":
+            if not decision.get("staffing_action"):
+                if normalized in {"auto", "auto recruit", "auto_recruit"}:
+                    decision["staffing_action"] = "auto_recruit"
+                elif normalized in {"deny", "denied", "reject", "no"}:
+                    decision["staffing_action"] = "deny"
+                elif normalized in {"approve", "approved", "manual approve"}:
+                    decision["staffing_action"] = "manual_approve"
+            if (
+                decision.get("staffing_action") == "manual_approve"
+                and not isinstance(decision.get("staffing_selections"), dict)
+            ):
+                payload = dict(checkpoint.payload or {})
+                defaults: dict[str, dict[str, Any]] = {}
+                for role in list(payload.get("staffing_roles", []) or []):
+                    if not isinstance(role, dict):
+                        continue
+                    role_id = str(role.get("role_id", "") or "").strip()
+                    selection = dict(role.get("default_selection", {}) or {})
+                    if role_id and selection:
+                        defaults[role_id] = selection
+                if defaults:
+                    decision["staffing_selections"] = defaults
+                default_agents = {
+                    str(role.get("role_id", "") or "").strip(): str(
+                        role.get("selected_agent")
+                        or role.get("default_agent")
+                        or "native"
+                    ).strip()
+                    for role in list(payload.get("staffing_roles", []) or [])
+                    if isinstance(role, dict)
+                    and str(role.get("role_id", "") or "").strip()
+                }
+                if default_agents and not isinstance(
+                    decision.get("recruitment_role_agents"), dict
+                ):
+                    decision["recruitment_role_agents"] = default_agents
+        elif checkpoint_type == "company_recruitment_confirmation":
+            if not decision.get("checkpoint_reply_kind"):
+                if normalized in {"approve", "approved", "yes", "confirm"}:
+                    decision["checkpoint_reply_kind"] = "approve"
+                elif normalized in {"deny", "denied", "reject", "no"}:
+                    decision["checkpoint_reply_kind"] = "deny"
+                elif text:
+                    decision["checkpoint_reply_kind"] = "feedback"
+        elif checkpoint_type == "company_reorg_pending":
+            command = re.match(
+                r"^reorg\s+(approve|deny)\s+(.+)$",
+                text,
+                re.IGNORECASE,
+            )
+            if command:
+                proposal_id = str(
+                    dict(checkpoint.payload or {}).get("proposal_id", "") or ""
+                ).strip()
+                if command.group(2).strip() == proposal_id:
+                    decision["text"] = command.group(1).lower()
+        elif checkpoint_type == "company_run_failure_review":
+            if not decision.get("checkpoint_reply_kind") and not decision.get(
+                "option_id"
+            ):
+                if normalized in {"deny", "denied", "dismiss", "ignore", "close"}:
+                    decision["checkpoint_reply_kind"] = "dismiss"
+                else:
+                    decision["checkpoint_reply_kind"] = "acknowledge"
+        return decision
+
+    @staticmethod
+    def _compatibility_interaction_decision(
+        checkpoint: ExecutionCheckpoint,
+        user_reply: str,
+        reply_metadata: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        """Backward-compatible alias for the public CLI/TUI protocol adapter."""
+
+        return OPCEngine.build_compatibility_checkpoint_decision(
+            checkpoint,
+            user_reply,
+            reply_metadata,
+        )
+
+    async def _await_compatibility_interaction_result(
+        self,
+        checkpoint: ExecutionCheckpoint,
+    ) -> str:
+        """Wait for the unified consumer so synchronous CLI keeps its UX."""
+
+        assert self.store
+        while True:
+            current = await self.store.get_execution_checkpoint(
+                checkpoint.checkpoint_id,
+                project_id=self.project_id or "default",
+                checkpoint_type=checkpoint.checkpoint_type,
+            )
+            if current is None:
+                return "This request is no longer active."
+            status = str(current.status or "").strip().lower()
+            if status not in {"pending", "answered", "consuming", "resuming"}:
+                interaction_result = dict(
+                    (current.payload or {}).get("interaction_result", {}) or {}
+                )
+                message = str(interaction_result.get("message", "") or "").strip()
+                if message:
+                    return message
+                if status == "resolved":
+                    return "The response was accepted."
+                return f"The request finished with status `{status or 'unknown'}`."
+            await asyncio.sleep(0.05)
+
+    async def _submit_compatibility_checkpoint_reply(
+        self,
+        checkpoint: ExecutionCheckpoint,
+        user_reply: str,
+        *,
+        session_id: str | None,
+        reply_metadata: dict[str, Any] | None,
+    ) -> str | None:
+        """Route legacy process-message replies through the canonical API."""
+
+        metadata = dict(reply_metadata or {})
+        decision = self._compatibility_interaction_decision(
+            checkpoint,
+            user_reply,
+            metadata,
+        )
+        request_seed = str(
+            metadata.get("client_request_id")
+            or metadata.get("ui_message_id")
+            or metadata.get("conversation_turn_id")
+            or metadata.get("canonical_turn_id")
+            or ""
+        ).strip()
+        if not request_seed:
+            request_seed = hashlib.sha256(
+                json.dumps(
+                    {
+                        "checkpoint_id": checkpoint.checkpoint_id,
+                        "decision": decision,
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    default=str,
+                ).encode("utf-8")
+            ).hexdigest()
+        requester_task_id = ""
+        requester_session_id = str(session_id or "").strip()
+        waiting_task_id = str(
+            checkpoint.task_id
+            or dict(checkpoint.payload or {}).get("waiting_task_id")
+            or dict(checkpoint.payload or {}).get("task_id")
+            or ""
+        ).strip()
+        requester_actor: dict[str, Any] | None = None
+        checkpoint_ownership = dict(
+            dict(checkpoint.payload or {}).get("interaction", {}).get(
+                "ownership",
+                {},
+            )
+            or {}
+        )
+        checkpoint_owner_session = str(
+            checkpoint.session_id
+            or checkpoint_ownership.get("root_session_id")
+            or checkpoint_ownership.get("ui_anchor_session_id")
+            or ""
+        ).strip()
+        if (
+            not waiting_task_id
+            and not checkpoint_owner_session
+            and checkpoint.checkpoint_type == "company_reorg_pending"
+        ):
+            requester_actor = self.issue_project_owner_actor(interface="cli")
+            requester_session_id = ""
+        elif not await self._checkpoint_visible_to_reply_session(
+            checkpoint,
+            requester_session_id,
+        ):
+            return "This request is no longer active."
+        if waiting_task_id and self.store:
+            try:
+                identity_index = await load_company_runtime_identity_index(
+                    self.store,
+                    self.project_id or "default",
+                )
+                identity = identity_index.resolve(task_id=waiting_task_id)
+            except Exception:
+                identity = None
+            if identity is not None:
+                requester_task_id = str(identity.ui_anchor_task_id or "").strip()
+                requester_session_id = str(identity.runtime_session_id or "").strip()
+        receipt = await self.submit_checkpoint_decision(
+            checkpoint_id=checkpoint.checkpoint_id,
+            checkpoint_type=checkpoint.checkpoint_type,
+            decision=decision,
+            client_request_id=f"process-message:{request_seed}",
+            requester_task_id=requester_task_id,
+            requester_session_id=requester_session_id or None,
+            requester_actor=requester_actor,
+        )
+        if not receipt.get("accepted"):
+            reason = str(receipt.get("reason", "") or "").strip()
+            status = str(receipt.get("status", "") or "").strip().lower()
+            if reason == "invalid_state" and status not in {
+                "pending",
+                "answered",
+                "consuming",
+                "resuming",
+            }:
+                if checkpoint.checkpoint_type == "company_delivery_feedback":
+                    # A late content-bearing delivery reply is a new owner turn,
+                    # not a second self-evolution decision.
+                    return None
+                return "This request is no longer active."
+            if reason in {"conflict", "invalid_state"}:
+                return "This request has already been answered."
+            if reason in {"not_found", "checkpoint_not_found", "not_authorized"}:
+                return "This request is no longer active."
+            if (
+                checkpoint.checkpoint_type == "company_delivery_feedback"
+                and reason
+                in {
+                    "empty_decision",
+                    "invalid_delivery_action",
+                    "feedback_text_required",
+                }
+            ):
+                return (
+                    "There is a pending delivery self-evolution review. Use the "
+                    "review card to fully agree, ignore, or send feedback."
+                )
+            return f"The response was not accepted ({reason or 'invalid_decision'})."
+        return await self._await_compatibility_interaction_result(checkpoint)
+
     async def _maybe_resume_checkpoint(
         self,
         user_reply: str,
@@ -11269,17 +16013,20 @@ class OPCEngine:
                 return "This request is no longer active."
             if explicit_checkpoint_type and explicit_checkpoint_type != str(checkpoint.checkpoint_type or "").strip():
                 return "This request is no longer active or does not match the selected checkpoint."
+            if checkpoint.checkpoint_type in OWNER_INTERACTION_CHECKPOINT_TYPES:
+                # CLI/TUI still transports explicit card replies through
+                # process_message.  It is only a presentation adapter: every
+                # owner decision enters through the same typed/authenticated
+                # durable submit API as Office and is never consumed here.
+                return await self._submit_compatibility_checkpoint_reply(
+                    checkpoint,
+                    user_reply,
+                    session_id=session_id,
+                    reply_metadata=reply_metadata,
+                )
             if not await self._checkpoint_visible_to_reply_session(checkpoint, session_id):
                 return "This request is no longer active."
             if str(getattr(checkpoint, "status", "") or "").strip().lower() != "pending":
-                if str(getattr(checkpoint, "checkpoint_type", "") or "").strip() == "company_delivery_feedback":
-                    if str(getattr(checkpoint, "status", "") or "").strip().lower() == "consuming":
-                        # Duplicate approve/feedback while the first reply is
-                        # still driving the self-evolution run: answer
-                        # idempotently instead of re-routing the click as a
-                        # fresh session message.
-                        return "Self-evolution for this delivery is already running."
-                    return None
                 return "This request is no longer active."
             if not await self._checkpoint_task_still_waiting(checkpoint):
                 return "This request is no longer active."
@@ -11287,12 +16034,17 @@ class OPCEngine:
             checkpoint = await self.get_latest_pending_checkpoint_for_session(session_id)
             if not checkpoint:
                 return None
-            if self._checkpoint_awaits_approval_decision(checkpoint):
+            if checkpoint.checkpoint_type in {
+                "tool_permission",
+                "action_permission",
+                "company_delivery_feedback",
+                "company_run_failure_review",
+            } or self._checkpoint_awaits_approval_decision(checkpoint):
                 # A parked permission prompt is answered by its approval card
                 # (the card reply carries an explicit response_to_checkpoint_id).
-                # Deferred cards stay pending indefinitely, so a plain chat
-                # message must not be consumed as the approval answer — let it
-                # continue as a normal conversation turn instead.
+                # Delivery/failure cards also must not swallow a normal company
+                # turn.  The explicit compatibility branch above still routes
+                # their CLI cards through the canonical submit API.
                 return None
         metadata_mode = str(dict(reply_metadata or {}).get("mode", "") or "").strip()
         inferred_mode = requested_mode or metadata_mode
@@ -11306,82 +16058,31 @@ class OPCEngine:
             and not self._is_company_runtime_suspend_checkpoint(checkpoint.checkpoint_type)
         ):
             return None
-        if checkpoint.checkpoint_type in {"route_clarification", "company_runtime_selection"}:
-            return await self._resume_routing_checkpoint(checkpoint, user_reply)
-        if checkpoint.checkpoint_type == "task_user_input":
-            return await self._resume_task_checkpoint(checkpoint, user_reply)
+        if checkpoint.checkpoint_type in OWNER_INTERACTION_CHECKPOINT_TYPES:
+            return await self._submit_compatibility_checkpoint_reply(
+                checkpoint,
+                user_reply,
+                session_id=session_id,
+                reply_metadata=reply_metadata,
+            )
         if checkpoint.checkpoint_type in {"task_peer_wait", "company_peer_wait"}:
             return await self._resume_peer_checkpoint(checkpoint, user_reply)
-        if checkpoint.checkpoint_type == "company_work_item_gate":
-            return await self._resume_company_runtime_checkpoint(checkpoint, user_reply)
         if self._is_company_runtime_suspend_checkpoint(checkpoint.checkpoint_type):
             if self._reply_metadata_requests_force_resume(
                 reply_metadata
             ) or self._is_plain_resume_control_reply(user_reply):
                 return await self._resume_company_suspend_checkpoint(checkpoint, user_reply)
             return await self._resume_company_suspend_checkpoint_via_final_decider(checkpoint, user_reply)
-        if checkpoint.checkpoint_type == "company_run_failure_review":
-            if not explicit_checkpoint_id:
-                # Closure cards must never swallow ordinary session messages.
-                return None
-            normalized_failure_reply = " ".join(
-                str(user_reply or "").strip().lower().split()
-            )
-            await self.store.resolve_execution_checkpoint(
-                checkpoint.checkpoint_id, status="resolved"
-            )
-            if normalized_failure_reply in {
-                # trailing entries are Chinese acknowledgement spellings
-                "", "dismiss", "ignore", "close", "ok", "okay", "知道了", "关闭",
-            }:
-                return "Company run closure acknowledged."
-            # Content-bearing reply: the failed run is closed, so let the
-            # message continue as a fresh request through normal routing.
-            return None
-        if checkpoint.checkpoint_type == "company_delivery_feedback":
-            if not explicit_checkpoint_id:
-                return None
-            reply_kind = str(dict(reply_metadata or {}).get("checkpoint_reply_kind", "") or "").strip().lower()
-            if not str(user_reply or "").strip() and reply_kind not in {"approve", "feedback", "ignore"}:
-                return "There is a pending delivery self-evolution review. Use the review card to fully agree, ignore, or send feedback."
-            if reply_kind not in {"approve", "feedback", "ignore"}:
-                normalized_reply = str(user_reply or "").strip().lower()
-                if normalized_reply in {"ignore", "ignored", "skip"}:
-                    reply_kind = "ignore"
-                else:
-                    reply_kind = "approve" if normalized_reply in {"approve", "approved", "i approve this delivery."} else "feedback"
-            if reply_kind == "ignore":
-                return await self.ignore_company_delivery_feedback_checkpoint(
-                    checkpoint,
-                    reply_metadata=reply_metadata,
-                )
-            return await self.run_company_delivery_self_evolution_checkpoint(
-                checkpoint,
-                action=reply_kind,
-                feedback=user_reply if reply_kind == "feedback" else "",
-                reply_metadata=reply_metadata,
-            )
-        if checkpoint.checkpoint_type == "company_staffing_selection":
-            return await self._resume_staffing_selection_checkpoint(
-                checkpoint,
-                user_reply,
-                reply_metadata=reply_metadata,
-            )
-        if checkpoint.checkpoint_type == "company_recruitment_confirmation":
-            return await self._resume_recruitment_checkpoint(
-                checkpoint,
-                user_reply,
-                reply_metadata=reply_metadata,
-            )
-        if checkpoint.checkpoint_type == "company_reorg_pending":
-            return await self._resume_reorg_checkpoint(checkpoint, user_reply)
         return None
 
-    async def _resume_routing_checkpoint(self, checkpoint: ExecutionCheckpoint, user_reply: str) -> str:
+    async def _resume_routing_checkpoint(
+        self,
+        checkpoint: ExecutionCheckpoint,
+        user_reply: str,
+    ) -> str:
         payload = checkpoint.payload
         original_message = payload.get("original_message", "")
         if not original_message:
-            await self.store.resolve_execution_checkpoint(checkpoint.checkpoint_id, status="invalid")
             return "Could not resume the pending request because the original message is missing."
 
         if checkpoint.checkpoint_type == "company_runtime_selection":
@@ -11389,7 +16090,6 @@ class OPCEngine:
         else:
             combined = f"{original_message}\n\nAdditional information from user:\n{user_reply.strip()}"
 
-        await self.store.resolve_execution_checkpoint(checkpoint.checkpoint_id, status="resolved")
         message = UserMessage(
             channel="cli",
             user_id="owner",
@@ -11461,101 +16161,24 @@ class OPCEngine:
         )
         return True
 
-    async def _resume_task_checkpoint(self, checkpoint: ExecutionCheckpoint, user_reply: str) -> str:
+    async def _resume_task_checkpoint(
+        self,
+        checkpoint: ExecutionCheckpoint,
+        user_reply: str,
+    ) -> str:
         assert self.store
         checkpoint = await self._ensure_checkpoint_runtime_v2_payload(checkpoint)
         payload = checkpoint.payload
         task_id = payload.get("task_id")
         if not task_id:
-            await self.store.resolve_execution_checkpoint(checkpoint.checkpoint_id, status="invalid")
             return "Could not resume the pending task because the task reference is missing."
 
         task = await self.store.get_task(task_id)
         if not task:
-            await self.store.resolve_execution_checkpoint(checkpoint.checkpoint_id, status="invalid")
             return "Could not resume the pending task because it no longer exists."
 
-        # Unified approval channel (OBS-7): when the pause was a blocked tool
-        # and the reply is an explicit decision, apply it through the same
-        # engine the Office UI card click uses. Without this bridge the chat
-        # route is input-only: the worker retries the still-blocked command
-        # and re-escalates until the attempt ledger terminalizes the card.
         pause_request = dict(payload.get("pause_request", {}))
         injected_reply = user_reply.strip()
-        permission_context = dict(pause_request.get("permission_context", {}) or {})
-        blocked_tool_name = str(permission_context.get("tool_name", "") or "").strip()
-        blocked_tool_args: dict[str, Any] = {}
-        if not blocked_tool_name:
-            # Company runtime parks persist the blocked call as a
-            # permission_requests entry (runtime_v2 artifacts), not as
-            # pause_request.permission_context. Without this fallback a late
-            # approval reply resumes the task but records no allowlist grant,
-            # so the identical command re-blocks and re-parks on a fresh card
-            # every cycle (the project-0012 approve treadmill).
-            for request in reversed(list(payload.get("permission_requests", []) or [])):
-                if not isinstance(request, dict):
-                    continue
-                if str(request.get("resolution", "") or "").strip() != "ask":
-                    continue
-                candidate_tool = str(request.get("tool_name", "") or "").strip()
-                if not candidate_tool:
-                    continue
-                blocked_tool_name = candidate_tool
-                raw_request_args = request.get("tool_args")
-                if isinstance(raw_request_args, dict):
-                    blocked_tool_args = dict(raw_request_args)
-                break
-        decision_token = normalize_escalation_reply(user_reply)
-        if blocked_tool_name and decision_token and self.approval_engine is not None:
-            arguments: dict[str, Any] = {}
-            raw_args = (
-                payload.get("tool_args")
-                or pause_request.get("tool_args")
-                or blocked_tool_args
-                or {}
-            )
-            if isinstance(raw_args, dict):
-                arguments = dict(raw_args)
-            candidate = str(permission_context.get("candidate", "") or "").strip()
-            if candidate and not str(arguments.get("command", "") or "").strip():
-                arguments["command"] = candidate
-            try:
-                context = self.approval_engine.escalation_context_for_blocked_tool(
-                    task,
-                    tool_name=blocked_tool_name,
-                    arguments=arguments,
-                )
-                outcome = self.approval_engine.apply_deferred_escalation_decision(
-                    decision_token,
-                    context,
-                )
-            except Exception:
-                logger.opt(exception=True).warning(
-                    "Checkpoint {} approval reply {} failed to apply; degrading to plain input",
-                    checkpoint.checkpoint_id,
-                    decision_token,
-                )
-            else:
-                approved = bool(outcome.get("approved"))
-                logger.info(
-                    "Checkpoint {} approval decision applied via reply: {} -> "
-                    "approved={} scope={} patterns={}",
-                    checkpoint.checkpoint_id,
-                    decision_token,
-                    approved,
-                    outcome.get("scope"),
-                    outcome.get("patterns"),
-                )
-                injected_reply = (
-                    f"Approval decision applied: {decision_token}. The blocked "
-                    f"`{blocked_tool_name}` action is now allowlisted — retry it "
-                    "and continue the task."
-                    if approved
-                    else
-                    f"Approval decision applied: deny. Do not retry the blocked "
-                    f"`{blocked_tool_name}` action; take an alternative approach "
-                    "or report the limitation in your handoff."
-                )
         task.context_snapshot = dict(task.context_snapshot)
         task.context_snapshot["user_supplied_input"] = injected_reply
         if pause_request:
@@ -11588,8 +16211,6 @@ class OPCEngine:
                 sibling.status = TaskStatus.PENDING
                 await self.store.save_task(sibling)
             tasks.append(sibling)
-
-        await self.store.resolve_execution_checkpoint(checkpoint.checkpoint_id, status="resolved")
 
         raw_execution_mode = str(payload.get("execution_mode", ExecutionMode.SINGLE_AGENT.value))
         try:
@@ -11747,6 +16368,11 @@ class OPCEngine:
             for item in set(expected_statuses or set())
             if str(item).strip()
         }
+        if checkpoint.checkpoint_type in OWNER_INTERACTION_CHECKPOINT_TYPES:
+            raise RuntimeError(
+                "owner interactions cannot be settled by the runtime checkpoint "
+                "status helper; use submit/claim/finish"
+            )
         compare_and_set = getattr(
             self.store,
             "compare_and_set_execution_checkpoint",
@@ -11901,7 +16527,6 @@ class OPCEngine:
                         )
                         tasks.extend(supplemental_tasks)
         if not tasks:
-            await self.store.resolve_execution_checkpoint(checkpoint.checkpoint_id, status="invalid")
             return None
 
         payload["checkpoint_id"] = checkpoint.checkpoint_id
@@ -11934,6 +16559,7 @@ class OPCEngine:
         tasks: list[Task],
         resume_state: str,
         error: BaseException | str,
+        controller_admission: CompanyRunControllerAdmission | None = None,
     ) -> None:
         """Fail a resume closed: restore the durable hold before publishing pending."""
 
@@ -11950,34 +16576,59 @@ class OPCEngine:
             if current is None or str(current.status or "").strip() == "resolved":
                 return
             payload = dict(current.payload or checkpoint.payload or {})
-            await self._suspend_company_runtime_tasks(
-                tasks,
-                reason="resume_failed",
-                checkpoint_type=str(
-                    current.checkpoint_type
-                    or checkpoint.checkpoint_type
-                    or "company_runtime_interrupted"
-                ),
-                stop_intent_id=str(payload.get("stop_intent_id", "") or ""),
-            )
             error_text = str(error).strip() or type(error).__name__
-            transitioned = await self._mark_company_runtime_checkpoint_status(
-                current,
-                status="pending",
-                payload_updates={
-                    "resume_state": resume_state,
-                    "resume_failed_at": datetime.now().isoformat(),
-                    "resume_error": error_text,
-                },
-                expected_statuses={"resuming"},
-            )
-            if not transitioned:
-                refreshed = await self._load_execution_checkpoint_by_id(
-                    checkpoint.checkpoint_id
+            payload_updates = {
+                "resume_state": resume_state,
+                "resume_failed_at": datetime.now().isoformat(),
+                "resume_error": error_text,
+            }
+            if controller_admission is not None:
+                current, _created, _affected = (
+                    await self._checkpoint_and_suspend_company_runtime_scope(
+                        checkpoint_type=str(
+                            current.checkpoint_type
+                            or checkpoint.checkpoint_type
+                            or "company_runtime_interrupted"
+                        ),
+                        reason="resume_failed",
+                        parent_session_id=parent_session_id,
+                        origin_task_id=str(current.task_id or "").strip()
+                        or (tasks[0].id if tasks else None),
+                        plan=self._company_runtime_plan_for_tasks(tasks),
+                        tasks=tasks,
+                        stop_intent_id=str(payload.get("stop_intent_id", "") or ""),
+                        controller_run_id=controller_admission.run_id,
+                        controller_owner_token=controller_admission.owner_token,
+                        controller_lease_generation=controller_admission.generation,
+                        checkpoint_payload_updates=payload_updates,
+                    )
                 )
-                if refreshed is None:
+                if current is None:
                     return
-                current = refreshed
+            else:
+                await self._suspend_company_runtime_tasks(
+                    tasks,
+                    reason="resume_failed",
+                    checkpoint_type=str(
+                        current.checkpoint_type
+                        or checkpoint.checkpoint_type
+                        or "company_runtime_interrupted"
+                    ),
+                    stop_intent_id=str(payload.get("stop_intent_id", "") or ""),
+                )
+                transitioned = await self._mark_company_runtime_checkpoint_status(
+                    current,
+                    status="pending",
+                    payload_updates=payload_updates,
+                    expected_statuses={"resuming"},
+                )
+                if not transitioned:
+                    refreshed = await self._load_execution_checkpoint_by_id(
+                        checkpoint.checkpoint_id
+                    )
+                    if refreshed is None:
+                        return
+                    current = refreshed
             checkpoint.status = current.status
             checkpoint.payload = dict(current.payload or {})
             checkpoint.updated_at = current.updated_at
@@ -11990,6 +16641,7 @@ class OPCEngine:
         tasks: list[Task],
         resume_state: str,
         error: BaseException,
+        controller_admission: CompanyRunControllerAdmission | None = None,
     ) -> None:
         recovery = asyncio.create_task(
             self._restore_company_suspend_checkpoint_pending(
@@ -11998,6 +16650,7 @@ class OPCEngine:
                 tasks=tasks,
                 resume_state=resume_state,
                 error=error,
+                controller_admission=controller_admission,
             )
         )
         try:
@@ -12010,6 +16663,7 @@ class OPCEngine:
         checkpoint: ExecutionCheckpoint,
         *,
         parent_session_id: str,
+        controller_admission: CompanyRunControllerAdmission | None = None,
     ) -> None:
         """Publish one successful resume and its UI projection as one boundary."""
 
@@ -12035,27 +16689,66 @@ class OPCEngine:
                 "resume_handoff_at": resolved_at.isoformat(),
                 "resume_resolved_at": resolved_at.isoformat(),
             }
-            transitioned = (
-                await self.store.complete_execution_checkpoint_and_reopen_ui_anchor(
-                    current.checkpoint_id,
-                    project_id=project_id,
-                    session_id=parent_session_id,
-                    expected_status="resuming",
-                    status="resolved",
+            ui_anchor_task_id = str(
+                payload.get("ui_anchor_task_id", "") or ""
+            ).strip()
+            if controller_admission is not None:
+                complete_for_controller = getattr(
+                    self.store,
+                    "complete_company_runtime_resume_for_controller",
+                    None,
+                )
+                if not callable(complete_for_controller):
+                    raise CompanyRunControllerLeaseLost(
+                        "company controller resume requires fenced completion"
+                    )
+                receipt = await complete_for_controller(
+                    run_id=controller_admission.run_id,
+                    project_id=controller_admission.project_id,
+                    root_session_id=controller_admission.root_session_id,
+                    owner_token=controller_admission.owner_token,
+                    generation=controller_admission.generation,
+                    checkpoint_id=current.checkpoint_id,
+                    checkpoint_types=_COMPANY_RUNTIME_SUSPEND_CHECKPOINT_TYPES,
                     payload=resolved_payload,
-                    ui_anchor_task_id=str(
-                        payload.get("ui_anchor_task_id", "") or ""
-                    ).strip(),
-                    updated_at=resolved_at,
+                    ui_anchor_task_id=ui_anchor_task_id,
+                    completed_at=resolved_at,
                 )
-            )
-            if not transitioned:
-                raise RuntimeError(
-                    "company runtime checkpoint changed during resume completion"
+                outcome = str(getattr(receipt, "outcome", "") or "")
+                if outcome == "stale":
+                    raise CompanyRunControllerLeaseLost(
+                        "company controller lease changed during resume completion"
+                    )
+                if not bool(getattr(receipt, "applied", False)):
+                    raise RuntimeError(
+                        "company runtime checkpoint changed during resume completion"
+                    )
+                persisted = getattr(receipt, "checkpoint", None)
+                if persisted is None:
+                    raise RuntimeError(
+                        "company runtime completion returned no checkpoint"
+                    )
+                current = persisted
+            else:
+                transitioned = (
+                    await self.store.complete_execution_checkpoint_and_reopen_ui_anchor(
+                        current.checkpoint_id,
+                        project_id=project_id,
+                        session_id=parent_session_id,
+                        expected_status="resuming",
+                        status="resolved",
+                        payload=resolved_payload,
+                        ui_anchor_task_id=ui_anchor_task_id,
+                        updated_at=resolved_at,
+                    )
                 )
-            current.status = "resolved"
-            current.payload = resolved_payload
-            current.updated_at = resolved_at
+                if not transitioned:
+                    raise RuntimeError(
+                        "company runtime checkpoint changed during resume completion"
+                    )
+                current.status = "resolved"
+                current.payload = resolved_payload
+                current.updated_at = resolved_at
             checkpoint.status = current.status
             checkpoint.payload = dict(current.payload or {})
             checkpoint.updated_at = current.updated_at
@@ -12075,6 +16768,7 @@ class OPCEngine:
         project_id = str(self.project_id or "default").strip() or "default"
         claimed = False
         driver_ownership: CompanyExecutorDriverOwnership | None = None
+        controller_admission: CompanyRunControllerAdmission | None = None
         try:
             async with self._active_task_run_registry.scope_lock(
                 project_id,
@@ -12083,42 +16777,173 @@ class OPCEngine:
                 current = await self._load_execution_checkpoint_by_id(
                     checkpoint.checkpoint_id
                 )
-                if current is None or str(current.status or "").strip() != "pending":
+                current_status = str(
+                    getattr(current, "status", "") or ""
+                ).strip()
+                if current is None or current_status not in {"pending", "resuming"}:
                     return None
                 checkpoint.status = current.status
                 checkpoint.payload = dict(current.payload or {})
                 checkpoint.updated_at = current.updated_at
+                # Durable controller admission is the first write-capable
+                # boundary.  A healthy remote owner returns Busy here while
+                # the checkpoint, Task/WorkItem holds, registry, and UI anchor
+                # are still byte-for-byte untouched.
+                acquire_controller = getattr(
+                    self.company_executor,
+                    "acquire_controller_admission",
+                    None,
+                )
+                if callable(acquire_controller):
+                    controller_admission = await acquire_controller(
+                        tasks,
+                        retry_busy_at_observed_expiry=False,
+                    )
+                if current_status == "resuming":
+                    if controller_admission is None:
+                        return None
+                    try:
+                        prior_resume_generation = int(
+                            dict(current.payload or {}).get(
+                                "resume_controller_lease_generation", 0
+                            )
+                            or 0
+                        )
+                    except (TypeError, ValueError):
+                        prior_resume_generation = 0
+                    if (
+                        prior_resume_generation > 0
+                        and controller_admission.generation
+                        <= prior_resume_generation
+                    ):
+                        await self._release_company_controller_admission(
+                            controller_admission
+                        )
+                        return None
                 ui_anchor_task_id = await self._resolve_company_runtime_ui_anchor_task_id(
                     parent_session_id=parent_session_id,
                     checkpoint_id=checkpoint.checkpoint_id,
                 )
-                transitioned = await self._mark_company_runtime_checkpoint_status(
-                    checkpoint,
-                    status="resuming",
-                    payload_updates={
-                        **payload,
-                        "resume_state": "resuming",
-                        "resume_started_at": datetime.now().isoformat(),
-                        "ui_anchor_task_id": ui_anchor_task_id,
-                    },
-                    expected_statuses={"pending"},
-                )
-                if transitioned is False:
-                    return None
-                claimed = True
-                driver_ownership = self._acquire_company_executor_driver_ownership(
-                    tasks,
-                    preferred_task_ids=resume_task_ids,
-                )
+                authoritative_core_prepared_task_ids: set[str] = set()
+                if controller_admission is not None:
+                    driver_ownership = (
+                        self._acquire_company_executor_driver_ownership(
+                            tasks,
+                            preferred_task_ids=resume_task_ids,
+                            controller_admission=controller_admission,
+                        )
+                    )
+                    if driver_ownership is None:
+                        raise RuntimeError(
+                            "company runtime resume has no schedulable driver Task"
+                        )
+                    resume_for_controller = getattr(
+                        self.store,
+                        "resume_company_runtime_scope_for_controller",
+                        None,
+                    )
+                    if not callable(resume_for_controller):
+                        raise CompanyRunControllerLeaseLost(
+                            "company controller resume requires an atomic Store command"
+                        )
+                    authoritative_core_prepared_task_ids = {
+                        str(task_id or "").strip()
+                        for task_id in (
+                            resume_task_ids
+                            if resume_task_ids is not None
+                            else {task.id for task in tasks}
+                        )
+                        if str(task_id or "").strip()
+                    }
+                    receipt = await resume_for_controller(
+                        run_id=controller_admission.run_id,
+                        project_id=controller_admission.project_id,
+                        root_session_id=controller_admission.root_session_id,
+                        owner_token=controller_admission.owner_token,
+                        generation=controller_admission.generation,
+                        checkpoint_id=checkpoint.checkpoint_id,
+                        checkpoint_types=_COMPANY_RUNTIME_SUSPEND_CHECKPOINT_TYPES,
+                        expected_checkpoint_statuses={current_status},
+                        task_ids=authoritative_core_prepared_task_ids,
+                        checkpoint_payload_updates={
+                            "resume_state": "resuming",
+                            "resume_started_at": datetime.now().isoformat(),
+                            "ui_anchor_task_id": ui_anchor_task_id,
+                        },
+                    )
+                    outcome = str(getattr(receipt, "outcome", "") or "")
+                    if outcome == "stale":
+                        raise CompanyRunControllerLeaseLost(
+                            "company controller lease changed during resume handoff"
+                        )
+                    if not bool(getattr(receipt, "applied", False)):
+                        driver_ownership.release()
+                        driver_ownership = None
+                        await self._release_company_controller_admission(
+                            controller_admission
+                        )
+                        return None
+                    current = getattr(receipt, "checkpoint", None)
+                    if current is None:
+                        raise RuntimeError(
+                            "atomic company runtime resume returned no checkpoint"
+                        )
+                    checkpoint.status = current.status
+                    checkpoint.payload = dict(current.payload or {})
+                    checkpoint.updated_at = current.updated_at
+                    claimed = True
+                    refreshed_tasks: list[Task] = []
+                    for task in tasks:
+                        fresh = await self.store.get_task(task.id)
+                        refreshed_tasks.append(fresh or task)
+                    tasks = refreshed_tasks
+                else:
+                    if current_status != "pending":
+                        return None
+                    transitioned = await self._mark_company_runtime_checkpoint_status(
+                        checkpoint,
+                        status="resuming",
+                        payload_updates={
+                            **payload,
+                            "resume_state": "resuming",
+                            "resume_started_at": datetime.now().isoformat(),
+                            "ui_anchor_task_id": ui_anchor_task_id,
+                        },
+                        expected_statuses={"pending"},
+                    )
+                    if transitioned is False:
+                        return None
+                    claimed = True
+                    driver_ownership = (
+                        self._acquire_company_executor_driver_ownership(
+                            tasks,
+                            preferred_task_ids=resume_task_ids,
+                            controller_admission=controller_admission,
+                        )
+                    )
+                resume_payload = {
+                    **dict(payload or {}),
+                    **dict(checkpoint.payload or {}),
+                    "checkpoint_id": checkpoint.checkpoint_id,
+                    "checkpoint_type": checkpoint.checkpoint_type,
+                }
                 tasks = await self._prepare_company_runtime_tasks_for_resume(
                     tasks,
-                    payload,
+                    resume_payload,
                     resume_task_ids=resume_task_ids,
+                    authoritative_core_prepared_task_ids=(
+                        authoritative_core_prepared_task_ids
+                    ),
+                    controller_admission=controller_admission,
                 )
-                await self._reset_company_executor_runtime_for_resume(tasks, payload)
+                await self._reset_company_executor_runtime_for_resume(
+                    tasks,
+                    resume_payload,
+                )
                 await self._clear_company_runtime_parent_stop_state(
                     parent_session_id,
-                    payload,
+                    resume_payload,
+                    controller_admission=controller_admission,
                 )
                 if parent_session_id:
                     self._reregister_company_runtime_children(
@@ -12138,6 +16963,13 @@ class OPCEngine:
                     # running/stoppable without introducing a second
                     # liveness signal in the WS layer.
                     await notify_kanban_changed()
+        except CompanyRunControllerLeaseLost:
+            if driver_ownership is not None:
+                driver_ownership.release()
+            await self._release_company_controller_admission(
+                controller_admission
+            )
+            raise
         except asyncio.CancelledError as exc:
             if driver_ownership is not None:
                 driver_ownership.release()
@@ -12148,7 +16980,15 @@ class OPCEngine:
                     tasks=tasks,
                     resume_state="failed_before_handoff",
                     error=exc,
+                    controller_admission=controller_admission,
                 )
+            release_controller = getattr(
+                self.company_executor,
+                "release_controller_admission",
+                None,
+            )
+            if callable(release_controller):
+                await release_controller(controller_admission)
             raise
         except Exception as exc:
             if driver_ownership is not None:
@@ -12160,7 +17000,15 @@ class OPCEngine:
                     tasks=tasks,
                     resume_state="failed_before_handoff",
                     error=exc,
+                    controller_admission=controller_admission,
                 )
+            release_controller = getattr(
+                self.company_executor,
+                "release_controller_admission",
+                None,
+            )
+            if callable(release_controller):
+                await release_controller(controller_admission)
             raise
         return tasks, driver_ownership
 
@@ -12169,6 +17017,7 @@ class OPCEngine:
         tasks: list[Task],
         *,
         preferred_task_ids: set[str] | None = None,
+        controller_admission: CompanyRunControllerAdmission | None = None,
     ) -> CompanyExecutorDriverOwnership | None:
         task = CompanyWorkItemExecutor._driver_ownership_task(
             tasks,
@@ -12181,6 +17030,7 @@ class OPCEngine:
             attempt_token = self._active_task_run_registry.register(
                 project_id,
                 task.id,
+                owner_task=asyncio.current_task(),
             )
         except ActiveTaskRunAdmissionClosed as exc:
             raise asyncio.CancelledError(str(exc)) from exc
@@ -12189,6 +17039,7 @@ class OPCEngine:
             project_id=project_id,
             task_id=task.id,
             attempt_token=attempt_token,
+            controller_admission=controller_admission,
         )
 
     @staticmethod
@@ -12196,6 +17047,36 @@ class OPCEngine:
         ownership: CompanyExecutorDriverOwnership | None,
     ):
         return ownership.bind() if ownership is not None else nullcontext()
+
+    async def _execute_with_company_controller_admission(
+        self,
+        plan: CompanyWorkItemRuntimePlan,
+        tasks: list[Task],
+        admission: CompanyRunControllerAdmission | None,
+        *,
+        retain_admission: bool,
+    ) -> str:
+        assert self.company_executor
+        if admission is None:
+            return await self.company_executor.execute(plan, tasks)
+        return await self.company_executor.execute(
+            plan,
+            tasks,
+            controller_admission=admission,
+            release_controller_admission_on_exit=not retain_admission,
+        )
+
+    async def _release_company_controller_admission(
+        self,
+        admission: CompanyRunControllerAdmission | None,
+    ) -> None:
+        release = getattr(
+            self.company_executor,
+            "release_controller_admission",
+            None,
+        )
+        if callable(release):
+            await release(admission)
 
     async def _company_suspend_resume_candidate_task_ids(
         self,
@@ -12248,6 +17129,7 @@ class OPCEngine:
         payload: dict[str, Any],
         parent_session_id: str,
         final_decider_task_id: str,
+        controller_admission: CompanyRunControllerAdmission | None = None,
     ) -> tuple[bool, str | None]:
         assert self.company_executor
         target_progressed = await self._company_followup_target_progressed(
@@ -12302,11 +17184,61 @@ class OPCEngine:
                     driver_ownership = self._acquire_company_executor_driver_ownership(
                         tasks,
                         preferred_task_ids=resume_task_ids,
+                        controller_admission=controller_admission,
                     )
+                    if driver_ownership is None:
+                        raise RuntimeError(
+                            "company runtime resume has no schedulable remaining Task"
+                        )
+                    authoritative_core_prepared_task_ids: set[str] = set()
+                    if controller_admission is not None:
+                        resume_for_controller = getattr(
+                            self.store,
+                            "resume_company_runtime_scope_for_controller",
+                            None,
+                        )
+                        if not callable(resume_for_controller):
+                            raise CompanyRunControllerLeaseLost(
+                                "company controller resume requires an atomic Store command"
+                            )
+                        receipt = await resume_for_controller(
+                            run_id=controller_admission.run_id,
+                            project_id=controller_admission.project_id,
+                            root_session_id=controller_admission.root_session_id,
+                            owner_token=controller_admission.owner_token,
+                            generation=controller_admission.generation,
+                            checkpoint_id=checkpoint.checkpoint_id,
+                            checkpoint_types=_COMPANY_RUNTIME_SUSPEND_CHECKPOINT_TYPES,
+                            expected_checkpoint_statuses={"resuming"},
+                            task_ids=resume_task_ids,
+                            checkpoint_payload_updates={
+                                "resume_state": "resuming_remaining",
+                                "remaining_resume_started_at": datetime.now().isoformat(),
+                            },
+                        )
+                        outcome = str(getattr(receipt, "outcome", "") or "")
+                        if outcome == "stale":
+                            raise CompanyRunControllerLeaseLost(
+                                "company controller lease changed during remaining resume"
+                            )
+                        if not bool(getattr(receipt, "applied", False)):
+                            raise RuntimeError(
+                                "company runtime remaining resume lost its checkpoint boundary"
+                            )
+                        authoritative_core_prepared_task_ids = set(resume_task_ids)
+                        refreshed_tasks: list[Task] = []
+                        for task in tasks:
+                            fresh = await self.store.get_task(task.id)
+                            refreshed_tasks.append(fresh or task)
+                        tasks = refreshed_tasks
                     tasks = await self._prepare_company_runtime_tasks_for_resume(
                         tasks,
                         payload,
                         resume_task_ids=resume_task_ids,
+                        authoritative_core_prepared_task_ids=(
+                            authoritative_core_prepared_task_ids
+                        ),
+                        controller_admission=controller_admission,
                     )
                     await self._reset_company_executor_runtime_for_resume(tasks, payload)
                     if parent_session_id:
@@ -12330,6 +17262,7 @@ class OPCEngine:
                 tasks=tasks,
                 resume_state="awaiting_final_decider_action",
                 error="final decider returned without a durable arbitration action",
+                controller_admission=controller_admission,
             )
             return False, None
         try:
@@ -12339,7 +17272,12 @@ class OPCEngine:
                         parent_session_id,
                         [t.id for t in tasks],
                     )
-                result = await self.company_executor.execute(plan, tasks)
+                result = await self._execute_with_company_controller_admission(
+                    plan,
+                    tasks,
+                    controller_admission,
+                    retain_admission=True,
+                )
                 return True, result
         finally:
             if driver_ownership is not None:
@@ -12386,18 +17324,26 @@ class OPCEngine:
                 f"new task if further work is needed.\n\n{plain}"
             ).strip()
 
-        handoff = await self._handoff_company_suspend_checkpoint(
-            checkpoint,
-            payload=payload,
-            parent_session_id=parent_session_id,
-            tasks=tasks,
-            resume_task_ids={target_task.id},
-        )
+        try:
+            handoff = await self._handoff_company_suspend_checkpoint(
+                checkpoint,
+                payload=payload,
+                parent_session_id=parent_session_id,
+                tasks=tasks,
+                resume_task_ids={target_task.id},
+            )
+        except CompanyRunControllerBusy as exc:
+            return str(exc)
         if handoff is None:
             return (
                 "This company runtime is already being resumed by another request."
             )
         tasks, driver_ownership = handoff
+        controller_admission = getattr(
+            driver_ownership,
+            "controller_admission",
+            None,
+        )
         try:
             with self._company_executor_driver_context(driver_ownership):
                 followup_result = await self._resume_company_runtime_via_final_decider(
@@ -12406,6 +17352,8 @@ class OPCEngine:
                     user_reply=user_reply,
                     session_id=parent_session_id,
                     degrade_to_plain_resume_on_missing_target=True,
+                    controller_admission=controller_admission,
+                    release_controller_admission_on_exit=False,
                 )
                 if followup_result is None:
                     await self._restore_company_suspend_checkpoint_pending(
@@ -12414,6 +17362,7 @@ class OPCEngine:
                         tasks=tasks,
                         resume_state="failed_during_execution",
                         error="final-decider work item was unavailable",
+                        controller_admission=controller_admission,
                     )
                     return (
                         "Could not route the suspended company runtime because the CEO/final-decider "
@@ -12426,6 +17375,7 @@ class OPCEngine:
                     payload=payload,
                     parent_session_id=parent_session_id,
                     final_decider_task_id=target_task.id,
+                    controller_admission=controller_admission,
                 )
                 if not continuation_owned:
                     if (
@@ -12444,7 +17394,10 @@ class OPCEngine:
                 await self._complete_company_suspend_checkpoint_resume(
                     checkpoint,
                     parent_session_id=parent_session_id,
+                    controller_admission=controller_admission,
                 )
+        except CompanyRunControllerLeaseLost:
+            raise
         except asyncio.CancelledError as exc:
             await self._restore_company_suspend_checkpoint_pending_after_cancellation(
                 checkpoint,
@@ -12452,6 +17405,7 @@ class OPCEngine:
                 tasks=tasks,
                 resume_state="failed_during_execution",
                 error=exc,
+                controller_admission=controller_admission,
             )
             raise
         except Exception as exc:
@@ -12461,11 +17415,15 @@ class OPCEngine:
                 tasks=tasks,
                 resume_state="failed_during_execution",
                 error=exc,
+                controller_admission=controller_admission,
             )
             raise
         finally:
             if driver_ownership is not None:
                 driver_ownership.release()
+            await self._release_company_controller_admission(
+                controller_admission
+            )
         if continuation_result:
             return f"{followup_result}\n\nResumed remaining company runtime after CEO/final-decider arbitration.\n\n{continuation_result}".strip()
         return followup_result
@@ -12480,22 +17438,38 @@ class OPCEngine:
         if loaded is None:
             return "Could not resume the suspended company runtime because its task set could not be restored."
         payload, parent_session_id, plan, tasks = loaded
-        handoff = await self._handoff_company_suspend_checkpoint(
-            checkpoint,
-            payload=payload,
-            parent_session_id=parent_session_id,
-            tasks=tasks,
-        )
+        try:
+            handoff = await self._handoff_company_suspend_checkpoint(
+                checkpoint,
+                payload=payload,
+                parent_session_id=parent_session_id,
+                tasks=tasks,
+            )
+        except CompanyRunControllerBusy as exc:
+            return str(exc)
         if handoff is None:
             return "This company runtime is already being resumed by another request."
         tasks, driver_ownership = handoff
+        controller_admission = getattr(
+            driver_ownership,
+            "controller_admission",
+            None,
+        )
         try:
             with self._company_executor_driver_context(driver_ownership):
-                result = await self.company_executor.execute(plan, tasks)
+                result = await self._execute_with_company_controller_admission(
+                    plan,
+                    tasks,
+                    controller_admission,
+                    retain_admission=True,
+                )
                 await self._complete_company_suspend_checkpoint_resume(
                     checkpoint,
                     parent_session_id=parent_session_id,
+                    controller_admission=controller_admission,
                 )
+        except CompanyRunControllerLeaseLost:
+            raise
         except asyncio.CancelledError as exc:
             await self._restore_company_suspend_checkpoint_pending_after_cancellation(
                 checkpoint,
@@ -12503,6 +17477,7 @@ class OPCEngine:
                 tasks=tasks,
                 resume_state="failed_during_execution",
                 error=exc,
+                controller_admission=controller_admission,
             )
             raise
         except Exception as exc:
@@ -12512,11 +17487,15 @@ class OPCEngine:
                 tasks=tasks,
                 resume_state="failed_during_execution",
                 error=exc,
+                controller_admission=controller_admission,
             )
             raise
         finally:
             if driver_ownership is not None:
                 driver_ownership.release()
+            await self._release_company_controller_admission(
+                controller_admission
+            )
         prefix = (
             "Resuming the suspended company runtime"
             if checkpoint.checkpoint_type == "company_runtime_suspended"
@@ -12524,168 +17503,289 @@ class OPCEngine:
         )
         return f"{prefix}.\n\n{result}".strip()
 
-    async def _resume_company_runtime_checkpoint(
+    async def _resume_company_work_item_gate_decision(
         self,
-        checkpoint: ExecutionCheckpoint,
-        user_reply: str,
+        lease: InteractionDecisionLease,
     ) -> str:
+        """Consume a typed work-item gate without reviving the parked turn."""
+
         assert self.store and self.company_executor
-        checkpoint = await self._ensure_checkpoint_runtime_v2_payload(checkpoint)
-        payload = checkpoint.payload
-        waiting_task_id = payload.get("waiting_task_id")
-        if not waiting_task_id:
-            await self.store.resolve_execution_checkpoint(checkpoint.checkpoint_id, status="invalid")
-            return "Could not resume the pending runtime because the waiting task reference is missing."
+        checkpoint = lease.checkpoint
+        payload = copy.deepcopy(dict(checkpoint.payload or {}))
+        action = canonical_company_work_item_gate_decision(lease.decision)
+        if not action:
+            raise _PermanentInteractionError(
+                "company work-item gate decision is not approve/deny"
+            )
+        try:
+            attempt_seq = int(payload.get("work_item_attempt_seq", 0) or 0)
+            gate_attempt = int(payload.get("gate_attempt", -1))
+        except (TypeError, ValueError) as exc:
+            raise _PermanentInteractionError(
+                "company work-item gate attempt identity is malformed"
+            ) from exc
+        run_id = str(payload.get("run_id", "") or "").strip()
+        task_id = str(payload.get("waiting_task_id", "") or "").strip()
+        work_item_id = str(
+            payload.get("waiting_work_item_id", "") or ""
+        ).strip()
+        basis_hash = str(payload.get("basis_hash", "") or "").strip()
+        project_id = str(
+            checkpoint.project_id or self.project_id or "default"
+        ).strip() or "default"
+        command = CompanyWorkItemGateDecisionCommand(
+            checkpoint_id=checkpoint.checkpoint_id,
+            project_id=project_id,
+            claim_id=lease.claim_id,
+            consumer_id=lease.consumer_id,
+            run_id=run_id,
+            task_id=task_id,
+            work_item_id=work_item_id,
+            attempt_seq=attempt_seq,
+            gate_attempt=gate_attempt,
+            basis_hash=basis_hash,
+            action=action,
+            feedback=company_work_item_gate_decision_feedback(lease.decision),
+        )
+        if not command.complete:
+            raise _PermanentInteractionError(
+                "company work-item gate command identity is incomplete"
+            )
 
-        waiting_task = await self.store.get_task(waiting_task_id)
-        if not waiting_task:
-            await self.store.resolve_execution_checkpoint(checkpoint.checkpoint_id, status="invalid")
-            return "Could not resume the pending runtime because the waiting task no longer exists."
-        self._restore_runtime_state_from_checkpoint(waiting_task, payload)
+        interaction = dict(payload.get("interaction", {}) or {})
+        ownership = dict(interaction.get("ownership", {}) or {})
+        root_session_id = str(
+            ownership.get("root_session_id")
+            or ownership.get("company_runtime_session_id")
+            or checkpoint.session_id
+            or ""
+        ).strip()
+        credential = self.company_executor.controller_lease_credential(run_id)
+        acquired_admission: CompanyRunControllerAdmission | None = None
+        if credential is None:
+            acquired_admission = (
+                await self.company_executor.acquire_controller_admission_for_scope(
+                    run_id=run_id,
+                    project_id=project_id,
+                    root_session_id=root_session_id,
+                    retry_busy_at_observed_expiry=False,
+                )
+            )
+            if acquired_admission is None:
+                raise CompanyRunControllerLeaseLost(
+                    "company gate decision could not acquire controller admission"
+                )
+            credential = {
+                "run_id": acquired_admission.run_id,
+                "project_id": acquired_admission.project_id,
+                "root_session_id": acquired_admission.root_session_id,
+                "owner_token": acquired_admission.owner_token,
+                "generation": acquired_admission.generation,
+            }
+        if (
+            str(credential.get("run_id", "") or "").strip() != run_id
+            or str(credential.get("project_id", "") or "").strip()
+            != project_id
+            or (
+                root_session_id
+                and str(credential.get("root_session_id", "") or "").strip()
+                != root_session_id
+            )
+        ):
+            if acquired_admission is not None:
+                await self.company_executor.release_controller_admission(
+                    acquired_admission
+                )
+            raise CompanyRunControllerLeaseLost(
+                "company gate controller admission crossed durable scope"
+            )
+        context = CompanyControllerAttemptContext(
+            run_id=run_id,
+            project_id=project_id,
+            owner_token=str(credential.get("owner_token", "") or "").strip(),
+            generation=int(credential.get("generation", 0) or 0),
+            task_id=task_id,
+            work_item_id=work_item_id,
+            attempt_seq=attempt_seq,
+        )
+        try:
+            result = (
+                await self.store.apply_company_work_item_gate_decision_for_controller(
+                    context,
+                    command,
+                )
+            )
+            duplicate = result.outcome == "duplicate"
+            if not result.applied and not duplicate:
+                conflict_reason = str(
+                    result.conflict_reason or result.outcome or ""
+                ).strip()
+                if conflict_reason in {
+                    "checkpoint_not_consuming",
+                    "interaction_claim_mismatch",
+                    "work_item_cas_lost",
+                    "checkpoint_cas_lost",
+                }:
+                    raise _RetryableInteractionConflict(
+                        "company work-item gate raced a durable fence: "
+                        f"{conflict_reason}"
+                    )
+                invalidated = (
+                    await self.store.invalidate_company_work_item_gate_decision_for_controller(
+                        context,
+                        command,
+                        conflict_reason=conflict_reason,
+                    )
+                )
+                if not invalidated.applied:
+                    invalidation_reason = str(
+                        invalidated.conflict_reason
+                        or invalidated.outcome
+                        or ""
+                    ).strip()
+                    if invalidation_reason in {
+                        "checkpoint_not_consuming",
+                        "interaction_claim_mismatch",
+                        "work_item_cas_lost",
+                        "checkpoint_cas_lost",
+                    }:
+                        raise _RetryableInteractionConflict(
+                            "company gate invalidation raced a durable fence: "
+                            f"{invalidation_reason}"
+                        )
+                    raise _PermanentInteractionError(
+                        "company work-item gate could not be invalidated: "
+                        f"{invalidation_reason}"
+                    )
+                result = invalidated
 
-        # Pre-register all child tasks so that any rework progress events
-        # emitted below can be dual-routed to the parent session channel.
-        _early_tasks: list[Task] = []
-        for _tid in payload.get("task_ids", []):
-            _t = await self.store.get_task(str(_tid))
-            if _t:
-                _early_tasks.append(_t)
-        if _early_tasks:
-            self._reregister_company_runtime_children(_early_tasks, checkpoint_session_id=checkpoint.session_id)
+            if result.checkpoint is not None:
+                try:
+                    await self.interaction_coordinator.notify_persisted_owner_checkpoint(
+                        result.checkpoint
+                    )
+                except BaseException as error:
+                    if isinstance(error, (KeyboardInterrupt, SystemExit)):
+                        raise
+                    logger.opt(exception=True).warning(
+                        "gate decision committed but interaction notification failed "
+                        "checkpoint_id={}",
+                        checkpoint.checkpoint_id,
+                    )
 
-        reply_text = user_reply.strip()
-        reply = reply_text.lower()
-        approved_tokens = {"y", "yes", "ok", "okay", "approve", "approved", "confirm", "continue", "proceed", "go"}
-        denied_tokens = {"n", "no", "deny", "denied", "reject", "rejected", "stop", "cancel", "abort"}
-        gate_data = dict(payload.get("gate", {}))
-        gate_metadata = dict(gate_data.get("metadata", {}) or {})
-        gate_source = str(gate_metadata.get("source", "") or "").strip()
-        if reply in approved_tokens:
-            waiting_task.status = TaskStatus.DONE
-            if gate_source == "gate_harness":
-                waiting_task.metadata = dict(waiting_task.metadata)
-                waiting_task.metadata.pop("gate_harness_pending_decision", None)
-                constraints = [
+            try:
+                live_dispatcher_woken = (
+                    self.company_executor.wake_live_run_dispatcher(run_id)
+                )
+            except BaseException as error:
+                if isinstance(error, (KeyboardInterrupt, SystemExit)):
+                    raise
+                live_dispatcher_woken = False
+                logger.opt(exception=True).warning(
+                    "gate decision committed but dispatcher wake failed run_id={}",
+                    run_id,
+                )
+            if live_dispatcher_woken:
+                self._schedule_company_work_item_gate_continuation(
+                    result.checkpoint or checkpoint
+                )
+                return (
+                    "Company work-item gate decision was already applied; "
+                    "the live runtime was woken."
+                    if duplicate
+                    else "Company work-item gate continuation was woken."
+                )
+
+            if acquired_admission is not None:
+                continuation_checkpoint = result.checkpoint or checkpoint
+                if not await self.store.validate_company_work_item_gate_runtime_scope(
+                    continuation_checkpoint.checkpoint_id,
+                    project_id=project_id,
+                ):
+                    self._schedule_company_work_item_gate_continuation(
+                        continuation_checkpoint
+                    )
+                    return (
+                        "Company work-item gate committed; its runtime scope "
+                        "changed before continuation and was left for durable "
+                        "reconciliation."
+                    )
+                task_ids = [
                     str(item).strip()
-                    for item in list(gate_metadata.get("constraints", []) or [])
+                    for item in [*list(payload.get("task_ids", []) or []), task_id]
                     if str(item).strip()
                 ]
-                if constraints:
-                    waiting_task.metadata["gate_harness_constraints"] = constraints
-                    waiting_task.metadata["gate_harness_status"] = "passed_with_constraints"
-                    waiting_task.metadata["risks"] = list(dict.fromkeys([
-                        *list(waiting_task.metadata.get("risks", []) or []),
-                        *constraints,
-                    ]))
-                else:
-                    waiting_task.metadata["gate_harness_status"] = "passed"
-            progress = list(waiting_task.metadata.get("progress_log", []))
-            progress.append(f"Human confirmed via resume message: {reply_text}")
-            waiting_task.metadata["progress_log"] = progress
-            await self.store.save_task(waiting_task)
-            # Emit a visible progress signal so the UI shows the resume actually
-            # took effect, instead of leaving the user staring at the same gate
-            # card. Without this, "approve" looks like a no-op when the runtime
-            # then proceeds silently.
-            resume_progress = self._make_task_progress_callback(waiting_task)
-            if resume_progress:
-                projection_label = projection_id_for_task(waiting_task) or waiting_task.title
-                await resume_progress(
-                    f"[Company:{projection_label}] human approved gate; resuming runtime"
-                )
-        else:
-            rejection_feedback = ""
-            if reply in denied_tokens:
-                rejection_feedback = reply_text
-            elif reply_text:
-                rejection_feedback = reply_text
-            else:
-                return (
-                    "There is a pending runtime waiting for confirmation. "
-                    "Reply with `approve` / `continue` to proceed, or `deny` / `stop` to halt it."
-                )
-            progress = list(waiting_task.metadata.get("progress_log", []))
-            progress.append(f"Human review feedback via resume message: {rejection_feedback}")
-            waiting_task.metadata["progress_log"] = progress
-            if gate_source == "gate_harness":
-                waiting_task.metadata = dict(waiting_task.metadata)
-                waiting_task.metadata.pop("gate_harness_pending_decision", None)
-            gate = self.company_executor._gate_from_metadata(gate_data)
-            rework_projection_id = rework_projection_id_for_gate(gate) if gate else ""
-            if gate and gate.on_reject == "rework" and rework_projection_id:
-                task_by_projection_id: dict[str, Task] = {waiting_task.id: waiting_task}
-                waiting_projection_id = projection_id_for_task(waiting_task)
-                if waiting_projection_id:
-                    task_by_projection_id[waiting_projection_id] = waiting_task
-                for task_id in payload.get("task_ids", []):
-                    task = await self.store.get_task(task_id)
-                    if not task:
+                tasks: list[Task] = []
+                seen_task_ids: set[str] = set()
+                for current_task_id in task_ids:
+                    if current_task_id in seen_task_ids:
                         continue
-                    task_by_projection_id[task.id] = task
-                    projection_id = projection_id_for_task(task)
-                    if projection_id:
-                        task_by_projection_id[projection_id] = task
-                rework_task = await self.company_executor.prepare_gate_rework(
-                    waiting_task,
-                    gate,
-                    task_by_projection_id,
-                    rejection_feedback,
+                    seen_task_ids.add(current_task_id)
+                    task = await self.store.get_task(current_task_id)
+                    if task is not None:
+                        tasks.append(task)
+                plan = deserialize_company_work_item_runtime_plan(
+                    dict(payload.get("company_work_item_plan", {}) or {})
                 )
-                if rework_task is None:
-                    waiting_task.metadata = dict(waiting_task.metadata)
-                    waiting_task.metadata["last_gate_review_feedback"] = rejection_feedback
-                    await self._fail_task_via_phase(
-                        waiting_task,
-                        reason="gate_rework_restore_failed",
-                    )
-                    await self.store.resolve_execution_checkpoint(checkpoint.checkpoint_id, status="resolved")
-                    return (
-                        f"Runtime halted after human rejection for work item `{waiting_task.title}` because "
-                        f"the configured rework projection `{rework_projection_id}` could not be restored."
-                    )
-                if rework_task is not waiting_task:
-                    await self.store.save_task(rework_task)
-                await self.store.save_task(waiting_task)
+                if tasks and plan is not None:
+                    try:
+                        if not await self.store.validate_company_work_item_gate_runtime_scope(
+                            continuation_checkpoint.checkpoint_id,
+                            project_id=project_id,
+                        ):
+                            raise CompanyRunControllerLeaseLost(
+                                "company gate continuation runtime scope changed"
+                            )
+                        await self.company_executor.execute(
+                            plan,
+                            tasks,
+                            controller_admission=acquired_admission,
+                            release_controller_admission_on_exit=True,
+                        )
+                    except BaseException as error:
+                        if isinstance(error, (KeyboardInterrupt, SystemExit)):
+                            raise
+                        logger.opt(exception=True).warning(
+                            "gate decision committed but runtime continuation failed "
+                            "checkpoint_id={}",
+                            checkpoint.checkpoint_id,
+                        )
+                        self._schedule_company_work_item_gate_continuation(
+                            result.checkpoint or checkpoint
+                        )
+                # A successful dispatcher turn may intentionally park on a
+                # manager/final owner handoff, or finish run-failure settlement
+                # only during executor convergence.  Keep one durable monitor
+                # until the exact continuation marker is Store-acknowledged.
+                self._schedule_company_work_item_gate_continuation(
+                    result.checkpoint or checkpoint
+                )
             else:
-                waiting_task.metadata = dict(waiting_task.metadata)
-                waiting_task.metadata["last_gate_review_feedback"] = rejection_feedback
-                await self._fail_task_via_phase(
-                    waiting_task,
-                    reason="human_gate_denied",
+                # A wake can race the old dispatcher's final exit.  The durable
+                # monitor waits for that generation to release and then admits a
+                # fresh one; it is the acknowledgement, while the event is only
+                # a latency optimization.
+                self._schedule_company_work_item_gate_continuation(
+                    result.checkpoint or checkpoint
                 )
-                await self.store.resolve_execution_checkpoint(checkpoint.checkpoint_id, status="resolved")
-                return f"Runtime halted after human denial for work item `{waiting_task.title}`."
-
-        tasks: list[Task] = []
-        for task_id in payload.get("task_ids", []):
-            task = await self.store.get_task(task_id)
-            if task:
-                tasks.append(task)
-
-        if not tasks:
-            await self.store.resolve_execution_checkpoint(checkpoint.checkpoint_id, status="invalid")
-            return "Could not resume the pending runtime because its task set could not be restored."
-
-        await self.store.resolve_execution_checkpoint(checkpoint.checkpoint_id, status="resolved")
-        return (
-            "This checkpoint belongs to a legacy company runtime run. "
-            "Legacy runs are available for inspection only and cannot be resumed."
-        )
-
-    async def _resume_company_feedback_checkpoint(self, checkpoint: ExecutionCheckpoint, user_reply: str) -> str:
-        assert self.store and self.company_executor
-        reply = str(user_reply or "").strip()
-        if not reply:
-            return "There is a pending delivery self-evolution review. Use the review card to fully agree, ignore, or send feedback."
-        normalized = reply.lower()
-        if normalized in {"ignore", "ignored", "skip"}:
-            return await self.ignore_company_delivery_feedback_checkpoint(checkpoint)
-        action = "approve" if normalized in {"approve", "approved", "i approve this delivery.", "fully agree"} else "feedback"
-        return await self.run_company_delivery_self_evolution_checkpoint(
-            checkpoint,
-            action=action,
-            feedback=reply if action == "feedback" else "",
-        )
+            return (
+                "Company work-item gate decision was already applied."
+                if duplicate
+                else "Company work-item gate was invalidated and failed closed."
+                if result.outcome == "invalidated"
+                else
+                "Company work-item gate approved."
+                if action == "approve"
+                else "Company work-item gate denial was applied."
+            )
+        finally:
+            if (
+                acquired_admission is not None
+                and not acquired_admission.released
+            ):
+                await self.company_executor.release_controller_admission(
+                    acquired_admission
+                )
 
     async def _save_company_feedback_followup_checkpoint(
         self,
@@ -12726,6 +17826,33 @@ class OPCEngine:
                     "review_chain_role_ids": [],
                     "delivery_revision": task.metadata.get("delivery_revision", ""),
                     "owner_directive_revision": task.metadata.get("owner_directive_revision", ""),
+                    "work_item_attempt_seq": int(
+                        task.metadata.get(
+                            "claimed_work_item_attempt_seq", 0
+                        )
+                        or 0
+                    ),
+                    "delivery_package_sha256": str(
+                        dict(
+                            task.metadata.get(
+                                "pre_delivery_validation", {}
+                            )
+                            or {}
+                        ).get("delivery_package_sha256", "")
+                        or ""
+                    ).strip(),
+                    "conversation_turn_id": str(
+                        task.metadata.get("conversation_turn_id", "") or ""
+                    ).strip(),
+                    "conversation_turn_sequence": int(
+                        task.metadata.get("conversation_turn_sequence", 0) or 0
+                    ),
+                    "source_event_id": (
+                        "company-delivery:"
+                        f"{linked_work_item_id_for_task(task) or task.id}:"
+                        f"{task.metadata.get('delivery_revision', 0) or 0}:"
+                        f"{task.metadata.get('owner_directive_revision', 0) or 0}"
+                    ),
                     "latest_user_directive": str(task.metadata.get("latest_user_directive", "") or "").strip(),
                     "result_content": result_content,
                     "delivery_package": delivery_package if isinstance(delivery_package, dict) else {},
@@ -13216,55 +18343,6 @@ class OPCEngine:
                     f"{getattr(item, 'work_item_id', '')}"
                 )
 
-    async def run_company_delivery_self_evolution_checkpoint(
-        self,
-        checkpoint: ExecutionCheckpoint,
-        *,
-        action: str,
-        feedback: str = "",
-        reply_metadata: dict[str, Any] | None = None,
-    ) -> str:
-        assert self.store
-        if str(action or "").strip().lower() == "ignore":
-            return await self.ignore_company_delivery_feedback_checkpoint(
-                checkpoint,
-                reply_metadata=reply_metadata,
-            )
-        checkpoint = await self._ensure_checkpoint_runtime_v2_payload(checkpoint)
-        status = str(getattr(checkpoint, "status", "") or "").strip().lower()
-        if status == "consuming":
-            return "Self-evolution for this delivery is already running."
-        if status and status != "pending":
-            return "This self-evolution review is no longer active."
-        # Claim the card before spawning anything: a second approve/feedback
-        # while this one is processing must not re-enter and reset the live
-        # self-evolution work item (same defect class as duplicate resume).
-        claimed = await self._mark_company_runtime_checkpoint_status(
-            checkpoint,
-            status="consuming",
-            payload_updates={"self_evolution_claimed_at": datetime.now().isoformat()},
-            expected_statuses={"pending"},
-        )
-        if not claimed:
-            return "Self-evolution for this delivery is already running."
-        try:
-            return await self._run_company_delivery_self_evolution_consumed(
-                checkpoint,
-                action=action,
-                feedback=feedback,
-            )
-        except Exception as exc:
-            # An unexpected crash must not strand the card in "consuming"
-            # (that would answer every retry with "already running" forever)
-            # — hand the claim back so the user can retry.
-            await self._mark_company_runtime_checkpoint_status(
-                checkpoint,
-                status="pending",
-                payload_updates={"self_evolution_consume_error": str(exc)[:500]},
-                expected_statuses={"consuming"},
-            )
-            raise
-
     async def _run_company_delivery_self_evolution_consumed(
         self,
         checkpoint: ExecutionCheckpoint,
@@ -13276,11 +18354,11 @@ class OPCEngine:
         payload = dict(checkpoint.payload or {})
         waiting_task_id = str(payload.get("waiting_task_id", "") or payload.get("task_id", "") or "").strip()
         if not waiting_task_id:
-            await self._mark_company_runtime_checkpoint_status(checkpoint, status="invalid")
+            checkpoint.status = "invalid"
             return "Could not run self-evolution because the delivery task reference is missing."
         waiting_task = await self.store.get_task(waiting_task_id)
         if not waiting_task:
-            await self._mark_company_runtime_checkpoint_status(checkpoint, status="invalid")
+            checkpoint.status = "invalid"
             return "Could not run self-evolution because the delivery task no longer exists."
 
         self._restore_runtime_state_from_checkpoint(waiting_task, payload)
@@ -13299,7 +18377,7 @@ class OPCEngine:
                 tasks.append(task)
                 seen_task_ids.add(task.id)
         if not tasks:
-            await self._mark_company_runtime_checkpoint_status(checkpoint, status="invalid")
+            checkpoint.status = "invalid"
             return "Could not run self-evolution because the runtime task set could not be restored."
 
         from opc.plugins.office_ui.execution_identity import resolve_delivery_task_org_identity
@@ -13311,7 +18389,7 @@ class OPCEngine:
             default_org_id=DEFAULT_ORGANIZATION_ID,
         )
         if identity_error:
-            await self._mark_company_runtime_checkpoint_status(checkpoint, status="invalid")
+            checkpoint.status = "invalid"
             return f"Could not run self-evolution because {identity_error}."
 
         plan = deserialize_company_work_item_runtime_plan(payload.get("company_work_item_plan") or payload.get("plan", {}))
@@ -13329,7 +18407,7 @@ class OPCEngine:
             target = self._company_followup_target_task(plan, tasks)
             root_role_id = str(getattr(target, "assigned_to", "") or getattr(target, "metadata", {}).get("work_item_role_id", "") or "").strip()
         if not root_role_id:
-            await self._mark_company_runtime_checkpoint_status(checkpoint, status="invalid")
+            checkpoint.status = "invalid"
             return "Could not run self-evolution because no final-decider role could be resolved."
 
         normalized_action = "feedback" if str(action or "").strip().lower() == "feedback" else "approve"
@@ -13346,7 +18424,7 @@ class OPCEngine:
         }
         assignments = self._self_evolution_assignments_by_role(tasks)
         if self.company_executor is None:
-            await self._mark_company_runtime_checkpoint_status(checkpoint, status="invalid")
+            checkpoint.status = "invalid"
             return "Could not run self-evolution because company runtime is not available."
         root_work_item = await self._create_company_self_evolution_root_work_item(
             checkpoint=checkpoint,
@@ -13359,7 +18437,7 @@ class OPCEngine:
             assignments=assignments,
         )
         if root_work_item is None:
-            await self._mark_company_runtime_checkpoint_status(checkpoint, status="invalid")
+            checkpoint.status = "invalid"
             return "Could not run self-evolution because the company runtime work-item state could not be restored."
 
         await self._close_company_delivery_review_task(
@@ -13575,12 +18653,12 @@ class OPCEngine:
         user_reply: str,
         *,
         reply_metadata: dict[str, Any] | None = None,
+        origin_interaction_lease: OriginOwnerInteractionLease | None = None,
     ) -> str:
         assert self.store and self.talent_market
         payload = checkpoint.payload
         original_message = str(payload.get("original_message", ""))
         if not original_message:
-            await self.store.resolve_execution_checkpoint(checkpoint.checkpoint_id, status="invalid")
             return "Could not resume staffing because the original request is missing."
 
         reply = user_reply.strip()
@@ -13601,7 +18679,7 @@ class OPCEngine:
                 runtime_model="multi_team_org",
                 work_item_driven=True,
                 metadata={
-                    "execution_model": "multi_team_org",
+                    "execution_model": self._organization_execution_model(),
                     "runtime_model": "multi_team_org",
                     "work_item_driven": True,
                     "original_request": original_message,
@@ -13620,7 +18698,6 @@ class OPCEngine:
                 reply_metadata.get("recruitment_agent") or payload.get("recruitment_agent"),
                 default="native",
             ) or "native"
-            await self.store.resolve_execution_checkpoint(checkpoint.checkpoint_id, status="resolved")
             return await self._begin_company_recruitment_loop(
                 decision,
                 original_message,
@@ -13634,10 +18711,16 @@ class OPCEngine:
                 force_confirmation=True,
                 role_agent_overrides=role_agent_overrides,
                 recruitment_agent=recruitment_agent,
+                conversation_turn_id=str(
+                    payload.get("conversation_turn_id", "") or ""
+                ).strip() or None,
+                conversation_turn_sequence=int(
+                    payload.get("conversation_turn_sequence", 0) or 0
+                ),
+                origin_interaction_lease=origin_interaction_lease,
             )
 
         if normalized in denied_tokens or staffing_action == "deny":
-            await self.store.resolve_execution_checkpoint(checkpoint.checkpoint_id, status="resolved")
             return "Manual staffing was cancelled. Execution will not continue."
 
         cli_overrides = self._parse_cli_staffing_selection_overrides(reply)
@@ -13720,7 +18803,6 @@ class OPCEngine:
             session_id,
             source="manual_staffing_approved",
         )
-        await self.store.resolve_execution_checkpoint(checkpoint.checkpoint_id, status="resolved")
         role_agent_overrides = self._staffing_role_agent_overrides(payload, reply_metadata)
         self._save_project_company_staffing_defaults(
             decision,
@@ -13746,6 +18828,13 @@ class OPCEngine:
                 fallback_role_ids=fallback_role_ids,
                 role_agent_overrides=role_agent_overrides,
                 attachment_refs=attachment_refs,
+                conversation_turn_id=str(
+                    payload.get("conversation_turn_id", "") or ""
+                ).strip() or None,
+                conversation_turn_sequence=int(
+                    payload.get("conversation_turn_sequence", 0) or 0
+                ),
+                origin_interaction_lease=origin_interaction_lease,
             )
         else:
             result = await self._continue_task_mode_execution(
@@ -13762,6 +18851,12 @@ class OPCEngine:
                 fallback_role_ids=fallback_role_ids,
                 role_agent_overrides=role_agent_overrides,
                 attachment_refs=attachment_refs,
+                conversation_turn_id=str(
+                    payload.get("conversation_turn_id", "") or ""
+                ).strip() or None,
+                conversation_turn_sequence=int(
+                    payload.get("conversation_turn_sequence", 0) or 0
+                ),
             )
         if not hired_messages:
             return result
@@ -13773,12 +18868,12 @@ class OPCEngine:
         user_reply: str,
         *,
         reply_metadata: dict[str, Any] | None = None,
+        origin_interaction_lease: OriginOwnerInteractionLease | None = None,
     ) -> str:
         assert self.store and self.company_recruiter and self.talent_market
         payload = checkpoint.payload
         original_message = str(payload.get("original_message", ""))
         if not original_message:
-            await self.store.resolve_execution_checkpoint(checkpoint.checkpoint_id, status="invalid")
             return "Could not resume recruitment because the original request is missing."
 
         reply = user_reply.strip()
@@ -13803,7 +18898,7 @@ class OPCEngine:
                 runtime_model="multi_team_org",
                 work_item_driven=True,
                 metadata={
-                    "execution_model": "multi_team_org",
+                    "execution_model": self._organization_execution_model(),
                     "runtime_model": "multi_team_org",
                     "work_item_driven": True,
                     "original_request": original_message,
@@ -13948,7 +19043,6 @@ class OPCEngine:
                 session_id,
                 source="checkpoint_approved",
             )
-            await self.store.resolve_execution_checkpoint(checkpoint.checkpoint_id, status="resolved")
             self._save_project_company_staffing_defaults(
                 decision,
                 company_profile=str(runtime_spec.profile or payload.get("company_profile", "") or CompanyProfile.CORPORATE.value),
@@ -13982,6 +19076,13 @@ class OPCEngine:
                     fallback_role_ids=fallback_role_ids,
                     role_agent_overrides=role_agent_overrides,
                     attachment_refs=attachment_refs,
+                    conversation_turn_id=str(
+                        payload.get("conversation_turn_id", "") or ""
+                    ).strip() or None,
+                    conversation_turn_sequence=int(
+                        payload.get("conversation_turn_sequence", 0) or 0
+                    ),
+                    origin_interaction_lease=origin_interaction_lease,
                 )
             else:
                 result = await self._continue_task_mode_execution(
@@ -14004,7 +19105,6 @@ class OPCEngine:
             return "Approved recruitment plan.\n" + "\n".join(hired_messages) + "\n\n" + result
 
         if reply_kind == "deny" or (reply_kind != "feedback" and normalized in denied_tokens):
-            await self.store.resolve_execution_checkpoint(checkpoint.checkpoint_id, status="resolved")
             return "Recruitment was cancelled. Execution will not continue."
 
         control_tokens = approved_tokens | denied_tokens
@@ -14058,8 +19158,11 @@ class OPCEngine:
             "recruitment_agent": selected_recruitment_agent,
             "superseded_checkpoint_ids": [*prior_superseded, checkpoint.checkpoint_id],
         }
+        # Interaction is Store-owned state for revision 1 (decision, claim,
+        # execution fence, completion).  Revision 2 is a new domain event and
+        # must receive a clean envelope from the canonical publisher.
+        revised_payload.pop("interaction", None)
         revised_payload.pop("basis_hash", None)
-        await self.store.resolve_execution_checkpoint(checkpoint.checkpoint_id, status="superseded")
         await self._save_execution_checkpoint(
             {
                 "project_id": checkpoint.project_id or self.project_id or "default",
@@ -14071,12 +19174,16 @@ class OPCEngine:
         )
         return revised_plan.summary or self.company_recruiter.render_recruitment_summary(revised_plan)
 
-    async def _resume_reorg_checkpoint(self, checkpoint: ExecutionCheckpoint, user_reply: str) -> str:
+    async def _resume_reorg_checkpoint(
+        self,
+        lease: InteractionDecisionLease,
+        user_reply: str,
+    ) -> str:
         assert self.store and self.reorg_manager
+        checkpoint = lease.checkpoint
         payload = checkpoint.payload
         proposal_id = payload.get("proposal_id", "")
         if not proposal_id:
-            await self.store.resolve_execution_checkpoint(checkpoint.checkpoint_id, status="invalid")
             return "Could not resume the pending reorg because the proposal reference is missing."
         reply = user_reply.strip().lower()
         approved_tokens = {"y", "yes", "ok", "okay", "approve", "approved", "confirm", "continue", "proceed", "go"}
@@ -14109,9 +19216,44 @@ class OPCEngine:
                     metadata={"execution_model": "multi_team_org", "work_item_driven": True},
                 )
         if reply in approved_tokens:
-            await self.reorg_manager.set_reorg_approval(proposal_id, approved=True, notes=user_reply.strip())
-            await self.store.resolve_execution_checkpoint(checkpoint.checkpoint_id, status="resolved")
-            result = await self.reorg_manager.apply_reorg(proposal_id)
+            proposal = await self.store.get_reorg_proposal(proposal_id)
+            if proposal is None:
+                raise _PermanentInteractionError(
+                    f"Unknown reorg proposal: {proposal_id}"
+                )
+            if proposal.status in {
+                ReorgProposalStatus.APPLYING,
+                ReorgProposalStatus.EXECUTION_UNKNOWN,
+            }:
+                raise InteractionEffectFailed(
+                    "reorg application outcome requires operator reconciliation"
+                )
+            if proposal.status != ReorgProposalStatus.APPLIED:
+                proposal = await self.reorg_manager.set_reorg_approval(
+                    proposal_id,
+                    approved=True,
+                    notes=user_reply.strip(),
+                    interaction_lease=lease,
+                )
+            try:
+                result = await self.reorg_manager.apply_reorg(proposal_id)
+            except Exception as exc:
+                failed_proposal = await self.store.get_reorg_proposal(proposal_id)
+                if failed_proposal is not None and failed_proposal.status in {
+                    ReorgProposalStatus.APPLYING,
+                    ReorgProposalStatus.EXECUTION_UNKNOWN,
+                }:
+                    raise InteractionEffectFailed(
+                        "reorg application outcome requires operator reconciliation"
+                    ) from exc
+                if (
+                    failed_proposal is not None
+                    and failed_proposal.status == ReorgProposalStatus.FAILED
+                ):
+                    raise _PermanentInteractionError(
+                        "reorg application failed before the organization mutation"
+                    ) from exc
+                raise
             if waiting_task is not None:
                 waiting_task = await self.store.get_task(waiting_task.id) or waiting_task
                 self._clear_pending_reorg_marker(waiting_task)
@@ -14142,7 +19284,25 @@ class OPCEngine:
                 )
                 if reconciled:
                     plan, tasks = reconciled
-                    resumed = await self.company_executor.execute(plan, tasks)
+                    # Proposal application has its own Store CAS.  The resumed
+                    # company dispatcher is the next non-idempotent boundary,
+                    # so fence it on the *same* owner lease.  A crash after
+                    # this point terminalizes outcome_unknown instead of
+                    # replaying a second dispatcher on recovery.
+                    assert self.interaction_coordinator is not None
+                    effect = await self.interaction_coordinator.begin_effect(lease)
+                    if not effect.acquired:
+                        raise InteractionLeaseLost(
+                            f"could not fence reorg continuation: {effect.outcome}"
+                        )
+                    try:
+                        resumed = await self.company_executor.execute(plan, tasks)
+                    except asyncio.CancelledError:
+                        raise
+                    except BaseException as exc:
+                        raise InteractionEffectFailed(
+                            "reorg continuation failed after its execution fence"
+                        ) from exc
                     return (
                         f"Reorg `{proposal_id}` approved and applied.\n"
                         f"Migrated tasks: {len(result.get('migration_summary', {}).get('migrated_task_ids', []))}\n"
@@ -14155,8 +19315,26 @@ class OPCEngine:
                 f"Migrated checkpoints: {len(result.get('migration_summary', {}).get('migrated_checkpoint_ids', []))}"
             )
         if reply in denied_tokens:
-            await self.reorg_manager.set_reorg_approval(proposal_id, approved=False, notes=user_reply.strip())
-            await self.store.resolve_execution_checkpoint(checkpoint.checkpoint_id, status="resolved")
+            proposal = await self.store.get_reorg_proposal(proposal_id)
+            if proposal is None:
+                raise _PermanentInteractionError(
+                    f"Unknown reorg proposal: {proposal_id}"
+                )
+            if proposal.status in {
+                ReorgProposalStatus.APPLYING,
+                ReorgProposalStatus.APPLIED,
+                ReorgProposalStatus.EXECUTION_UNKNOWN,
+            }:
+                raise InteractionEffectFailed(
+                    "reorg decision conflicts with an organization mutation"
+                )
+            if proposal.status != ReorgProposalStatus.DENIED:
+                await self.reorg_manager.set_reorg_approval(
+                    proposal_id,
+                    approved=False,
+                    notes=user_reply.strip(),
+                    interaction_lease=lease,
+                )
             if waiting_task is not None:
                 self._clear_pending_reorg_marker(waiting_task)
                 waiting_task.result = {
@@ -14178,6 +19356,37 @@ class OPCEngine:
             "Reply with `approve` / `continue` to apply it, or `deny` / `stop` to reject it."
         )
 
+    async def _reorg_interaction_checkpoint(
+        self,
+        proposal_id: str,
+        *,
+        active_only: bool = False,
+    ) -> ExecutionCheckpoint | None:
+        if not self.store:
+            return None
+        rows = await self.store.get_execution_checkpoints(
+            project_id=self.project_id or "default",
+            checkpoint_types=["company_reorg_pending"],
+            statuses=(
+                ["pending", "answered", "consuming"]
+                if active_only
+                else None
+            ),
+        )
+        matching = [
+            checkpoint
+            for checkpoint in rows
+            if str(
+                dict(checkpoint.payload or {}).get("proposal_id", "") or ""
+            ).strip()
+            == str(proposal_id or "").strip()
+        ]
+        if len(matching) > 1:
+            raise RuntimeError(
+                f"multiple active reorg interactions for proposal {proposal_id}"
+            )
+        return matching[0] if matching else None
+
     async def _maybe_handle_reorg_message(self, content: str, session_id: str | None) -> str | None:
         assert self.reorg_manager and self.store
         stripped = content.strip()
@@ -14188,14 +19397,42 @@ class OPCEngine:
             return "Unsupported reorg command. Use `reorg propose|approve|deny|apply|show|adjust`."
         action = match.group(1).lower()
         remainder = match.group(2).strip()
-        project_id = self.project_id or "default"
-
         if action == "show":
             proposal = await self.store.get_reorg_proposal(remainder)
             if not proposal:
                 return f"Unknown reorg proposal `{remainder}`."
             return self._format_reorg_summary(proposal)
         if action in {"approve", "deny"}:
+            checkpoint = await self._reorg_interaction_checkpoint(remainder)
+            if checkpoint is not None:
+                if checkpoint.status == "pending":
+                    return await self._submit_compatibility_checkpoint_reply(
+                        checkpoint,
+                        action,
+                        session_id=session_id,
+                        reply_metadata={"checkpoint_reply_kind": action},
+                    )
+                proposal = await self.store.get_reorg_proposal(remainder)
+                if checkpoint.status in {"answered", "consuming"}:
+                    return (
+                        f"Reorg `{remainder}` already has an accepted owner decision "
+                        "that is being consumed."
+                    )
+                if proposal is None:
+                    return f"Unknown reorg proposal `{remainder}`."
+                return (
+                    f"Reorg `{remainder}` owner decision is immutable after "
+                    f"checkpoint status `{checkpoint.status}`.\n\n"
+                    f"{self._format_reorg_summary(proposal)}"
+                )
+            proposal = await self.store.get_reorg_proposal(remainder)
+            if proposal is None:
+                return f"Unknown reorg proposal `{remainder}`."
+            if proposal.user_confirmation_required:
+                return (
+                    f"Reorg `{remainder}` has no active owner confirmation. "
+                    "Refresh the proposal instead of bypassing its decision checkpoint."
+                )
             proposal = await self.approve_company_reorg(
                 proposal_id=remainder,
                 approved=(action == "approve"),
@@ -14209,6 +19446,21 @@ class OPCEngine:
                 )
             return self._format_reorg_summary(proposal)
         if action == "apply":
+            checkpoint = await self._reorg_interaction_checkpoint(remainder)
+            if checkpoint is not None:
+                proposal = await self.store.get_reorg_proposal(remainder)
+                if proposal is not None and proposal.status == ReorgProposalStatus.APPLIED:
+                    result = await self.reorg_manager.apply_reorg(remainder)
+                    return (
+                        f"Reorg `{remainder}` was already applied.\n"
+                        f"Migrated tasks: {len(result.get('migration_summary', {}).get('migrated_task_ids', []))}\n"
+                        f"Migrated checkpoints: {len(result.get('migration_summary', {}).get('migrated_checkpoint_ids', []))}"
+                    )
+                return (
+                    f"Reorg `{remainder}` is governed by an owner confirmation "
+                    f"checkpoint (`{checkpoint.status}`). It cannot be applied through "
+                    "a command outside that decision."
+                )
             result = await self.apply_company_reorg(remainder)
             return (
                 f"Applied reorg `{remainder}`.\n"
@@ -14232,7 +19484,6 @@ class OPCEngine:
                 metadata={"source": "process_message"},
             )
             if proposal.user_confirmation_required:
-                await self._save_reorg_checkpoint(proposal)
                 return (
                     f"{self._format_reorg_summary(proposal)}\n\n"
                     "This reorg changes the company architecture and requires user confirmation. "
@@ -14262,21 +19513,6 @@ class OPCEngine:
         # ``json.loads`` accepts any JSON type; callers do ``parsed.get(...)`` and crash
         # (AttributeError) on a non-dict value such as ``reorg propose 42`` or ``[1,2]``.
         return data if isinstance(data, dict) else None
-
-    async def _save_reorg_checkpoint(self, proposal: ReorgProposal) -> None:
-        await self._save_execution_checkpoint(
-            {
-                "project_id": proposal.project_id,
-                "session_id": proposal.session_id,
-                "checkpoint_type": "company_reorg_pending",
-                "task_id": proposal.task_id,
-                "payload": {
-                    "proposal_id": proposal.proposal_id,
-                    "org_version": proposal.old_org_version,
-                    "runtime_topology_version": proposal.old_runtime_topology_version,
-                },
-            }
-        )
 
     def _format_reorg_summary(self, proposal: ReorgProposal) -> str:
         return (
@@ -14323,11 +19559,48 @@ class OPCEngine:
         approved: bool,
         notes: str = "",
     ) -> ReorgProposal:
-        assert self.reorg_manager
+        assert self.reorg_manager and self.store
+        checkpoint = await self._reorg_interaction_checkpoint(proposal_id)
+        proposal = await self.store.get_reorg_proposal(proposal_id)
+        if checkpoint is not None:
+            if proposal is not None and (
+                (approved and proposal.status in {
+                    ReorgProposalStatus.APPROVED,
+                    ReorgProposalStatus.APPLYING,
+                    ReorgProposalStatus.APPLIED,
+                })
+                or (not approved and proposal.status == ReorgProposalStatus.DENIED)
+            ):
+                return proposal
+            raise RuntimeError(
+                f"reorg {proposal_id} is governed by owner checkpoint "
+                f"{checkpoint.checkpoint_id} ({checkpoint.status}); submit that "
+                "interaction decision instead"
+            )
+        if proposal is not None and proposal.user_confirmation_required:
+            raise RuntimeError(
+                f"reorg {proposal_id} requires owner confirmation but its durable "
+                "interaction checkpoint is missing; reconcile the proposal before deciding"
+            )
         return await self.reorg_manager.set_reorg_approval(proposal_id, approved=approved, notes=notes)
 
     async def apply_company_reorg(self, proposal_id: str) -> dict[str, Any]:
-        assert self.reorg_manager
+        assert self.reorg_manager and self.store
+        checkpoint = await self._reorg_interaction_checkpoint(proposal_id)
+        proposal = await self.store.get_reorg_proposal(proposal_id)
+        if checkpoint is not None:
+            if proposal is not None and proposal.status == ReorgProposalStatus.APPLIED:
+                return await self.reorg_manager.apply_reorg(proposal_id)
+            raise RuntimeError(
+                f"reorg {proposal_id} is governed by owner checkpoint "
+                f"{checkpoint.checkpoint_id} ({checkpoint.status}); it cannot be "
+                "applied outside the claimed interaction consumer"
+            )
+        if proposal is not None and proposal.user_confirmation_required:
+            raise RuntimeError(
+                f"reorg {proposal_id} requires owner confirmation but its durable "
+                "interaction checkpoint is missing; application is fail-closed"
+            )
         return await self.reorg_manager.apply_reorg(proposal_id)
 
     async def show_company_reorg(self, proposal_id: str) -> ReorgProposal | None:
@@ -14379,6 +19652,16 @@ class OPCEngine:
         """
         normalized_project_id = str(project_id or "").strip() or "default"
         current_project_id = str(self.project_id or "default").strip() or "default"
+        if bool(getattr(self, "_shutting_down", False)) or bool(
+            getattr(
+                getattr(self, "_active_task_run_registry", None),
+                "admission_closed",
+                False,
+            )
+        ):
+            raise ActiveTaskRunAdmissionClosed(
+                "project delegate admission is closed for controller shutdown"
+            )
         if normalized_project_id == current_project_id:
             return self
         existing = self._project_engine_delegates.get(normalized_project_id)
@@ -14387,6 +19670,10 @@ class OPCEngine:
         if self._project_delegate_lock is None:
             self._project_delegate_lock = asyncio.Lock()
         async with self._project_delegate_lock:
+            if self._shutting_down or self._active_task_run_registry.admission_closed:
+                raise ActiveTaskRunAdmissionClosed(
+                    "project delegate admission is closed for controller shutdown"
+                )
             existing = self._project_engine_delegates.get(normalized_project_id)
             if existing is not None:
                 if self._is_delegate_usable(existing):
@@ -14410,11 +19697,53 @@ class OPCEngine:
                 on_progress=self.on_progress,
                 on_runtime_event=self.on_runtime_event,
                 on_escalation=self.on_escalation,
+                pre_delivery_validator=self.pre_delivery_validator,
             )
             delegate.on_company_runtime_children = self.on_company_runtime_children
             delegate.on_company_kanban_callback_factory = self.on_company_kanban_callback_factory
-            await delegate.initialize()
+            construction_task = asyncio.current_task()
+            candidates = getattr(self, "_project_delegate_candidates", None)
+            if candidates is None:
+                candidates = {}
+                self._project_delegate_candidates = candidates
+            construction_tasks = getattr(
+                self,
+                "_project_delegate_construction_tasks",
+                None,
+            )
+            if construction_tasks is None:
+                construction_tasks = set()
+                self._project_delegate_construction_tasks = construction_tasks
+            candidates[normalized_project_id] = delegate
+            if construction_task is not None:
+                construction_tasks.add(construction_task)
+            try:
+                await delegate.initialize()
+                if (
+                    self._shutting_down
+                    or self._active_task_run_registry.admission_closed
+                ):
+                    await delegate.shutdown()
+                    candidates.pop(normalized_project_id, None)
+                    raise ActiveTaskRunAdmissionClosed(
+                        "project delegate initialized after shutdown admission closed"
+                    )
+            except BaseException:
+                # Initialization may already have opened the Store, heartbeat,
+                # or a custom child.  Teardown is mandatory.  Preserve the
+                # candidate if teardown fails so ordered shutdown can retry it.
+                if not bool(getattr(delegate, "_shutdown_complete", False)):
+                    try:
+                        await delegate.shutdown()
+                    except BaseException:
+                        raise
+                candidates.pop(normalized_project_id, None)
+                raise
+            finally:
+                if construction_task is not None:
+                    construction_tasks.discard(construction_task)
             self._project_engine_delegates[normalized_project_id] = delegate
+            candidates.pop(normalized_project_id, None)
             return delegate
 
     async def process_message(
@@ -14445,6 +19774,20 @@ class OPCEngine:
             message_metadata: Optional metadata to preserve UI message identity across
                 transcript sync and chat rendering.
         """
+        # New execution ingress is categorically closed before any project
+        # rebinding, initialization, MessageBus handler, or Store write.  The
+        # explicit checkpoint-decision API is separate and remains available
+        # for its durable ACK/non-owner semantics.
+        if bool(getattr(self, "_shutting_down", False)) or bool(
+            getattr(
+                getattr(self, "_active_task_run_registry", None),
+                "admission_closed",
+                False,
+            )
+        ):
+            raise ActiveTaskRunAdmissionClosed(
+                "message execution admission is closed for controller shutdown"
+            )
         target_project_id = str(project_id or "").strip() or None
         current_project_id = str(self.project_id or "default").strip() or "default"
         if self._initialized and target_project_id and target_project_id != current_project_id:
@@ -14541,20 +19884,79 @@ class OPCEngine:
 
     async def shutdown(self) -> None:
         """Clean shutdown of all subsystems."""
+
+        async with self._shutdown_lock:
+            if self._shutdown_complete:
+                return
+            await self._shutdown_once()
+            self._shutdown_complete = True
+
+    async def _shutdown_once(self) -> None:
+        """Perform one ordered shutdown while the Store remains available."""
+
         self._shutting_down = True
         logger.info("Shutting down OPC Engine...")
         if self._owns_active_task_run_registry:
-            await self.prepare_active_company_runtimes_for_shutdown()
-        delegates = list(self._project_engine_delegates.values())
-        self._project_engine_delegates.clear()
-        for delegate in delegates:
-            try:
-                await delegate.shutdown()
-            except Exception:
-                logger.opt(exception=True).warning(
-                    "Failed to shut down project delegate {}",
-                    getattr(delegate, "project_id", None),
-                )
+            # First reject every new ingress.  Existing driver contexts remain
+            # able to register the child of an already-committed WorkItem
+            # claim until the atomic scope suspend below closes that window.
+            self._active_task_run_registry.close_admission()
+        # This is intentionally required for borrowed-registry *project
+        # delegates* too because each delegate owns its Store.  A normal
+        # CustomRuntimeRunner child borrows that Store and must not scan or
+        # suspend unrelated same-project scopes when its one ingress ends;
+        # the Store-owning parent explicitly prepares all children during
+        # controller shutdown.
+        owns_runtime_boundary = bool(
+            self._owns_store or self._owns_active_task_run_registry
+        )
+        if owns_runtime_boundary:
+            await self.prepare_active_company_runtimes_for_shutdown(
+                _controller_shutdown=True,
+            )
+
+        project_id = str(self.project_id or "default").strip() or "default"
+        owns_live_store = bool(self._owns_store and self.store is not None)
+        await self._cancel_and_join_runtime_activity(
+            cancel_registry_project_id=(
+                project_id if owns_live_store else None
+            ),
+        )
+
+        # Ingress cancellation normally tears down and unregisters its own
+        # child.  Explicitly finish any child which was between construction
+        # and ingress ownership, and retain it on failure so shutdown can be
+        # retried without losing the only exact controller credential.
+        for runtime_child in list(
+            getattr(self, "_runtime_child_engines", ())
+        ):
+            await runtime_child.shutdown()
+            self._runtime_child_engines.discard(runtime_child)
+
+        for candidate_project_id, candidate in list(
+            getattr(self, "_project_delegate_candidates", {}).items()
+        ):
+            await candidate.shutdown()
+            if self._project_delegate_candidates.get(candidate_project_id) is candidate:
+                self._project_delegate_candidates.pop(candidate_project_id, None)
+
+        # Pop a delegate only after its Store and local custom children have
+        # shut down successfully.  A failure propagates, leaves this Engine's
+        # Store open, and preserves the delegate reference for a retry.
+        for delegate_project_id, delegate in list(
+            self._project_engine_delegates.items()
+        ):
+            await delegate.shutdown()
+            if self._project_engine_delegates.get(delegate_project_id) is delegate:
+                self._project_engine_delegates.pop(delegate_project_id, None)
+
+        # The registry owner is the final controller-wide backstop after every
+        # Store-owning delegate has drained its own project scope, including
+        # initialization-gap ingress which never reached registry.register().
+        if self._owns_active_task_run_registry:
+            await self._cancel_and_join_runtime_activity(
+                cancel_all_registry_projects=True,
+            )
         if self.comms_reactivation_sweeper:
             await self.comms_reactivation_sweeper.stop()
         if self.heartbeat_scheduler:
@@ -14564,6 +19966,41 @@ class OPCEngine:
             await self.channel_manager.stop_all()
         if self.mcp_manager:
             await self.mcp_manager.shutdown()
+        self._interaction_consumer_tasks.clear()
+        if self.interaction_coordinator and self._owns_interaction_coordinator:
+            await self.interaction_coordinator.shutdown()
+        if getattr(self, "_runtime_child_engines", None):
+            raise RuntimeError(
+                "engine shutdown cannot close Store with registered custom children"
+            )
+        if any(
+            not task.done()
+            for task in getattr(self, "_runtime_child_ingress_tasks", ())
+        ):
+            raise RuntimeError(
+                "engine shutdown cannot close Store with live custom ingress"
+            )
+        if getattr(self, "_project_delegate_candidates", None):
+            raise RuntimeError(
+                "engine shutdown cannot close Store with delegate candidates"
+            )
+        if any(
+            not task.done()
+            for task in getattr(
+                self,
+                "_project_delegate_construction_tasks",
+                (),
+            )
+        ):
+            raise RuntimeError(
+                "engine shutdown cannot close Store with delegate construction"
+            )
+        if owns_live_store and self._active_task_run_registry.active_owner_tasks(
+            project_id
+        ):
+            raise RuntimeError(
+                "engine shutdown cannot close Store with live project execution"
+            )
         if self.store and self._owns_store:
             await self.store.close()
 

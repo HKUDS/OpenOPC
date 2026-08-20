@@ -89,10 +89,9 @@ function buildMessage(index: number): ChatMessage {
       timestamp: BASE_TIMESTAMP + index * 1_000,
       mentions: [],
       metadata: {
-        checkpoint_type: 'human_escalation',
+        checkpoint_type: 'tool_permission',
         checkpoint_id: checkpointId,
-        escalation_id: checkpointId,
-        escalation_type: 'decision_needed',
+        escalation_type: 'tool_permission',
         prompt: `Approval checkpoint ${index}\nKeep this card at its chronological position.`,
         summary: 'Chronological checkpoint regression fixture',
         options: [
@@ -398,7 +397,7 @@ function Fixture() {
           metadata: {
             ui_message_id: 'fixture-checkpoint-response-ui',
             response_to_checkpoint_id: CHECKPOINT_ID,
-            response_to_checkpoint_type: 'human_escalation',
+            response_to_checkpoint_type: 'tool_permission',
             checkpoint_reply_kind: 'approve',
           },
         },
@@ -484,7 +483,13 @@ function Fixture() {
           draftUpdatedAt={BASE_TIMESTAMP + 900_000}
           draftTurnId={LIVE_TURN_ID}
           isCompanyRuntime
-          onSend={() => undefined}
+          onInteractionReply={async (_text, _taskId, metadata) => ({
+            ok: true,
+            accepted: true,
+            checkpoint_id: String(metadata?.response_to_checkpoint_id ?? ''),
+            checkpoint_type: String(metadata?.response_to_checkpoint_type ?? ''),
+            client_request_id: 'fixture-interaction',
+          })}
           onMarkRead={handleMarkRead}
           hasOlderHistory
           totalMessageCount={messages.length + 100}

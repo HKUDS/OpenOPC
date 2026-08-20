@@ -23,6 +23,7 @@ from pathlib import Path
 
 from opc.core.config import OPCConfig
 from opc.core.models import (
+    DelegationRun,
     DelegationRoleSession,
     DelegationWorkItem,
     Phase,
@@ -633,7 +634,37 @@ class SerialQueueReconcilerTests(_StoreFixture):
 
 
 class StartupClaimSweepTests(_StoreFixture):
-    async def test_restart_clears_dead_running_focus_so_auxiliary_can_resume(self) -> None:
+    async def _seed_run(self) -> None:
+        await self.store.save_delegation_run(
+            DelegationRun(
+                run_id="r",
+                project_id="default",
+                session_id="root-session",
+                execution_model="multi_team_org",
+                status="running",
+                lifecycle_status="active",
+            )
+        )
+
+    async def _take_over_and_settle(self) -> None:
+        lease = await self.store.acquire_delegation_run_controller_lease(
+            "r",
+            project_id="default",
+            root_session_id="root-session",
+            owner_token="startup-recovery-test",
+            lease_seconds=60,
+        )
+        self.assertTrue(lease.acquired)
+        await self.store.settle_stale_delegation_run_claims_for_controller(
+            "r",
+            project_id="default",
+            root_session_id="root-session",
+            owner_token="startup-recovery-test",
+            generation=lease.generation,
+        )
+
+    async def test_restart_preserves_claim_until_controller_takeover(self) -> None:
+        await self._seed_run()
         sid = "role-runtime::r::cto"
         report_id = "report::wi-parent::v1"
         await self.store.save_delegation_role_session(
@@ -675,22 +706,29 @@ class StartupClaimSweepTests(_StoreFixture):
         await self.store.initialize()
         self.store.role_serial_queue_enabled = True
 
-        report = await self.store.get_delegation_work_item(report_id)
+        # Merely opening a second process is not proof the first controller is
+        # dead.  The durable run lease must be won before its claims are
+        # released; this is the invariant that prevents split-brain startup.
+        report_before = await self.store.get_delegation_work_item(report_id)
         session_before = await self.store.get_delegation_role_session(sid)
-        self.assertEqual(report.claimed_by_role_runtime_session_id, "")
-        self.assertTrue(is_dispatchable(report))
+        self.assertEqual(report_before.claimed_by_role_runtime_session_id, sid)
+        self.assertFalse(is_dispatchable(report_before))
         self.assertEqual(session_before.focused_work_item_id, report_id)
         self.assertEqual(session_before.status, "running")
 
+        await self._take_over_and_settle()
         result = await reconcile_role_serial_queues(self.store, "r")
 
+        report_after = await self.store.get_delegation_work_item(report_id)
         session_after = await self.store.get_delegation_role_session(sid)
-        self.assertIn(sid, result["cleared_focus_session_ids"])
+        self.assertEqual(report_after.claimed_by_role_runtime_session_id, "")
+        self.assertTrue(is_dispatchable(report_after))
         self.assertEqual(session_after.focused_work_item_id, "")
         self.assertEqual(session_after.status, "idle")
-        self.assertTrue(is_dispatchable(await self.store.get_delegation_work_item(report_id)))
+        self.assertEqual(result["cleared_focus_session_ids"], [])
 
-    async def test_restart_releases_review_claim_without_dispatching_parent(self) -> None:
+    async def test_controller_takeover_releases_review_claim_without_dispatching_parent(self) -> None:
+        await self._seed_run()
         parent = DelegationWorkItem(
             work_item_id="wi-parent",
             run_id="r", cell_id="c", role_id="cto", seat_id="seat",
@@ -721,13 +759,20 @@ class StartupClaimSweepTests(_StoreFixture):
         self.store = OPCStore(db_path=db_path)
         await self.store.initialize()
 
+        parent_before = await self.store.get_delegation_work_item("wi-parent")
+        self.assertEqual(
+            parent_before.claimed_by_role_runtime_session_id,
+            "dead-role-session",
+        )
+
+        await self._take_over_and_settle()
         parent_after = await self.store.get_delegation_work_item("wi-parent")
         report_after = await self.store.get_delegation_work_item("wi-report")
         self.assertEqual(parent_after.claimed_by_role_runtime_session_id, "")
         self.assertEqual(parent_after.claimed_by_seat_id, "")
         self.assertEqual(parent_after.metadata.get("claimed_by_role_session_id"), "")
         self.assertEqual(parent_after.metadata.get("claimed_task_id"), "")
-        self.assertTrue(parent_after.metadata.get("claim_swept_at"))
+        self.assertTrue(parent_after.metadata.get("controller_takeover_released_at"))
         self.assertFalse(is_dispatchable(parent_after))
         self.assertTrue(is_dispatchable(report_after))
 

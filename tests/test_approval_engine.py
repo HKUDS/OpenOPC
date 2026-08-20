@@ -6,10 +6,21 @@ import tempfile
 import unittest
 import uuid
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from opc.core.config import AutonomyConfig
-from opc.core.models import ApprovalAction, PermissionResolution, PermissionScope, RiskLevel, Task
+from opc.core.models import (
+    ApprovalAction,
+    DelegationRun,
+    DelegationWorkItem,
+    PermissionResolution,
+    PermissionScope,
+    RiskLevel,
+    Task,
+)
+from opc.database.store import OPCStore
+from opc.layer0_interaction.coordinator import InteractionCoordinator
 from opc.layer2_organization.approval import ApprovalEngine
 from opc.layer5_memory.approval_allowlist import ApprovalAllowlistManager
 from opc.layer5_memory.preference import PreferenceManager
@@ -51,7 +62,6 @@ class ApprovalEngineHeuristicTests(unittest.TestCase):
             store=_StoreStub(),
             preferences=_PreferencesStub(),
             memory=_MemoryStub(),
-            escalation=None,
             config=AutonomyConfig(),
         )
 
@@ -157,9 +167,7 @@ class ApprovalEngineHeuristicTests(unittest.TestCase):
             self.assertFalse(self.engine._command_has_shell_substitution(payload))
             self.assertTrue(self.engine._command_matches_safe_prefix(payload, prefixes))
 
-    def test_compound_readonly_command_matches_safe_prefix(self) -> None:
-        # Agents habitually chain read-only commands and discard stderr; that
-        # alone must not disqualify the command from LOW risk.
+    def test_compound_readonly_command_never_matches_safe_prefix(self) -> None:
         prefixes = list(self.engine.config.safe_command_prefixes)
         payloads = [
             'ls -la /a 2>&1 && echo "---" && ls -la /b 2>/dev/null',
@@ -168,10 +176,151 @@ class ApprovalEngineHeuristicTests(unittest.TestCase):
             "grep -rn pattern src | wc -l",
         ]
         for payload in payloads:
-            self.assertTrue(
+            self.assertFalse(
                 self.engine._command_matches_safe_prefix(payload, prefixes),
-                f"compound read-only command must stay safe: {payload}",
+                f"compound shell command must require manual review: {payload}",
             )
+
+    def test_runtime_prediction_requires_review_for_shell_structure(self) -> None:
+        tool = SimpleNamespace(
+            name="shell_exec",
+            requires_confirmation=False,
+            read_only=False,
+        )
+        cases = (
+            "ls -la file && wc -l file",
+            "ls file || wc -l file",
+            "ls file; wc -l file",
+            "cat file | wc -l",
+            "ls file &",
+            "ls file\nwc -l file",
+            "ls file > listing.txt",
+            "echo $(pwd)",
+            "(ls file)",
+        )
+        for command in cases:
+            with self.subTest(command=command):
+                decision = self.engine.predict(tool, {"command": command})
+                self.assertEqual(decision.resolution, PermissionResolution.ASK)
+                self.assertEqual(decision.source, "shell_structure_guard")
+
+        standalone = self.engine.predict(tool, {"command": "ls -la file"})
+        self.assertEqual(standalone.resolution, PermissionResolution.ALLOW)
+        self.assertEqual(standalone.source, "shell_read_only")
+
+        # The two exact E2E validation commands remain ordinary first-use ASK
+        # requests when no human allowlist entry exists.
+        for command in (
+            "python3 -m json.tool investment_case/company_analysis.json",
+            "node --check app_case/app.js",
+        ):
+            with self.subTest(exact_validation_command=command):
+                decision = self.engine.predict(tool, {"command": command})
+                self.assertEqual(decision.resolution, PermissionResolution.ASK)
+                self.assertEqual(decision.source, "shell_guard")
+
+    def test_denial_memory_is_exact_scoped_and_idempotent(self) -> None:
+        tool = SimpleNamespace(
+            name="shell_exec",
+            requires_confirmation=True,
+            read_only=False,
+        )
+        workspace = "/tmp/company-case"
+        compound = {
+            "command": "mkdir -p investment_case && ls -la investment_case",
+            "working_directory": workspace,
+        }
+        exact_validation = {
+            "command": "python3 -m json.tool investment_case/company_analysis.json",
+            "working_directory": workspace,
+        }
+        risk_task = Task(
+            id="risk-task",
+            project_id="company-project",
+            assigned_to="risk_analyst",
+            metadata={
+                "work_item_role_id": "risk_analyst",
+                "workspace_root": workspace,
+            },
+        )
+        analyst_task = Task(
+            id="analyst-task",
+            project_id="company-project",
+            assigned_to="investment_analyst",
+            metadata={
+                "work_item_role_id": "investment_analyst",
+                "workspace_root": workspace,
+            },
+        )
+
+        # Re-observing the same rejected ToolCall must not turn one human
+        # denial into two denial-memory strikes.
+        self.engine.record_denial(
+            "shell_exec", compound, task=risk_task, denial_id="call-risk-1"
+        )
+        self.engine.record_denial(
+            "shell_exec", compound, task=risk_task, denial_id="call-risk-1"
+        )
+        first_repeat = self.engine.predict(tool, compound, task=risk_task)
+        self.assertEqual(first_repeat.resolution, PermissionResolution.ASK)
+        self.assertEqual(first_repeat.source, "shell_structure_guard")
+
+        self.engine.record_denial(
+            "shell_exec", compound, task=risk_task, denial_id="call-risk-2"
+        )
+        repeated = self.engine.predict(tool, compound, task=risk_task)
+        self.assertEqual(repeated.resolution, PermissionResolution.DENY)
+        self.assertEqual(repeated.source, "denial_memory")
+        self.assertEqual(repeated.metadata["repeated_denials"], 2)
+
+        # A different exact command in the same cwd remains independently
+        # reviewable, and another Task/role cannot inherit the compound denial.
+        exact = self.engine.predict(tool, exact_validation, task=risk_task)
+        self.assertEqual(exact.resolution, PermissionResolution.ASK)
+        self.assertEqual(exact.source, "company_exact_tool_permission")
+        other_role = self.engine.predict(tool, compound, task=analyst_task)
+        self.assertEqual(other_role.resolution, PermissionResolution.ASK)
+        self.assertEqual(other_role.source, "shell_structure_guard")
+
+    def test_runtime_prediction_requires_review_for_git_side_effect_options(self) -> None:
+        tool = SimpleNamespace(
+            name="shell_exec",
+            requires_confirmation=False,
+            read_only=False,
+        )
+        for command in (
+            "git diff --output=/tmp/diff.txt",
+            "git diff --ext-diff",
+            "git diff --textconv",
+            "git grep -Oless needle",
+            "git grep --open-files-in-pager=less needle",
+            "git grep --ext-grep needle",
+            "git cat-file --filters HEAD:README.md",
+            "git log --show-signature",
+            "git -c core.pager=less log",
+            "git --config-env=core.pager=PAGER log",
+            "git --exec-path=/tmp/helpers status",
+            "git --paginate log",
+            "git --help",
+            "git help log",
+            "git -c alias.audit=!/tmp/helper audit",
+            "GIT_EDITOR=/tmp/helper git commit",
+            "PAGER=less git log",
+            "GIT_PAGER=less git log",
+            "env PAGER=less git log",
+            "nohup env GIT_PAGER=less git log",
+        ):
+            with self.subTest(command=command):
+                decision = self.engine.predict(tool, {"command": command})
+                self.assertEqual(decision.resolution, PermissionResolution.ASK)
+                self.assertEqual(decision.source, "shell_git_option_guard")
+
+        safe = self.engine.predict(
+            tool,
+            {"command": "git --no-pager log --no-textconv --oneline -5"},
+        )
+        self.assertEqual(safe.resolution, PermissionResolution.ALLOW)
+        self.assertEqual(safe.source, "shell_read_only")
 
     def test_write_redirection_or_unsafe_segment_still_not_safe(self) -> None:
         prefixes = list(self.engine.config.safe_command_prefixes)
@@ -232,6 +381,53 @@ class ApprovalEngineHeuristicTests(unittest.TestCase):
         self.assertIn(f"command={long_command}", summary)
         self.assertTrue(summary.endswith(long_command))
 
+    def test_configured_shell_pattern_predicts_review_from_raw_command(self) -> None:
+        self.engine.config.permissions_v2.dangerous_shell_patterns = [r"(?s)^.*$"]
+        tool = SimpleNamespace(
+            name="shell_exec",
+            requires_confirmation=False,
+            read_only=False,
+        )
+
+        decision = self.engine.predict(
+            tool,
+            {"command": "  'wc' -l README.md  "},
+        )
+
+        self.assertEqual(decision.resolution, PermissionResolution.ASK)
+        self.assertEqual(decision.source, "shell_pattern")
+        self.assertEqual(decision.risk_level, RiskLevel.CRITICAL)
+        self.assertIn(r"(?s)^.*$", decision.rationale)
+
+    def test_invalid_configured_shell_pattern_fails_closed_but_not_non_shell(self) -> None:
+        self.engine.config.permissions_v2.dangerous_shell_patterns = ["["]
+        shell_tool = SimpleNamespace(
+            name="shell_exec",
+            requires_confirmation=False,
+            read_only=False,
+        )
+        file_tool = SimpleNamespace(
+            name="file_read",
+            requires_confirmation=False,
+            read_only=True,
+        )
+
+        shell_decision = self.engine.predict(
+            shell_tool,
+            {"command": "wc -l README.md"},
+        )
+        file_decision = self.engine.predict(
+            file_tool,
+            {"path": "README.md"},
+        )
+
+        self.assertEqual(shell_decision.resolution, PermissionResolution.ASK)
+        self.assertEqual(shell_decision.source, "shell_pattern")
+        self.assertEqual(shell_decision.risk_level, RiskLevel.HIGH)
+        self.assertIn("Invalid dangerous shell pattern", shell_decision.rationale)
+        self.assertEqual(file_decision.resolution, PermissionResolution.ALLOW)
+        self.assertNotEqual(file_decision.source, "shell_pattern")
+
 class _LLMStub:
     class _Config:
         default_model = "stub-model"
@@ -260,15 +456,53 @@ class _EscalationStub:
     def __init__(self, reply: str | None) -> None:
         self.reply = reply
         self.calls: list[tuple[str, list[dict]]] = []
-        self.default_actions: list[str | None] = []
-        self.contexts: list[dict | None] = []
 
-    async def escalate_decision(self, task, question, options, default_action=None, context=None):
-        _ = task
+    async def __call__(self, question: str, options: list[dict]) -> str | None:
         self.calls.append((question, options))
-        self.default_actions.append(default_action)
-        self.contexts.append(context)
         return self.reply
+
+
+class _SecretaryAutoAllowStub:
+    def evaluate_tool_policy(self, **kwargs):
+        _ = kwargs
+        return {
+            "effect": "auto_allow",
+            "reason": "Broad secretary test rule.",
+            "rule_id": "secretary-auto-allow",
+        }
+
+
+async def _attach_durable_approval_transport(
+    testcase: unittest.IsolatedAsyncioTestCase,
+    engine: ApprovalEngine,
+    presentation: _EscalationStub,
+    root: Path | None = None,
+) -> None:
+    if root is None:
+        root = Path(tempfile.mkdtemp(prefix="openopc-approval-test-"))
+        testcase.addCleanup(shutil.rmtree, root, True)
+    store = OPCStore(root / f"approval-interactions-{uuid.uuid4().hex}.db")
+    await store.initialize()
+    coordinator = InteractionCoordinator(
+        store=store,
+        project_id="demo",
+        presentation_callback=presentation,
+    )
+    engine.store = store
+    engine.interaction_coordinator = coordinator
+    testcase.addAsyncCleanup(store.close)
+    testcase.addAsyncCleanup(coordinator.shutdown)
+
+
+def _tool_call_context(
+    call_id: str,
+    *,
+    runtime_session_id: str = "runtime-test",
+) -> dict[str, str]:
+    return {
+        "id": call_id,
+        "runtime_session_id": runtime_session_id,
+    }
 
 
 class ApprovalAllowlistManagerTests(unittest.TestCase):
@@ -296,6 +530,261 @@ class ApprovalAllowlistManagerTests(unittest.TestCase):
 
 
 class ApprovalEngineAllowlistTests(unittest.IsolatedAsyncioTestCase):
+    async def test_company_opaque_tools_ignore_all_broad_grants_and_offer_once_only(self) -> None:
+        with _workspace_tempdir() as opc_home:
+            escalation = _EscalationStub("approve_once")
+            engine = ApprovalEngine(
+                llm=_RecordingLLMStub(),
+                store=_StoreStub(),
+                preferences=PreferenceManager(opc_home),
+                memory=_MemoryStub(),
+                config=AutonomyConfig(
+                    enabled=False,
+                    permissions_v2={
+                        "enabled": False,
+                        "allow_tools": ["shell_exec", "python_exec"],
+                    },
+                ),
+                secretary_policies=_SecretaryAutoAllowStub(),
+            )
+            await _attach_durable_approval_transport(
+                self,
+                engine,
+                escalation,
+                opc_home,
+            )
+            (opc_home / "workspace").mkdir(parents=True, exist_ok=True)
+            task = Task(
+                id="company-exact-task",
+                title="Company acquisition worker",
+                project_id="demo",
+                session_id="company-exact-session",
+                assigned_to="acquisition_specialist",
+                metadata={
+                    "work_item_projection_id": "data_acquisition",
+                    "work_item_role_id": "acquisition_specialist",
+                    "delegation_run_id": "company-exact-run",
+                    "target_output_dir": str(opc_home / "workspace"),
+                },
+            )
+            store = engine.store
+            self.assertIsInstance(store, OPCStore)
+            await store.save_delegation_run(
+                DelegationRun(
+                    run_id="company-exact-run",
+                    project_id="demo",
+                    session_id=task.session_id,
+                    status="running",
+                    lifecycle_status="active",
+                )
+            )
+            await store.save_delegation_work_item(
+                DelegationWorkItem(
+                    work_item_id="company-exact-work-item",
+                    run_id="company-exact-run",
+                    role_id="acquisition_specialist",
+                    seat_id="seat-company-exact",
+                    projection_id="data_acquisition",
+                    title="Acquire exact inputs",
+                )
+            )
+            await store.save_task(task)
+            self.assertTrue(
+                await store.link_work_item_runtime_task(
+                    "company-exact-work-item",
+                    task.id,
+                )
+            )
+            for tool_name in ("shell_exec", "python_exec"):
+                engine._add_session_patterns(
+                    task=task,
+                    action_kind="tool",
+                    action_name=tool_name,
+                    patterns=["*"],
+                )
+                assert engine.allowlist is not None
+                engine.allowlist.add_patterns(
+                    "tool",
+                    tool_name,
+                    ["*"],
+                    project_id=task.project_id,
+                )
+                engine.allowlist.add_patterns("tool", tool_name, ["*"])
+
+            cases = (
+                ("shell_exec", {"command": "touch exact-shell.txt"}),
+                (
+                    "python_exec",
+                    {
+                        "code": (
+                            "if True:\n"
+                            "    value = '<tag>`literal`'\n\n"
+                            "    print(value)"
+                        )
+                    },
+                ),
+            )
+            for index, (tool_name, arguments) in enumerate(cases, 1):
+                approved, decision = await engine.authorize_tool_call(
+                    task=task,
+                    tool_name=tool_name,
+                    arguments=arguments,
+                    call_context=_tool_call_context(
+                        f"company-exact-{index}",
+                        runtime_session_id="runtime-company-exact",
+                    ),
+                )
+                self.assertTrue(approved)
+                self.assertEqual(decision.policy_source, "human_escalation")
+                self.assertEqual(decision.metadata.get("human_reply"), "approve_once")
+
+            self.assertEqual(len(escalation.calls), 2)
+            for _question, options in escalation.calls:
+                self.assertEqual(
+                    [option["id"] for option in options],
+                    ["approve_once", "deny"],
+                )
+            python_question = escalation.calls[1][0]
+            self.assertIn("    if True:\n        value = '<tag>`literal`'", python_question)
+            self.assertIn("\n    \n        print(value)", python_question)
+            self.assertIn("Python code SHA-256", python_question)
+
+            approved, decision = await engine.authorize_tool_call(
+                task=task,
+                tool_name="python_exec",
+                arguments={"code": "x" * 16_001},
+                call_context=_tool_call_context(
+                    "company-exact-over-limit",
+                    runtime_session_id="runtime-company-exact",
+                ),
+            )
+            self.assertFalse(approved)
+            self.assertEqual(
+                decision.policy_source,
+                "company_exact_envelope_invalid",
+            )
+            self.assertEqual(len(escalation.calls), 2)
+
+    async def test_configured_shell_pattern_precedes_all_auto_allow_policies(self) -> None:
+        with _workspace_tempdir() as root:
+            for index, policy in enumerate(
+                ("session", "persisted", "secretary"),
+                start=1,
+            ):
+                with self.subTest(policy=policy):
+                    opc_home = root / policy
+                    prefs = PreferenceManager(opc_home)
+                    escalation = _EscalationStub("approve_once")
+                    config = AutonomyConfig(
+                        allow_native_tool_auto_approval=True,
+                        tool_first_use_approval=False,
+                    )
+                    config.permissions_v2.dangerous_shell_patterns = [r"(?s)^.*$"]
+                    engine = ApprovalEngine(
+                        llm=_LLMStub(),
+                        store=_StoreStub(),
+                        preferences=prefs,
+                        memory=_MemoryStub(),
+                        config=config,
+                        secretary_policies=(
+                            _SecretaryAutoAllowStub()
+                            if policy == "secretary"
+                            else None
+                        ),
+                    )
+                    await _attach_durable_approval_transport(
+                        self,
+                        engine,
+                        escalation,
+                        opc_home,
+                    )
+                    task = Task(
+                        title=f"Inspect repo ({policy})",
+                        project_id="demo",
+                        session_id=f"shell-pattern-{policy}",
+                    )
+                    if policy == "session":
+                        engine._add_session_patterns(
+                            task=task,
+                            action_kind="tool",
+                            action_name="shell_exec",
+                            patterns=["*"],
+                        )
+                    elif policy == "persisted":
+                        assert engine.allowlist is not None
+                        engine.allowlist.add_patterns(
+                            "tool",
+                            "shell_exec",
+                            ["*"],
+                            project_id=task.project_id,
+                        )
+
+                    predicted = engine.predict(
+                        SimpleNamespace(
+                            name="shell_exec",
+                            requires_confirmation=False,
+                            read_only=False,
+                        ),
+                        {"command": "wc -l README.md"},
+                        task=task,
+                    )
+                    approved, decision = await engine.authorize_tool_call(
+                        task=task,
+                        tool_name="shell_exec",
+                        arguments={"command": "wc -l README.md"},
+                        call_context=_tool_call_context(
+                            f"configured-pattern-{index}",
+                            runtime_session_id=f"runtime-pattern-{index}",
+                        ),
+                    )
+
+                    self.assertEqual(predicted.resolution, PermissionResolution.ASK)
+                    self.assertEqual(predicted.source, "shell_pattern")
+                    self.assertTrue(approved)
+                    self.assertEqual(decision.policy_source, "human_escalation")
+                    self.assertEqual(len(escalation.calls), 1)
+                    question, options = escalation.calls[0]
+                    self.assertIn("dangerous shell pattern", question)
+                    self.assertEqual(
+                        [option["id"] for option in options],
+                        ["approve_once", "deny"],
+                    )
+
+    async def test_invalid_configured_shell_pattern_async_fails_closed(self) -> None:
+        config = AutonomyConfig(
+            allow_native_tool_auto_approval=True,
+            tool_first_use_approval=False,
+        )
+        config.permissions_v2.dangerous_shell_patterns = ["["]
+        engine = ApprovalEngine(
+            llm=_LLMStub(),
+            store=_StoreStub(),
+            preferences=_PreferencesStub(),
+            memory=_MemoryStub(),
+            config=config,
+            secretary_policies=_SecretaryAutoAllowStub(),
+        )
+
+        approved, decision = await engine.authorize_tool_call(
+            task=Task(title="Inspect repo", project_id="demo"),
+            tool_name="shell_exec",
+            arguments={"command": "wc -l README.md"},
+        )
+        file_approved, file_decision = await engine.authorize_tool_call(
+            task=Task(title="Read repo", project_id="demo"),
+            tool_name="file_read",
+            arguments={"path": "README.md"},
+        )
+
+        self.assertFalse(approved)
+        self.assertEqual(decision.action, ApprovalAction.ESCALATE)
+        self.assertEqual(decision.policy_source, "shell_pattern")
+        self.assertEqual(decision.risk_level, RiskLevel.HIGH)
+        self.assertIn("Invalid dangerous shell pattern", decision.rationale)
+        self.assertTrue(file_approved)
+        self.assertEqual(file_decision.action, ApprovalAction.AUTO_APPROVE)
+        self.assertEqual(file_decision.policy_source, "secretary_policy")
+
     async def test_memory_path_policy_auto_approves_direct_memory_file_edits(self) -> None:
         with _workspace_tempdir() as opc_home, patch(
             "opc.layer2_organization.approval.get_opc_home",
@@ -308,7 +797,6 @@ class ApprovalEngineAllowlistTests(unittest.IsolatedAsyncioTestCase):
                 store=_StoreStub(),
                 preferences=prefs,
                 memory=_MemoryStub(),
-                escalation=escalation,
                 config=AutonomyConfig(),
             )
             task = Task(title="Memory edit", project_id="demo")
@@ -336,7 +824,6 @@ class ApprovalEngineAllowlistTests(unittest.IsolatedAsyncioTestCase):
                 store=_StoreStub(),
                 preferences=prefs,
                 memory=_MemoryStub(),
-                escalation=escalation,
                 config=AutonomyConfig(),
             )
             task = Task(title="External memory permission", project_id="demo")
@@ -361,7 +848,6 @@ class ApprovalEngineAllowlistTests(unittest.IsolatedAsyncioTestCase):
                 store=_StoreStub(),
                 preferences=prefs,
                 memory=_MemoryStub(),
-                escalation=escalation,
                 config=AutonomyConfig(),
             )
             task = Task(title="CEO Intake", project_id="demo")
@@ -387,7 +873,6 @@ class ApprovalEngineAllowlistTests(unittest.IsolatedAsyncioTestCase):
                 store=_StoreStub(),
                 preferences=prefs,
                 memory=_MemoryStub(),
-                escalation=escalation,
                 config=AutonomyConfig(),
             )
             task = Task(title="External bridge", project_id="demo")
@@ -419,8 +904,10 @@ class ApprovalEngineAllowlistTests(unittest.IsolatedAsyncioTestCase):
                 store=_StoreStub(),
                 preferences=prefs,
                 memory=_MemoryStub(),
-                escalation=escalation,
                 config=AutonomyConfig(),
+            )
+            await _attach_durable_approval_transport(
+                self, engine, escalation, opc_home
             )
             task = Task(title="Install deps", project_id="demo")
 
@@ -428,6 +915,7 @@ class ApprovalEngineAllowlistTests(unittest.IsolatedAsyncioTestCase):
                 task=task,
                 tool_name="shell_exec",
                 arguments={"command": "pip install requests"},
+                call_context=_tool_call_context("project-allow-1"),
             )
 
             self.assertTrue(approved)
@@ -441,6 +929,7 @@ class ApprovalEngineAllowlistTests(unittest.IsolatedAsyncioTestCase):
                 task=task,
                 tool_name="shell_exec",
                 arguments={"command": "pip install flask"},
+                call_context=_tool_call_context("project-allow-2"),
             )
 
             self.assertTrue(approved)
@@ -456,8 +945,10 @@ class ApprovalEngineAllowlistTests(unittest.IsolatedAsyncioTestCase):
                 store=_StoreStub(),
                 preferences=prefs,
                 memory=_MemoryStub(),
-                escalation=escalation,
                 config=AutonomyConfig(),
+            )
+            await _attach_durable_approval_transport(
+                self, engine, escalation, opc_home
             )
             task = Task(title="Check repo", project_id="demo")
 
@@ -465,6 +956,7 @@ class ApprovalEngineAllowlistTests(unittest.IsolatedAsyncioTestCase):
                 task=task,
                 tool_name="shell_exec",
                 arguments={"command": "git commit -m demo"},
+                call_context=_tool_call_context("session-scope-1"),
             )
 
             self.assertEqual(permission.resolution, PermissionResolution.ALLOW)
@@ -477,7 +969,6 @@ class ApprovalEngineAllowlistTests(unittest.IsolatedAsyncioTestCase):
             store=_StoreStub(),
             preferences=_PreferencesStub(),
             memory=_MemoryStub(),
-            escalation=None,
             config=AutonomyConfig(),
         )
 
@@ -506,8 +997,10 @@ class ApprovalEngineAllowlistTests(unittest.IsolatedAsyncioTestCase):
                 store=_StoreStub(),
                 preferences=prefs,
                 memory=_MemoryStub(),
-                escalation=escalation,
                 config=AutonomyConfig(),
+            )
+            await _attach_durable_approval_transport(
+                self, engine, escalation, opc_home
             )
             task = Task(title="Check repo", project_id="demo")
 
@@ -515,6 +1008,7 @@ class ApprovalEngineAllowlistTests(unittest.IsolatedAsyncioTestCase):
                 task=task,
                 tool_name="shell_exec",
                 arguments={"command": "git commit -m demo"},
+                call_context=_tool_call_context("global-allow-1"),
             )
 
             self.assertTrue(approved)
@@ -527,22 +1021,23 @@ class ApprovalEngineAllowlistTests(unittest.IsolatedAsyncioTestCase):
                 task=task,
                 tool_name="shell_exec",
                 arguments={"command": "git commit -m again"},
+                call_context=_tool_call_context("global-allow-2"),
             )
 
             self.assertTrue(approved)
             self.assertEqual(decision.policy_source, "approval_allowlist")
             self.assertEqual(len(escalation.calls), 1)
 
-    async def test_low_risk_data_acquisition_shell_command_skips_first_use_prompt(self) -> None:
+    async def test_data_acquisition_shell_requires_exact_human_approval(self) -> None:
         with _workspace_tempdir() as opc_home:
             prefs = PreferenceManager(opc_home)
+            (opc_home / "workspace").mkdir()
             escalation = _EscalationStub("approve_once")
             engine = ApprovalEngine(
                 llm=_LLMStub(),
                 store=_StoreStub(),
                 preferences=prefs,
                 memory=_MemoryStub(),
-                escalation=escalation,
                 config=AutonomyConfig(),
             )
             task = Task(
@@ -565,10 +1060,13 @@ class ApprovalEngineAllowlistTests(unittest.IsolatedAsyncioTestCase):
                 },
             )
 
-            self.assertTrue(approved)
-            self.assertEqual(decision.action, ApprovalAction.AUTO_APPROVE)
-            self.assertEqual(decision.risk_level, RiskLevel.LOW)
-            self.assertEqual(decision.policy_source, "heuristic")
+            self.assertFalse(approved)
+            self.assertEqual(decision.action, ApprovalAction.ESCALATE)
+            self.assertEqual(decision.risk_level, RiskLevel.MEDIUM)
+            self.assertEqual(
+                decision.policy_source,
+                "company_exact_tool_permission",
+            )
             self.assertEqual(len(escalation.calls), 0)
 
     async def test_low_risk_readonly_command_skips_first_use_prompt(self) -> None:
@@ -580,7 +1078,6 @@ class ApprovalEngineAllowlistTests(unittest.IsolatedAsyncioTestCase):
                 store=_StoreStub(),
                 preferences=prefs,
                 memory=_MemoryStub(),
-                escalation=escalation,
                 config=AutonomyConfig(),
             )
             task = Task(title="Inspect repo", project_id="demo")
@@ -588,13 +1085,113 @@ class ApprovalEngineAllowlistTests(unittest.IsolatedAsyncioTestCase):
             approved, decision = await engine.authorize_tool_call(
                 task=task,
                 tool_name="shell_exec",
-                arguments={"command": "cd /repo && git status --short 2>&1 | head -20"},
+                arguments={"command": "git status --short"},
             )
 
             self.assertTrue(approved)
             self.assertEqual(decision.action, ApprovalAction.AUTO_APPROVE)
             self.assertEqual(decision.risk_level, RiskLevel.LOW)
             self.assertEqual(len(escalation.calls), 0)
+
+    async def test_compound_readonly_command_requires_real_human_checkpoint(self) -> None:
+        with _workspace_tempdir() as opc_home:
+            prefs = PreferenceManager(opc_home)
+            escalation = _EscalationStub("approve_once")
+            # Simulate both a legacy broad prefix grant and an explicit generic
+            # tool allow rule; neither may bypass the structural checkpoint.
+            ApprovalAllowlistManager(opc_home).add_patterns(
+                "tool", "shell_exec", ["ls"]
+            )
+            engine = ApprovalEngine(
+                llm=_LLMStub(),
+                store=_StoreStub(),
+                preferences=prefs,
+                memory=_MemoryStub(),
+                # Prove the structural gate is independent of the generic
+                # first-use switch and cannot fall through to LLM auto-review.
+                config=AutonomyConfig(
+                    tool_first_use_approval=False,
+                    permissions_v2={"allow_tools": ["shell_exec"]},
+                ),
+            )
+            await _attach_durable_approval_transport(
+                self, engine, escalation, opc_home
+            )
+            task = Task(title="Inspect repo", project_id="demo")
+
+            approved, decision = await engine.authorize_tool_call(
+                task=task,
+                tool_name="shell_exec",
+                arguments={"command": "ls -la report.json && wc -l report.json"},
+                call_context=_tool_call_context("compound-review-1"),
+            )
+
+            self.assertTrue(approved)
+            self.assertEqual(decision.policy_source, "human_escalation")
+            self.assertEqual(decision.metadata.get("human_reply"), "approve_once")
+            self.assertEqual(len(escalation.calls), 1)
+            question, options = escalation.calls[0]
+            self.assertIn("manual review required for shell control operator", question)
+            self.assertEqual(
+                [option["id"] for option in options],
+                ["approve_once", "deny"],
+            )
+
+    async def test_git_output_flag_requires_durable_one_shot_human_checkpoint(self) -> None:
+        with _workspace_tempdir() as opc_home:
+            prefs = PreferenceManager(opc_home)
+            escalation = _EscalationStub("approve_once")
+            # Neither a legacy broad Git grant nor a generic allow_tools rule
+            # may turn a later write/helper option into a read-only command.
+            ApprovalAllowlistManager(opc_home).add_patterns(
+                "tool", "shell_exec", ["git diff"]
+            )
+            engine = ApprovalEngine(
+                llm=_LLMStub(),
+                store=_StoreStub(),
+                preferences=prefs,
+                memory=_MemoryStub(),
+                config=AutonomyConfig(
+                    tool_first_use_approval=False,
+                    permissions_v2={"allow_tools": ["shell_exec"]},
+                ),
+            )
+            await _attach_durable_approval_transport(
+                self, engine, escalation, opc_home
+            )
+            task = Task(title="Inspect repo", project_id="demo")
+
+            for index, output_path in enumerate(("/tmp/a.diff", "/tmp/b.diff"), 1):
+                approved, decision = await engine.authorize_tool_call(
+                    task=task,
+                    tool_name="shell_exec",
+                    arguments={
+                        "command": f"git diff --output={output_path}"
+                    },
+                    call_context=_tool_call_context(f"git-output-review-{index}"),
+                )
+                self.assertTrue(approved)
+                self.assertEqual(decision.policy_source, "human_escalation")
+                self.assertEqual(
+                    decision.metadata.get("human_reply"), "approve_once"
+                )
+
+            self.assertEqual(len(escalation.calls), 2)
+            for question, options in escalation.calls:
+                self.assertIn(
+                    "Git options or environment that are not proven read-only",
+                    question,
+                )
+                self.assertEqual(
+                    [option["id"] for option in options],
+                    ["approve_once", "deny"],
+                )
+            self.assertEqual(
+                ApprovalAllowlistManager(opc_home).list_patterns(
+                    "tool", "shell_exec"
+                ),
+                ["git diff"],
+            )
 
     async def test_session_allowlist_persists_across_engine_restart(self) -> None:
         with _workspace_tempdir() as opc_home:
@@ -606,8 +1203,10 @@ class ApprovalEngineAllowlistTests(unittest.IsolatedAsyncioTestCase):
                 store=_StoreStub(),
                 preferences=prefs,
                 memory=_MemoryStub(),
-                escalation=escalation,
                 config=config,
+            )
+            await _attach_durable_approval_transport(
+                self, engine, escalation, opc_home
             )
             task = Task(title="Check repo", project_id="demo", session_id="sess-persist")
 
@@ -615,6 +1214,7 @@ class ApprovalEngineAllowlistTests(unittest.IsolatedAsyncioTestCase):
                 task=task,
                 tool_name="shell_exec",
                 arguments={"command": "git commit -m demo"},
+                call_context=_tool_call_context("session-persist-1"),
             )
 
             self.assertTrue(approved)
@@ -628,30 +1228,32 @@ class ApprovalEngineAllowlistTests(unittest.IsolatedAsyncioTestCase):
                 store=_StoreStub(),
                 preferences=prefs,
                 memory=_MemoryStub(),
-                escalation=escalation,
                 config=config,
             )
             approved, decision = await engine_restarted.authorize_tool_call(
                 task=task,
                 tool_name="shell_exec",
                 arguments={"command": "git commit -m again"},
+                call_context=_tool_call_context("session-persist-2"),
             )
 
             self.assertTrue(approved)
             self.assertEqual(decision.policy_source, "session_approval")
             self.assertEqual(len(escalation.calls), 1)
 
-    async def test_deferred_escalation_decision_applies_session_grant(self) -> None:
+    async def test_durable_approval_decision_applies_session_grant(self) -> None:
         with _workspace_tempdir() as opc_home:
             prefs = PreferenceManager(opc_home)
-            escalation = _EscalationStub(None)  # inline wait times out
+            escalation = _EscalationStub("approve_session")
             engine = ApprovalEngine(
                 llm=_LLMStub(),
                 store=_StoreStub(),
                 preferences=prefs,
                 memory=_MemoryStub(),
-                escalation=escalation,
                 config=AutonomyConfig(),
+            )
+            await _attach_durable_approval_transport(
+                self, engine, escalation, opc_home
             )
             task = Task(title="Install deps", project_id="demo", session_id="sess-deferred")
 
@@ -659,62 +1261,52 @@ class ApprovalEngineAllowlistTests(unittest.IsolatedAsyncioTestCase):
                 task=task,
                 tool_name="shell_exec",
                 arguments={"command": "pip install requests"},
+                call_context=_tool_call_context("durable-session-1"),
             )
-            self.assertFalse(approved)
-            self.assertEqual(decision.action, ApprovalAction.REQUIRE_INPUT)
-            # The card carries the approval context needed for a late decision.
-            context = escalation.contexts[-1]
-            self.assertIsInstance(context, dict)
-            self.assertEqual(context["action_name"], "shell_exec")
-            self.assertEqual(context["session_scope_id"], "sess-deferred")
-            self.assertIn("pip install", context["allowlist_patterns"])
-
-            # The user clicks the card minutes later: the grant persists and
-            # the retried command auto-approves without a new prompt.
-            summary = engine.apply_deferred_escalation_decision("approve_session", context)
-            self.assertTrue(summary["approved"])
-            self.assertEqual(summary["scope"], "session:sess-deferred")
+            self.assertTrue(approved)
+            self.assertEqual(decision.metadata["allowlist_scope"], "session:sess-deferred")
 
             prompts_before = len(escalation.calls)
             approved, decision = await engine.authorize_tool_call(
                 task=task,
                 tool_name="shell_exec",
                 arguments={"command": "pip install flask"},
+                call_context=_tool_call_context("durable-session-2"),
             )
             self.assertTrue(approved)
             self.assertEqual(decision.policy_source, "session_approval")
             self.assertEqual(len(escalation.calls), prompts_before)
 
-    async def test_deferred_escalation_deny_grants_nothing(self) -> None:
+    async def test_durable_approval_deny_grants_nothing(self) -> None:
         with _workspace_tempdir() as opc_home:
             prefs = PreferenceManager(opc_home)
-            escalation = _EscalationStub(None)
+            escalation = _EscalationStub("deny")
             engine = ApprovalEngine(
                 llm=_LLMStub(),
                 store=_StoreStub(),
                 preferences=prefs,
                 memory=_MemoryStub(),
-                escalation=escalation,
                 config=AutonomyConfig(),
+            )
+            await _attach_durable_approval_transport(
+                self, engine, escalation, opc_home
             )
             task = Task(title="Install deps", project_id="demo", session_id="sess-deny")
 
-            await engine.authorize_tool_call(
+            approved, _ = await engine.authorize_tool_call(
                 task=task,
                 tool_name="shell_exec",
                 arguments={"command": "pip install requests"},
+                call_context=_tool_call_context("durable-deny-1"),
             )
-            context = escalation.contexts[-1]
-
-            summary = engine.apply_deferred_escalation_decision("deny", context)
-            self.assertFalse(summary["approved"])
-            self.assertIsNone(summary["scope"])
+            self.assertFalse(approved)
 
             prompts_before = len(escalation.calls)
             approved, _ = await engine.authorize_tool_call(
                 task=task,
                 tool_name="shell_exec",
                 arguments={"command": "pip install requests"},
+                call_context=_tool_call_context("durable-deny-2"),
             )
             self.assertFalse(approved)
             self.assertEqual(len(escalation.calls), prompts_before + 1)
@@ -728,12 +1320,16 @@ class ApprovalEngineAllowlistTests(unittest.IsolatedAsyncioTestCase):
                 store=_StoreStub(),
                 preferences=prefs,
                 memory=_MemoryStub(),
-                escalation=escalation,
                 config=AutonomyConfig(),
             )
+            await _attach_durable_approval_transport(
+                self, engine, escalation, opc_home
+            )
+            (opc_home / "workspace").mkdir(parents=True, exist_ok=True)
             task = Task(
                 title="Regular shell task",
                 project_id="demo",
+                session_id="download-first-use-session",
                 assigned_to="coo",
                 metadata={
                     "work_item_projection_id": "coo_coordination",
@@ -741,6 +1337,11 @@ class ApprovalEngineAllowlistTests(unittest.IsolatedAsyncioTestCase):
                     "target_output_dir": str(opc_home / "workspace"),
                 },
             )
+            # Work-item metadata makes this a company-runtime Task.  Persist
+            # its durable session identity just as the production executor
+            # does before requesting tool authorization; an unsaved company
+            # Task must fail closed rather than inventing an owner actor.
+            await engine.store.save_task(task)
 
             approved, decision = await engine.authorize_tool_call(
                 task=task,
@@ -749,6 +1350,7 @@ class ApprovalEngineAllowlistTests(unittest.IsolatedAsyncioTestCase):
                     "command": "yt-dlp -o inputs/trailers/%(title)s.%(ext)s https://example.com/video",
                     "working_directory": str(opc_home / "workspace"),
                 },
+                call_context=_tool_call_context("download-first-use-1"),
             )
 
             self.assertTrue(approved)
@@ -761,7 +1363,6 @@ class ApprovalEngineAllowlistTests(unittest.IsolatedAsyncioTestCase):
             store=_StoreStub(),
             preferences=_PreferencesStub(),
             memory=_MemoryStub(),
-            escalation=None,
             config=AutonomyConfig(),
         )
 
@@ -787,9 +1388,9 @@ class ApprovalEngineExternalAgentAutoApproveTests(unittest.IsolatedAsyncioTestCa
             store=_StoreStub(),
             preferences=_PreferencesStub(),
             memory=_MemoryStub(),
-            escalation=escalation,
             config=AutonomyConfig(allow_external_agent_auto_approval=False),
         )
+        await _attach_durable_approval_transport(self, engine, escalation)
         task = Task(title="CEO Intake", project_id="demo")
 
         approved, decision = await engine.authorize_external_action(
@@ -803,6 +1404,7 @@ class ApprovalEngineExternalAgentAutoApproveTests(unittest.IsolatedAsyncioTestCa
                 "run_mode": "interactive",
                 "approval_mode": "auto",
                 "workspace": "/tmp/work",
+                "source_event_id": "external-disabled-1",
             },
         )
 
@@ -819,9 +1421,9 @@ class ApprovalEngineExternalAgentAutoApproveTests(unittest.IsolatedAsyncioTestCa
             store=_StoreStub(),
             preferences=_PreferencesStub(),
             memory=_MemoryStub(),
-            escalation=escalation,
             config=AutonomyConfig(allow_external_agent_auto_approval=True),
         )
+        await _attach_durable_approval_transport(self, engine, escalation)
         task = Task(title="CEO Intake", project_id="demo")
 
         approved, decision = await engine.authorize_external_action(
@@ -851,9 +1453,9 @@ class ApprovalEngineExternalAgentAutoApproveTests(unittest.IsolatedAsyncioTestCa
             store=_StoreStub(),
             preferences=_PreferencesStub(),
             memory=_MemoryStub(),
-            escalation=escalation,
             config=AutonomyConfig(allow_external_agent_auto_approval=True),
         )
+        await _attach_durable_approval_transport(self, engine, escalation)
         task = Task(title="CEO Intake", project_id="demo")
 
         approved, decision = await engine.authorize_external_action(
@@ -870,6 +1472,7 @@ class ApprovalEngineExternalAgentAutoApproveTests(unittest.IsolatedAsyncioTestCa
                 "run_mode": "interactive",
                 "approval_mode": "full-auto",
                 "workspace": "/tmp/work",
+                "source_event_id": "external-full-auto-1",
             },
         )
 
@@ -886,9 +1489,9 @@ class ApprovalEngineExternalAgentAutoApproveTests(unittest.IsolatedAsyncioTestCa
             store=_StoreStub(),
             preferences=_PreferencesStub(),
             memory=_MemoryStub(),
-            escalation=escalation,
             config=AutonomyConfig(allow_external_agent_auto_approval=True),
         )
+        await _attach_durable_approval_transport(self, engine, escalation)
 
         approved, decision = await engine.authorize_external_action(
             task=Task(title="Ask Cursor", project_id="demo"),
@@ -901,6 +1504,7 @@ class ApprovalEngineExternalAgentAutoApproveTests(unittest.IsolatedAsyncioTestCa
                 "run_mode": "interactive",
                 "approval_mode": "full-auto",
                 "workspace": "/tmp/work",
+                "source_event_id": "external-options-1",
             },
         )
 
@@ -929,8 +1533,10 @@ class ApprovalEngineExternalAgentAutoApproveTests(unittest.IsolatedAsyncioTestCa
                 store=_StoreStub(),
                 preferences=prefs,
                 memory=_MemoryStub(),
-                escalation=escalation,
                 config=AutonomyConfig(allow_external_agent_auto_approval=True),
+            )
+            await _attach_durable_approval_transport(
+                self, engine, escalation, opc_home
             )
             metadata = {
                 "agent": "cursor",
@@ -940,6 +1546,7 @@ class ApprovalEngineExternalAgentAutoApproveTests(unittest.IsolatedAsyncioTestCa
                 "run_mode": "interactive",
                 "approval_mode": "full-auto",
                 "workspace": "/tmp/work",
+                "source_event_id": "cursor-session-1",
             }
 
             approved, decision = await engine.authorize_external_action(
@@ -968,6 +1575,7 @@ class ApprovalEngineExternalAgentAutoApproveTests(unittest.IsolatedAsyncioTestCa
                 metadata={
                     **metadata,
                     "command": "cursor-agent -p --output-format stream-json --force '<prompt:456-chars>'",
+                    "source_event_id": "cursor-session-2",
                 },
             )
 
@@ -986,8 +1594,10 @@ class ApprovalEngineExternalAgentAutoApproveTests(unittest.IsolatedAsyncioTestCa
                 store=_StoreStub(),
                 preferences=prefs,
                 memory=_MemoryStub(),
-                escalation=escalation,
                 config=AutonomyConfig(allow_external_agent_auto_approval=True),
+            )
+            await _attach_durable_approval_transport(
+                self, engine, escalation, opc_home
             )
             metadata = {
                 "agent": "opencode",
@@ -997,6 +1607,7 @@ class ApprovalEngineExternalAgentAutoApproveTests(unittest.IsolatedAsyncioTestCa
                 "run_mode": "interactive",
                 "approval_mode": "full-auto",
                 "workspace": "/tmp/work",
+                "source_event_id": "opencode-project-1",
             }
 
             approved, decision = await engine.authorize_external_action(
@@ -1023,6 +1634,7 @@ class ApprovalEngineExternalAgentAutoApproveTests(unittest.IsolatedAsyncioTestCa
                 metadata={
                     **metadata,
                     "command": "opencode run --format json --dangerously-skip-permissions '<prompt:456-chars>'",
+                    "source_event_id": "opencode-project-2",
                 },
             )
 
@@ -1040,8 +1652,10 @@ class ApprovalEngineExternalAgentAutoApproveTests(unittest.IsolatedAsyncioTestCa
                 store=_StoreStub(),
                 preferences=prefs,
                 memory=_MemoryStub(),
-                escalation=escalation,
                 config=AutonomyConfig(allow_external_agent_auto_approval=False),
+            )
+            await _attach_durable_approval_transport(
+                self, engine, escalation, opc_home
             )
             first_task = Task(
                 title="CEO Intake",
@@ -1058,6 +1672,7 @@ class ApprovalEngineExternalAgentAutoApproveTests(unittest.IsolatedAsyncioTestCa
                     "prompt_text": "Allow OpenCode to access `/tmp/shared` outside the workspace?",
                     "run_mode": "interactive",
                     "workspace": "/tmp/work",
+                    "source_event_id": "external-dir-session-1",
                 },
             )
 
@@ -1079,6 +1694,7 @@ class ApprovalEngineExternalAgentAutoApproveTests(unittest.IsolatedAsyncioTestCa
                     "prompt_text": "Allow OpenCode to access `/tmp/shared` outside the workspace?",
                     "run_mode": "interactive",
                     "workspace": "/tmp/work",
+                    "source_event_id": "external-dir-session-2",
                 },
             )
 
@@ -1096,8 +1712,10 @@ class ApprovalEngineExternalAgentAutoApproveTests(unittest.IsolatedAsyncioTestCa
                 store=_StoreStub(),
                 preferences=prefs,
                 memory=_MemoryStub(),
-                escalation=escalation,
                 config=AutonomyConfig(allow_external_agent_auto_approval=False),
+            )
+            await _attach_durable_approval_transport(
+                self, engine, escalation, opc_home
             )
             task = Task(title="CEO Intake", project_id="demo")
 
@@ -1109,6 +1727,7 @@ class ApprovalEngineExternalAgentAutoApproveTests(unittest.IsolatedAsyncioTestCa
                     "prompt_text": "Allow OpenCode to access `/tmp/shared` outside the workspace?",
                     "run_mode": "interactive",
                     "workspace": "/tmp/work",
+                    "source_event_id": "external-dir-project-1",
                 },
             )
 
@@ -1131,6 +1750,7 @@ class ApprovalEngineExternalAgentAutoApproveTests(unittest.IsolatedAsyncioTestCa
                     "prompt_text": "Allow OpenCode to access `/tmp/shared` outside the workspace?",
                     "run_mode": "interactive",
                     "workspace": "/tmp/work",
+                    "source_event_id": "external-dir-project-2",
                 },
             )
 
@@ -1145,7 +1765,6 @@ class ApprovalEngineExternalAgentAutoApproveTests(unittest.IsolatedAsyncioTestCa
             store=_StoreStub(),
             preferences=_PreferencesStub(),
             memory=_MemoryStub(),
-            escalation=None,
             config=AutonomyConfig(),
         )
         task = Task(
@@ -1178,7 +1797,6 @@ class ApprovalEngineExternalAgentAutoApproveTests(unittest.IsolatedAsyncioTestCa
             store=_StoreStub(),
             preferences=_PreferencesStub(),
             memory=_MemoryStub(),
-            escalation=escalation,
             config=AutonomyConfig(),
         )
         task = Task(
@@ -1213,7 +1831,6 @@ class ApprovalEngineExternalAgentAutoApproveTests(unittest.IsolatedAsyncioTestCa
             store=_StoreStub(),
             preferences=_PreferencesStub(),
             memory=_MemoryStub(),
-            escalation=escalation,
             config=AutonomyConfig(allow_external_agent_auto_approval=True),
         )
 
@@ -1243,7 +1860,6 @@ class ApprovalEngineExternalAgentAutoApproveTests(unittest.IsolatedAsyncioTestCa
             store=_StoreStub(),
             preferences=_PreferencesStub(),
             memory=_MemoryStub(),
-            escalation=escalation,
             config=AutonomyConfig(allow_external_agent_auto_approval=True),
         )
 
@@ -1266,14 +1882,13 @@ class ApprovalEngineExternalAgentAutoApproveTests(unittest.IsolatedAsyncioTestCa
         self.assertEqual(decision.policy_source, "explicit_user_agent_selection")
         self.assertEqual(len(escalation.calls), 0)
 
-    async def test_human_escalation_timeout_requires_input_without_default_approval(self) -> None:
+    async def test_missing_durable_transport_fails_closed_without_default_approval(self) -> None:
         escalation = _EscalationStub(None)
         engine = ApprovalEngine(
             llm=_LLMStub(),
             store=_StoreStub(),
             preferences=_PreferencesStub(),
             memory=_MemoryStub(),
-            escalation=escalation,
             config=AutonomyConfig(allow_external_agent_auto_approval=True),
         )
 
@@ -1291,10 +1906,10 @@ class ApprovalEngineExternalAgentAutoApproveTests(unittest.IsolatedAsyncioTestCa
         )
 
         self.assertFalse(approved)
-        self.assertEqual(decision.action, ApprovalAction.REQUIRE_INPUT)
-        self.assertTrue(decision.requires_user_input)
-        self.assertEqual(decision.policy_source, "human_escalation")
-        self.assertEqual(escalation.default_actions, [None])
+        self.assertEqual(decision.action, ApprovalAction.ESCALATE)
+        self.assertFalse(decision.requires_user_input)
+        self.assertEqual(decision.policy_source, "external_agent_policy")
+        self.assertEqual(escalation.calls, [])
 
     async def test_external_session_continuation_skips_launch_approval(self) -> None:
         engine = ApprovalEngine(
@@ -1302,7 +1917,6 @@ class ApprovalEngineExternalAgentAutoApproveTests(unittest.IsolatedAsyncioTestCa
             store=_StoreStub(),
             preferences=_PreferencesStub(),
             memory=_MemoryStub(),
-            escalation=None,
             config=AutonomyConfig(),
         )
         task = Task(

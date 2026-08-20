@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from opc.layer4_tools.registry import ToolDefinition
+from opc.layer4_tools.registry import COMPANY_EFFECT_RUNTIME_INTERNAL, ToolDefinition
 
 
 async def _runtime_noop(**_kwargs: Any) -> dict[str, Any]:
@@ -67,6 +67,7 @@ def create_agent_runtime_tools() -> list[ToolDefinition]:
             concurrency_safe=False,
             read_only=False,
             runtime_managed=True,
+            company_effect_kind=COMPANY_EFFECT_RUNTIME_INTERNAL,
         ),
         ToolDefinition(
             name="agent_wait",
@@ -88,6 +89,7 @@ def create_agent_runtime_tools() -> list[ToolDefinition]:
             concurrency_safe=False,
             read_only=True,
             runtime_managed=True,
+            company_effect_kind=COMPANY_EFFECT_RUNTIME_INTERNAL,
         ),
         ToolDefinition(
             name="agent_send",
@@ -105,6 +107,7 @@ def create_agent_runtime_tools() -> list[ToolDefinition]:
             concurrency_safe=False,
             read_only=False,
             runtime_managed=True,
+            company_effect_kind=COMPANY_EFFECT_RUNTIME_INTERNAL,
         ),
         ToolDefinition(
             name="agent_list",
@@ -118,5 +121,6 @@ def create_agent_runtime_tools() -> list[ToolDefinition]:
             concurrency_safe=True,
             read_only=True,
             runtime_managed=True,
+            company_effect_kind=COMPANY_EFFECT_RUNTIME_INTERNAL,
         ),
     ]

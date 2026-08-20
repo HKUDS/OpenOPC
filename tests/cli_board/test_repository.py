@@ -62,6 +62,19 @@ class _StubFacade:
 
 
 class BoardRepositoryTests(unittest.IsolatedAsyncioTestCase):
+    def test_permission_prompt_uses_complete_verbatim_interaction_payload(self) -> None:
+        prompt = "if True:\n    print(`<tag>`)\n\n" + ("x" * 4_000)
+        checkpoint = ExecutionCheckpoint(
+            checkpoint_id="cp-exact",
+            project_id="demo",
+            checkpoint_type="tool_permission",
+            payload={"interaction": {"prompt": prompt}},
+        )
+
+        _summary, rendered = BoardRepository._checkpoint_prompt(checkpoint)
+
+        self.assertEqual(rendered, prompt)
+
     async def test_snapshot_hides_internal_origin_tasks(self) -> None:
         visible = Task(
             id="visible-1",

@@ -43,6 +43,7 @@ from opc.layer2_organization.company_runtime_identity import (
     ACTIVE_COMPANY_RUNTIME_CHECKPOINT_STATUSES,
     COMPANY_RUNTIME_CHECKPOINT_TYPES,
     build_company_runtime_identity_index,
+    is_runtime_auxiliary_task,
 )
 from opc.layer2_organization.work_item_context_view import WorkItemContextView
 from opc.layer2_organization.work_item_identity import (
@@ -1530,6 +1531,8 @@ def _primary_session_tasks_by_session_id(
     primary_tasks_by_session_id: dict[str, Any] = {}
     ordered_session_ids: list[str] = []
     for task in tasks:
+        if is_runtime_auxiliary_task(task):
+            continue
         task_id = str(getattr(task, "id", "") or "").strip()
         task_meta = (
             task_meta_map.get(task_id, {}) if task_meta_map is not None and task_id else _task_metadata(task)
@@ -2746,6 +2749,8 @@ async def reconcile_sessions(
     if not engine.store:
         return 0
 
+    tasks = [task for task in tasks if not is_runtime_auxiliary_task(task)]
+
     total_backfilled = 0
     hydrated = 0
     task_ids = {
@@ -2907,6 +2912,14 @@ async def build_project_index_sync(
         except Exception:
             logger.opt(exception=True).warning("Failed to load tasks for project index")
 
+    auxiliary_task_ids = {
+        str(getattr(task, "id", "") or "").strip()
+        for task in tasks
+        if is_runtime_auxiliary_task(task)
+        and str(getattr(task, "id", "") or "").strip()
+    }
+    tasks = [task for task in tasks if not is_runtime_auxiliary_task(task)]
+
     existing_task_ids = {
         str(getattr(task, "id", "") or "").strip()
         for task in tasks
@@ -2931,6 +2944,34 @@ async def build_project_index_sync(
         session_channels = list(resolved_session_channels) if isinstance(resolved_session_channels, list) else []
     else:
         session_channels = []
+    hidden_auxiliary_channel_ids = {
+        f"session:{task_id}" for task_id in auxiliary_task_ids
+    }
+    if hidden_auxiliary_channel_ids:
+        channels = [
+            channel
+            for channel in channels
+            if str(channel.get("channel_id", "") or "").strip()
+            not in hidden_auxiliary_channel_ids
+        ]
+        session_channels = [
+            channel
+            for channel in session_channels
+            if str(channel.get("channel_id", "") or "").strip()
+            not in hidden_auxiliary_channel_ids
+        ]
+        delete_channel = getattr(chat_store, "delete_channel", None)
+        if callable(delete_channel):
+            for channel_id in hidden_auxiliary_channel_ids:
+                try:
+                    deleted = delete_channel(channel_id, project_id=project_id)
+                    if inspect.isawaitable(deleted):
+                        await deleted
+                except Exception:
+                    logger.opt(exception=True).debug(
+                        "Failed to prune auxiliary runtime channel {}",
+                        channel_id,
+                    )
     session_channel_map = {ch["channel_id"]: ch for ch in session_channels}
     known_channel_ids = {
         str(ch.get("channel_id", "") or "").strip()
@@ -3003,7 +3044,8 @@ async def build_project_index_sync(
     all_task_meta_map = {str(getattr(t, "id", "") or ""): _task_metadata(t) for t in tasks}
     session_tasks = [
         t for t in tasks
-        if not bool(all_task_meta_map.get(str(getattr(t, "id", "") or ""), {}).get("review_task", False))
+        if not is_runtime_auxiliary_task(t)
+        and not bool(all_task_meta_map.get(str(getattr(t, "id", "") or ""), {}).get("review_task", False))
         and not (
             (canonical_id := _task_mode_origin_ui_task_id(
                 t,
@@ -3286,6 +3328,7 @@ async def build_collab_sync(
             tasks = await engine.store.get_tasks(project_id=project_id)
         except Exception:
             logger.warning("Failed to load tasks for collab_sync")
+    tasks = [task for task in tasks if not is_runtime_auxiliary_task(task)]
     company_board_tasks: list[dict[str, Any]] = []
     company_board_columns: list[dict[str, Any]] = []
     company_boards: list[dict[str, Any]] = []
@@ -3558,7 +3601,8 @@ async def build_collab_sync(
     }
     session_tasks = [
         t for t in tasks
-        if not bool(all_task_meta_map.get(str(getattr(t, "id", "") or ""), {}).get("review_task", False))
+        if not is_runtime_auxiliary_task(t)
+        and not bool(all_task_meta_map.get(str(getattr(t, "id", "") or ""), {}).get("review_task", False))
         and not (
             (canonical_id := _task_mode_origin_ui_task_id(
                 t,

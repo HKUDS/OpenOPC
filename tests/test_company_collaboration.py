@@ -1,9 +1,12 @@
 ﻿from __future__ import annotations
 
+import asyncio
+import copy
 import contextlib
 import json
 import os
 import shutil
+import sqlite3
 import unittest
 import uuid
 from datetime import datetime, timedelta
@@ -13,26 +16,28 @@ from typing import Any
 from unittest.mock import AsyncMock, patch
 
 from opc.core.config import EmployeeConfig, ExternalAgentConfig, OPCConfig, OrgConfig
+from opc.core.company_controller import CompanyRunControllerLeaseLost
 from opc.core.events import EventBus
 from opc.core.models import (
     AgentMessage,
+    ApprovalAction,
     ArtifactRecord,
     CompanyMemberSession,
     CommsSemanticType,
     CommsTransportKind,
+    DelegationRun,
     DelegationWorkItem,
     ExternalSession,
     ExecutionCheckpoint,
     ExecutionMode,
     MeetingStatus,
     MessageStatus,
-    MessageUrgency,
     Phase,
     RecruitmentCandidateRecommendation,
     RecruitmentPlan,
     RecruitmentProposal,
-    RoleMemoryRecord,
     RouterDecision,
+    RoleMemoryRecord,
     SeatState,
     Task,
     TaskResult,
@@ -41,6 +46,7 @@ from opc.core.models import (
 )
 from opc.database.store import OPCStore
 from opc.engine import OPCEngine
+from opc.layer0_interaction.coordinator import InteractionCoordinator
 from opc.layer1_perception.context_assembler import ContextAssembler
 from opc.layer3_agent.adapters.codex_adapter import CodexAdapter
 from opc.layer3_agent.adapters.opencode_adapter import OpenCodeAdapter
@@ -48,8 +54,10 @@ from opc.layer2_organization.communication import CommunicationManager
 from opc.layer2_organization import comms as file_comms
 from opc.layer2_organization.collaboration_service import CollaborationContext
 from opc.layer2_organization.company_mode import (
+    CompanyRuntimeSpec,
     CompanyRuntimeSpecBuilder,
     CompanyWorkItemExecutor,
+    deserialize_company_runtime_spec,
 )
 from opc.layer2_organization.company_runtime import CompanyRuntime
 from opc.layer2_organization.company_runtime_profiles import get_builtin_roles
@@ -61,9 +69,14 @@ from opc.layer2_organization.org_work_item_planner import (
     serialize_company_work_item_plan,
 )
 from opc.layer2_organization.work_item_links import linked_work_item_id_for_task, set_linked_work_item_id
-from opc.layer4_tools.collaboration import _serialize_board_item, create_collaboration_tools
+from opc.layer4_tools.collaboration import (
+    _serialize_board_item,
+    build_external_cli_tool_contract_lines,
+    create_collaboration_tools,
+)
 from opc.layer4_tools.registry import ToolDefinition
 from opc.layer5_memory.memory_manager import MemoryManager
+from opc.llm.provider import ProviderQuotaExhaustedError
 
 
 @contextlib.contextmanager
@@ -74,6 +87,45 @@ def _workspace_tempdir() -> Path:
         yield base
     finally:
         shutil.rmtree(base, ignore_errors=True)
+
+
+def _atomic_delegate_item(
+    work_item_id: str,
+    *,
+    invocation_id: str,
+    invocation_index: int,
+    batch_id: str = "stable-business-batch",
+    parent_work_item_id: str = "parent-item",
+    source_seat_id: str = "seat::team::chief::chief",
+    work_kind: str = "execute",
+) -> DelegationWorkItem:
+    return DelegationWorkItem(
+        work_item_id=work_item_id,
+        run_id="run-atomic-delegate",
+        cell_id="team::worker",
+        team_id="team::worker",
+        role_id="worker",
+        seat_id=f"seat::team::worker::{work_item_id}",
+        parent_work_item_id=parent_work_item_id,
+        source_role_id="chief",
+        source_seat_id=source_seat_id,
+        title=work_item_id,
+        kind=work_kind,
+        projection_id=work_item_id,
+        phase=Phase.READY,
+        batch_id=batch_id,
+        batch_index=invocation_index,
+        manager_role_id="chief",
+        manager_seat_id=source_seat_id,
+        metadata={
+            "created_by_delegate_work": True,
+            "delegate_invocation_id": invocation_id,
+            "delegate_invocation_index": invocation_index,
+            "created_by_seat_id": source_seat_id,
+            "manager_board_parent_work_item_id": parent_work_item_id,
+            "scope_key": work_item_id,
+        },
+    )
 
 
 class DummyOrgEngine:
@@ -275,6 +327,148 @@ class DummySelectionLLM:
 
 
 class CompanyCollaborationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_dispatch_reload_excludes_durable_runtime_auxiliary_tasks(
+        self,
+    ) -> None:
+        business_task = Task(
+            id="work-task",
+            title="Business work",
+            session_id="role-session",
+            parent_session_id="root-session",
+            project_id="proj1",
+            metadata={"delegation_run_id": "run-1"},
+        )
+        auxiliary = Task(
+            id="work-task::ceo_pre_delivery_assessment::aux",
+            title="Internal assessment",
+            session_id="role-session:aux:ceo_pre_delivery_assessment:aux",
+            parent_session_id="role-session",
+            parent_id=business_task.id,
+            project_id="proj1",
+            metadata={
+                "delegation_run_id": "run-1",
+                "runtime_auxiliary_task": True,
+                "company_runtime_auxiliary_task": True,
+                "runtime_auxiliary_kind": "role_prompt",
+                "runtime_auxiliary_source_task_id": business_task.id,
+            },
+        )
+        unrelated = Task(
+            id="other-task",
+            title="Other run",
+            session_id="root-session",
+            project_id="proj1",
+            metadata={"delegation_run_id": "run-2"},
+        )
+
+        selected = CompanyWorkItemExecutor._tasks_for_company_dispatch_reload(
+            [business_task, auxiliary, unrelated],
+            [business_task],
+            parent_session_id="root-session",
+        )
+
+        self.assertEqual(selected, [business_task])
+
+    async def _open_real_store(self, label: str) -> OPCStore:
+        root = Path.cwd() / ".tmp-test" / f"{label}-{uuid.uuid4().hex}"
+        root.mkdir(parents=True, exist_ok=True)
+        self.addCleanup(shutil.rmtree, root, True)
+        store = OPCStore(root / "tasks.db")
+        await store.initialize()
+        self.addAsyncCleanup(store.close)
+        return store
+
+    @staticmethod
+    async def _publish_delivery_interaction(
+        store: OPCStore,
+        checkpoint: ExecutionCheckpoint,
+    ) -> ExecutionCheckpoint:
+        payload = dict(checkpoint.payload or {})
+        waiting_task_id = str(
+            payload.get("waiting_task_id") or checkpoint.task_id or ""
+        ).strip()
+        waiting_task = await store.get_task(waiting_task_id) if waiting_task_id else None
+        interaction = dict(payload.get("interaction", {}) or {})
+        domain_key = str(
+            interaction.get("domain_key")
+            or f"test-delivery:{checkpoint.checkpoint_id}"
+        ).strip()
+        ownership = dict(interaction.get("ownership", {}) or {})
+        ownership.setdefault("waiting_task_id", waiting_task_id)
+        waiting_session_id = str(
+            checkpoint.session_id
+            or getattr(waiting_task, "session_id", "")
+            or ""
+        ).strip()
+        if waiting_session_id:
+            ownership.setdefault("waiting_session_id", waiting_session_id)
+        interaction.update({
+            "kind": "company_delivery_feedback",
+            "domain_key": domain_key,
+            "ownership": ownership,
+        })
+        payload["interaction"] = interaction
+        checkpoint.payload = payload
+        persisted, _created = await store.publish_owner_interaction_checkpoint(
+            checkpoint,
+            interaction_key=domain_key,
+            supersede_pending_scope=False,
+        )
+        return persisted
+
+    @staticmethod
+    async def _consume_delivery_interaction(
+        engine: OPCEngine,
+        checkpoint: ExecutionCheckpoint,
+        *,
+        action: str,
+        feedback: str = "",
+    ) -> tuple[ExecutionCheckpoint, str]:
+        assert engine.store is not None
+        engine.interaction_coordinator = InteractionCoordinator(
+            store=engine.store,
+            project_id=checkpoint.project_id,
+        )
+        engine._initialized = True
+        engine._schedule_interaction_consumption = lambda *_args: None
+        text = str(feedback or action).strip()
+        decision = {
+            "checkpoint_reply_kind": action,
+            "option_id": action,
+            "text": text,
+        }
+        if action == "feedback":
+            decision["human_feedback_text"] = text
+        waiting_task = (
+            await engine.store.get_task(str(checkpoint.task_id or ""))
+            if checkpoint.task_id
+            else None
+        )
+        root_session_id = str(
+            getattr(waiting_task, "parent_session_id", "") or ""
+        ).strip()
+        receipt = await engine.submit_checkpoint_decision(
+            checkpoint_id=checkpoint.checkpoint_id,
+            checkpoint_type=checkpoint.checkpoint_type,
+            decision=decision,
+            client_request_id=f"test:{checkpoint.checkpoint_id}:{action}",
+            requester_task_id=("" if root_session_id else str(checkpoint.task_id or "")),
+            requester_session_id=root_session_id or checkpoint.session_id,
+        )
+        assert receipt["accepted"], receipt
+        await engine._consume_answered_interaction(
+            checkpoint.checkpoint_id,
+            checkpoint.checkpoint_type,
+        )
+        persisted = await engine.store.get_execution_checkpoint(
+            checkpoint.checkpoint_id,
+            project_id=checkpoint.project_id,
+            checkpoint_type=checkpoint.checkpoint_type,
+        )
+        assert persisted is not None
+        result = dict(persisted.payload.get("interaction_result", {}) or {})
+        return persisted, str(result.get("message", "") or "")
+
     @staticmethod
     def _self_evolution_runtime_topology(
         *,
@@ -378,8 +572,77 @@ class CompanyCollaborationTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(root_work_item.metadata["allowed_delegate_role_ids"], ["cto", "cmo", "coo"])
             run = await store.get_delegation_run(run_id)
             assert run is not None
+            self.assertEqual(run.execution_model, "actor_runtime")
+            self.assertEqual(run.metadata["runtime_model"], "multi_team_org")
+            self.assertEqual(run.metadata["source"], "multi_team_org")
             self.assertEqual(run.metadata["company_work_item_plan"]["root_projection_id"], plan.root_projection_id)
             await store.close()
+
+            reopened_store = OPCStore(Path(tmpdir) / "tasks.db")
+            await reopened_store.initialize()
+            try:
+                reopened_run = await reopened_store.get_delegation_run(run_id)
+                assert reopened_run is not None
+                self.assertEqual(reopened_run.execution_model, "actor_runtime")
+                self.assertEqual(reopened_run.metadata["runtime_model"], "multi_team_org")
+            finally:
+                await reopened_store.close()
+
+    async def test_custom_actor_runtime_bootstrap_survives_sqlite_reopen(self) -> None:
+        with _workspace_tempdir() as tmpdir:
+            db_path = Path(tmpdir) / "tasks.db"
+            store = OPCStore(db_path)
+            await store.initialize()
+            config = OPCConfig()
+            config.org.company_profile = "custom"
+            config.org.execution_model = "actor_runtime"
+            org = OrgEngine(config, Path(tmpdir))
+            engine = OPCEngine(config=config, opc_home=Path(tmpdir), project_id="proj1")
+            engine.store = store
+            engine.org_engine = org
+
+            run_id, _root_work_item = await engine._bootstrap_runtime_delegation_run(
+                session_id="sess-custom-actor-runtime",
+                project_id="proj1",
+                runtime_spec=CompanyRuntimeSpec(
+                    profile="custom",
+                    metadata={
+                        "execution_model": "actor_runtime",
+                        "runtime_model": "multi_team_org",
+                        "source": "work_item_runtime",
+                    },
+                ),
+                original_message="Analyze an investment target",
+                runtime_topology={
+                    "company_profile": "custom",
+                    "final_decider_role_id": "principal",
+                    "top_level_role_ids": ["principal"],
+                    "teams": [],
+                    "seats": [],
+                },
+                work_item_plan=None,
+                delegation_playbook={},
+                target_output_dir=None,
+                comms_workspace_root="",
+                force_native_execution=True,
+            )
+            await store.close()
+
+            reopened_store = OPCStore(db_path)
+            await reopened_store.initialize()
+            try:
+                run = await reopened_store.get_delegation_run(run_id)
+                assert run is not None
+                self.assertEqual(run.company_profile, "custom")
+                self.assertEqual(run.execution_model, "actor_runtime")
+                self.assertEqual(run.metadata["runtime_model"], "multi_team_org")
+                self.assertEqual(run.metadata["source"], "multi_team_org")
+                self.assertEqual(
+                    run.metadata["runtime_spec"]["metadata"]["execution_model"],
+                    "actor_runtime",
+                )
+            finally:
+                await reopened_store.close()
 
     async def test_company_runtime_persists_member_session_across_same_role_work_items(self) -> None:
         runtime = CompanyRuntime(
@@ -608,6 +871,183 @@ class CompanyCollaborationTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(work_item.work_item_id, runtime._claimed_work_item_ids)
         claim.assert_awaited_once()
 
+    async def test_company_runtime_claim_exclusions_preserve_queue_until_owner_harvest(self) -> None:
+        runtime = CompanyRuntime(
+            org_engine=DummyOrgEngine(),
+            communication=DummyRuntimeCommunication(),
+        )
+        task = Task(
+            id="tail-owned-task",
+            title="Tail-owned work item",
+            session_id="root-a",
+            parent_session_id="root-a",
+            assigned_to="executor",
+            status=TaskStatus.PENDING,
+            project_id="proj1",
+            metadata={
+                "work_item_projection_id": "tail_owned_execution",
+                "work_item_role_id": "executor",
+                "employee_assignment": {
+                    "employee_id": "backend-architect",
+                    "role_id": "executor",
+                },
+            },
+        )
+        set_linked_work_item_id(task, "tail-owned-work-item")
+        work_item = DelegationWorkItem(
+            work_item_id="tail-owned-work-item",
+            run_id="run-1",
+            cell_id="cell-1",
+            role_id="executor",
+            projection_id="tail_owned_execution",
+            phase=Phase.READY_FOR_REWORK,
+        )
+        await runtime.bootstrap([task])
+        session = runtime.session_for_task(task)
+        runtime.enqueue_runnable_work_items(
+            [work_item],
+            task_by_work_item_id={work_item.work_item_id: task},
+        )
+        queue = runtime.role_queues[runtime._queue_key_for_task(task)]
+        expected_queue = list(queue)
+
+        async def claim_work_item(*_args: object, **kwargs: object) -> DelegationWorkItem:
+            role_session_id = str(kwargs["role_runtime_session_id"])
+            work_item.phase = Phase.RUNNING
+            work_item.claimed_by_role_runtime_session_id = role_session_id
+            work_item.metadata = {
+                **dict(work_item.metadata or {}),
+                "claimed_by_role_session_id": role_session_id,
+                "claimed_task_id": str(kwargs["task_id"]),
+            }
+            return work_item
+
+        claim = AsyncMock(side_effect=claim_work_item)
+        runtime.store = SimpleNamespace(
+            is_ready=True,
+            claim_delegation_work_item_if_dispatchable=claim,
+            save_delegation_role_session=AsyncMock(),
+        )
+
+        self.assertEqual(
+            await runtime.claim_runnable_tasks(
+                [task],
+                work_items=[work_item],
+                excluded_task_ids={task.id},
+            ),
+            [],
+        )
+        self.assertEqual(list(queue), expected_queue)
+        self.assertEqual(
+            await runtime.claim_runnable_tasks(
+                [task],
+                work_items=[work_item],
+                excluded_work_item_ids={work_item.work_item_id},
+            ),
+            [],
+        )
+        self.assertEqual(list(queue), expected_queue)
+        self.assertEqual(
+            await runtime.claim_runnable_tasks(
+                [task],
+                work_items=[work_item],
+                excluded_member_session_ids={session.member_session_id},
+            ),
+            [],
+        )
+        self.assertEqual(list(queue), expected_queue)
+        self.assertEqual(
+            await runtime.claim_runnable_tasks(
+                [task],
+                work_items=[work_item],
+                excluded_role_session_ids={session.role_session_id},
+            ),
+            [],
+        )
+        self.assertEqual(list(queue), expected_queue)
+        claim.assert_not_awaited()
+
+        claims = await runtime.claim_runnable_tasks(
+            [task],
+            work_items=[work_item],
+        )
+
+        self.assertEqual(len(claims), 1)
+        self.assertEqual(claims[0][1].id, task.id)
+        claim.assert_awaited_once()
+
+    async def test_role_session_exclusion_blocks_another_employee_on_shared_role_queue(self) -> None:
+        runtime = CompanyRuntime(
+            org_engine=DummyOrgEngine(),
+            communication=DummyRuntimeCommunication(),
+        )
+        common_metadata = {
+            "work_item_role_id": "executor",
+            "session_scope_id": "root-a",
+            "delegation_run_id": "run-1",
+        }
+        first = Task(
+            id="employee-a-task",
+            title="Employee A",
+            session_id="root-a",
+            parent_session_id="root-a",
+            assigned_to="executor",
+            status=TaskStatus.PENDING,
+            project_id="proj1",
+            metadata={
+                **common_metadata,
+                "work_item_projection_id": "employee_a",
+                "employee_assignment": {
+                    "employee_id": "employee-a",
+                    "role_id": "executor",
+                },
+            },
+        )
+        second = Task(
+            id="employee-b-task",
+            title="Employee B",
+            session_id="root-a",
+            parent_session_id="root-a",
+            assigned_to="executor",
+            status=TaskStatus.PENDING,
+            project_id="proj1",
+            metadata={
+                **common_metadata,
+                "work_item_projection_id": "employee_b",
+                "employee_assignment": {
+                    "employee_id": "employee-b",
+                    "role_id": "executor",
+                },
+            },
+        )
+        await runtime.bootstrap([first, second])
+        first_session = runtime.session_for_task(first)
+        second_session = runtime.session_for_task(second)
+        self.assertNotEqual(
+            first_session.member_session_id,
+            second_session.member_session_id,
+        )
+        self.assertEqual(
+            first_session.role_session_id,
+            second_session.role_session_id,
+        )
+        runtime.enqueue_runnable_tasks([second])
+        queue = runtime.role_queues[runtime._queue_key_for_task(second)]
+        expected_queue = list(queue)
+
+        claims = await runtime.claim_runnable_tasks(
+            [first, second],
+            excluded_member_session_ids={first_session.member_session_id},
+            excluded_role_session_ids={first_session.role_session_id},
+        )
+
+        self.assertEqual(claims, [])
+        self.assertEqual(list(queue), expected_queue)
+
+        claims = await runtime.claim_runnable_tasks([first, second])
+        self.assertEqual(len(claims), 1)
+        self.assertEqual(claims[0][1].id, second.id)
+
     async def test_company_runtime_does_not_double_claim_same_work_item(self) -> None:
         runtime = CompanyRuntime(
             org_engine=DummyOrgEngine(),
@@ -707,6 +1147,44 @@ class CompanyCollaborationTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(hasattr(builder, "build_plan"))
         self.assertFalse(hasattr(builder, "build_" + "task_dicts"))
+
+    def test_runtime_spec_keeps_public_execution_and_internal_runtime_models_separate(self) -> None:
+        config = OPCConfig()
+        config.org.execution_model = "actor_runtime"
+        builder = CompanyRuntimeSpecBuilder(OrgEngine(config))
+
+        spec = builder.build_spec(
+            RouterDecision(
+                mode=ExecutionMode.COMPANY_MODE,
+                company_profile="corporate",
+            ),
+            original_message="Analyze an investment target.",
+        )
+
+        self.assertEqual(spec.metadata["execution_model"], "actor_runtime")
+        self.assertEqual(spec.metadata["runtime_model"], "multi_team_org")
+        self.assertEqual(spec.runtime_model, "multi_team_org")
+
+    def test_runtime_spec_legacy_deserialization_never_treats_actor_runtime_as_scheduler(self) -> None:
+        public_only = deserialize_company_runtime_spec(
+            {"metadata": {"execution_model": "actor_runtime"}}
+        )
+        legacy_internal = deserialize_company_runtime_spec(
+            {"metadata": {"execution_model": "multi_team_org"}}
+        )
+        canonical_internal = deserialize_company_runtime_spec(
+            {
+                "metadata": {
+                    "execution_model": "multi_team_org",
+                    "runtime_model": "future_scheduler",
+                }
+            }
+        )
+
+        self.assertEqual(public_only.runtime_model, "multi_team_org")
+        self.assertEqual(public_only.metadata["execution_model"], "actor_runtime")
+        self.assertEqual(legacy_internal.runtime_model, "multi_team_org")
+        self.assertEqual(canonical_internal.runtime_model, "future_scheduler")
 
     def test_corporate_roles_include_acquisition_specialist_under_coo(self) -> None:
         role_by_id = {role.id: role for role in get_builtin_roles("corporate")}
@@ -1886,6 +2364,49 @@ class CompanyCollaborationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(task.metadata["verification_status"]["label"], "not_verified")
         self.assertEqual(result.status, TaskStatus.DONE)
 
+    def test_runtime_verifier_evidence_preserves_quality_outcome(self) -> None:
+        executor = CompanyWorkItemExecutor(
+            org_engine=DummyOrgEngine(),
+            communication=SimpleNamespace(),
+            approval_engine=SimpleNamespace(),
+            memory=None,
+            execute_task=AsyncMock(),
+            save_task=AsyncMock(),
+        )
+        task = Task(
+            id="verification-status-mapping",
+            title="Verification status mapping",
+            project_id="proj1",
+            metadata={"work_item_verification_required": True},
+        )
+        cases = (
+            ("provided", "pass", "verified"),
+            ("provided", "fail", "failed"),
+            ("provided", "partial", "partial"),
+            ("unavailable", "partial", "not_verified"),
+        )
+
+        for evidence_status, verdict, expected_label in cases:
+            with self.subTest(status=evidence_status, verdict=verdict):
+                status = executor._build_verification_status(
+                    task,
+                    TaskResult(
+                        status=TaskStatus.DONE,
+                        content="completed",
+                        artifacts={
+                            "verification_evidence": {
+                                "status": evidence_status,
+                                "verdict": verdict,
+                                "summary": f"{evidence_status} {verdict}",
+                            }
+                        },
+                    ),
+                    review_verdict={},
+                )
+
+                self.assertEqual(status["label"], expected_label)
+                self.assertEqual(status["source"], "runtime_verifier_evidence")
+
     async def test_company_executor_pauses_before_learning_when_feedback_is_required(self) -> None:
         memory = DummyMemory()
         checkpoints: list[dict[str, object]] = []
@@ -2377,7 +2898,7 @@ class CompanyCollaborationTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_run_work_item_without_gate_emits_completed_work_item_progress(self) -> None:
         progress_events: list[tuple[str, str | None]] = []
-        saved_statuses: list[TaskStatus] = []
+        saved_tasks: list[Task] = []
 
         async def execute_task(task: Task) -> TaskResult:
             result = TaskResult(
@@ -2390,7 +2911,7 @@ class CompanyCollaborationTests(unittest.IsolatedAsyncioTestCase):
             return result
 
         async def save_task(task: Task) -> None:
-            saved_statuses.append(task.status)
+            saved_tasks.append(copy.deepcopy(task))
 
         async def progress_callback(message: str, task_id: str | None = None) -> None:
             progress_events.append((message, task_id))
@@ -2426,7 +2947,31 @@ class CompanyCollaborationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(task.status, TaskStatus.DONE)
         self.assertIn("Work item completed by role executor.", task.metadata["progress_log"])
         self.assertIn(("[Company:implementation] completed", "implementation-task"), progress_events)
-        self.assertEqual(saved_statuses, [TaskStatus.RUNNING, TaskStatus.DONE])
+        self.assertEqual(
+            [saved.status for saved in saved_tasks],
+            [
+                TaskStatus.RUNNING,
+                TaskStatus.RUNNING,
+                TaskStatus.DONE,
+                TaskStatus.DONE,
+            ],
+        )
+        output_preimage, finalized = saved_tasks[-2:]
+        self.assertNotIn("gate_harness_decision", output_preimage.metadata)
+        self.assertNotIn("gate_harness_status", output_preimage.metadata)
+        self.assertEqual(
+            output_preimage.result,
+            {"content": "Implementation complete.", "artifacts": {}},
+        )
+        self.assertEqual(finalized.metadata["gate_harness_status"], "passed")
+        self.assertEqual(
+            finalized.metadata["gate_harness_decision"]["action"],
+            "pass",
+        )
+        self.assertNotEqual(
+            output_preimage.metadata,
+            finalized.metadata,
+        )
 
     async def test_assign_task_execution_agent_prefers_llm_decision(self) -> None:
         engine = OPCEngine()
@@ -2471,7 +3016,7 @@ class CompanyCollaborationTests(unittest.IsolatedAsyncioTestCase):
             project_id="proj1",
         )
 
-        selected = await engine._assign_task_execution_agent(task)
+        await engine._assign_task_execution_agent(task)
 
         # No LLM call attempted; selection comes from rule-based fallback.
         self.assertEqual(len(engine.llm.calls), 0)
@@ -2591,9 +3136,10 @@ class CompanyCollaborationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(task.metadata["agent_selection"]["selection_source"], "fallback_rules")
         self.assertEqual(task.metadata["agent_selection"]["llm_attempts"], 3)
 
-    async def test_assign_task_execution_agent_prefers_native_for_company_execute_native_first(self) -> None:
+    async def test_assign_task_execution_agent_enforces_native_for_company(self) -> None:
         engine = OPCEngine()
         engine.org_engine = DummyOrgEngine()
+        engine.store = SimpleNamespace(save_task=AsyncMock())
         adapter = SimpleNamespace(supports_interactive=lambda: True)
         engine.adapter_registry = SimpleNamespace(
             list_available=lambda: ["codex", "cursor"],
@@ -2619,8 +3165,15 @@ class CompanyCollaborationTests(unittest.IsolatedAsyncioTestCase):
         selected = await engine._assign_task_execution_agent(task)
 
         self.assertIsNone(selected)
-        self.assertEqual(task.metadata["agent_selection"]["decision_reason"], "company_execute_native_first")
-        self.assertEqual(task.metadata["agent_selection"]["selection_source"], "fallback_rules")
+        engine.store.save_task.assert_awaited_once_with(task)
+        self.assertEqual(
+            task.metadata["agent_selection"]["decision_reason"],
+            "company_external_execution_forbidden",
+        )
+        self.assertEqual(
+            task.metadata["agent_selection"]["selection_source"],
+            "company_isolation_boundary",
+        )
 
     async def test_company_executor_uses_agent_selector_callback(self) -> None:
         with _workspace_tempdir() as tmpdir:
@@ -3098,39 +3651,10 @@ class CompanyCollaborationTests(unittest.IsolatedAsyncioTestCase):
                 "plan": {"profile": "corporate", "final_decider_role_id": "reviewer", "projections": []},
             },
         )
-
-        class DummyStore:
-            def __init__(self, tasks: list[Task], checkpoint: ExecutionCheckpoint) -> None:
-                self.tasks = {task.id: task for task in tasks}
-                self.checkpoint = checkpoint
-                self.work_items: dict[str, DelegationWorkItem] = {}
-
-            async def get_task(self, task_id: str) -> Task | None:
-                return self.tasks.get(task_id)
-
-            async def save_task(self, task: Task) -> None:
-                self.tasks[task.id] = task
-
-            async def resolve_execution_checkpoint(self, checkpoint_id: str, status: str = "resolved") -> None:
-                if checkpoint_id == self.checkpoint.checkpoint_id:
-                    self.checkpoint.status = status
-
-            async def save_execution_checkpoint(self, checkpoint: ExecutionCheckpoint) -> None:
-                self.checkpoint = checkpoint
-
-            async def get_latest_pending_checkpoint(self, project_id: str) -> ExecutionCheckpoint | None:
-                if project_id == self.checkpoint.project_id and self.checkpoint.status == "pending":
-                    return self.checkpoint
-                return None
-
-            async def save_delegation_work_item(self, item: DelegationWorkItem) -> None:
-                self.work_items[item.work_item_id] = item
-
-            async def list_delegation_work_items(self, run_id: str) -> list[DelegationWorkItem]:
-                return [item for item in self.work_items.values() if item.run_id == run_id]
-
-            async def get_delegation_work_item(self, work_item_id: str) -> DelegationWorkItem | None:
-                return self.work_items.get(work_item_id)
+        store = await self._open_real_store("delivery-self-evolution-only")
+        await store.save_task(execution_task)
+        await store.save_task(waiting_task)
+        checkpoint = await self._publish_delivery_interaction(store, checkpoint)
 
         resumed_tasks: list[Task] = []
 
@@ -3168,13 +3692,18 @@ class CompanyCollaborationTests(unittest.IsolatedAsyncioTestCase):
 
         engine = OPCEngine()
         engine.project_id = "proj1"
-        engine.store = DummyStore([execution_task, waiting_task], checkpoint)
+        engine.store = store
         engine.memory = DummyFeedbackMemory()
         engine.company_executor = DummyExecutor()
         engine.llm = DummySelectionLLM(responses=[AssertionError("delivery feedback should not be classified")])
         engine._run_role_prompt_via_task_execution_agent = AsyncMock(return_value='{"patches":[]}')  # type: ignore[method-assign]
 
-        response = await engine._resume_company_feedback_checkpoint(checkpoint, "Please continue with mobile-first refinements.")
+        _terminal_checkpoint, response = await self._consume_delivery_interaction(
+            engine,
+            checkpoint,
+            action="feedback",
+            feedback="Please continue with mobile-first refinements.",
+        )
         refreshed = await engine.store.get_task(waiting_task.id)
 
         self.assertIn("Self-evolution completed", response)
@@ -3272,7 +3801,10 @@ class CompanyCollaborationTests(unittest.IsolatedAsyncioTestCase):
                     )
                 )
                 await store.link_work_item_runtime_task("delivery-wi-sidecar", waiting_task.id)
-                await store.save_execution_checkpoint(checkpoint)
+                checkpoint = await self._publish_delivery_interaction(
+                    store,
+                    checkpoint,
+                )
 
                 patch_json = json.dumps({
                     "patches": [
@@ -3313,7 +3845,8 @@ class CompanyCollaborationTests(unittest.IsolatedAsyncioTestCase):
                     store=store,
                 )
 
-                response = await engine.run_company_delivery_self_evolution_checkpoint(
+                _terminal_checkpoint, response = await self._consume_delivery_interaction(
+                    engine,
                     checkpoint,
                     action="approve",
                 )
@@ -3492,7 +4025,10 @@ class CompanyCollaborationTests(unittest.IsolatedAsyncioTestCase):
                         "plan": {"profile": "corporate", "final_decider_role_id": "ceo", "projections": []},
                     },
                 )
-                await store.save_execution_checkpoint(checkpoint)
+                checkpoint = await self._publish_delivery_interaction(
+                    store,
+                    checkpoint,
+                )
 
                 class DummyExecutor:
                     def __init__(self) -> None:
@@ -3520,7 +4056,11 @@ class CompanyCollaborationTests(unittest.IsolatedAsyncioTestCase):
                 engine.llm = DummySelectionLLM(responses=[AssertionError("approval should be handled by the final-decider runtime")])
                 engine._run_role_prompt_via_task_execution_agent = AsyncMock(return_value='{"patches":[]}')  # type: ignore[method-assign]
 
-                response = await engine._resume_company_feedback_checkpoint(checkpoint, "I approve this delivery.")
+                _terminal_checkpoint, response = await self._consume_delivery_interaction(
+                    engine,
+                    checkpoint,
+                    action="approve",
+                )
                 refreshed_task = await store.get_task(waiting_task.id)
                 refreshed_item = await store.get_delegation_work_item("delivery-wi")
                 checkpoints = await store.get_execution_checkpoints("proj1")
@@ -3610,7 +4150,10 @@ class CompanyCollaborationTests(unittest.IsolatedAsyncioTestCase):
                         "plan": {"profile": "corporate", "final_decider_role_id": "ceo", "projections": []},
                     },
                 )
-                await store.save_execution_checkpoint(checkpoint)
+                checkpoint = await self._publish_delivery_interaction(
+                    store,
+                    checkpoint,
+                )
 
                 class DummyExecutor:
                     def __init__(self) -> None:
@@ -3647,9 +4190,11 @@ class CompanyCollaborationTests(unittest.IsolatedAsyncioTestCase):
                 )
                 engine._run_role_prompt_via_task_execution_agent = AsyncMock(return_value='{"patches":[]}')  # type: ignore[method-assign]
 
-                response = await engine._resume_company_feedback_checkpoint(
+                _terminal_checkpoint, response = await self._consume_delivery_interaction(
+                    engine,
                     checkpoint,
-                    "I do not accept this delivery; I want changes.",
+                    action="feedback",
+                    feedback="I do not accept this delivery; I want changes.",
                 )
                 refreshed_task = await store.get_task(waiting_task.id)
                 refreshed_item = await store.get_delegation_work_item("delivery-wi")
@@ -3820,39 +4365,10 @@ class CompanyCollaborationTests(unittest.IsolatedAsyncioTestCase):
                 "plan": {"profile": "corporate", "final_decider_role_id": "reviewer", "projections": []},
             },
         )
-
-        class DummyStore:
-            def __init__(self, tasks: list[Task], checkpoint: ExecutionCheckpoint) -> None:
-                self.tasks = {task.id: task for task in tasks}
-                self.checkpoint = checkpoint
-                self.work_items: dict[str, DelegationWorkItem] = {}
-
-            async def get_task(self, task_id: str) -> Task | None:
-                return self.tasks.get(task_id)
-
-            async def save_task(self, task: Task) -> None:
-                self.tasks[task.id] = task
-
-            async def resolve_execution_checkpoint(self, checkpoint_id: str, status: str = "resolved") -> None:
-                if checkpoint_id == self.checkpoint.checkpoint_id:
-                    self.checkpoint.status = status
-
-            async def save_execution_checkpoint(self, checkpoint: ExecutionCheckpoint) -> None:
-                self.checkpoint = checkpoint
-
-            async def get_latest_pending_checkpoint(self, project_id: str) -> ExecutionCheckpoint | None:
-                if project_id == self.checkpoint.project_id and self.checkpoint.status == "pending":
-                    return self.checkpoint
-                return None
-
-            async def save_delegation_work_item(self, item: DelegationWorkItem) -> None:
-                self.work_items[item.work_item_id] = item
-
-            async def list_delegation_work_items(self, run_id: str) -> list[DelegationWorkItem]:
-                return [item for item in self.work_items.values() if item.run_id == run_id]
-
-            async def get_delegation_work_item(self, work_item_id: str) -> DelegationWorkItem | None:
-                return self.work_items.get(work_item_id)
+        store = await self._open_real_store("delivery-feedback-question")
+        await store.save_task(execution_task)
+        await store.save_task(waiting_task)
+        checkpoint = await self._publish_delivery_interaction(store, checkpoint)
 
         class DummyExecutor:
             def __init__(self) -> None:
@@ -3875,14 +4391,19 @@ class CompanyCollaborationTests(unittest.IsolatedAsyncioTestCase):
 
         engine = OPCEngine()
         engine.project_id = "proj1"
-        engine.store = DummyStore([execution_task, waiting_task], checkpoint)
+        engine.store = store
         engine.memory = DummyFeedbackMemory()
         executor = DummyExecutor()
         engine.company_executor = executor
         engine.llm = DummySelectionLLM(responses=[AssertionError("question should resume the final-decider runtime")])
         engine._run_role_prompt_via_task_execution_agent = AsyncMock(return_value='{"patches":[]}')  # type: ignore[method-assign]
 
-        response = await engine._resume_company_feedback_checkpoint(checkpoint, "Why is this still a known limitation?")
+        _terminal_checkpoint, response = await self._consume_delivery_interaction(
+            engine,
+            checkpoint,
+            action="feedback",
+            feedback="Why is this still a known limitation?",
+        )
         refreshed = await engine.store.get_task(waiting_task.id)
         pending = await engine.store.get_latest_pending_checkpoint("proj1")
 
@@ -3998,44 +4519,15 @@ class CompanyCollaborationTests(unittest.IsolatedAsyncioTestCase):
                 "plan": plan,
             },
         )
-
-        class DummyStore:
-            def __init__(self, tasks: list[Task], checkpoint: ExecutionCheckpoint) -> None:
-                self.tasks = {task.id: task for task in tasks}
-                self.checkpoint = checkpoint
-                self.work_items: dict[str, DelegationWorkItem] = {}
-
-            async def get_task(self, task_id: str) -> Task | None:
-                return self.tasks.get(task_id)
-
-            async def save_task(self, task: Task) -> None:
-                self.tasks[task.id] = task
-
-            async def resolve_execution_checkpoint(self, checkpoint_id: str, status: str = "resolved") -> None:
-                if checkpoint_id == self.checkpoint.checkpoint_id:
-                    self.checkpoint.status = status
-
-            async def save_execution_checkpoint(self, checkpoint: ExecutionCheckpoint) -> None:
-                self.checkpoint = checkpoint
-
-            async def get_latest_pending_checkpoint(self, project_id: str) -> ExecutionCheckpoint | None:
-                if project_id == self.checkpoint.project_id and self.checkpoint.status == "pending":
-                    return self.checkpoint
-                return None
-
-            async def save_delegation_work_item(self, item: DelegationWorkItem) -> None:
-                self.work_items[item.work_item_id] = item
-
-            async def list_delegation_work_items(self, run_id: str) -> list[DelegationWorkItem]:
-                return [item for item in self.work_items.values() if item.run_id == run_id]
-
-            async def get_delegation_work_item(self, work_item_id: str) -> DelegationWorkItem | None:
-                return self.work_items.get(work_item_id)
+        store = await self._open_real_store("delivery-feedback-change-request")
+        await store.save_task(execution_task)
+        await store.save_task(waiting_task)
+        checkpoint = await self._publish_delivery_interaction(store, checkpoint)
 
         engine = OPCEngine()
         engine.project_id = "proj1"
         engine.on_progress = AsyncMock()
-        engine.store = DummyStore([execution_task, waiting_task], checkpoint)
+        engine.store = store
         engine.memory = DummyFeedbackMemory()
         engine.company_executor = CompanyWorkItemExecutor(
             org_engine=DummyOrgEngine(),
@@ -4059,7 +4551,12 @@ class CompanyCollaborationTests(unittest.IsolatedAsyncioTestCase):
         engine.llm = DummySelectionLLM(responses=[AssertionError("change request should resume the final-decider runtime")])
         engine._run_role_prompt_via_task_execution_agent = AsyncMock(return_value='{"patches":[]}')  # type: ignore[method-assign]
 
-        response = await engine._resume_company_feedback_checkpoint(checkpoint, "Please fix the edge case before I accept this.")
+        _terminal_checkpoint, response = await self._consume_delivery_interaction(
+            engine,
+            checkpoint,
+            action="feedback",
+            feedback="Please fix the edge case before I accept this.",
+        )
         refreshed_execution = await engine.store.get_task(execution_task.id)
         refreshed_delivery = await engine.store.get_task(waiting_task.id)
 
@@ -4425,7 +4922,7 @@ class CompanyCollaborationTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(coordinator_task.context_snapshot["meeting_decision_method"], "semantic_consensus")
             await store.close()
 
-    async def test_auto_resolve_stale_meeting_uses_owner_override_for_short_conflicts(self) -> None:
+    async def test_auto_resolve_stale_meeting_normalizes_legacy_owner_policy_to_owner_override(self) -> None:
         with _workspace_tempdir() as tmpdir:
             store = OPCStore(Path(tmpdir) / "tasks.db")
             await store.initialize()
@@ -4438,7 +4935,6 @@ class CompanyCollaborationTests(unittest.IsolatedAsyncioTestCase):
                             "decision": "Use SQLite",
                             "action_items": ["Proceed with additive migrations."],
                             "reasoning": "The decision owner prefers the local-first option.",
-                            "requires_human_input": False,
                             "follow_up_questions": [],
                         },
                         ensure_ascii=False,
@@ -4465,6 +4961,7 @@ class CompanyCollaborationTests(unittest.IsolatedAsyncioTestCase):
                 agenda=["Choose a v1 datastore"],
                 shared_context="Pick the v1 storage engine.",
                 timeout_seconds=60,
+                decision_policy="owner_then_human",
             )
             meeting = await store.get_meeting(pause["meeting_room_id"])
             assert meeting is not None
@@ -4481,13 +4978,26 @@ class CompanyCollaborationTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(coordinator_task.context_snapshot["meeting_outcome"]["decision"], "Use SQLite")
             await store.close()
 
-    async def test_auto_resolve_stale_meeting_escalates_to_human_when_vote_ties(self) -> None:
+    async def test_auto_resolve_stale_meeting_uses_owner_override_when_vote_ties(self) -> None:
         with _workspace_tempdir() as tmpdir:
             store = OPCStore(Path(tmpdir) / "tasks.db")
             await store.initialize()
             communication = CommunicationManager(store, EventBus())
+            turn_modes: list[tuple[str, str]] = []
 
             async def runner(_meeting: Any, participant: str, request: dict[str, Any]) -> str:
+                turn_modes.append((participant, request["mode"]))
+                if request["mode"] == "decision_owner":
+                    self.assertEqual(participant, "coordinator")
+                    return json.dumps(
+                        {
+                            "decision": "Use SQLite for v1",
+                            "action_items": ["Revisit scale assumptions before v2."],
+                            "reasoning": "The owner accepts the simpler operational path for v1.",
+                            "follow_up_questions": [],
+                        },
+                        ensure_ascii=False,
+                    )
                 self.assertEqual(request["mode"], "participant")
                 if participant == "executor":
                     return json.dumps(
@@ -4544,9 +5054,81 @@ class CompanyCollaborationTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual(resolved, [pause["meeting_room_id"]])
             assert refreshed is not None
-            self.assertEqual(refreshed.decision_method, "human_escalation")
-            self.assertEqual(coordinator_task.status, TaskStatus.AWAITING_HUMAN)
-            self.assertTrue(coordinator_task.context_snapshot["meeting_outcome"]["requires_human_input"])
+            self.assertEqual(refreshed.decision_method, "owner_override")
+            self.assertEqual(refreshed.outcome["decision"], "Use SQLite for v1")
+            self.assertEqual(coordinator_task.status, TaskStatus.PENDING)
+            self.assertIn(("coordinator", "decision_owner"), turn_modes)
+            self.assertNotIn("requires_human_input", refreshed.outcome)
+            self.assertEqual(await store.get_pending_checkpoints(project_id="proj1"), [])
+            await store.close()
+
+    async def test_native_owner_without_decision_closes_meeting_for_internal_retry(self) -> None:
+        with _workspace_tempdir() as tmpdir:
+            store = OPCStore(Path(tmpdir) / "tasks.db")
+            await store.initialize()
+            communication = CommunicationManager(store, EventBus())
+            engine = OPCEngine.__new__(OPCEngine)
+            engine.store = store
+            engine.project_id = "proj1"
+            engine.company_executor = None
+
+            async def run_native_agent(task: Task) -> TaskResult:
+                if task.metadata["meeting_turn_mode"] == "decision_owner":
+                    return TaskResult(status=TaskStatus.DONE, content="")
+                if task.assigned_to == "executor":
+                    content = (
+                        '{"stance":"agree","proposal":"SQLite","vote":"support",'
+                        '"reasoning":"SQLite is simpler.","blocking_issues":[],"assumptions":[],'
+                        '"questions_for_others":[]}'
+                    )
+                else:
+                    content = (
+                        '{"stance":"disagree","proposal":"Postgres","vote":"oppose",'
+                        '"reasoning":"Postgres scales better.","blocking_issues":["Scale posture is unresolved."],'
+                        '"assumptions":[],"questions_for_others":[]}'
+                    )
+                return TaskResult(status=TaskStatus.DONE, content=content)
+
+            engine._run_native_agent = run_native_agent
+            communication.set_meeting_turn_runner(engine._run_meeting_turn)
+            coordinator_task = Task(
+                id="meeting-task-no-owner-decision",
+                title="Architecture Sync",
+                project_id="proj1",
+                assigned_to="coordinator",
+                status=TaskStatus.PENDING,
+                metadata={"work_item_projection_id": "architecture_sync"},
+            )
+            await store.save_task(coordinator_task)
+
+            pause = await communication.open_meeting_wait(
+                task=coordinator_task,
+                topic="Database selection",
+                participants=["executor", "reviewer"],
+                agenda=["Choose a v1 datastore"],
+                shared_context="Pick the v1 storage engine.",
+                decision_policy="majority_vote",
+            )
+            meeting = await store.get_meeting(pause["meeting_room_id"])
+            assert meeting is not None
+            meeting.max_rounds = 1
+            await store.save_meeting(meeting)
+
+            resolved = await communication.auto_resolve_stale_meetings([coordinator_task])
+            refreshed = await store.get_meeting(pause["meeting_room_id"])
+
+            self.assertEqual(resolved, [pause["meeting_room_id"]])
+            assert refreshed is not None
+            self.assertEqual(refreshed.status, MeetingStatus.CLOSED)
+            self.assertEqual(refreshed.decision_method, "owner_unresolved")
+            self.assertEqual(refreshed.outcome["resolution_status"], "unresolved")
+            self.assertTrue(refreshed.outcome["retry_recommended"])
+            self.assertNotIn("requires_human_input", refreshed.outcome)
+            self.assertEqual(coordinator_task.status, TaskStatus.PENDING)
+            self.assertEqual(coordinator_task.context_snapshot["meeting_resolution_status"], "unresolved")
+            self.assertIn("meeting_internal_retry", coordinator_task.context_snapshot)
+            self.assertNotIn("meeting_requires_human_review", coordinator_task.context_snapshot)
+            self.assertEqual(await store.get_pending_checkpoints(project_id="proj1"), [])
             await store.close()
 
     async def test_runtime_scoped_inbox_reads_cross_work_item_messages(self) -> None:
@@ -4627,6 +5209,501 @@ class CompanyCollaborationTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(result["blocking_deprecated"])
             self.assertFalse(result.get("requires_peer_wait", False))
             self.assertEqual(task.status, TaskStatus.RUNNING)
+            await store.close()
+
+    async def test_atomic_delegate_append_assigns_same_call_sequence_after_commit(self) -> None:
+        with _workspace_tempdir() as tmpdir:
+            store = OPCStore(Path(tmpdir) / "tasks.db")
+            await store.initialize()
+            observed: list[tuple[str, bool]] = []
+
+            async def observe_phase(
+                previous_phase: Phase | None,
+                target_phase: Phase,
+                item: DelegationWorkItem,
+                *,
+                store: OPCStore,
+                **_kwargs: Any,
+            ) -> None:
+                self.assertIsNone(previous_phase)
+                self.assertEqual(target_phase, Phase.READY)
+                observed.append(
+                    (
+                        item.work_item_id,
+                        await store.get_delegation_work_item(item.work_item_id)
+                        is not None,
+                    )
+                )
+
+            items = [
+                _atomic_delegate_item(
+                    "same-call-developer",
+                    invocation_id="invocation-same-call",
+                    invocation_index=0,
+                ),
+                _atomic_delegate_item(
+                    "same-call-qa",
+                    invocation_id="invocation-same-call",
+                    invocation_index=1,
+                ),
+            ]
+            with patch(
+                "opc.database.store.on_phase_transition",
+                new=observe_phase,
+            ):
+                persisted = await store.append_delegated_work_items_atomically(
+                    items
+                )
+
+            self.assertEqual(
+                [item.metadata["delegate_sequence_index"] for item in persisted],
+                [0, 1],
+            )
+            self.assertEqual(
+                [item.metadata["delegate_invocation_index"] for item in persisted],
+                [0, 1],
+            )
+            self.assertEqual(
+                observed,
+                [("same-call-developer", True), ("same-call-qa", True)],
+            )
+            await store.close()
+
+    async def test_atomic_delegate_append_allocates_each_explicit_batch_group(self) -> None:
+        with _workspace_tempdir() as tmpdir:
+            store = OPCStore(Path(tmpdir) / "tasks.db")
+            await store.initialize()
+            items = [
+                _atomic_delegate_item(
+                    "batch-a-first",
+                    invocation_id="invocation-multibatch",
+                    invocation_index=0,
+                    batch_id="batch-a",
+                ),
+                _atomic_delegate_item(
+                    "batch-b-first",
+                    invocation_id="invocation-multibatch",
+                    invocation_index=1,
+                    batch_id="batch-b",
+                ),
+                _atomic_delegate_item(
+                    "batch-a-second",
+                    invocation_id="invocation-multibatch",
+                    invocation_index=2,
+                    batch_id="batch-a",
+                ),
+            ]
+            with patch(
+                "opc.database.store.on_phase_transition",
+                new_callable=AsyncMock,
+            ):
+                persisted = await store.append_delegated_work_items_atomically(
+                    items
+                )
+
+            self.assertEqual(
+                [item.metadata["delegate_sequence_index"] for item in persisted],
+                [0, 0, 1],
+            )
+            await store.close()
+
+    async def test_atomic_delegate_append_canonicalizes_scope_before_sequence_allocation(self) -> None:
+        with _workspace_tempdir() as tmpdir:
+            store = OPCStore(Path(tmpdir) / "tasks.db")
+            await store.initialize()
+            first = _atomic_delegate_item(
+                "  canonical-first  ",
+                invocation_id="  invocation-canonical-first  ",
+                invocation_index=0,
+                batch_id="  stable-business-batch  ",
+                parent_work_item_id="  parent-item  ",
+                source_seat_id="  seat::team::chief::chief  ",
+            )
+            first.run_id = "  run-atomic-delegate  "
+            persisted_first = (
+                await store.append_delegated_work_items_atomically([first])
+            )[0]
+            persisted_second = (
+                await store.append_delegated_work_items_atomically(
+                    [
+                        _atomic_delegate_item(
+                            "canonical-second",
+                            invocation_id="invocation-canonical-second",
+                            invocation_index=0,
+                        )
+                    ]
+                )
+            )[0]
+
+            self.assertEqual(persisted_first.work_item_id, "canonical-first")
+            self.assertEqual(
+                persisted_first.metadata["delegate_invocation_id"],
+                "invocation-canonical-first",
+            )
+            self.assertEqual(persisted_first.run_id, "run-atomic-delegate")
+            self.assertEqual(
+                persisted_first.batch_id,
+                "stable-business-batch",
+            )
+            self.assertEqual(persisted_first.parent_work_item_id, "parent-item")
+            self.assertEqual(
+                persisted_first.source_seat_id,
+                "seat::team::chief::chief",
+            )
+            self.assertEqual(
+                [
+                    persisted_first.metadata["delegate_sequence_index"],
+                    persisted_second.metadata["delegate_sequence_index"],
+                ],
+                [0, 1],
+            )
+            from_db = await store.get_delegation_work_item("canonical-first")
+            assert from_db is not None
+            self.assertEqual(from_db.batch_id, "stable-business-batch")
+            await store.close()
+
+    async def test_atomic_delegate_append_reserves_legacy_sibling_prefix_only(self) -> None:
+        with _workspace_tempdir() as tmpdir:
+            store = OPCStore(Path(tmpdir) / "tasks.db")
+            await store.initialize()
+            source_seat_id = "seat::team::chief::chief"
+            await store.save_delegation_work_item(
+                DelegationWorkItem(
+                    work_item_id="legacy-delegated-child",
+                    run_id="run-atomic-delegate",
+                    parent_work_item_id="parent-item",
+                    source_seat_id=source_seat_id,
+                    title="Legacy delegated child",
+                    kind="execute",
+                    batch_id="stable-business-batch",
+                    phase=Phase.READY,
+                    metadata={
+                        "created_by_seat_id": source_seat_id,
+                        "manager_board_parent_work_item_id": "parent-item",
+                        "scope_key": "legacy-child",
+                    },
+                )
+            )
+            # This delivery-shaped row shares the old batch index namespace but
+            # is not a delegate_work sibling and must not consume a sequence.
+            await store.save_delegation_work_item(
+                DelegationWorkItem(
+                    work_item_id="delivery-card",
+                    run_id="run-atomic-delegate",
+                    parent_work_item_id="parent-item",
+                    source_seat_id=source_seat_id,
+                    title="Delivery",
+                    kind="delivery",
+                    batch_id="stable-business-batch",
+                    batch_index=1,
+                    phase=Phase.WAITING_DEPENDENCIES,
+                    metadata={"work_kind": "delivery"},
+                )
+            )
+            item = _atomic_delegate_item(
+                "new-delegated-child",
+                invocation_id="invocation-after-legacy",
+                invocation_index=0,
+            )
+            with patch(
+                "opc.database.store.on_phase_transition",
+                new_callable=AsyncMock,
+            ):
+                persisted = await store.append_delegated_work_items_atomically(
+                    [item]
+                )
+
+            self.assertEqual(
+                persisted[0].metadata["delegate_sequence_index"],
+                1,
+            )
+            await store.close()
+
+    async def test_atomic_delegate_append_same_store_concurrency_is_unique(self) -> None:
+        with _workspace_tempdir() as tmpdir:
+            store = OPCStore(Path(tmpdir) / "tasks.db")
+            await store.initialize()
+            barrier = asyncio.Barrier(2)
+
+            async def append(item: DelegationWorkItem) -> DelegationWorkItem:
+                await barrier.wait()
+                return (
+                    await store.append_delegated_work_items_atomically([item])
+                )[0]
+
+            with patch(
+                "opc.database.store.on_phase_transition",
+                new_callable=AsyncMock,
+            ):
+                first, second = await asyncio.gather(
+                    append(
+                        _atomic_delegate_item(
+                            "same-store-a",
+                            invocation_id="same-store-invocation-a",
+                            invocation_index=0,
+                        )
+                    ),
+                    append(
+                        _atomic_delegate_item(
+                            "same-store-b",
+                            invocation_id="same-store-invocation-b",
+                            invocation_index=0,
+                        )
+                    ),
+                )
+
+            self.assertEqual(
+                {
+                    first.metadata["delegate_sequence_index"],
+                    second.metadata["delegate_sequence_index"],
+                },
+                {0, 1},
+            )
+            await store.close()
+
+    async def test_atomic_delegate_append_two_store_concurrency_is_unique(self) -> None:
+        with _workspace_tempdir() as tmpdir:
+            db_path = Path(tmpdir) / "tasks.db"
+            first_store = OPCStore(db_path)
+            second_store = OPCStore(db_path)
+            await first_store.initialize()
+            await second_store.initialize()
+            barrier = asyncio.Barrier(2)
+
+            async def append(
+                store: OPCStore,
+                item: DelegationWorkItem,
+            ) -> DelegationWorkItem:
+                await barrier.wait()
+                return (
+                    await store.append_delegated_work_items_atomically([item])
+                )[0]
+
+            with patch(
+                "opc.database.store.on_phase_transition",
+                new_callable=AsyncMock,
+            ):
+                first, second = await asyncio.gather(
+                    append(
+                        first_store,
+                        _atomic_delegate_item(
+                            "two-store-a",
+                            invocation_id="two-store-invocation-a",
+                            invocation_index=0,
+                        ),
+                    ),
+                    append(
+                        second_store,
+                        _atomic_delegate_item(
+                            "two-store-b",
+                            invocation_id="two-store-invocation-b",
+                            invocation_index=0,
+                        ),
+                    ),
+                )
+
+            self.assertEqual(
+                {
+                    first.metadata["delegate_sequence_index"],
+                    second.metadata["delegate_sequence_index"],
+                },
+                {0, 1},
+            )
+            await second_store.close()
+            await first_store.close()
+
+    async def test_atomic_delegate_append_sql_conflict_rolls_back_all_items(self) -> None:
+        with _workspace_tempdir() as tmpdir:
+            store = OPCStore(Path(tmpdir) / "tasks.db")
+            await store.initialize()
+            first = _atomic_delegate_item(
+                "duplicate-id",
+                invocation_id="invocation-conflict",
+                invocation_index=0,
+            )
+            second = _atomic_delegate_item(
+                "duplicate-id",
+                invocation_id="invocation-conflict",
+                invocation_index=1,
+            )
+            with patch(
+                "opc.database.store.on_phase_transition",
+                new_callable=AsyncMock,
+            ) as phase_hook:
+                with self.assertRaises(sqlite3.IntegrityError):
+                    await store.append_delegated_work_items_atomically(
+                        [first, second]
+                    )
+                phase_hook.assert_not_awaited()
+
+            self.assertIsNone(
+                await store.get_delegation_work_item("duplicate-id")
+            )
+            await store.close()
+
+    async def test_atomic_delegate_append_rejects_preassigned_sequence(self) -> None:
+        with _workspace_tempdir() as tmpdir:
+            store = OPCStore(Path(tmpdir) / "tasks.db")
+            await store.initialize()
+            item = _atomic_delegate_item(
+                "preassigned-sequence",
+                invocation_id="invocation-preassigned",
+                invocation_index=0,
+            )
+            item.metadata["delegate_sequence_index"] = 41
+            with patch(
+                "opc.database.store.on_phase_transition",
+                new_callable=AsyncMock,
+            ) as phase_hook:
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "delegate_sequence_index is Store-assigned",
+                ):
+                    await store.append_delegated_work_items_atomically([item])
+                phase_hook.assert_not_awaited()
+            self.assertIsNone(
+                await store.get_delegation_work_item("preassigned-sequence")
+            )
+            await store.close()
+
+    async def test_generic_save_preserves_atomic_delegate_identity_from_stale_object(self) -> None:
+        with _workspace_tempdir() as tmpdir:
+            store = OPCStore(Path(tmpdir) / "tasks.db")
+            await store.initialize()
+            stale = _atomic_delegate_item(
+                "stale-delegate",
+                invocation_id="invocation-stale",
+                invocation_index=0,
+            )
+            persisted = (
+                await store.append_delegated_work_items_atomically([stale])
+            )[0]
+            self.assertNotIn("delegate_sequence_index", stale.metadata)
+            await store.update_delegation_work_item(
+                persisted.work_item_id,
+                metadata_updates={"later_runtime_update": True},
+            )
+
+            stale.summary = "saved from a stale whole object"
+            stale.batch_id = "  stable-business-batch  "
+            await store.save_delegation_work_item(stale)
+            refreshed = await store.get_delegation_work_item(stale.work_item_id)
+            assert refreshed is not None
+            self.assertEqual(refreshed.summary, stale.summary)
+            self.assertEqual(refreshed.batch_id, "stable-business-batch")
+            self.assertEqual(
+                {
+                    key: refreshed.metadata[key]
+                    for key in OPCStore._DELEGATE_WORK_RESERVED_METADATA_KEYS
+                },
+                {
+                    "created_by_delegate_work": True,
+                    "delegate_invocation_id": "invocation-stale",
+                    "delegate_invocation_index": 0,
+                    "delegate_sequence_index": 0,
+                },
+            )
+            await store.close()
+
+    async def test_generic_writes_reject_delegate_identity_conflict_and_scope_change(self) -> None:
+        with _workspace_tempdir() as tmpdir:
+            store = OPCStore(Path(tmpdir) / "tasks.db")
+            await store.initialize()
+            persisted = (
+                await store.append_delegated_work_items_atomically(
+                    [
+                        _atomic_delegate_item(
+                            "immutable-delegate",
+                            invocation_id="invocation-immutable",
+                            invocation_index=0,
+                        )
+                    ]
+                )
+            )[0]
+
+            conflicting = copy.deepcopy(persisted)
+            conflicting.metadata["delegate_sequence_index"] = 9
+            with self.assertRaisesRegex(ValueError, "reserved metadata is immutable"):
+                await store.save_delegation_work_item(conflicting)
+            moved = copy.deepcopy(persisted)
+            moved.batch_id = "another-batch"
+            with self.assertRaisesRegex(ValueError, "sequence scope is immutable"):
+                await store.save_delegation_work_item(moved)
+            with self.assertRaisesRegex(ValueError, "reserved metadata is immutable"):
+                await store.update_delegation_work_item(
+                    persisted.work_item_id,
+                    metadata_updates={"delegate_invocation_index": 12},
+                )
+
+            refreshed = await store.get_delegation_work_item(
+                persisted.work_item_id
+            )
+            assert refreshed is not None
+            self.assertEqual(refreshed.batch_id, "stable-business-batch")
+            self.assertEqual(refreshed.metadata["delegate_sequence_index"], 0)
+            await store.close()
+
+    async def test_metadata_unset_cannot_erase_delegate_identity(self) -> None:
+        with _workspace_tempdir() as tmpdir:
+            store = OPCStore(Path(tmpdir) / "tasks.db")
+            await store.initialize()
+            persisted = (
+                await store.append_delegated_work_items_atomically(
+                    [
+                        _atomic_delegate_item(
+                            "unset-delegate",
+                            invocation_id="invocation-unset",
+                            invocation_index=0,
+                        )
+                    ]
+                )
+            )[0]
+            updated = await store.update_delegation_work_item(
+                persisted.work_item_id,
+                metadata_unset=list(
+                    OPCStore._DELEGATE_WORK_RESERVED_METADATA_KEYS
+                ),
+            )
+            assert updated is not None
+            self.assertTrue(updated.metadata["created_by_delegate_work"])
+            self.assertEqual(updated.metadata["delegate_sequence_index"], 0)
+            await store.close()
+
+    async def test_generic_create_and_legacy_update_cannot_forge_delegate_identity(self) -> None:
+        with _workspace_tempdir() as tmpdir:
+            store = OPCStore(Path(tmpdir) / "tasks.db")
+            await store.initialize()
+            forged = _atomic_delegate_item(
+                "forged-delegate",
+                invocation_id="invocation-forged",
+                invocation_index=0,
+            )
+            with self.assertRaisesRegex(ValueError, "reserved metadata"):
+                await store.save_delegation_work_item(forged)
+            self.assertIsNone(
+                await store.get_delegation_work_item("forged-delegate")
+            )
+
+            legacy = DelegationWorkItem(
+                work_item_id="ordinary-legacy",
+                run_id="run-atomic-delegate",
+                title="Ordinary row",
+                kind="execute",
+                phase=Phase.READY,
+                metadata={"ordinary": True},
+            )
+            await store.save_delegation_work_item(legacy)
+            legacy.summary = "ordinary updates remain supported"
+            await store.save_delegation_work_item(legacy)
+            with self.assertRaisesRegex(ValueError, "cannot add or change"):
+                await store.update_delegation_work_item(
+                    legacy.work_item_id,
+                    metadata_updates={"created_by_delegate_work": True},
+                )
+            refreshed = await store.get_delegation_work_item(legacy.work_item_id)
+            assert refreshed is not None
+            self.assertEqual(refreshed.summary, legacy.summary)
+            self.assertNotIn("created_by_delegate_work", refreshed.metadata)
             await store.close()
 
     async def test_delegate_work_resolves_semantic_dependencies_and_aliases(self) -> None:
@@ -4831,14 +5908,22 @@ class CompanyCollaborationTests(unittest.IsolatedAsyncioTestCase):
                         "role_id": "researcher",
                         "title": "Research engine feasibility",
                         "brief": "Research coding-agent game engine feasibility.",
-                        "scope_key": "engine_feasibility_research",
+                        "scope_key": "issue35-e2e::developer::implement",
+                        "id": "implementation-node",
+                        "work_item_ref": "implementation-ref",
+                        "projection_id": "implementation-projection",
                     },
                     {
                         "role_id": "report_producer",
                         "title": "Create feasibility report",
                         "brief": "Create the final report from the research brief.",
                         "scope_key": "engine_feasibility_report",
-                        "depends_on": ["engine_feasibility_research"],
+                        "depends_on": [
+                            "scope_key:issue35-e2e::developer::implement",
+                            "id:implementation-node",
+                            "work_item_ref:implementation-ref",
+                            "projection_id:implementation-projection",
+                        ],
                     },
                 ],
                 task=task,
@@ -4850,20 +5935,372 @@ class CompanyCollaborationTests(unittest.IsolatedAsyncioTestCase):
             report_id = delegated[1]["work_item_id"]
             research = await store.get_delegation_work_item(research_id)
             report = await store.get_delegation_work_item(report_id)
-            self.assertEqual(research.metadata["scope_key"], "engine-feasibility-research")
+            self.assertTrue(research.metadata["created_by_delegate_work"])
+            self.assertTrue(report.metadata["created_by_delegate_work"])
+            self.assertEqual(
+                research.metadata["delegate_invocation_id"],
+                report.metadata["delegate_invocation_id"],
+            )
+            self.assertEqual(
+                [
+                    research.metadata["delegate_invocation_index"],
+                    report.metadata["delegate_invocation_index"],
+                ],
+                [0, 1],
+            )
+            self.assertEqual(
+                [
+                    research.metadata["delegate_sequence_index"],
+                    report.metadata["delegate_sequence_index"],
+                ],
+                [0, 1],
+            )
+            self.assertEqual(research.metadata["scope_key"], "issue35-e2e-developer-implement")
+            self.assertEqual(research.metadata["delegate_item_id"], "implementation-node")
+            self.assertEqual(research.metadata["work_item_ref"], "implementation-ref")
+            self.assertEqual(research.projection_id, "implementation-projection")
+            self.assertEqual(research.phase, Phase.READY)
+            self.assertEqual(report.phase, Phase.WAITING_DEPENDENCIES)
             self.assertEqual(report.metadata["dependency_work_item_ids"], [research_id])
-            self.assertEqual(report.metadata["resolved_dependencies"][0]["resolved_by"], "scope_key")
+            self.assertEqual(
+                [record["resolved_by"] for record in report.metadata["resolved_dependencies"]],
+                ["scope_key", "id", "work_item_ref", "projection_id"],
+            )
             items = await store.list_delegation_work_items("run-1")
             self.assertEqual(
                 [
                     item.work_item_id
                     for item in items
-                    if str((item.metadata or {}).get("scope_key", "") or "") == "engine-feasibility-research"
+                    if str((item.metadata or {}).get("scope_key", "") or "")
+                    == "issue35-e2e-developer-implement"
                 ],
                 [research_id],
             )
             self.assertEqual(wake_calls, ["wake"])
             self.assertEqual(kanban_calls, ["kanban"])
+            await store.close()
+
+    async def test_delegate_work_rejects_durable_ids_before_building_any_batch_item(
+        self,
+    ) -> None:
+        with _workspace_tempdir() as tmpdir:
+            store = OPCStore(Path(tmpdir) / "tasks.db")
+            await store.initialize()
+            communication = CommunicationManager(store, EventBus())
+            wake_calls: list[str] = []
+            kanban_calls: list[str] = []
+            communication.on_work_items_created = lambda: wake_calls.append("wake")
+
+            async def on_kanban_changed() -> None:
+                kanban_calls.append("kanban")
+
+            communication.on_kanban_changed = on_kanban_changed
+            delegate_tool = next(
+                tool
+                for tool in create_collaboration_tools(communication)
+                if tool.name == "delegate_work"
+            )
+            parent = DelegationWorkItem(
+                work_item_id="parent-item",
+                run_id="run-durable-id",
+                cell_id="team::chief",
+                team_id="team::chief",
+                role_id="chief_analyst",
+                seat_id="seat::team::chief::chief_analyst",
+                title="Chief Analyst Intake",
+                kind="intake",
+                projection_id="chief-intake",
+                phase=Phase.WAITING_FOR_CHILDREN,
+                metadata={"dependency_work_item_ids": ["existing-research"]},
+            )
+            existing = DelegationWorkItem(
+                work_item_id="existing-research",
+                run_id="run-durable-id",
+                cell_id="team::research",
+                team_id="team::research",
+                role_id="researcher",
+                seat_id="seat::team::chief::researcher",
+                parent_work_item_id=parent.work_item_id,
+                manager_role_id="chief_analyst",
+                manager_seat_id="seat::team::chief::chief_analyst",
+                title="Existing research",
+                kind="execute",
+                projection_id="research-existing",
+                phase=Phase.APPROVED,
+                metadata={
+                    "scope_key": "existing-research-scope",
+                    "dependency_work_item_ids": [],
+                },
+            )
+            foreign = DelegationWorkItem(
+                work_item_id="foreign-existing",
+                run_id="run-durable-id",
+                cell_id="team::foreign",
+                team_id="team::foreign",
+                role_id="foreign_secret_role",
+                seat_id="seat::team::foreign::worker",
+                parent_work_item_id="foreign-parent",
+                manager_role_id="foreign_manager",
+                manager_seat_id="seat::team::foreign::manager",
+                title="classified owner title",
+                kind="execute",
+                projection_id="foreign-existing",
+                phase=Phase.APPROVED,
+                metadata={
+                    "scope_key": "foreign-existing-scope",
+                    "dependency_work_item_ids": [],
+                },
+            )
+            for item in (parent, existing, foreign):
+                await store.save_delegation_work_item(item)
+
+            task = Task(
+                id="chief-task",
+                title="Chief Analyst Dispatch",
+                project_id="proj1",
+                assigned_to="chief_analyst",
+                status=TaskStatus.RUNNING,
+                metadata={
+                    "execution_mode": "company_mode",
+                    "runtime_model": "multi_team_org",
+                    "current_turn_mode": "dispatch_required",
+                    "delegation_run_id": "run-durable-id",
+                    "delegation_seat_id": "seat::team::chief::chief_analyst",
+                    "direct_report_role_ids": ["researcher", "report_producer"],
+                    "runtime_topology": {
+                        "seats": [
+                            {
+                                "role_id": "researcher",
+                                "seat_id": "seat::team::chief::researcher",
+                                "team_id": "team::research",
+                            },
+                            {
+                                "role_id": "report_producer",
+                                "seat_id": "seat::team::chief::report_producer",
+                                "team_id": "team::report",
+                            },
+                        ]
+                    },
+                },
+            )
+            set_linked_work_item_id(task, parent.work_item_id)
+
+            with patch.object(
+                store,
+                "append_delegated_work_items_atomically",
+                wraps=store.append_delegated_work_items_atomically,
+            ) as append_batch:
+                with self.assertRaises(ValueError) as current_collision:
+                    await delegate_tool.func(
+                        planning_context="Prepare a report, then revise existing research.",
+                        items=[
+                            {
+                                "role_id": "report_producer",
+                                "title": "Prepare report",
+                                "scope_key": "fresh-report",
+                                "id": "fresh-local-alias",
+                            },
+                            {
+                                "role_id": "researcher",
+                                "title": "Revise research",
+                                "scope_key": "new-research-rework-scope",
+                                "id": existing.work_item_id,
+                            },
+                        ],
+                        task=task,
+                    )
+
+                current_message = str(current_collision.exception)
+                self.assertIn("before creating any work items", current_message)
+                self.assertIn("only a same-call alias", current_message)
+                self.assertIn(
+                    "modify_work_item(work_item_id=existing-research, reset_to_ready=true)",
+                    current_message,
+                )
+
+                with self.assertRaises(ValueError) as foreign_collision:
+                    await delegate_tool.func(
+                        planning_context="Do not duplicate work owned by another board.",
+                        items=[
+                            {
+                                "role_id": "researcher",
+                                "title": "Incorrect foreign replacement",
+                                "scope_key": "foreign-replacement",
+                                "id": foreign.work_item_id,
+                            }
+                        ],
+                        task=task,
+                    )
+
+                foreign_message = str(foreign_collision.exception)
+                self.assertIn("outside the current manager board", foreign_message)
+                self.assertIn("only a same-call alias", foreign_message)
+                self.assertNotIn(foreign.role_id, foreign_message)
+                self.assertNotIn(foreign.title, foreign_message)
+                self.assertNotIn(foreign.phase.value, foreign_message)
+                append_batch.assert_not_awaited()
+
+            run_items = await store.list_delegation_work_items("run-durable-id")
+            self.assertEqual(
+                {item.work_item_id for item in run_items},
+                {parent.work_item_id, existing.work_item_id, foreign.work_item_id},
+            )
+            durable_existing = await store.get_delegation_work_item(
+                existing.work_item_id
+            )
+            assert durable_existing is not None
+            self.assertEqual(durable_existing.phase, Phase.APPROVED)
+            self.assertEqual(
+                durable_existing.metadata["scope_key"],
+                "existing-research-scope",
+            )
+            self.assertEqual(wake_calls, [])
+            self.assertEqual(kanban_calls, [])
+            await store.close()
+
+    async def test_delegate_work_documents_id_as_same_call_alias_only(self) -> None:
+        delegate_tool = next(
+            tool
+            for tool in create_collaboration_tools(SimpleNamespace())
+            if tool.name == "delegate_work"
+        )
+        item_schema = delegate_tool.parameters["properties"]["items"]["items"]
+        id_description = item_schema["properties"]["id"]["description"]
+        contract = "\n".join(
+            build_external_cli_tool_contract_lines(["delegate_work"])
+        )
+
+        self.assertIn("same-call alias", delegate_tool.description)
+        self.assertIn("same-call alias", id_description)
+        self.assertIn("Never pass an existing durable WorkItem ID", id_description)
+        self.assertIn("`id` is only a same-call alias", contract)
+        self.assertIn("modify_work_item(work_item_id=...", contract)
+
+    async def test_delegate_work_sequential_calls_append_durable_sibling_sequence(self) -> None:
+        with _workspace_tempdir() as tmpdir:
+            store = OPCStore(Path(tmpdir) / "tasks.db")
+            await store.initialize()
+            communication = CommunicationManager(store, EventBus())
+            delegate_tool = next(
+                tool
+                for tool in create_collaboration_tools(communication)
+                if tool.name == "delegate_work"
+            )
+            await store.save_delegation_work_item(
+                DelegationWorkItem(
+                    work_item_id="manager-item",
+                    run_id="run-split-append",
+                    cell_id="team::engineering",
+                    team_id="team::engineering",
+                    role_id="engineering_manager",
+                    seat_id="seat::engineering::manager",
+                    title="Engineering Manager Intake",
+                    kind="intake",
+                    projection_id="engineering-manager-intake",
+                    phase=Phase.RUNNING,
+                    metadata={"dependency_work_item_ids": []},
+                )
+            )
+            task = Task(
+                id="engineering-manager-task",
+                title="Build and validate the app",
+                project_id="proj1",
+                assigned_to="engineering_manager",
+                status=TaskStatus.RUNNING,
+                metadata={
+                    "execution_mode": "company_mode",
+                    "runtime_model": "multi_team_org",
+                    "current_turn_mode": "dispatch_required",
+                    "delegation_run_id": "run-split-append",
+                    "delegation_seat_id": "seat::engineering::manager",
+                    "work_item_batch_id": "issue35-app-build",
+                    "direct_report_role_ids": ["developer", "qa_engineer"],
+                    "runtime_topology": {
+                        "seats": [
+                            {
+                                "role_id": "developer",
+                                "seat_id": "seat::engineering::developer",
+                                "team_id": "team::development",
+                            },
+                            {
+                                "role_id": "qa_engineer",
+                                "seat_id": "seat::engineering::qa",
+                                "team_id": "team::qa",
+                            },
+                        ]
+                    },
+                },
+            )
+            set_linked_work_item_id(task, "manager-item")
+
+            developer_result = await delegate_tool.func(
+                planning_context="Implement before QA.",
+                items=[
+                    {
+                        "role_id": "developer",
+                        "title": "Implement app",
+                        "brief": "Create the complete static app.",
+                        "scope_key": "issue35-app-implementation",
+                        "batch_id": "issue35-app-build",
+                    }
+                ],
+                task=task,
+            )
+            qa_result = await delegate_tool.func(
+                planning_context="QA is a hard-dependent sequential append.",
+                items=[
+                    {
+                        "role_id": "qa_engineer",
+                        "title": "Validate app",
+                        "brief": "Validate the completed static app.",
+                        "scope_key": "issue35-app-qa",
+                        "batch_id": "issue35-app-build",
+                        "depends_on": [
+                            {"scope_key": "issue35-app-implementation"}
+                        ],
+                    }
+                ],
+                task=task,
+            )
+
+            developer_payload = developer_result["delegated"][0]
+            qa_payload = qa_result["delegated"][0]
+            developer = await store.get_delegation_work_item(
+                developer_payload["work_item_id"]
+            )
+            qa = await store.get_delegation_work_item(qa_payload["work_item_id"])
+            assert developer is not None
+            assert qa is not None
+            self.assertEqual(developer.batch_id, "issue35-app-build")
+            self.assertEqual(qa.batch_id, developer.batch_id)
+            self.assertEqual(developer.batch_index, 0)
+            self.assertEqual(qa.batch_index, 0)
+            self.assertNotEqual(
+                developer.metadata["delegate_invocation_id"],
+                qa.metadata["delegate_invocation_id"],
+            )
+            self.assertEqual(
+                [
+                    developer.metadata["delegate_invocation_index"],
+                    qa.metadata["delegate_invocation_index"],
+                ],
+                [0, 0],
+            )
+            self.assertEqual(
+                [
+                    developer.metadata["delegate_sequence_index"],
+                    qa.metadata["delegate_sequence_index"],
+                ],
+                [0, 1],
+            )
+            self.assertEqual(
+                qa.metadata["dependency_work_item_ids"],
+                [developer.work_item_id],
+            )
+            self.assertEqual(
+                qa.metadata["resolved_dependencies"][0]["resolved_by"],
+                "scope_key",
+            )
             await store.close()
 
     async def test_delegate_work_batch_dependency_failure_has_no_partial_work_item_side_effect(self) -> None:
@@ -4934,6 +6371,121 @@ class CompanyCollaborationTests(unittest.IsolatedAsyncioTestCase):
                             "brief": "Report later.",
                             "scope_key": "engine_feasibility_report",
                             "depends_on": ["missing_research"],
+                        },
+                    ],
+                    task=task,
+                )
+
+            items = await store.list_delegation_work_items("run-1")
+            self.assertEqual([item.work_item_id for item in items], ["parent-item"])
+            await store.close()
+
+    async def test_delegate_work_rejects_same_batch_dependency_cycle_atomically(self) -> None:
+        with _workspace_tempdir() as tmpdir:
+            store = OPCStore(Path(tmpdir) / "tasks.db")
+            await store.initialize()
+            communication = CommunicationManager(store, EventBus())
+            delegate_tool = next(
+                tool
+                for tool in create_collaboration_tools(communication)
+                if tool.name == "delegate_work"
+            )
+            await store.save_delegation_work_item(
+                DelegationWorkItem(
+                    work_item_id="parent-item",
+                    run_id="run-1",
+                    cell_id="team::chief",
+                    team_id="team::chief",
+                    role_id="chief_analyst",
+                    seat_id="seat::team::chief::chief_analyst",
+                    title="Chief Analyst Intake",
+                    kind="intake",
+                    projection_id="chief-intake",
+                    phase=Phase.RUNNING,
+                    metadata={"dependency_work_item_ids": []},
+                )
+            )
+            task = Task(
+                id="chief-task",
+                title="Chief Analyst Dispatch",
+                project_id="proj1",
+                assigned_to="chief_analyst",
+                status=TaskStatus.RUNNING,
+                metadata={
+                    "execution_mode": "company_mode",
+                    "runtime_model": "multi_team_org",
+                    "current_turn_mode": "dispatch_required",
+                    "delegation_run_id": "run-1",
+                    "delegation_seat_id": "seat::team::chief::chief_analyst",
+                    "direct_report_role_ids": ["developer", "qa"],
+                    "runtime_topology": {
+                        "seats": [
+                            {
+                                "role_id": "developer",
+                                "seat_id": "seat::team::chief::developer",
+                                "team_id": "team::development",
+                            },
+                            {
+                                "role_id": "qa",
+                                "seat_id": "seat::team::chief::qa",
+                                "team_id": "team::qa",
+                            },
+                        ]
+                    },
+                },
+            )
+            set_linked_work_item_id(task, "parent-item")
+
+            with self.assertRaisesRegex(ValueError, "dependency cycle detected within batch"):
+                await delegate_tool.func(
+                    planning_context="The batch must form a DAG.",
+                    items=[
+                        {
+                            "role_id": "developer",
+                            "title": "Implement",
+                            "brief": "Implement the application.",
+                            "scope_key": "implementation",
+                            "depends_on": ["scope_key:qa"],
+                        },
+                        {
+                            "role_id": "qa",
+                            "title": "QA",
+                            "brief": "Verify the application.",
+                            "scope_key": "qa",
+                            "depends_on": ["scope_key:implementation"],
+                        },
+                    ],
+                    task=task,
+                )
+
+            items = await store.list_delegation_work_items("run-1")
+            self.assertEqual([item.work_item_id for item in items], ["parent-item"])
+            self.assertNotIn("delegation_wait_for_work_item_ids", task.metadata)
+
+            with self.assertRaisesRegex(ValueError, "matched multiple work items"):
+                await delegate_tool.func(
+                    planning_context="Ambiguous aliases must fail before persistence.",
+                    items=[
+                        {
+                            "role_id": "developer",
+                            "title": "Implementation A",
+                            "brief": "Implement option A.",
+                            "scope_key": "implementation-a",
+                            "work_item_ref": "implementation",
+                        },
+                        {
+                            "role_id": "developer",
+                            "title": "Implementation B",
+                            "brief": "Implement option B.",
+                            "scope_key": "implementation-b",
+                            "work_item_ref": "implementation",
+                        },
+                        {
+                            "role_id": "qa",
+                            "title": "QA",
+                            "brief": "Verify the selected implementation.",
+                            "scope_key": "qa-after-implementation",
+                            "depends_on": ["work_item_ref:implementation"],
                         },
                     ],
                     task=task,
@@ -5116,6 +6668,11 @@ class CompanyCollaborationTests(unittest.IsolatedAsyncioTestCase):
                     ],
                     task=task,
                 )
+            items = await store.list_delegation_work_items("run-1")
+            self.assertEqual(
+                {item.work_item_id for item in items},
+                {"parent-item", "research-a", "research-b"},
+            )
             await store.close()
 
     def test_monitor_children_attention_kind_is_not_dispatch(self) -> None:
@@ -6490,6 +8047,71 @@ class CompanyCollaborationTests(unittest.IsolatedAsyncioTestCase):
     async def test_read_inbox_tool_is_not_exposed(self) -> None:
         tools = create_collaboration_tools(DummyRuntimeCommunication())
         self.assertNotIn("read_inbox", [tool.name for tool in tools])
+
+    async def test_close_human_review_leaves_checkpoint_to_canonical_consumer(self) -> None:
+        with _workspace_tempdir() as tmpdir:
+            store = OPCStore(Path(tmpdir) / "tasks.db")
+            await store.initialize()
+            try:
+                communication = CommunicationManager(store, EventBus())
+                close_tool = next(
+                    tool
+                    for tool in create_collaboration_tools(communication)
+                    if tool.name == "close_human_review"
+                )
+                task = Task(
+                    id="delivery-review-task",
+                    title="Owner Delivery Review",
+                    project_id="proj1",
+                    session_id="delivery-session",
+                    assigned_to="ceo",
+                    status=TaskStatus.AWAITING_HUMAN,
+                    metadata={
+                        "human_review_close_allowed": True,
+                        "progress_log": [],
+                    },
+                )
+                await store.save_task(task)
+                checkpoint = ExecutionCheckpoint(
+                    checkpoint_id="delivery-review-checkpoint",
+                    project_id="proj1",
+                    session_id="delivery-session",
+                    checkpoint_type="company_delivery_feedback",
+                    task_id=task.id,
+                    payload={
+                        "waiting_task_id": task.id,
+                        "interaction": {
+                            "domain_key": "delivery-review-event-1",
+                        },
+                    },
+                )
+                await store.create_owner_interaction_checkpoint(
+                    checkpoint,
+                    interaction_key="delivery-review-event-1",
+                )
+
+                result = await close_tool.func(
+                    summary="The final decider accepted the owner's directive.",
+                    user_message="Review closed.",
+                    task=task,
+                )
+
+                persisted_task = await store.get_task(task.id)
+                persisted_checkpoint = await store.get_execution_checkpoint(
+                    checkpoint.checkpoint_id,
+                    project_id="proj1",
+                    checkpoint_type="company_delivery_feedback",
+                )
+                self.assertIsNotNone(persisted_task)
+                self.assertIsNotNone(persisted_checkpoint)
+                assert persisted_task is not None
+                assert persisted_checkpoint is not None
+                self.assertEqual(persisted_task.status, TaskStatus.DONE)
+                self.assertTrue(persisted_task.metadata["human_review_closed"])
+                self.assertEqual(persisted_checkpoint.status, "pending")
+                self.assertNotIn("closed_checkpoint_ids", result)
+            finally:
+                await store.close()
 
     def test_manager_board_read_schema_exposes_only_canonical_arguments(self) -> None:
         tools = create_collaboration_tools(DummyRuntimeCommunication())
@@ -8588,6 +10210,24 @@ class CompanyCollaborationTests(unittest.IsolatedAsyncioTestCase):
                 },
             )
             await store.save_task(task)
+            auxiliary = Task(
+                id="done-work-item::ceo_pre_delivery_assessment::attempt-1",
+                session_id="work-item-session:aux:role_prompt:attempt-1",
+                parent_session_id="root-session",
+                parent_id=task.id,
+                title="CEO Pre-delivery Assessment",
+                assigned_to="executor",
+                status=TaskStatus.DONE,
+                project_id="proj1",
+                metadata={
+                    "work_item_role_id": "executor",
+                    "target_output_dir": str(tmpdir),
+                    "runtime_auxiliary_task": True,
+                    "runtime_auxiliary_kind": "role_prompt",
+                    "runtime_auxiliary_source_task_id": task.id,
+                },
+            )
+            await store.save_task(auxiliary)
             executor = CompanyWorkItemExecutor(
                 org_engine=DummyOrgEngine(),
                 communication=DummyRuntimeCommunication(),
@@ -8597,22 +10237,131 @@ class CompanyCollaborationTests(unittest.IsolatedAsyncioTestCase):
                 save_task=store.save_task,
                 store=store,
             )
+
+            # The mutation boundary must reject direct callers too, even
+            # though the auxiliary Task has the same role/workspace and can
+            # see the same actionable unread message as the business Task.
+            self.assertFalse(
+                await executor._reactivate_for_unread_mail(auxiliary)
+            )
+            self.assertEqual(auxiliary.status, TaskStatus.DONE)
+
+            reactivation_calls: list[str] = []
+
+            async def reactivate(candidate: Task) -> bool:
+                reactivation_calls.append(candidate.id)
+                return await executor._reactivate_for_unread_mail(candidate)
+
             sweeper = CommsReactivationSweeper(
                 store=store,
                 project_id_getter=lambda: "proj1",
-                reactivate_fn=executor._reactivate_for_unread_mail,
+                reactivate_fn=reactivate,
                 interval_sec=10.0,
             )
             # Exercise a single tick directly (no asyncio sleep).
             await sweeper._tick()
             refreshed = await store.get_task(task.id)
+            refreshed_auxiliary = await store.get_task(auxiliary.id)
             assert refreshed is not None
+            assert refreshed_auxiliary is not None
             self.assertEqual(refreshed.status, TaskStatus.PENDING)
+            self.assertEqual(refreshed_auxiliary.status, TaskStatus.DONE)
+            self.assertEqual(reactivation_calls, [task.id])
             self.assertGreaterEqual(
                 int(refreshed.metadata.get("comms_reactivation_depth", 0) or 0),
                 1,
             )
             await store.close()
+
+    async def test_heartbeat_scheduler_never_executes_pending_auxiliary_task(self) -> None:
+        from opc.layer2_organization.heartbeat import HeartbeatScheduler
+
+        auxiliary = Task(
+            id="source::meeting_turn::attempt-1",
+            title="Private meeting turn",
+            assigned_to="executor",
+            status=TaskStatus.PENDING,
+            project_id="proj1",
+            metadata={
+                "runtime_auxiliary_task": True,
+                "runtime_auxiliary_kind": "meeting_turn",
+                "runtime_auxiliary_source_task_id": "source",
+            },
+        )
+        business = Task(
+            id="business-task",
+            title="Business work",
+            assigned_to="executor",
+            status=TaskStatus.PENDING,
+            project_id="proj1",
+        )
+        store = SimpleNamespace(
+            get_tasks=AsyncMock(return_value=[auxiliary, business]),
+            checkout_task=AsyncMock(return_value=True),
+        )
+        execute = AsyncMock()
+        scheduler = HeartbeatScheduler(
+            store=store,
+            org_engine=SimpleNamespace(),
+            execute_task_fn=execute,
+        )
+
+        await scheduler._run_agent_heartbeat("executor")
+        store.checkout_task.assert_awaited_once_with(business.id, "executor")
+        execute.assert_awaited_once_with(business)
+
+        # With no business Task available, the hidden envelope is not checked
+        # out or executed merely because it is malformed/stale PENDING data.
+        store.get_tasks.return_value = [auxiliary]
+        store.checkout_task.reset_mock()
+        execute.reset_mock()
+        await scheduler._run_agent_heartbeat("executor")
+        store.checkout_task.assert_not_awaited()
+        execute.assert_not_awaited()
+
+    async def test_auxiliary_task_does_not_block_stalled_meeting_recovery(self) -> None:
+        from opc.layer2_organization.heartbeat import HeartbeatScheduler
+
+        waiting = Task(
+            id="waiting-business-task",
+            title="Waiting business work",
+            assigned_to="executor",
+            status=TaskStatus.AWAITING_PEER,
+            project_id="proj1",
+        )
+        auxiliary = Task(
+            id="waiting-business-task::role_prompt::attempt-1",
+            title="Private role prompt",
+            assigned_to="executor",
+            status=TaskStatus.PENDING,
+            project_id="proj1",
+            metadata={
+                "runtime_auxiliary_task": True,
+                "runtime_auxiliary_kind": "role_prompt",
+                "runtime_auxiliary_source_task_id": waiting.id,
+            },
+        )
+
+        async def get_tasks(**kwargs):
+            if kwargs.get("status") == TaskStatus.AWAITING_PEER:
+                return [waiting]
+            return [waiting, auxiliary]
+
+        communication = SimpleNamespace(
+            refresh_waiting_tasks=AsyncMock(return_value=[]),
+            auto_resolve_stale_meetings=AsyncMock(return_value=["meeting-1"]),
+        )
+        scheduler = HeartbeatScheduler(
+            store=SimpleNamespace(get_tasks=AsyncMock(side_effect=get_tasks)),
+            org_engine=SimpleNamespace(),
+            execute_task_fn=AsyncMock(),
+            communication=communication,
+        )
+
+        await scheduler._resolve_stale_waits()
+        communication.auto_resolve_stale_meetings.assert_awaited_once_with(
+            [waiting]
+        )
 
     async def test_send_manager_notification_routes_to_direct_manager(self) -> None:
         with _workspace_tempdir() as tmpdir:
@@ -9005,6 +10754,272 @@ class _FailingSimpleChatLLM:
 
 
 class CompanyExecutorRolePromptRoutingTests(unittest.IsolatedAsyncioTestCase):
+    async def test_role_prompt_preserves_typed_controller_and_quota_failures(
+        self,
+    ) -> None:
+        task = Task(id="typed-role-prompt", title="Typed prompt")
+        for failure in (
+            CompanyRunControllerLeaseLost("stale controller"),
+            ProviderQuotaExhaustedError("quota exhausted"),
+        ):
+            async def runner(*_args: Any, **_kwargs: Any) -> str:
+                raise failure
+
+            executor = CompanyWorkItemExecutor(
+                org_engine=DummyOrgEngine(),
+                communication=SimpleNamespace(),
+                approval_engine=SimpleNamespace(),
+                memory=None,
+                execute_task=AsyncMock(),
+                save_task=AsyncMock(),
+                role_prompt_runner=runner,
+            )
+            with self.subTest(failure=type(failure).__name__):
+                with self.assertRaises(type(failure)):
+                    await executor._run_role_prompt(
+                        source_task=task,
+                        system_prompt="system",
+                        payload={},
+                        prompt_kind="ceo_pre_delivery_assessment",
+                    )
+
+    def test_role_prompt_json_accepts_only_runtime_verification_envelope(
+        self,
+    ) -> None:
+        payload = {
+            "deliverable": True,
+            "summary": "ready",
+            "rework_targets": [],
+        }
+        encoded = json.dumps(payload)
+        accepted = (
+            encoded,
+            f"{encoded}\n\nVerification: runtime complete",
+            f"```json\n{encoded}\n```",
+            f"```json\n{encoded}\n```\n\nVerification: runtime complete",
+            f"```JSON\r\n{encoded}\r\n```\r\n\r\nVerification: runtime complete",
+        )
+        for raw in accepted:
+            with self.subTest(raw=raw):
+                self.assertEqual(
+                    CompanyWorkItemExecutor._parse_role_prompt_json(raw),
+                    payload,
+                )
+
+        rejected = (
+            f"{encoded}\nVerification: glued footer",
+            f"{encoded}\n\nverification: wrong case",
+            f"{encoded}\n\nVerification: ok\nextra prose",
+            f"```json\n{encoded}\n\nVerification: inside fence\n```",
+            f"```json\n{encoded}```",
+            f"```json\n{encoded} midline ```",
+            f"```json\n{encoded}",
+            f"```json\n{encoded}\n``` trailing garbage",
+            f"{encoded}\n{encoded}",
+            f"narration\n{encoded}",
+            "[1, 2, 3]",
+        )
+        for raw in rejected:
+            with self.subTest(raw=raw):
+                self.assertIsNone(
+                    CompanyWorkItemExecutor._parse_role_prompt_json(raw)
+                )
+
+    async def test_unlinked_manager_gate_require_input_falls_back_to_owner(self) -> None:
+        checkpoint_callback = AsyncMock()
+        approval_engine = SimpleNamespace(
+            authorize_work_item_action=AsyncMock(
+                return_value=(
+                    False,
+                    SimpleNamespace(action=ApprovalAction.REQUIRE_INPUT),
+                )
+            )
+        )
+        executor = CompanyWorkItemExecutor(
+            org_engine=DummyOrgEngine(),
+            communication=SimpleNamespace(),
+            approval_engine=approval_engine,
+            memory=None,
+            execute_task=AsyncMock(),
+            save_task=AsyncMock(),
+            checkpoint_callback=checkpoint_callback,
+        )
+        executor._active_plan = CompanyWorkItemRuntimePlan(
+            profile="corporate",
+            projections=[],
+        )
+        task = Task(
+            id="manager-gate-task",
+            title="Manager review",
+            project_id="proj1",
+            session_id="manager-gate-session",
+            assigned_to="executor",
+            metadata={"work_item_projection_id": "execution"},
+        )
+        gate = WorkItemGatePolicy(
+            gate_type="approval",
+            reviewer_role="reviewer",
+            requires_human=False,
+        )
+
+        await executor._apply_gate(task, gate, {"execution": task})
+
+        self.assertEqual(task.status, TaskStatus.AWAITING_HUMAN)
+        checkpoint_callback.assert_awaited_once()
+        publication = checkpoint_callback.await_args.args[0]
+        self.assertEqual(
+            publication["checkpoint_type"],
+            "company_work_item_gate",
+        )
+        self.assertEqual(publication["payload"]["review_level"], "human")
+        self.assertTrue(publication["payload"]["gate"]["requires_human"])
+        self.assertTrue(
+            publication["payload"]["gate"]["metadata"][
+                "manager_gate_fallback"
+            ]
+        )
+        self.assertEqual(
+            publication["payload"]["gate"]["metadata"][
+                "manager_gate_original_reviewer_role"
+            ],
+            "reviewer",
+        )
+
+    async def test_auto_approved_linked_work_item_enters_manager_review_and_spawns_report_without_owner_checkpoint(
+        self,
+    ) -> None:
+        checkpoint_callback = AsyncMock()
+        approval_engine = SimpleNamespace(
+            authorize_work_item_action=AsyncMock(
+                return_value=(
+                    True,
+                    SimpleNamespace(action=ApprovalAction.AUTO_APPROVE),
+                )
+            )
+        )
+        with _workspace_tempdir() as tmpdir:
+            store = OPCStore(Path(tmpdir) / "manager-gate.db")
+            await store.initialize()
+            try:
+                await store.save_delegation_run(
+                    DelegationRun(
+                        run_id="manager-gate-run",
+                        project_id="proj1",
+                        session_id="manager-gate-session",
+                        execution_model="multi_team_org",
+                        status="running",
+                        lifecycle_status="active",
+                    )
+                )
+                gate = WorkItemGatePolicy(
+                    gate_type="approval",
+                    reviewer_role="reviewer",
+                    requires_human=False,
+                )
+                task = Task(
+                    id="linked-manager-gate-task",
+                    title="Manager review",
+                    project_id="proj1",
+                    session_id="manager-gate-session",
+                    assigned_to="executor",
+                    status=TaskStatus.RUNNING,
+                    result={"content": "Implementation complete.", "artifacts": {}},
+                    context_snapshot={
+                        "work_item_owned_outputs": {
+                            "structured_review_verdict": {
+                                "label": "approve",
+                                "summary": "Implementation is ready for manager review.",
+                            }
+                        }
+                    },
+                    metadata={
+                        "execution_mode": "company_mode",
+                        "runtime_model": "multi_team_org",
+                        "delegation_run_id": "manager-gate-run",
+                        "work_item_projection_id": "execution",
+                        "work_item_turn_type": "execute",
+                        "work_kind": "execute",
+                        "manager_role_id": "reviewer",
+                        "manager_seat_id": "seat::reviewer",
+                        "work_item_gate": gate.to_dict(),
+                    },
+                )
+                item = DelegationWorkItem(
+                    work_item_id="linked-manager-gate-wi",
+                    run_id="manager-gate-run",
+                    cell_id="team::executor",
+                    team_id="team::executor",
+                    role_id="executor",
+                    seat_id="seat::executor",
+                    manager_role_id="reviewer",
+                    manager_seat_id="seat::reviewer",
+                    title="Implementation",
+                    kind="execute",
+                    projection_id="execution",
+                    phase=Phase.RUNNING,
+                    metadata={
+                        "runtime_model": "multi_team_org",
+                        "work_item_runtime": True,
+                        "work_item_projection_id": "execution",
+                        "work_item_turn_type": "execute",
+                    },
+                )
+                await store.save_task(task)
+                await store.save_delegation_work_item(item)
+                await store.link_work_item_runtime_task(item.work_item_id, task.id)
+                loaded_task = await store.get_task(task.id)
+                assert loaded_task is not None
+                executor = CompanyWorkItemExecutor(
+                    org_engine=DummyOrgEngine(),
+                    communication=SimpleNamespace(),
+                    approval_engine=approval_engine,
+                    memory=None,
+                    execute_task=AsyncMock(),
+                    save_task=store.save_task,
+                    checkpoint_callback=checkpoint_callback,
+                    store=store,
+                )
+                executor._active_plan = CompanyWorkItemRuntimePlan(
+                    profile="corporate",
+                    projections=[],
+                )
+                executor._active_tasks = [loaded_task]
+
+                await executor._apply_gate(
+                    loaded_task,
+                    gate,
+                    {"execution": loaded_task},
+                )
+
+                refreshed_task = await store.get_task(loaded_task.id)
+                refreshed_item = await store.get_delegation_work_item(
+                    item.work_item_id
+                )
+                run_items = await store.list_delegation_work_items(
+                    "manager-gate-run"
+                )
+                reports = [
+                    candidate
+                    for candidate in run_items
+                    if candidate.metadata.get("report_execution_work_item")
+                    and candidate.metadata.get("report_target_work_item_id")
+                    == item.work_item_id
+                ]
+                assert refreshed_task is not None and refreshed_item is not None
+                self.assertEqual(
+                    refreshed_task.status,
+                    TaskStatus.AWAITING_MANAGER_REVIEW,
+                )
+                self.assertEqual(
+                    refreshed_item.phase,
+                    Phase.AWAITING_MANAGER_REVIEW,
+                )
+                self.assertEqual(len(reports), 1)
+                self.assertEqual(reports[0].phase, Phase.READY)
+                checkpoint_callback.assert_not_awaited()
+            finally:
+                await store.close()
+
     async def test_gate_harness_uses_role_prompt_runner(self) -> None:
         calls: list[dict[str, Any]] = []
 
@@ -9149,6 +11164,123 @@ class CompanyExecutorRolePromptRoutingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(calls[0]["task_id"], delivery_task.id)
         self.assertEqual(calls[0]["prompt_kind"], "ceo_pre_delivery_assessment")
         self.assertTrue(calls[0]["force_new_session"])
+
+    async def test_ceo_pre_delivery_assessment_rejects_coercive_schema(
+        self,
+    ) -> None:
+        responses = (
+            {"deliverable": "false", "summary": "bad", "rework_targets": []},
+            {"deliverable": False, "summary": "bad", "rework_targets": {}},
+        )
+        for response in responses:
+            async def runner(*_args: Any, **_kwargs: Any) -> str:
+                return json.dumps(response)
+
+            executor = CompanyWorkItemExecutor(
+                org_engine=DummyOrgEngine(),
+                communication=SimpleNamespace(),
+                approval_engine=SimpleNamespace(),
+                memory=None,
+                execute_task=AsyncMock(),
+                save_task=AsyncMock(),
+                role_prompt_runner=runner,
+            )
+            delivery = Task(
+                id="delivery-schema",
+                title="Delivery",
+                assigned_to="ceo",
+                status=TaskStatus.AWAITING_HUMAN,
+                project_id="proj1",
+                metadata={
+                    "work_item_projection_id": "delivery_projection",
+                    "authoritative_output": True,
+                    "user_visible": True,
+                },
+            )
+            with self.subTest(response=response):
+                assessment = await executor._ceo_pre_delivery_assessment(
+                    delivery,
+                    CompanyWorkItemRuntimePlan(profile="corporate"),
+                    [delivery],
+                    {"executive_summary": "candidate"},
+                )
+                self.assertTrue(assessment["awaiting_human"])
+                self.assertEqual(
+                    assessment["assessment_failure_kind"],
+                    "role_prompt_invalid_schema",
+                )
+                # A clean deterministic fallback may still classify the
+                # package as deliverable, but infrastructure unavailability
+                # always routes final publication through human review.
+                self.assertTrue(assessment["awaiting_human"])
+
+    async def test_ceo_prompt_marks_only_current_delivery_wait_as_expected(
+        self,
+    ) -> None:
+        captured: dict[str, Any] = {}
+
+        async def runner(
+            _source_task: Task,
+            system_prompt: str,
+            payload: dict[str, Any],
+            *_args: Any,
+        ) -> str:
+            captured["system_prompt"] = system_prompt
+            captured["payload"] = payload
+            return json.dumps(
+                {"deliverable": False, "summary": "blocked", "rework_targets": []}
+            )
+
+        executor = CompanyWorkItemExecutor(
+            org_engine=DummyOrgEngine(),
+            communication=SimpleNamespace(),
+            approval_engine=SimpleNamespace(),
+            memory=None,
+            execute_task=AsyncMock(),
+            save_task=AsyncMock(),
+            role_prompt_runner=runner,
+        )
+        delivery = Task(
+            id="delivery-wait",
+            title="Delivery",
+            assigned_to="ceo",
+            status=TaskStatus.AWAITING_HUMAN,
+            project_id="proj1",
+            metadata={
+                "work_item_projection_id": "delivery_projection",
+                "authoritative_output": True,
+                "user_visible": True,
+            },
+        )
+        child = Task(
+            id="child-wait",
+            title="Child",
+            assigned_to="executor",
+            status=TaskStatus.AWAITING_HUMAN,
+            project_id="proj1",
+            metadata={"work_item_projection_id": "child_projection"},
+        )
+
+        await executor._ceo_pre_delivery_assessment(
+            delivery,
+            CompanyWorkItemRuntimePlan(profile="corporate"),
+            [delivery, child],
+            {"executive_summary": "candidate"},
+        )
+
+        prompt = captured["payload"]
+        self.assertEqual(
+            prompt["current_delivery_prepublication_state"],
+            {
+                "task_id": delivery.id,
+                "status": "awaiting_human",
+                "expected": True,
+            },
+        )
+        tasks = {item["task_id"]: item for item in prompt["work_item_tasks"]}
+        self.assertEqual(tasks[delivery.id]["open_issues"], [])
+        self.assertIn("status: awaiting_human", tasks[child.id]["open_issues"])
+        self.assertIn("current_delivery_prepublication_state", captured["system_prompt"])
 
     async def test_ceo_pre_delivery_assessment_runner_failure_awaits_human_for_blockers(self) -> None:
         class _Org:

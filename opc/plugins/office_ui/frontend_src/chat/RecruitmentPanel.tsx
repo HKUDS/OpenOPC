@@ -30,7 +30,7 @@ type StaffingOption =
 
 interface RecruitmentPanelProps {
   meta: ChatMessageMeta
-  onReply: (text: string, metadata?: CheckpointReplyMetadata) => void
+  onReply: (text: string, metadata?: CheckpointReplyMetadata) => Promise<boolean>
   responded: boolean
 }
 
@@ -250,13 +250,13 @@ export const RecruitmentPanel = React.memo(function RecruitmentPanel({
 
   const handleApprove = useCallback(() => {
     if (isResponded) return
-    onReply('approve', buildReplyMetadata('approve'))
+    void onReply('approve', buildReplyMetadata('approve'))
   }, [buildReplyMetadata, isResponded, onReply])
 
-  const handleFeedback = useCallback(() => {
+  const handleFeedback = useCallback(async () => {
     if (isResponded || !feedback.trim()) return
-    onReply(feedback.trim(), buildReplyMetadata('feedback'))
-    setFeedback('')
+    const accepted = await onReply(feedback.trim(), buildReplyMetadata('feedback'))
+    if (accepted) setFeedback('')
   }, [buildReplyMetadata, isResponded, feedback, onReply])
 
   return (

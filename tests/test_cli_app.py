@@ -12,6 +12,7 @@ import yaml
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import patch
 
 import opc
@@ -35,10 +36,13 @@ from opc.cli.app import (
     _handle_kanban_slash,
     _handle_work_items_slash,
     _busy_slash_policy,
+    _apply_reorg,
+    _approve_reorg,
     _normalize_interactive_preferred_agent,
     _process_interactive_chat_message,
     _restore_chat_context,
     _run_interactive_startup_selector,
+    _submit_reorg_interaction,
     app,
     main,
     _format_escalation_option,
@@ -47,7 +51,10 @@ from opc.cli.app import (
     _project_config_template_dir,
 )
 from opc.core.config import EmployeeConfig, OPCConfig, RoleConfig, SeatConfig, TeamConfig
-from opc.core.models import OPCEvent, TaskStatus
+from opc.core.models import ExecutionCheckpoint, OPCEvent, TaskStatus
+from opc.database.store import OPCStore
+from opc.engine import OPCEngine
+from opc.layer0_interaction.coordinator import InteractionCoordinator
 from opc.core.windows_ssl import (
     format_windows_sslkeylog_warning,
     pop_windows_sslkeylogfile,
@@ -711,7 +718,7 @@ class CliSlashCommandTests(unittest.TestCase):
                 SimpleNamespace(
                     proposal_id="reorg-1",
                     title="Reorg One",
-                    status=SimpleNamespace(value="pending"),
+                    status=SimpleNamespace(value="proposed"),
                     risk_level=SimpleNamespace(value="low"),
                     scope=SimpleNamespace(value="org"),
                     initiated_by="owner",
@@ -888,6 +895,7 @@ class CliSlashCommandTests(unittest.TestCase):
         memory_updates: list[tuple[str, str]] = []
         reorg_approvals: list[tuple[str, bool, str]] = []
         reorg_applies: list[str] = []
+        checkpoint_submissions: list[dict] = []
 
         async def process_message(content, **kwargs):
             calls.append({"content": content, **kwargs})
@@ -904,12 +912,68 @@ class CliSlashCommandTests(unittest.TestCase):
             return next((item for item in proposals if item.proposal_id == proposal_id), None)
 
         async def approve_company_reorg(proposal_id: str, *, approved: bool, notes: str = ""):
+            proposal = await show_company_reorg(proposal_id)
+            if proposal is None:
+                raise ValueError(f"Unknown reorg proposal {proposal_id}")
+            target = "approved" if approved else "denied"
+            current = str(getattr(proposal.status, "value", proposal.status) or "")
+            if current == target:
+                return proposal
+            if current != "proposed":
+                raise ValueError(
+                    f"Reorg proposal decision is immutable after {current}."
+                )
             reorg_approvals.append((proposal_id, approved, notes))
-            return SimpleNamespace(proposal_id=proposal_id)
+            proposal.status = SimpleNamespace(value=target)
+            return proposal
 
         async def apply_company_reorg(proposal_id: str):
+            proposal = await show_company_reorg(proposal_id)
+            if proposal is None:
+                raise ValueError(f"Unknown reorg proposal {proposal_id}")
+            current = str(getattr(proposal.status, "value", proposal.status) or "")
+            if current == "applied":
+                return {"proposal_id": proposal_id, "applied": True}
+            if current != "approved":
+                raise ValueError(
+                    "Reorg proposal must be approved before apply; "
+                    f"current status is {current}."
+                )
             reorg_applies.append(proposal_id)
+            proposal.status = SimpleNamespace(value="applied")
             return {"proposal_id": proposal_id, "applied": True}
+
+        async def submit_checkpoint_decision(**kwargs):
+            checkpoint_submissions.append(dict(kwargs))
+            checkpoint = next(
+                (
+                    item
+                    for item in getattr(store, "checkpoints", [])
+                    if item.checkpoint_id == kwargs.get("checkpoint_id")
+                    and item.checkpoint_type == kwargs.get("checkpoint_type")
+                ),
+                None,
+            )
+            if checkpoint is None:
+                return {"accepted": False, "reason": "checkpoint_not_found"}
+            if checkpoint.status != "pending":
+                return {"accepted": False, "reason": "invalid_state"}
+            checkpoint.status = "answered"
+            return {
+                "accepted": True,
+                "reason": "",
+                "status": "answered",
+                "checkpoint_id": checkpoint.checkpoint_id,
+                "checkpoint_type": checkpoint.checkpoint_type,
+            }
+
+        def issue_project_owner_actor(*, interface: str):
+            return {
+                "kind": "project_owner",
+                "project_id": "demo",
+                "interface": interface,
+                "capability": "test-capability",
+            }
 
         async def get_latest_pending_checkpoint_for_session(session_id: str):
             if store is None:
@@ -936,9 +1000,12 @@ class CliSlashCommandTests(unittest.TestCase):
             show_company_reorg=show_company_reorg,
             approve_company_reorg=approve_company_reorg,
             apply_company_reorg=apply_company_reorg,
+            submit_checkpoint_decision=submit_checkpoint_decision,
+            issue_project_owner_actor=issue_project_owner_actor,
             get_latest_pending_checkpoint_for_session=get_latest_pending_checkpoint_for_session,
             reorg_approvals=reorg_approvals,
             reorg_applies=reorg_applies,
+            checkpoint_submissions=checkpoint_submissions,
         )
         state = _InteractiveChatState(
             config=config,
@@ -1214,9 +1281,9 @@ class CliSlashCommandTests(unittest.TestCase):
                 checkpoint_type="company_runtime_interrupted",
                 status="pending",
                 task_id="task-1",
-                session_id="sess-1",
+                session_id=None,
                 updated_at=datetime(2026, 5, 17, 12, 0),
-                payload={},
+                payload={"parent_session_id": "sess-1"},
             )
         ]
         state, engine = self._make_state(store=store)
@@ -2844,8 +2911,228 @@ class CliSlashCommandTests(unittest.TestCase):
         self.assertIn("Adjust roles", rendered)
         self.assertIn("requires --yes", rendered)
         self.assertIn("Applied reorg reorg-1", rendered)
-        self.assertEqual(engine.reorg_approvals, [("reorg-1", True, "Looks good"), ("reorg-1", False, "Denied via CLI.")])
+        self.assertEqual(engine.reorg_approvals, [("reorg-1", True, "Looks good")])
         self.assertEqual(engine.reorg_applies, ["reorg-1"])
+
+    def test_reorg_slash_uses_durable_checkpoint_and_blocks_early_apply(self) -> None:
+        console = Console(record=True, force_terminal=False, width=180)
+        store = self._Store()
+        store.checkpoints.append(
+            SimpleNamespace(
+                checkpoint_id="cp-reorg",
+                project_id="demo",
+                checkpoint_type="company_reorg_pending",
+                status="pending",
+                task_id="task-1",
+                session_id="sess-1",
+                payload={
+                    "proposal_id": "reorg-1",
+                    "interaction": {
+                        "ownership": {
+                            "ui_anchor_task_id": "task-1",
+                            "ui_anchor_session_id": "sess-1",
+                        }
+                    },
+                },
+            )
+        )
+        state, engine = self._make_state(store=store)
+
+        async def _run() -> None:
+            await _handle_chat_slash_command(
+                state,
+                '/reorg approve reorg-1 --notes "Looks good"',
+            )
+            store.checkpoints[-1].status = "resolved"
+            await _handle_chat_slash_command(state, "/reorg deny reorg-1")
+            await _handle_chat_slash_command(state, "/reorg apply reorg-1 --yes")
+
+        with patch("opc.cli.app.console", console):
+            asyncio.run(_run())
+
+        rendered = console.export_text()
+        self.assertIn("Submitted reorg decision", rendered)
+        self.assertIn("already durable (resolved)", rendered)
+        self.assertIn("must be approved before apply", rendered)
+        self.assertEqual(engine.reorg_approvals, [])
+        self.assertEqual(engine.reorg_applies, [])
+        self.assertEqual(len(engine.checkpoint_submissions), 1)
+        submission = engine.checkpoint_submissions[0]
+        self.assertEqual(submission["decision"]["option_id"], "approve")
+        self.assertEqual(submission["requester_task_id"], "task-1")
+        self.assertEqual(submission["requester_session_id"], "sess-1")
+
+    def test_noninteractive_reorg_deny_submits_checkpoint_not_proposal(self) -> None:
+        console = Console(record=True, force_terminal=False, width=180)
+        store = self._Store()
+        store.checkpoints.append(
+            SimpleNamespace(
+                checkpoint_id="cp-reorg-deny",
+                project_id="demo",
+                checkpoint_type="company_reorg_pending",
+                status="pending",
+                task_id=None,
+                session_id=None,
+                payload={
+                    "proposal_id": "reorg-1",
+                    "interaction": {
+                        "ownership": {}
+                    },
+                },
+            )
+        )
+        state, engine = self._make_state(store=store)
+
+        async def initialize() -> None:
+            return None
+
+        engine.initialize = initialize
+        with (
+            patch("opc.cli.app.console", console),
+            patch("opc.cli.app._create_cli_engine", return_value=(engine, state.runtime_display)),
+        ):
+            asyncio.run(
+                _approve_reorg(
+                    state.config,
+                    "reorg-1",
+                    "demo",
+                    approved=False,
+                )
+            )
+            with self.assertRaisesRegex(ValueError, "must be approved before apply"):
+                asyncio.run(_apply_reorg(state.config, "reorg-1", "demo"))
+
+        self.assertEqual(engine.reorg_approvals, [])
+        self.assertEqual(engine.reorg_applies, [])
+        self.assertEqual(len(engine.checkpoint_submissions), 1)
+        submission = engine.checkpoint_submissions[0]
+        self.assertEqual(submission["decision"]["option_id"], "deny")
+        self.assertEqual(submission["requester_task_id"], "")
+        self.assertIsNone(submission["requester_session_id"])
+        self.assertEqual(
+            submission["requester_actor"],
+            {
+                "kind": "project_owner",
+                "project_id": "demo",
+                "interface": "cli",
+                "capability": "test-capability",
+            },
+        )
+
+    def test_reorg_root_session_actor_does_not_use_checkpoint_child(self) -> None:
+        store = self._Store()
+        checkpoint = SimpleNamespace(
+            checkpoint_id="cp-reorg-root-session",
+            project_id="demo",
+            checkpoint_type="company_reorg_pending",
+            status="pending",
+            task_id="waiting-child",
+            session_id="waiting-session",
+            payload={
+                "proposal_id": "reorg-1",
+                "interaction": {
+                    "ownership": {
+                        "ui_anchor_task_id": "",
+                        "ui_anchor_session_id": "root-session",
+                        "root_session_id": "root-session",
+                        "waiting_task_id": "waiting-child",
+                    }
+                },
+            },
+        )
+        store.checkpoints.append(checkpoint)
+        _state, engine = self._make_state(store=store)
+
+        asyncio.run(
+            _submit_reorg_interaction(
+                engine,
+                checkpoint,
+                approved=True,
+                notes="Approve from the root session",
+            )
+        )
+
+        submission = engine.checkpoint_submissions[0]
+        self.assertEqual(submission["requester_task_id"], "")
+        self.assertEqual(submission["requester_session_id"], "root-session")
+        self.assertIsNone(submission["requester_actor"])
+
+    def test_real_store_taskless_reorg_requires_issued_owner_actor(self) -> None:
+        async def _run(db_path: Path) -> None:
+            store = OPCStore(db_path)
+            await store.initialize()
+            try:
+                checkpoint = ExecutionCheckpoint(
+                    checkpoint_id="cp-taskless-reorg",
+                    project_id="demo",
+                    checkpoint_type="company_reorg_pending",
+                    status="pending",
+                    task_id=None,
+                    session_id=None,
+                    payload={
+                        "proposal_id": "reorg-taskless",
+                        "interaction": {
+                            "kind": "company_reorg_pending",
+                            "domain_key": "reorg:reorg-taskless",
+                            "ownership": {},
+                        },
+                    },
+                )
+                checkpoint, _created = await store.publish_owner_interaction_checkpoint(
+                    checkpoint,
+                    interaction_key="reorg:reorg-taskless",
+                    supersede_pending_scope=False,
+                )
+                engine = OPCEngine.__new__(OPCEngine)
+                engine.store = store
+                engine.project_id = "demo"
+                engine._initialized = True
+                engine.interaction_coordinator = InteractionCoordinator(
+                    store=store,
+                    project_id="demo",
+                )
+                engine._schedule_interaction_consumption = lambda *_args: None
+
+                self.assertFalse(
+                    await engine.can_answer_checkpoint(
+                        checkpoint,
+                        requester_actor={
+                            "kind": "project_owner",
+                            "project_id": "demo",
+                            "interface": "cli",
+                            "capability": "forged",
+                        },
+                    )
+                )
+                receipt = await _submit_reorg_interaction(
+                    engine,
+                    checkpoint,
+                    approved=False,
+                    notes="Denied from trusted CLI.",
+                )
+                self.assertTrue(receipt["accepted"])
+                persisted = await store.get_execution_checkpoint(
+                    checkpoint.checkpoint_id,
+                    project_id="demo",
+                    checkpoint_type="company_reorg_pending",
+                )
+                self.assertIsNotNone(persisted)
+                self.assertEqual(persisted.status, "answered")
+                decision = dict(
+                    dict(persisted.payload.get("interaction", {}) or {}).get(
+                        "decision", {}
+                    )
+                    or {}
+                )
+                self.assertEqual(
+                    dict(decision.get("value", {}) or {}).get("option_id"),
+                    "deny",
+                )
+            finally:
+                await store.close()
+
+        with tempfile.TemporaryDirectory(prefix="opc-taskless-reorg-") as tmp:
+            asyncio.run(_run(Path(tmp) / "tasks.db"))
 
     def test_aliases_completion_and_full_view_args(self) -> None:
         console = Console(record=True, force_terminal=False, width=180)

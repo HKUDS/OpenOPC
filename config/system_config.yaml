@@ -2,7 +2,6 @@ system:
   auto_approve_below_cost: 10.0
   context_compression_threshold: 0.85
   default_channel: cli
-  escalation_timeout_seconds: 300
   log_level: INFO
   max_agent_iterations: 50
   opc_home: ''

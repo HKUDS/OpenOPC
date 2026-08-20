@@ -20,7 +20,7 @@ import asyncio
 from functools import wraps
 from pathlib import Path
 
-from opc.core.models import DelegationWorkItem, Phase
+from opc.core.models import DelegationRun, DelegationWorkItem, Phase
 from opc.database.store import OPCStore
 
 
@@ -157,12 +157,22 @@ async def test_claim_cas_ignores_stale_mirror(tmp_path: Path) -> None:
 
 
 @_async_test
-async def test_startup_sweep_heals_claimed_runnable_rows(tmp_path: Path) -> None:
-    """Legacy rows wedged in a runnable phase with a claim heal on restart."""
+async def test_controller_takeover_heals_claimed_runnable_rows(tmp_path: Path) -> None:
+    """A won run lease, not process startup, heals a wedged legacy claim."""
     db_path = tmp_path / "tasks.db"
     store = OPCStore(db_path)
     await store.initialize()
     try:
+        await store.save_delegation_run(
+            DelegationRun(
+                run_id="claim-invariant-run",
+                project_id="default",
+                session_id="claim-invariant-root",
+                execution_model="multi_team_org",
+                status="running",
+                lifecycle_status="active",
+            )
+        )
         item = _work_item(
             "legacy-wedged",
             phase=Phase.READY_FOR_REWORK,
@@ -180,6 +190,30 @@ async def test_startup_sweep_heals_claimed_runnable_rows(tmp_path: Path) -> None
     reopened = OPCStore(db_path)
     await reopened.initialize()
     try:
+        # Opening the DB cannot steal a healthy process's claim. Recovery is
+        # authorized only after this controller wins the durable run lease.
+        before_takeover = await reopened.get_delegation_work_item("legacy-wedged")
+        assert before_takeover is not None
+        assert before_takeover.claimed_by_role_runtime_session_id == (
+            "role-runtime::dead-worker"
+        )
+
+        lease = await reopened.acquire_delegation_run_controller_lease(
+            "claim-invariant-run",
+            project_id="default",
+            root_session_id="claim-invariant-root",
+            owner_token="claim-invariant-recovery",
+            lease_seconds=60,
+        )
+        assert lease.acquired
+        await reopened.settle_stale_delegation_run_claims_for_controller(
+            "claim-invariant-run",
+            project_id="default",
+            root_session_id="claim-invariant-root",
+            owner_token="claim-invariant-recovery",
+            generation=lease.generation,
+        )
+
         healed = await reopened.get_delegation_work_item("legacy-wedged")
         assert healed is not None
         assert healed.phase == Phase.READY_FOR_REWORK
@@ -187,6 +221,16 @@ async def test_startup_sweep_heals_claimed_runnable_rows(tmp_path: Path) -> None
         assert healed.claimed_by_seat_id == ""
         assert healed.metadata["claimed_by_role_session_id"] == ""
         assert healed.metadata["claimed_task_id"] == ""
-        await _assert_claimable(reopened, "legacy-wedged", Phase.READY_FOR_REWORK)
+        claimed = await reopened.claim_delegation_work_item_if_dispatchable(
+            "legacy-wedged",
+            expected_phase=Phase.READY_FOR_REWORK,
+            role_runtime_session_id="fresh-session",
+            seat_id="seat::executor",
+            task_id="fresh-task",
+            controller_owner_token="claim-invariant-recovery",
+            controller_lease_generation=lease.generation,
+        )
+        assert claimed is not None
+        assert claimed.phase == Phase.RUNNING
     finally:
         await reopened.close()

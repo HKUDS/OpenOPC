@@ -3,7 +3,6 @@ import assert from 'node:assert/strict'
 import type { ChatMessage } from '../types/chat'
 import {
   analyzeCheckpointMessages,
-  checkpointReplyMetadataForComposer,
   isCheckpointCardMetadata,
   isCheckpointType,
   toCheckpointReplyMetadata,
@@ -27,21 +26,23 @@ const checkpoint: ChatMessage = {
 
 assert.equal(isCheckpointType('company_delivery_feedback'), true)
 assert.equal(isCheckpointType('company_staffing_selection'), true)
+assert.equal(isCheckpointType('action_permission'), true)
 assert.equal(isCheckpointCardMetadata(checkpoint.metadata), true)
 assert.deepEqual(toCheckpointReplyMetadata(checkpoint.metadata), {
   response_to_checkpoint_id: 'cp-delivery',
   response_to_checkpoint_type: 'company_delivery_feedback',
-  response_to_escalation_id: undefined,
+})
+assert.deepEqual(toCheckpointReplyMetadata({
+  ...checkpoint.metadata,
+  interaction_requester_session_id: 'root-session',
+}), {
+  response_to_checkpoint_id: 'cp-delivery',
+  response_to_checkpoint_type: 'company_delivery_feedback',
+  interaction_requester_session_id: 'root-session',
 })
 
 const pending = analyzeCheckpointMessages([checkpoint])
 assert.deepEqual([...pending.pendingMessageIds], ['msg-checkpoint'])
-assert.deepEqual(pending.latestPendingReplyMetadata, {
-  response_to_checkpoint_id: 'cp-delivery',
-  response_to_checkpoint_type: 'company_delivery_feedback',
-  response_to_escalation_id: undefined,
-})
-assert.equal(checkpointReplyMetadataForComposer(pending.latestPendingReplyMetadata), undefined)
 
 const legacySelfEvolutionResult: ChatMessage = {
   ...checkpoint,
@@ -58,18 +59,6 @@ assert.equal(isCheckpointCardMetadata(legacySelfEvolutionResult.metadata), false
 const ignoredSelfEvolutionResult = analyzeCheckpointMessages([legacySelfEvolutionResult])
 assert.deepEqual([...ignoredSelfEvolutionResult.pendingMessageIds], [])
 assert.deepEqual([...ignoredSelfEvolutionResult.respondedMessageIds], [])
-assert.equal(checkpointReplyMetadataForComposer({
-  response_to_checkpoint_id: 'esc-approval',
-  response_to_checkpoint_type: 'human_escalation',
-  response_to_escalation_id: 'esc-approval',
-}), undefined)
-assert.deepEqual(checkpointReplyMetadataForComposer({
-  response_to_checkpoint_id: 'cp-staffing',
-  response_to_checkpoint_type: 'company_staffing_selection',
-}), {
-  response_to_checkpoint_id: 'cp-staffing',
-  response_to_checkpoint_type: 'company_staffing_selection',
-})
 
 const duplicatePending = analyzeCheckpointMessages([
   checkpoint,
@@ -124,7 +113,6 @@ const replyBeforeEngineResolution = analyzeCheckpointMessages([
 ])
 assert.deepEqual([...replyBeforeEngineResolution.respondedMessageIds], ['msg-checkpoint'])
 assert.deepEqual([...replyBeforeEngineResolution.pendingMessageIds], [])
-assert.equal(replyBeforeEngineResolution.latestPendingReplyMetadata, undefined)
 
 const responded = analyzeCheckpointMessages([
   {
@@ -147,10 +135,8 @@ const expiredApproval: ChatMessage = {
   timestamp: 3,
   mentions: [],
   metadata: {
-    checkpoint_type: 'human_escalation',
+    checkpoint_type: 'action_permission',
     checkpoint_id: 'esc-expired',
-    escalation_id: 'esc-expired',
-    escalation_type: 'decision_needed',
     prompt: 'Approve external_agent?',
     options: [{ id: 'approve_once', label: 'Approve once' }],
     checkpoint_status: 'timeout',
@@ -162,7 +148,6 @@ const staleApproval: ChatMessage = {
   metadata: {
     ...expiredApproval.metadata,
     checkpoint_id: 'esc-stale',
-    escalation_id: 'esc-stale',
     checkpoint_status: 'stale',
   },
 }
@@ -187,5 +172,19 @@ const ignoredDelivery: ChatMessage = {
 const terminal = analyzeCheckpointMessages([expiredApproval, staleApproval, supersededRecruitment, ignoredDelivery])
 assert.deepEqual([...terminal.pendingMessageIds], [])
 assert.deepEqual([...terminal.respondedMessageIds], ['msg-expired-approval', 'msg-stale-approval', 'msg-superseded-recruitment', 'msg-ignored-delivery'])
+
+for (const checkpointStatus of ['failed', 'outcome_unknown']) {
+  const terminalPermission = analyzeCheckpointMessages([{
+    ...checkpoint,
+    id: `permission-${checkpointStatus}`,
+    metadata: {
+      checkpoint_type: 'action_permission',
+      checkpoint_id: `cp-${checkpointStatus}`,
+      checkpoint_status: checkpointStatus,
+    },
+  }])
+  assert.deepEqual([...terminalPermission.pendingMessageIds], [])
+  assert.deepEqual([...terminalPermission.respondedMessageIds], [`permission-${checkpointStatus}`])
+}
 
 console.log('checkpointUtils.test.ts: OK (checkpoint pending/reply/terminal status handling)')

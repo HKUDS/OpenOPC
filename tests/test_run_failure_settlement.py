@@ -20,10 +20,10 @@ from opc.core.models import (
     DelegationWorkItem,
     ExecutionCheckpoint,
     Task,
-    TaskStatus,
 )
 from opc.database.store import OPCStore
 from opc.engine import OPCEngine
+from opc.layer0_interaction.coordinator import InteractionCoordinator
 from opc.layer2_organization.company_mode import CompanyWorkItemExecutor
 from opc.layer2_organization.phase import Phase
 
@@ -129,6 +129,21 @@ class FailureReviewCheckpointReplyTests(unittest.IsolatedAsyncioTestCase):
         await self.store.initialize()
         self.engine = OPCEngine(project_id="p")
         self.engine.store = self.store
+        self.engine.interaction_coordinator = InteractionCoordinator(
+            store=self.store,
+            project_id="p",
+            checkpoint_changed_callback=self.engine._interaction_checkpoint_changed,
+        )
+        self.engine._initialized = True
+        self.engine._schedule_interaction_consumption = lambda *_args: None
+        await self.store.save_task(
+            Task(
+                id="task-1",
+                project_id="p",
+                session_id="s",
+                metadata={"execution_mode": "company_mode"},
+            )
+        )
         checkpoint = ExecutionCheckpoint(
             checkpoint_id="ckpt-fail-1",
             project_id="p",
@@ -140,11 +155,26 @@ class FailureReviewCheckpointReplyTests(unittest.IsolatedAsyncioTestCase):
                 "run_id": "run-1",
                 "session_id": "s",
                 "prompt": "run closed",
+                "interaction": {
+                    "kind": "company_run_failure_review",
+                    "domain_key": "test:company_run_failure_review:run-1",
+                    "ownership": {
+                        "waiting_task_id": "task-1",
+                        "waiting_session_id": "s",
+                        "ui_anchor_task_id": "task-1",
+                        "ui_anchor_session_id": "s",
+                    },
+                },
             },
             created_at=datetime.now(),
         )
-        await self.store.save_execution_checkpoint(checkpoint)
-        self.checkpoint = checkpoint
+        self.checkpoint, _ = (
+            await self.engine.interaction_coordinator.publish_owner_checkpoint(
+                checkpoint,
+                interaction_key="test:company_run_failure_review:run-1",
+                supersede_pending_scope=False,
+            )
+        )
 
     async def asyncTearDown(self) -> None:
         await self.store.close()
@@ -153,6 +183,33 @@ class FailureReviewCheckpointReplyTests(unittest.IsolatedAsyncioTestCase):
     async def _checkpoint_status(self) -> str:
         loaded = await self.engine._load_execution_checkpoint_by_id("ckpt-fail-1")
         return str(getattr(loaded, "status", "") or "")
+
+    async def _submit_and_consume(self, action: str) -> str:
+        receipt = await self.engine.submit_checkpoint_decision(
+            checkpoint_id=self.checkpoint.checkpoint_id,
+            checkpoint_type=self.checkpoint.checkpoint_type,
+            decision={
+                "option_id": action,
+                "checkpoint_reply_kind": action,
+                "text": action,
+            },
+            client_request_id=f"test:failure-review:{action}",
+            requester_task_id="task-1",
+            requester_session_id="s",
+        )
+        self.assertTrue(receipt["accepted"], receipt)
+        await self.engine._consume_answered_interaction(
+            self.checkpoint.checkpoint_id,
+            self.checkpoint.checkpoint_type,
+        )
+        persisted = await self.store.get_execution_checkpoint(
+            self.checkpoint.checkpoint_id,
+            project_id="p",
+            checkpoint_type=self.checkpoint.checkpoint_type,
+        )
+        assert persisted is not None
+        result = dict(persisted.payload.get("interaction_result", {}) or {})
+        return str(result.get("message", "") or "")
 
     async def test_untargeted_message_is_never_swallowed(self) -> None:
         reply = await self.engine._maybe_resume_checkpoint(
@@ -163,21 +220,23 @@ class FailureReviewCheckpointReplyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self._checkpoint_status(), "pending")
 
     async def test_dismiss_resolves_with_acknowledgement(self) -> None:
-        reply = await self.engine._maybe_resume_checkpoint(
-            "dismiss",
-            session_id="s",
-            reply_metadata={"response_to_checkpoint_id": "ckpt-fail-1"},
-        )
+        reply = await self._submit_and_consume("dismiss")
         self.assertEqual(reply, "Company run closure acknowledged.")
         self.assertEqual(await self._checkpoint_status(), "resolved")
 
-    async def test_content_reply_resolves_and_falls_through(self) -> None:
+    async def test_content_message_falls_through_without_deciding_card(self) -> None:
         reply = await self.engine._maybe_resume_checkpoint(
             "Redo the research, focused on open-source frameworks this time",
             session_id="s",
-            reply_metadata={"response_to_checkpoint_id": "ckpt-fail-1"},
         )
         self.assertIsNone(reply)
+        self.assertEqual(await self._checkpoint_status(), "pending")
+
+        acknowledgement = await self._submit_and_consume("acknowledge")
+        self.assertEqual(
+            acknowledgement,
+            "Company run closure acknowledged.",
+        )
         self.assertEqual(await self._checkpoint_status(), "resolved")
 
 

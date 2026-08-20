@@ -250,7 +250,15 @@ class OrgEngine:
         return self.config.org.company_profile
 
     def get_execution_model(self) -> str:
-        return "actor_runtime"
+        # ``execution_model`` is the organization-facing runtime contract.  It
+        # is deliberately distinct from the internal company scheduler model
+        # (currently ``multi_team_org``), so callers must observe the value
+        # loaded from the active organization config instead of an internal
+        # implementation label.
+        return (
+            str(getattr(self.config.org, "execution_model", "") or "").strip()
+            or "actor_runtime"
+        )
 
     def get_top_level_role_ids(self) -> list[str]:
         agent_ids = set(self._agents)

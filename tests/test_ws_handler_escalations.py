@@ -1,108 +1,95 @@
 from __future__ import annotations
 
 import unittest
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 from opc.plugins.office_ui.ws_handler import WSHandler
 
 
-class WSHandlerEscalationResolutionTests(unittest.IsolatedAsyncioTestCase):
-    async def test_session_scope_reply_resolves_matching_sibling_escalations(self) -> None:
-        handler = object.__new__(WSHandler)
-        handler._pending_escalations = {}
-        handler._pending_escalation_order = []
+def _engine() -> SimpleNamespace:
+    return SimpleNamespace(
+        store=SimpleNamespace(is_ready=lambda: True),
+        submit_checkpoint_decision=AsyncMock(return_value={
+            "accepted": True,
+            "deduplicated": False,
+            "status": "answered",
+        }),
+    )
 
-        first = handler._remember_pending_escalation({
-            "escalation_id": "esc-ext-first",
-            "task_id": "session-root",
-            "source_task_id": "exec-1",
-            "message": (
-                "[DECISION NEEDED] Task: CEO Intake\n"
-                "Approve external_agent 'codex'?\n"
-                "Risk: high\n"
-                "Allowlist target: external_agent:codex"
-            ),
-            "options": [
-                {"id": "approve_once", "label": "Approve once"},
-                {"id": "approve_session", "label": "Allow for this session"},
-                {"id": "deny", "label": "Deny"},
-            ],
-            "default_action": "approve_once",
-            "escalation_type": "decision_needed",
-        })
-        second = handler._remember_pending_escalation({
-            "escalation_id": "esc-ext-second",
-            "task_id": "session-root",
-            "source_task_id": "exec-2",
-            "message": (
-                "[DECISION NEEDED] Task: CTO Planning\n"
-                "Approve external_agent 'codex'?\n"
-                "Risk: high\n"
-                "Allowlist target: external_agent:codex"
-            ),
-            "options": [
-                {"id": "approve_once", "label": "Approve once"},
-                {"id": "approve_session", "label": "Allow for this session"},
-                {"id": "deny", "label": "Deny"},
-            ],
-            "default_action": "approve_once",
-            "escalation_type": "decision_needed",
-        })
 
-        first["future"].set_result("approve_session")
-        resolved_ids = handler._resolve_related_pending_escalations(first, "approve_session")
+def _handler(engines: dict[str, SimpleNamespace]) -> WSHandler:
+    handler = object.__new__(WSHandler)
 
-        self.assertTrue(first["future"].done())
-        self.assertEqual(first["future"].result(), "approve_session")
-        self.assertTrue(second["future"].done())
-        self.assertEqual(second["future"].result(), "approve_session")
-        self.assertEqual(resolved_ids, ["esc-ext-second"])
+    async def resolve_engine(data: dict) -> tuple[SimpleNamespace, str]:
+        project_id = str(data.get("project_id", "") or "").strip()
+        return engines[project_id], project_id
 
-    async def test_project_scope_keeps_parallel_approval_groups_isolated(self) -> None:
-        handler = object.__new__(WSHandler)
-        handler._pending_escalations = {}
-        handler._pending_escalation_order = []
+    handler._engine_for_request = AsyncMock(side_effect=resolve_engine)
+    handler._send_ack = AsyncMock()
+    handler._project_accepted_interaction_reply = AsyncMock()
+    return handler
 
-        first = handler._remember_pending_escalation({
-            "escalation_id": "esc-project-a",
-            "project_id": "project-a",
-            "task_id": "session-root",
-            "source_task_id": "exec-a",
-            "message": "Approve external_agent 'codex'?",
-            "options": [
-                {"id": "approve_once", "label": "Approve once"},
-                {"id": "approve_session", "label": "Allow for this session"},
-            ],
-            "default_action": "approve_once",
-            "escalation_type": "decision_needed",
-            "approval_group_key": "external_agent:codex",
-        })
-        second = handler._remember_pending_escalation({
-            "escalation_id": "esc-project-b",
-            "project_id": "project-b",
-            "task_id": "session-root",
-            "source_task_id": "exec-b",
-            "message": "Approve external_agent 'codex'?",
-            "options": [
-                {"id": "approve_once", "label": "Approve once"},
-                {"id": "approve_session", "label": "Allow for this session"},
-            ],
-            "default_action": "approve_once",
-            "escalation_type": "decision_needed",
-            "approval_group_key": "external_agent:codex",
-        })
 
-        try:
-            resolved_ids = handler._resolve_related_pending_escalations(first, "approve_session")
+def _reply(project_id: str, checkpoint_id: str, request_id: str) -> dict:
+    return {
+        "project_id": project_id,
+        "checkpoint_id": checkpoint_id,
+        "checkpoint_type": "action_permission",
+        "client_request_id": request_id,
+        "requester_task_id": "root-task",
+        "requester_session_id": "root-session",
+        "decision": {
+            "text": "Allow for this session",
+            "option_id": "approve_session",
+        },
+    }
 
-            self.assertEqual(resolved_ids, [])
-            self.assertFalse(second["future"].done())
-            self.assertIs(handler._find_pending_escalation(task_id="session-root", project_id="project-a"), first)
-            self.assertIs(handler._find_pending_escalation(task_id="session-root", project_id="project-b"), second)
-        finally:
-            for record in (first, second):
-                future = record.get("future")
-                if future and not future.done():
-                    future.cancel()
+
+class WSHandlerInteractionReplyTests(unittest.IsolatedAsyncioTestCase):
+    async def test_each_checkpoint_is_submitted_independently(self) -> None:
+        engine = _engine()
+        handler = _handler({"project-a": engine})
+
+        await handler._handle_interaction_reply(
+            object(),
+            _reply("project-a", "checkpoint-first", "request-first"),
+        )
+
+        engine.submit_checkpoint_decision.assert_awaited_once_with(
+            checkpoint_id="checkpoint-first",
+            checkpoint_type="action_permission",
+            decision={
+                "text": "Allow for this session",
+                "option_id": "approve_session",
+            },
+            client_request_id="request-first",
+            requester_task_id="root-task",
+            requester_session_id="root-session",
+        )
+        self.assertEqual(handler._send_ack.await_count, 1)
+        self.assertEqual(handler._project_accepted_interaction_reply.await_count, 1)
+
+    async def test_project_scope_selects_one_engine_without_sibling_fanout(self) -> None:
+        project_a = _engine()
+        project_b = _engine()
+        handler = _handler({"project-a": project_a, "project-b": project_b})
+
+        await handler._handle_interaction_reply(
+            object(),
+            _reply("project-a", "checkpoint-a", "request-a"),
+        )
+
+        project_a.submit_checkpoint_decision.assert_awaited_once()
+        project_b.submit_checkpoint_decision.assert_not_awaited()
+        projection = handler._project_accepted_interaction_reply.await_args.kwargs
+        self.assertEqual(projection["project_id"], "project-a")
+        self.assertEqual(projection["checkpoint_id"], "checkpoint-a")
+
+    def test_process_local_escalation_registry_is_gone(self) -> None:
+        self.assertFalse(hasattr(WSHandler, "_remember_pending_escalation"))
+        self.assertFalse(hasattr(WSHandler, "_find_pending_escalation"))
+        self.assertFalse(hasattr(WSHandler, "_resolve_related_pending_escalations"))
 
 
 if __name__ == "__main__":

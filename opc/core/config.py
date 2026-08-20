@@ -528,7 +528,10 @@ class ContextUsageReportingConfig(BaseModel):
 
 
 class VerificationPolicyConfig(BaseModel):
-    enabled: bool = True
+    # Company mode already has its own manager-review/rework state machine.
+    # Keep the optional extra verifier opt-in so a freshly-created config has
+    # the same behaviour as the shipped system_config.yaml template.
+    enabled: bool = False
     min_todos_for_verification: int = 3
     require_on_code_edits: bool = True
     require_on_risky_tools: bool = True
@@ -904,7 +907,6 @@ class SystemConfig(BaseModel):
     log_level: str = "INFO"
     max_agent_iterations: int = 50
     context_compression_threshold: float = 0.85
-    escalation_timeout_seconds: int = 3600
     auto_approve_below_cost: float = 10.0
     require_confirmation: list[str] = Field(
         default_factory=lambda: ["deploy to production", "send external emails", "modify database schema"]
@@ -948,8 +950,8 @@ class AutonomyConfig(BaseModel):
     safe_command_prefixes: list[str] = Field(default_factory=lambda: [
         "ls", "pwd", "echo", "rg", "find", "git status", "git diff", "python -V",
         "python3 -V", "node -v", "npm -v", "curl", "wget", "yt-dlp", "aria2c", "ffmpeg",
-        # Read-only commands agents chain constantly; each segment of a compound
-        # command must match one of these for the whole command to stay LOW risk.
+        # Standalone read-only commands. Shell control structures always route
+        # through an explicit permission checkpoint, regardless of prefix.
         "cd", "cat", "head", "tail", "grep", "wc", "sort", "uniq", "cut", "tr",
         "stat", "file", "which", "date", "du", "df", "tree", "basename", "dirname",
         "realpath", "readlink", "uname", "nproc", "whoami", "hostname", "git log",
@@ -1775,7 +1777,9 @@ class OPCConfig(BaseModel):
                         existing = yaml.safe_load(f) or {}
                     existing_roles = existing.get("roles") or []
                     if existing_roles:
-                        import logging, os as _os
+                        import logging
+                        import os as _os
+
                         logging.getLogger(__name__).error(
                             "OPCConfig.save(): REFUSED to wipe %d existing roles with "
                             "empty list in custom mode. pid=%d, path=%s. "

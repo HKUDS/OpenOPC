@@ -1121,6 +1121,34 @@ class TaskTransitionReviewFallbackTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(reason, "")
 
+    def test_approve_cannot_override_failed_or_partial_verification(self) -> None:
+        from opc.layer2_organization.company_mode import CompanyWorkItemExecutor
+
+        for label in ("failed", "partial"):
+            with self.subTest(label=label):
+                reason = CompanyWorkItemExecutor._review_approval_blocker_reason({
+                    "structured_review_verdict": {
+                        "label": "approve",
+                        "summary": "Looks good.",
+                    },
+                    "review_completion_report": "Reviewer approved the handoff.",
+                    "review_evidence": {
+                        "artifact_manifest": [
+                            {"path": "TEST_REPORT.md", "status": "provided"}
+                        ],
+                        "output_paths": ["TEST_REPORT.md"],
+                        "verification_results": {
+                            "status": {
+                                "label": label,
+                                "summary": "Verifier found unresolved quality issues.",
+                            },
+                            "checks": [],
+                        },
+                    },
+                })
+
+                self.assertIn(f"`{label}`", reason)
+
     async def test_failed_task_can_close_in_progress_work_item_as_terminal_done(self) -> None:
         """Terminal failures should close a claimed work item without routing
         through manager review."""

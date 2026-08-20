@@ -17,6 +17,7 @@ from typing import Any, TYPE_CHECKING
 
 from opc.core.config import OPCConfig
 from opc.core.models import UserMessage
+from opc.layer0_interaction.coordinator import InteractionDecisionLease
 from opc.core.org_config import (
     apply_org_config_payload_to_config,
     load_org_config_payload,
@@ -32,6 +33,7 @@ class CustomRuntimeRunner:
 
     def __init__(self, parent: OPCEngine) -> None:
         self.parent = parent
+        self._runtime_ingress_tasks: dict[int, Any] = {}
 
     def _build_org_config(self, organization_id: str | None) -> tuple[OPCConfig, str | None]:
         config_dir = self.parent.opc_home / "config"
@@ -49,6 +51,132 @@ class CustomRuntimeRunner:
         validate_runnable_org_config(loaded_config, organization_id=resolved_org_id or "")
         return loaded_config, resolved_org_id
 
+    async def _create_runtime(
+        self,
+        *,
+        project_id: str | None,
+        org_id: str | None,
+    ) -> tuple[OPCEngine, str]:
+        """Build the one isolated Engine used by every custom-org ingress."""
+
+        from opc.engine import OPCEngine
+        from opc.plugins.office_ui.services.models import ServiceError
+
+        normalized_org_id = str(org_id or "").strip()
+        if not normalized_org_id:
+            raise ServiceError(
+                "org_id_required",
+                "org_id_required",
+                {
+                    "project_id": project_id or self.parent.project_id or "default",
+                    "reason": "custom_company_run_requires_durable_org_id",
+                },
+            )
+        org_config, resolved_org_id = self._build_org_config(normalized_org_id)
+        if not resolved_org_id:
+            raise ServiceError(
+                "org_id_required",
+                "org_id_required",
+                {
+                    "project_id": project_id or self.parent.project_id or "default",
+                    "reason": "custom_company_run_requires_durable_org_id",
+                },
+            )
+        normalized_project_id = str(
+            project_id or self.parent.project_id or "default"
+        ).strip() or "default"
+        shared_store = getattr(self.parent, "store", None)
+        runtime = OPCEngine(
+            config=org_config,
+            opc_home=self.parent.opc_home,
+            project_id=normalized_project_id,
+            store=shared_store,
+            owns_store=shared_store is None,
+            run_startup_reconcile=shared_store is None,
+            active_task_run_registry=getattr(
+                self.parent,
+                "_active_task_run_registry",
+                None,
+            ),
+            owns_active_task_run_registry=False,
+            on_progress=self.parent.on_progress,
+            on_runtime_event=self.parent.on_runtime_event,
+            on_escalation=None,
+            interaction_coordinator=getattr(
+                self.parent,
+                "interaction_coordinator",
+                None,
+            ),
+            pre_delivery_validator=getattr(
+                self.parent,
+                "pre_delivery_validator",
+                None,
+            ),
+        )
+        # Registration is synchronous and precedes initialization's first
+        # await.  The Store-owning parent can therefore always find and cancel
+        # this ingress if shutdown crosses custom runtime construction.
+        ingress_task = self.parent._register_runtime_child(runtime)
+        self._runtime_ingress_tasks[id(runtime)] = ingress_task
+        runtime.on_company_runtime_children = self.parent.on_company_runtime_children
+        try:
+            await runtime.initialize()
+        except BaseException:
+            shutdown_completed = False
+            try:
+                await runtime.shutdown()
+                shutdown_completed = True
+            finally:
+                if shutdown_completed:
+                    self.parent._unregister_runtime_child(runtime, ingress_task)
+                    self._runtime_ingress_tasks.pop(id(runtime), None)
+            raise
+        company_executor = getattr(runtime, "company_executor", None)
+        if company_executor is not None:
+            callback_factory = getattr(
+                self.parent,
+                "on_company_kanban_callback_factory",
+                None,
+            )
+            if callable(callback_factory):
+                company_executor.on_kanban_changed = callback_factory(runtime)
+            else:
+                parent_executor = getattr(self.parent, "company_executor", None)
+                company_executor.on_kanban_changed = getattr(
+                    parent_executor,
+                    "on_kanban_changed",
+                    None,
+                )
+        return runtime, resolved_org_id
+
+    async def _shutdown_runtime(self, runtime: OPCEngine) -> None:
+        from opc.layer2_organization.phase_hooks import unregister_dispatcher_wake
+
+        company_executor = getattr(runtime, "company_executor", None)
+        wake = getattr(company_executor, "_signal_dispatcher_wake", None)
+        if wake is not None:
+            unregister_dispatcher_wake(wake)
+        await runtime.shutdown()
+        ingress_task = self._runtime_ingress_tasks.pop(id(runtime), None)
+        self.parent._unregister_runtime_child(runtime, ingress_task)
+
+    async def dispatch_interaction_decision(
+        self,
+        lease: InteractionDecisionLease,
+        *,
+        org_id: str,
+    ) -> Any:
+        """Consume a claimed owner decision under its durable org config."""
+
+        runtime, _ = await self._create_runtime(
+            project_id=lease.checkpoint.project_id,
+            org_id=org_id,
+        )
+        try:
+            return await runtime._dispatch_interaction_decision(lease)
+        finally:
+            await self._shutdown_runtime(runtime)
+
     async def process_message(
         self,
         content: str,
@@ -62,49 +190,14 @@ class CustomRuntimeRunner:
         attachment_refs: list[dict[str, Any]] | None,
         message_metadata: dict[str, Any] | None,
     ) -> str:
-        from opc.engine import OPCEngine
-        from opc.layer2_organization.phase_hooks import unregister_dispatcher_wake
-        from opc.plugins.office_ui.services.models import ServiceError
-
-        normalized_org_id = str(org_id or "").strip()
-        if not normalized_org_id:
-            # Isolated org mode must carry a durable org_id; resolving the
-            # active index here would silently route the run to whichever
-            # organization is currently loaded.
-            raise ServiceError(
-                "org_id_required",
-                "org_id_required",
-                {
-                    "project_id": project_id or self.parent.project_id or "default",
-                    "reason": "custom_company_run_requires_durable_org_id",
-                },
-            )
-        org_config, resolved_org_id = self._build_org_config(normalized_org_id)
-        normalized_project_id = str(project_id or self.parent.project_id or "default").strip() or "default"
-        shared_store = getattr(self.parent, "store", None)
-        runtime = OPCEngine(
-            config=org_config,
-            opc_home=self.parent.opc_home,
-            project_id=normalized_project_id,
-            store=shared_store,
-            owns_store=shared_store is None,
-            run_startup_reconcile=shared_store is None,
-            active_task_run_registry=getattr(self.parent, "_active_task_run_registry", None),
-            owns_active_task_run_registry=False,
-            on_progress=self.parent.on_progress,
-            on_runtime_event=self.parent.on_runtime_event,
-            on_escalation=self.parent.on_escalation,
+        runtime, resolved_org_id = await self._create_runtime(
+            project_id=project_id,
+            org_id=org_id,
         )
-        runtime.on_company_runtime_children = self.parent.on_company_runtime_children
-        await runtime.initialize()
-        company_executor = getattr(runtime, "company_executor", None)
-        if company_executor is not None:
-            callback_factory = getattr(self.parent, "on_company_kanban_callback_factory", None)
-            if callable(callback_factory):
-                company_executor.on_kanban_changed = callback_factory(runtime)
-            else:
-                parent_executor = getattr(self.parent, "company_executor", None)
-                company_executor.on_kanban_changed = getattr(parent_executor, "on_kanban_changed", None)
+        normalized_project_id = str(
+            project_id or self.parent.project_id or "default"
+        ).strip() or "default"
+        org_config = runtime.config
 
         try:
             normalized_attachment_refs = runtime._normalize_attachment_refs(attachment_refs)
@@ -141,8 +234,4 @@ class CustomRuntimeRunner:
             response = await runtime.message_bus.process_single(message)
             return response.content if response else "No response generated."
         finally:
-            company_executor = getattr(runtime, "company_executor", None)
-            wake = getattr(company_executor, "_signal_dispatcher_wake", None)
-            if wake is not None:
-                unregister_dispatcher_wake(wake)
-            await runtime.shutdown()
+            await self._shutdown_runtime(runtime)

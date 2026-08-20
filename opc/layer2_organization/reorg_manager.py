@@ -2,12 +2,17 @@
 
 from __future__ import annotations
 
+import asyncio
+import copy
+import hashlib
+import json
+import uuid
 from datetime import datetime
 from typing import Any, Callable, Coroutine
 
 from opc.core.models import (
-    ApprovalAction,
     OrgSnapshot,
+    ExecutionCheckpoint,
     ReorgChangeSet,
     ReorgEventKind,
     ReorgEventRecord,
@@ -22,10 +27,20 @@ from opc.core.models import (
     TaskStatus,
 )
 from opc.database.store import OPCStore
-from opc.layer2_organization.approval import ApprovalEngine
+from opc.core.interaction_protocol import OWNER_INTERACTION_CHECKPOINT_TYPES
+from opc.layer0_interaction.coordinator import (
+    InteractionCoordinator,
+    InteractionDecisionLease,
+)
 from opc.layer2_organization.communication import CommunicationManager
+from opc.layer2_organization.company_runtime_identity import (
+    resolve_company_interaction_ownership,
+)
 from opc.layer2_organization.org_engine import OrgEngine
 from opc.layer2_organization.work_item_identity import work_item_identity_payload_for_task
+
+
+_SYSTEM_REORG_DECISION_AUTHORITY = object()
 
 
 class ReorgManager:
@@ -44,15 +59,15 @@ class ReorgManager:
         self,
         store: OPCStore,
         org_engine: OrgEngine,
-        approval_engine: ApprovalEngine | None,
         communication: CommunicationManager | None,
         progress_callback: Callable[[str], Coroutine[Any, Any, None]] | None = None,
+        interaction_coordinator: InteractionCoordinator | None = None,
     ) -> None:
         self.store = store
         self.org_engine = org_engine
-        self.approval_engine = approval_engine
         self.communication = communication
         self.progress_callback = progress_callback
+        self.interaction_coordinator = interaction_coordinator
 
     async def _emit_progress(self, message: str) -> None:
         if self.progress_callback:
@@ -90,11 +105,59 @@ class ReorgManager:
         task_id: str | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> ReorgProposal:
+        """Create a proposal governed by an owner interaction."""
+
+        return await self._propose_reorg(
+            project_id=project_id,
+            summary=summary,
+            rationale=rationale,
+            title=title,
+            initiated_by=initiated_by,
+            source_role_id=source_role_id,
+            changeset=changeset,
+            scope=scope,
+            session_id=session_id,
+            task_id=task_id,
+            metadata=metadata,
+            _system_authority=None,
+        )
+
+    async def _propose_reorg(
+        self,
+        *,
+        project_id: str,
+        summary: str,
+        rationale: str = "",
+        title: str = "",
+        initiated_by: str = "owner",
+        source_role_id: str = "",
+        changeset: ReorgChangeSet | dict[str, Any] | None = None,
+        scope: ReorgScope | None = None,
+        session_id: str | None = None,
+        task_id: str | None = None,
+        metadata: dict[str, Any] | None = None,
+        _system_authority: object | None,
+    ) -> ReorgProposal:
+        if (
+            _system_authority is not None
+            and _system_authority is not _SYSTEM_REORG_DECISION_AUTHORITY
+        ):
+            raise ValueError("invalid system reorg decision authority")
         if isinstance(changeset, dict):
             changeset = ReorgChangeSet(**changeset)
         changeset = self._normalize_changeset(changeset or ReorgChangeSet())
         scope = scope or self._infer_scope(changeset)
         risk_level = self._classify_risk(scope, changeset)
+        system_decision_authorized = (
+            _system_authority is _SYSTEM_REORG_DECISION_AUTHORITY
+        )
+        if system_decision_authorized and not (
+            scope == ReorgScope.TASK_ADJUSTMENT
+            and risk_level == ReorgRiskLevel.LOW
+        ):
+            raise ValueError(
+                "system reorg decisions are limited to low-risk task adjustments"
+            )
         snapshot = await self.build_org_snapshot(project_id)
         await self.store.save_org_snapshot(snapshot)
 
@@ -117,7 +180,9 @@ class ReorgManager:
             title=title or summary[:120],
             summary=summary,
             rationale=rationale or summary,
-            user_confirmation_required=(scope != ReorgScope.TASK_ADJUSTMENT or risk_level != ReorgRiskLevel.LOW),
+            # Risk alone never grants authority.  Only the explicitly
+            # authorized system path may omit the owner interaction.
+            user_confirmation_required=not system_decision_authorized,
             old_org_version=snapshot.org_version,
             new_org_version=migration_plan.metadata.get("target_org_version", snapshot.org_version),
             old_runtime_topology_version=snapshot.runtime_topology_version,
@@ -129,126 +194,382 @@ class ReorgManager:
                 "affected_checkpoints": len(migration_plan.affected_checkpoint_ids),
                 "role_mapping": migration_plan.role_mapping,
             },
-            metadata=dict(metadata or {}),
+            metadata={
+                **dict(metadata or {}),
+                "system_decision_authorized": system_decision_authorized,
+            },
         )
-        await self.store.save_reorg_proposal(proposal)
-        await self.store.record_reorg_event(
-            ReorgEventRecord(
-                proposal_id=proposal.proposal_id,
-                project_id=project_id,
-                event_kind=ReorgEventKind.PROPOSED,
-                summary=proposal.summary,
-                details={
-                    "scope": proposal.scope.value,
-                    "risk_level": proposal.risk_level.value,
-                    "changeset": proposal.changeset.__dict__,
-                },
+        if proposal.user_confirmation_required:
+            if self.interaction_coordinator is None:
+                # Standalone domain consumers (tests/embedded use) still use
+                # the same coordinator protocol; Engine injects its shared
+                # instance so UI notifications and recovery remain owned by
+                # the root controller.
+                self.interaction_coordinator = InteractionCoordinator(
+                    store=self.store,
+                    project_id=proposal.project_id,
+                )
+            proposal, created, _checkpoint, _checkpoint_created = (
+                await self.interaction_coordinator.publish_reorg_proposal(
+                    proposal,
+                    await self.build_reorg_owner_checkpoint(proposal),
+                )
             )
-        )
+        else:
+            proposal, created, _checkpoint, _checkpoint_created = (
+                await self.store._create_system_task_adjustment_proposal(proposal)
+            )
+        if created:
+            await self.store.record_reorg_event(
+                ReorgEventRecord(
+                    proposal_id=proposal.proposal_id,
+                    project_id=project_id,
+                    event_kind=ReorgEventKind.PROPOSED,
+                    summary=proposal.summary,
+                    details={
+                        "scope": proposal.scope.value,
+                        "risk_level": proposal.risk_level.value,
+                        "changeset": proposal.changeset.__dict__,
+                    },
+                )
+            )
         return proposal
 
-    async def request_reorg_approval(self, proposal_id: str) -> tuple[bool, ReorgProposal]:
-        proposal = await self._require_proposal(proposal_id)
-        if not proposal.user_confirmation_required:
-            proposal.status = ReorgProposalStatus.APPROVED
-            proposal.updated_at = datetime.now()
-            await self.store.save_reorg_proposal(proposal)
-            return True, proposal
-        if not self.approval_engine:
-            raise RuntimeError("Approval engine is unavailable")
+    async def build_reorg_owner_checkpoint(
+        self,
+        proposal: ReorgProposal,
+    ) -> ExecutionCheckpoint:
+        """Build the canonical, deterministic owner card for one proposal."""
 
-        approval_task = Task(
-            id=proposal.task_id or proposal.proposal_id,
-            session_id=proposal.session_id,
+        domain_key = hashlib.sha256(
+            json.dumps(
+                {
+                    "project_id": proposal.project_id,
+                    "checkpoint_type": "company_reorg_pending",
+                    "proposal_id": proposal.proposal_id,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        supersession_key = hashlib.sha256(
+            f"{proposal.project_id}:company_reorg_pending:{proposal.proposal_id}".encode(
+                "utf-8"
+            )
+        ).hexdigest()
+        interaction: dict[str, Any] = {
+            "kind": "company_reorg_pending",
+            "prompt": proposal.summary,
+            "options": [
+                {"id": "approve", "label": "Approve"},
+                {"id": "deny", "label": "Deny"},
+            ],
+            "domain_key": domain_key,
+            "supersession_key": supersession_key,
+            "supersession_order": [0, 0],
+            # The task id is execution identity, not necessarily the owner UI
+            # anchor (company child tasks resolve to their root).  Canonical
+            # ownership resolution derives that anchor when publishing/viewing;
+            # taskless proposals use the explicit project-owner capability.
+            "ownership": {},
+        }
+        proposal_metadata = dict(proposal.metadata or {})
+        task = (
+            await self.store.get_task(proposal.task_id)
+            if proposal.task_id
+            else None
+        )
+        task_metadata = dict(getattr(task, "metadata", {}) or {})
+        profile = str(
+            proposal_metadata.get("company_profile")
+            or task_metadata.get("company_profile")
+            or (
+                "custom"
+                if str(task_metadata.get("exec_mode", "") or "").lower()
+                in {"org", "custom"}
+                else ""
+            )
+            or ""
+        ).strip().lower()
+        org_id = str(
+            proposal_metadata.get("org_id")
+            or getattr(task, "org_id", None)
+            or task_metadata.get("org_id")
+            or task_metadata.get("organization_id")
+            or ""
+        ).strip()
+        scope = {"company_profile": profile, "org_id": org_id}
+        if any(scope.values()):
+            interaction["execution_scope"] = scope
+        continuation_payload: dict[str, Any] = {}
+        if task is not None:
+            parent_session_id = str(
+                getattr(task, "parent_session_id", "")
+                or task_metadata.get("parent_session_id")
+                or ""
+            ).strip()
+            interaction["ownership"] = await resolve_company_interaction_ownership(
+                self.store,
+                proposal.project_id,
+                waiting_task_id=task.id,
+                waiting_session_id=str(task.session_id or "").strip(),
+                execution_parent_task_id=str(
+                    getattr(task, "parent_id", "") or ""
+                ).strip(),
+                execution_parent_session_id=parent_session_id,
+                origin_task_id=str(
+                    task_metadata.get("origin_task_id", "") or ""
+                ).strip(),
+                root_session_id_hint=str(
+                    task_metadata.get("company_runtime_root_session_id")
+                    or proposal.session_id
+                    or ""
+                ).strip(),
+            )
+            continuation_payload = {
+                # The atomic proposal/card pair is the first durable card.  It
+                # must already contain enough execution identity to resume if
+                # the owner answers before the task-pause projection runs.
+                "waiting_task_id": task.id,
+                "task_ids": list(
+                    task_metadata.get("execution_task_ids", [task.id]) or [task.id]
+                ),
+                "parent_session_id": parent_session_id,
+                "company_work_item_plan": task_metadata.get(
+                    "company_work_item_plan"
+                ),
+                "original_message": str(
+                    task_metadata.get("original_message")
+                    or task_metadata.get("original_request")
+                    or ""
+                ),
+            }
+        checkpoint_id = str(
+            uuid.uuid5(
+                uuid.NAMESPACE_URL,
+                f"openopc:reorg:{proposal.project_id}:{proposal.proposal_id}",
+            )
+        )
+        return ExecutionCheckpoint(
+            checkpoint_id=checkpoint_id,
             project_id=proposal.project_id,
-            title=proposal.title,
-            description=proposal.summary,
-            assigned_to=proposal.source_role_id or "coordinator",
-            metadata={
-                "reorg_proposal_id": proposal.proposal_id,
+            session_id=proposal.session_id,
+            checkpoint_type="company_reorg_pending",
+            task_id=proposal.task_id,
+            payload={
+                "proposal_id": proposal.proposal_id,
                 "org_version": proposal.old_org_version,
                 "runtime_topology_version": proposal.old_runtime_topology_version,
+                "source_event_id": proposal.proposal_id,
+                **continuation_payload,
+                "interaction": interaction,
             },
         )
-        approved, decision = await self.approval_engine.authorize_work_item_action(
-            task=approval_task,
-            work_item_title=f"reorg:{proposal.title or proposal.proposal_id}",
-            metadata={
-                "role_id": proposal.source_role_id or "owner",
-                "company_profile": self.org_engine.get_company_profile(),
-                "gate_type": "company_reorg",
-                "proposal_id": proposal.proposal_id,
-                "scope": proposal.scope.value,
-                "risk_level": proposal.risk_level.value,
-            },
-            on_progress=self.progress_callback,
-            force_human=True,
-        )
-        proposal.approval_notes = decision.rationale
-        proposal.status = ReorgProposalStatus.APPROVED if approved else ReorgProposalStatus.DENIED
-        proposal.updated_at = datetime.now()
-        await self.store.save_reorg_proposal(proposal)
-        await self.store.record_reorg_event(
-            ReorgEventRecord(
-                proposal_id=proposal.proposal_id,
-                project_id=proposal.project_id,
-                event_kind=ReorgEventKind.APPROVED if approved else ReorgEventKind.DENIED,
-                summary=decision.rationale,
-                details={
-                    "approval_action": decision.action.value,
-                    "risk_level": decision.risk_level.value,
-                    "metadata": decision.metadata,
-                },
-            )
-        )
-        return approved, proposal
 
-    async def set_reorg_approval(self, proposal_id: str, approved: bool, notes: str = "") -> ReorgProposal:
-        proposal = await self._require_proposal(proposal_id)
-        proposal.status = ReorgProposalStatus.APPROVED if approved else ReorgProposalStatus.DENIED
-        proposal.approval_notes = notes or proposal.approval_notes
-        proposal.updated_at = datetime.now()
-        await self.store.save_reorg_proposal(proposal)
-        await self.store.record_reorg_event(
-            ReorgEventRecord(
-                proposal_id=proposal.proposal_id,
-                project_id=proposal.project_id,
-                event_kind=ReorgEventKind.APPROVED if approved else ReorgEventKind.DENIED,
-                summary=notes or proposal.summary,
-                details={"status": proposal.status.value},
-            )
+    async def set_reorg_approval(
+        self,
+        proposal_id: str,
+        approved: bool,
+        notes: str = "",
+        *,
+        interaction_lease: InteractionDecisionLease | None = None,
+    ) -> ReorgProposal:
+        """Apply a decision carried by the proposal's claimed owner card."""
+
+        return await self._set_reorg_approval(
+            proposal_id,
+            approved=approved,
+            notes=notes,
+            interaction_lease=interaction_lease,
+            _system_authority=None,
         )
+
+    async def _set_reorg_approval(
+        self,
+        proposal_id: str,
+        approved: bool,
+        notes: str = "",
+        *,
+        interaction_lease: InteractionDecisionLease | None = None,
+        _system_authority: object | None,
+    ) -> ReorgProposal:
+        if (
+            _system_authority is not None
+            and _system_authority is not _SYSTEM_REORG_DECISION_AUTHORITY
+        ):
+            raise ValueError("invalid system reorg decision authority")
+        system_decision = (
+            _system_authority is _SYSTEM_REORG_DECISION_AUTHORITY
+        )
+        if system_decision:
+            receipt = await self.store._decide_system_task_adjustment_proposal(
+                proposal_id,
+                approved=approved,
+                notes=notes,
+            )
+        elif self.interaction_coordinator is not None:
+            receipt = await self.interaction_coordinator.decide_reorg_proposal(
+                proposal_id,
+                approved=approved,
+                notes=notes,
+                lease=interaction_lease,
+            )
+        else:
+            raise RuntimeError("required reorg decision needs interaction lease")
+        proposal = receipt.proposal
+        if proposal is None:
+            raise ValueError(f"Unknown reorg proposal: {proposal_id}")
+        if receipt.outcome == "conflict":
+            if (
+                proposal.status == ReorgProposalStatus.PROPOSED
+                and proposal.user_confirmation_required
+            ):
+                raise ValueError(
+                    "Confirmation-required reorg decisions need the matching "
+                    "claimed owner interaction."
+                )
+            raise ValueError(
+                "Reorg proposal decision is immutable after "
+                f"{proposal.status.value}."
+            )
+        if not receipt.applied:
+            raise RuntimeError(
+                f"Reorg proposal decision failed ({receipt.outcome})."
+            )
+        if receipt.outcome == "applied":
+            await self.store.record_reorg_event(
+                ReorgEventRecord(
+                    proposal_id=proposal.proposal_id,
+                    project_id=proposal.project_id,
+                    event_kind=(
+                        ReorgEventKind.APPROVED
+                        if approved
+                        else ReorgEventKind.DENIED
+                    ),
+                    summary=notes or proposal.summary,
+                    details={"status": proposal.status.value},
+                )
+            )
         return proposal
 
-    async def apply_reorg(self, proposal_id: str) -> dict[str, Any]:
-        proposal = await self._require_proposal(proposal_id)
-        if proposal.user_confirmation_required and proposal.status != ReorgProposalStatus.APPROVED:
-            raise ValueError("Proposal must be approved before apply.")
-
-        before_snapshot = await self.build_org_snapshot(proposal.project_id)
-        await self.store.save_org_snapshot(before_snapshot)
-        proposal.migration_plan.rollback_snapshot_id = before_snapshot.snapshot_id
-
-        change_result = self.org_engine.apply_changeset(
-            proposal.changeset,
-            persist=True,
-        ) if proposal.scope == ReorgScope.ORG_MUTATION or proposal.changeset.role_changes else {
-            "old_org_version": self.org_engine.current_org_version(),
-            "new_org_version": self.org_engine.current_org_version(),
-            "role_mapping": {},
+    @staticmethod
+    def _persisted_apply_result(proposal: ReorgProposal) -> dict[str, Any]:
+        saved = dict(proposal.metadata or {}).get("apply_result")
+        if isinstance(saved, dict) and saved:
+            return copy.deepcopy(saved)
+        migration_summary = dict(
+            proposal.migration_plan.metadata.get("migration_summary", {}) or {}
+        )
+        return {
+            "proposal_id": proposal.proposal_id,
+            "status": ReorgProposalStatus.APPLIED.value,
+            "migration_summary": migration_summary,
+            "change_result": {
+                "old_org_version": proposal.old_org_version,
+                "new_org_version": proposal.new_org_version,
+                "role_mapping": dict(proposal.migration_plan.role_mapping or {}),
+            },
+            "snapshot_id": str(
+                dict(proposal.metadata or {}).get("applied_snapshot_id", "") or ""
+            ),
         }
 
-        migration_summary = await self._migrate_active_state(proposal, change_result)
-        proposal.status = ReorgProposalStatus.APPLIED
-        proposal.old_org_version = change_result["old_org_version"]
-        proposal.new_org_version = change_result["new_org_version"]
-        proposal.migration_plan.role_mapping = dict(change_result.get("role_mapping", {}))
-        proposal.migration_plan.metadata["migration_summary"] = migration_summary
-        proposal.updated_at = datetime.now()
-        await self.store.save_reorg_proposal(proposal)
+    async def apply_reorg(self, proposal_id: str) -> dict[str, Any]:
+        operation_token = uuid.uuid4().hex
+        claim = await self.store.claim_reorg_application(
+            proposal_id,
+            operation_token=operation_token,
+        )
+        proposal = claim.proposal
+        if claim.outcome == "applied" and proposal is not None:
+            return self._persisted_apply_result(proposal)
+        if claim.outcome in {"busy", "duplicate"}:
+            raise RuntimeError(
+                "Reorg application is already in progress or its prior controller "
+                "stopped before recording the outcome; it will not be replayed."
+            )
+        if claim.outcome == "not_found" or proposal is None:
+            raise ValueError(f"Unknown reorg proposal: {proposal_id}")
+        if claim.outcome == "invalid_state":
+            raise ValueError(
+                "Reorg proposal must be approved before apply; "
+                f"current status is {proposal.status.value}."
+            )
+        if not claim.acquired:
+            raise RuntimeError(
+                f"Reorg application claim failed ({claim.outcome})."
+            )
 
-        after_snapshot = await self.build_org_snapshot(proposal.project_id)
-        await self.store.save_org_snapshot(after_snapshot)
+        effect_started = False
+        try:
+            before_snapshot = await self.build_org_snapshot(proposal.project_id)
+            await self.store.save_org_snapshot(before_snapshot)
+            proposal.migration_plan.rollback_snapshot_id = before_snapshot.snapshot_id
+
+            mutates_org = bool(
+                proposal.scope == ReorgScope.ORG_MUTATION
+                or proposal.changeset.role_changes
+            )
+            if mutates_org:
+                effect_started = True
+                change_result = self.org_engine.apply_changeset(
+                    proposal.changeset,
+                    persist=True,
+                )
+            else:
+                change_result = {
+                    "old_org_version": self.org_engine.current_org_version(),
+                    "new_org_version": self.org_engine.current_org_version(),
+                    "role_mapping": {},
+                }
+
+            effect_started = True
+            migration_summary = await self._migrate_active_state(proposal, change_result)
+            proposal.status = ReorgProposalStatus.APPLIED
+            proposal.old_org_version = change_result["old_org_version"]
+            proposal.new_org_version = change_result["new_org_version"]
+            proposal.migration_plan.role_mapping = dict(change_result.get("role_mapping", {}))
+            proposal.migration_plan.metadata["migration_summary"] = migration_summary
+            proposal.updated_at = datetime.now()
+
+            after_snapshot = await self.build_org_snapshot(proposal.project_id)
+            await self.store.save_org_snapshot(after_snapshot)
+            result = {
+                "proposal_id": proposal.proposal_id,
+                "status": proposal.status.value,
+                "migration_summary": migration_summary,
+                "change_result": change_result,
+                "snapshot_id": after_snapshot.snapshot_id,
+            }
+            proposal.metadata = dict(proposal.metadata or {})
+            proposal.metadata["applied_snapshot_id"] = after_snapshot.snapshot_id
+            proposal.metadata["apply_result"] = copy.deepcopy(result)
+            finished = await self.store.finish_reorg_application(
+                proposal,
+                operation_token=operation_token,
+            )
+            if not finished.applied:
+                raise RuntimeError(
+                    "Reorg application ownership was lost before its result "
+                    f"could be persisted ({finished.outcome})."
+                )
+        except asyncio.CancelledError:
+            await asyncio.shield(self.store.fail_reorg_application(
+                proposal_id,
+                operation_token=operation_token,
+                effect_started=effect_started,
+                error="application_cancelled",
+            ))
+            raise
+        except Exception as exc:
+            await self.store.fail_reorg_application(
+                proposal_id,
+                operation_token=operation_token,
+                effect_started=effect_started,
+                error=str(exc),
+            )
+            raise
+
         await self.store.record_reorg_event(
             ReorgEventRecord(
                 proposal_id=proposal.proposal_id,
@@ -262,13 +583,7 @@ class ReorgManager:
                 },
             )
         )
-        return {
-            "proposal_id": proposal.proposal_id,
-            "status": proposal.status.value,
-            "migration_summary": migration_summary,
-            "change_result": change_result,
-            "snapshot_id": after_snapshot.snapshot_id,
-        }
+        return result
 
     async def suggest_task_adjustment(
         self,
@@ -280,21 +595,43 @@ class ReorgManager:
         session_id: str | None = None,
         task_id: str | None = None,
     ) -> dict[str, Any]:
-        proposal = await self.propose_reorg(
+        if isinstance(changeset, dict):
+            changeset = ReorgChangeSet(**changeset)
+        normalized_changeset = self._normalize_changeset(changeset)
+        auto_authorized = bool(
+            self._classify_risk(
+                ReorgScope.TASK_ADJUSTMENT,
+                normalized_changeset,
+            )
+            == ReorgRiskLevel.LOW
+            and self._is_top_level_role(source_role_id)
+        )
+        proposal = await self._propose_reorg(
             project_id=project_id,
             summary=summary,
             rationale=summary,
             initiated_by=source_role_id,
             source_role_id=source_role_id,
-            changeset=changeset,
+            changeset=normalized_changeset,
             scope=ReorgScope.TASK_ADJUSTMENT,
             session_id=session_id,
             task_id=task_id,
-            metadata={"auto_apply_candidate": True},
+            metadata={"auto_apply_candidate": auto_authorized},
+            _system_authority=(
+                _SYSTEM_REORG_DECISION_AUTHORITY
+                if auto_authorized
+                else None
+            ),
         )
-        if proposal.risk_level == ReorgRiskLevel.LOW and self._is_top_level_role(source_role_id):
-            await self.set_reorg_approval(proposal.proposal_id, approved=True, notes="Auto-approved low-risk task adjustment.")
+        if auto_authorized:
+            proposal = await self._set_reorg_approval(
+                proposal.proposal_id,
+                approved=True,
+                notes="Auto-approved low-risk task adjustment.",
+                _system_authority=_SYSTEM_REORG_DECISION_AUTHORITY,
+            )
             result = await self.apply_reorg(proposal.proposal_id)
+            proposal = await self._require_proposal(proposal.proposal_id)
             await self.store.record_reorg_event(
                 ReorgEventRecord(
                     proposal_id=proposal.proposal_id,
@@ -305,6 +642,10 @@ class ReorgManager:
                 )
             )
             return {"proposal": proposal, "auto_applied": True, "result": result}
+        # A notification callback may have consumed the freshly published
+        # card before this coroutine resumes.  Return the durable proposal,
+        # not the stale object constructed before publication.
+        proposal = await self._require_proposal(proposal.proposal_id)
         return {"proposal": proposal, "auto_applied": False}
 
     async def _build_migration_plan(
@@ -316,7 +657,10 @@ class ReorgManager:
         target_org_version: int,
     ) -> ReorgMigrationPlan:
         tasks = await self.store.get_tasks(project_id=project_id)
-        checkpoints = await self.store.get_pending_checkpoints(project_id=project_id)
+        checkpoints = await self.store.get_execution_checkpoints(
+            project_id=project_id,
+            statuses=["pending", "answered", "consuming"],
+        )
         affected_tasks = [task.id for task in tasks if task.status in self.ACTIVE_TASK_STATUSES]
         role_mapping: dict[str, str] = {}
         for change in changeset.role_changes:
@@ -345,7 +689,10 @@ class ReorgManager:
 
     async def _migrate_active_state(self, proposal: ReorgProposal, change_result: dict[str, Any]) -> dict[str, Any]:
         tasks = await self.store.get_tasks(project_id=proposal.project_id)
-        checkpoints = await self.store.get_pending_checkpoints(project_id=proposal.project_id)
+        checkpoints = await self.store.get_execution_checkpoints(
+            project_id=proposal.project_id,
+            statuses=["pending", "answered", "consuming"],
+        )
         migrated_task_ids: list[str] = []
         migrated_checkpoint_ids: list[str] = []
         role_mapping = dict(change_result.get("role_mapping", {}))
@@ -405,11 +752,31 @@ class ReorgManager:
             migrated_task_ids.append(task.id)
 
         for checkpoint in checkpoints:
-            checkpoint.payload = dict(checkpoint.payload)
-            checkpoint.payload["org_version"] = target_org_version
-            checkpoint.payload["reorg_proposal_id"] = proposal.proposal_id
-            await self.store.save_execution_checkpoint(checkpoint)
-            migrated_checkpoint_ids.append(checkpoint.checkpoint_id)
+            patch = {
+                "org_version": target_org_version,
+                "reorg_proposal_id": proposal.proposal_id,
+            }
+            if checkpoint.checkpoint_type in OWNER_INTERACTION_CHECKPOINT_TYPES:
+                if self.interaction_coordinator is None:
+                    raise RuntimeError(
+                        "owner checkpoint migration requires InteractionCoordinator"
+                    )
+                _, applied = await self.interaction_coordinator.enrich_owner_checkpoint(
+                    checkpoint.checkpoint_id,
+                    checkpoint_type=checkpoint.checkpoint_type,
+                    expected_statuses={checkpoint.status},
+                    payload_patch=patch,
+                )
+            else:
+                _, applied = await self.store.patch_execution_checkpoint_payload(
+                    checkpoint.checkpoint_id,
+                    project_id=checkpoint.project_id,
+                    checkpoint_type=checkpoint.checkpoint_type,
+                    expected_statuses={checkpoint.status},
+                    payload_patch=patch,
+                )
+            if applied:
+                migrated_checkpoint_ids.append(checkpoint.checkpoint_id)
 
         proposal.migration_plan.affected_task_ids = migrated_task_ids
         proposal.migration_plan.affected_checkpoint_ids = migrated_checkpoint_ids

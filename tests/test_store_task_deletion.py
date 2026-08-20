@@ -344,6 +344,7 @@ class TestOPCStoreTaskDeletion(unittest.IsolatedAsyncioTestCase):
                     "runtime_sessions",
                     "runtime_events",
                     "runtime_transcript_entries",
+                    "runtime_user_turn_seeds",
                     "runtime_tool_calls",
                     "runtime_tool_results",
                     "runtime_permission_grants",

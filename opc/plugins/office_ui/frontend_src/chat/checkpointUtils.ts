@@ -6,8 +6,12 @@ const CHECKPOINT_TYPES = new Set([
   'company_staffing_selection',
   'company_recruitment_confirmation',
   'company_reorg_pending',
-  'human_escalation',
   'task_user_input',
+  'tool_permission',
+  'action_permission',
+  'route_clarification',
+  'company_runtime_selection',
+  'company_run_failure_review',
 ])
 
 const TERMINAL_CHECKPOINT_STATUSES = new Set([
@@ -22,6 +26,10 @@ const TERMINAL_CHECKPOINT_STATUSES = new Set([
   'cancelled',
   'canceled',
   'invalid',
+  'answered',
+  'consuming',
+  'failed',
+  'outcome_unknown',
 ])
 
 export function isCheckpointType(value: string | undefined): boolean {
@@ -55,22 +63,14 @@ export function toCheckpointReplyMetadata(meta: ChatMessageMeta | undefined): Ch
     return undefined
   }
   const checkpointType = String(meta?.checkpoint_type ?? '').trim()
-  const escalationId = String(meta?.escalation_id ?? '').trim()
+  const requesterTaskId = String(meta?.interaction_requester_task_id ?? '').trim()
+  const requesterSessionId = String(meta?.interaction_requester_session_id ?? '').trim()
   return {
     response_to_checkpoint_id: checkpointId,
     response_to_checkpoint_type: checkpointType || undefined,
-    response_to_escalation_id: escalationId || undefined,
+    ...(requesterTaskId ? { interaction_requester_task_id: requesterTaskId } : {}),
+    ...(requesterSessionId ? { interaction_requester_session_id: requesterSessionId } : {}),
   }
-}
-
-export function checkpointReplyMetadataForComposer(
-  meta: CheckpointReplyMetadata | undefined,
-): CheckpointReplyMetadata | undefined {
-  const checkpointType = String(meta?.response_to_checkpoint_type ?? '').trim()
-  if (checkpointType === 'company_delivery_feedback' || checkpointType === 'human_escalation') {
-    return undefined
-  }
-  return meta
 }
 
 export function isResponseForCheckpoint(message: ChatMessage, checkpointMeta: ChatMessageMeta | undefined): boolean {
@@ -85,25 +85,18 @@ export function isResponseForCheckpoint(message: ChatMessage, checkpointMeta: Ch
   if (String(replyMeta?.response_to_checkpoint_id ?? '').trim() === checkpointId) {
     return true
   }
-  const checkpointType = String(checkpointMeta?.checkpoint_type ?? '').trim()
-  const escalationId = String(checkpointMeta?.escalation_id ?? '').trim()
-  return checkpointType === 'human_escalation'
-    && !!escalationId
-    && String(replyMeta?.response_to_escalation_id ?? '').trim() === escalationId
+  return false
 }
 
 export function analyzeCheckpointMessages(messages: ChatMessage[]): {
   pendingMessageIds: Set<string>
   respondedMessageIds: Set<string>
   duplicateMessageIds: Set<string>
-  latestPendingReplyMetadata?: CheckpointReplyMetadata
 } {
   const pendingMessageIds = new Set<string>()
   const respondedMessageIds = new Set<string>()
   const duplicateMessageIds = new Set<string>()
-  let latestPendingReplyMetadata: CheckpointReplyMetadata | undefined
   const latestCheckpointReplyIndex = new Map<string, number>()
-  const latestEscalationReplyIndex = new Map<string, number>()
   const seenCheckpointIds = new Set<string>()
 
   for (let i = 0; i < messages.length; i++) {
@@ -113,10 +106,6 @@ export function analyzeCheckpointMessages(messages: ChatMessage[]): {
     const checkpointId = String(replyMeta?.response_to_checkpoint_id ?? '').trim()
     if (checkpointId) {
       latestCheckpointReplyIndex.set(checkpointId, i)
-    }
-    const escalationId = String(replyMeta?.response_to_escalation_id ?? '').trim()
-    if (escalationId) {
-      latestEscalationReplyIndex.set(escalationId, i)
     }
   }
 
@@ -128,8 +117,6 @@ export function analyzeCheckpointMessages(messages: ChatMessage[]): {
     }
 
     const checkpointId = String(checkpointMeta?.checkpoint_id ?? '').trim()
-    const checkpointType = String(checkpointMeta?.checkpoint_type ?? '').trim()
-    const escalationId = String(checkpointMeta?.escalation_id ?? '').trim()
     if (checkpointId && seenCheckpointIds.has(checkpointId)) {
       duplicateMessageIds.add(message.id)
       continue
@@ -139,23 +126,17 @@ export function analyzeCheckpointMessages(messages: ChatMessage[]): {
     }
 
     const hasLaterCheckpointReply = !!checkpointId && (latestCheckpointReplyIndex.get(checkpointId) ?? -1) > i
-    const hasLaterEscalationReply = checkpointType === 'human_escalation'
-      && !!escalationId
-      && (latestEscalationReplyIndex.get(escalationId) ?? -1) > i
-
-    if (isCheckpointResolved(checkpointMeta) || hasLaterCheckpointReply || hasLaterEscalationReply) {
+    if (isCheckpointResolved(checkpointMeta) || hasLaterCheckpointReply) {
       respondedMessageIds.add(message.id)
       continue
     }
 
     pendingMessageIds.add(message.id)
-    latestPendingReplyMetadata = toCheckpointReplyMetadata(checkpointMeta) ?? latestPendingReplyMetadata
   }
 
   return {
     pendingMessageIds,
     respondedMessageIds,
     duplicateMessageIds,
-    latestPendingReplyMetadata,
   }
 }

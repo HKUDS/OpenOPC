@@ -1,7 +1,7 @@
 /**
  * Structural regression test for OrgTab's 4-tab layout.
  *
- * Guards the sub-tab rename (flow → runtime, marketplace → architecture +
+ * Guards the localized sub-tab keys (flow → runtime, marketplace → architecture +
  * employees) and the three new marketplace panels. Reads OrgTab.tsx as
  * source text and asserts against it — the existing zero-framework test
  * convention (see runtimeOrg.test.ts, workItemSessions.test.ts) runs with
@@ -25,14 +25,33 @@ const here = dirname(fileURLToPath(import.meta.url))
 const src = readFileSync(join(here, 'OrgTab.tsx'), 'utf8')
 const createModalSrc = readFileSync(join(here, 'OrgCreateModal.tsx'), 'utf8')
 const visualTypesSrc = readFileSync(join(here, '..', 'types', 'visual.ts'), 'utf8')
+const i18nSrc = readFileSync(join(here, '..', 'i18n', 'index.tsx'), 'utf8')
 const orgCssSrc = readFileSync(join(here, 'org.css'), 'utf8')
 
-// ── 1. Four sub-tab labels declared ──
-for (const label of ['Team', 'Runtime', 'Architecture', 'Employees']) {
+// ── 1. Four sub-tab labels use shared i18n keys ──
+for (const tab of ['team', 'runtime', 'architecture', 'employees']) {
   assert.match(
     src,
-    new RegExp(`label:\\s*['"]${label}['"]`),
-    `OrgTab.tsx must declare tab label "${label}" (sub-tab rename regression)`,
+    new RegExp(`label:\\s*t\\(\\s*['"]org\\.tab\\.${tab}['"]\\s*\\)`),
+    `OrgTab.tsx must translate the ${tab} tab through org.tab.${tab}`,
+  )
+}
+
+for (const [key, english, chinese] of [
+  ['org.tab.team', 'Team', '团队'],
+  ['org.tab.runtime', 'Runtime', '运行时'],
+  ['org.tab.architecture', 'Architecture', '架构'],
+  ['org.tab.employees', 'Employees', '员工'],
+] as const) {
+  assert.equal(
+    i18nSrc.includes(`'${key}': '${english}'`),
+    true,
+    `English dictionary must define ${key}`,
+  )
+  assert.equal(
+    i18nSrc.includes(`'${key}': '${chinese}'`),
+    true,
+    `Chinese dictionary must define ${key}`,
   )
 }
 
@@ -124,5 +143,5 @@ assert.match(
 )
 
 console.log(
-  'OrgTab.test.tsx: OK (tabs, marketplace panels, create-org prompt, select option theme colors)',
+  'OrgTab.test.tsx: OK (localized tabs, marketplace panels, create-org prompt, select option theme colors)',
 )

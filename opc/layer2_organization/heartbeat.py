@@ -8,11 +8,14 @@ process — no separate service needed.
 from __future__ import annotations
 
 import asyncio
-import uuid
 from datetime import datetime, timedelta
 from typing import Any, Callable, Coroutine
 
 from loguru import logger
+
+from opc.layer2_organization.company_runtime_identity import (
+    is_runtime_auxiliary_task,
+)
 
 
 class HeartbeatScheduler:
@@ -116,6 +119,7 @@ class HeartbeatScheduler:
                 has_runnable = any(
                     t.status in {TaskStatus.PENDING, TaskStatus.RUNNING}
                     for t in all_project_tasks
+                    if not is_runtime_auxiliary_task(t)
                 )
                 if has_runnable:
                     continue
@@ -158,6 +162,8 @@ class HeartbeatScheduler:
             tasks = await self.store.get_tasks(status=TaskStatus.PENDING)
             candidate = None
             for task in tasks:
+                if is_runtime_auxiliary_task(task):
+                    continue
                 if task.assigned_to == agent_id or not task.assigned_to:
                     candidate = task
                     break

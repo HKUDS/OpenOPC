@@ -27,7 +27,7 @@ from typing import Any
 
 from loguru import logger
 
-from opc.core.models import Phase, TaskStatus
+from opc.core.models import Phase
 from opc.layer2_organization.phase import (
     DONE_PHASES,
     RUNNABLE_PHASES,
@@ -80,6 +80,20 @@ async def sync_task_status_hook(
     # the linked task. This repairs task/work_item drift when an older
     # task row is still awaiting review after the work item already
     # reached a terminal phase.
+    desired_status = task_status_for_phase(target)
+    fenced_projection = getattr(
+        store,
+        "sync_runtime_task_status_for_work_item_projection",
+        None,
+    )
+    if callable(fenced_projection):
+        try:
+            await fenced_projection(item, desired_status)
+        except Exception:
+            logger.opt(exception=True).debug(
+                "sync_task_status_hook: fenced Task projection failed"
+            )
+        return
     if not hasattr(store, "get_task") or not hasattr(store, "save_task"):
         return
     try:
@@ -91,7 +105,6 @@ async def sync_task_status_hook(
         return
     if task is None:
         return
-    desired_status = task_status_for_phase(target)
     if task.status == desired_status:
         return
     task.status = desired_status
@@ -134,16 +147,25 @@ async def signal_dispatcher_hook(
             logger.opt(exception=True).debug("dispatcher wake callback raised")
 
 
+# Controller-owned phase transitions persist the WorkItem and Task together.
+# After that commit only in-memory notifications may run without carrying the
+# transaction's owner/generation fence; every durable convergence hook is
+# deferred to the winning dispatcher's next DB-driven reconcile tick.
+signal_dispatcher_hook._phase_notification_only = True  # type: ignore[attr-defined]
+
+
 # ── Hook 3: propagate child terminal/escalation to parent dep frontier ──
 
 # Which transitions can unblock or re-evaluate a parent.
 # APPROVED — may make parent's all_approved true → WAITING_FOR_CHILDREN → RUNNING.
 # FAILED / CANCELLED — parent should see the child exited; same refresh pass
 # rewrites waiting_on_work_item_ids and lets higher-level policy decide next.
-# AWAITING_HUMAN — a human needs to act on this child; the frontier refresh
-# keeps parent metadata consistent (e.g. waiting_on_work_item_ids). When the
-# human subsequently approves (AWAITING_HUMAN → APPROVED), that transition
-# also fires this hook and finally unblocks the parent.
+# AWAITING_HUMAN — a final delivery or explicit owner-input gate needs a human
+# decision; the frontier refresh keeps parent metadata consistent (e.g.
+# waiting_on_work_item_ids). Manager review never escalates to this phase: its
+# only outcomes are APPROVED or READY_FOR_REWORK. When an actual owner gate is
+# subsequently approved (AWAITING_HUMAN → APPROVED), that transition also
+# fires this hook and finally unblocks the parent.
 # READY_FOR_REWORK — child was sent back to worker by reviewer. Parent's
 # waiting_on_work_item_ids is stale in the opposite direction (the child is
 # no longer "done" from parent's perspective) and parent's claim may be
@@ -167,11 +189,10 @@ async def refresh_dependents_hook(
 
     Before this hook existed, ``_refresh_delegation_dependents`` was
     only called on the APPROVED-verdict branch of
-    ``_finalize_review_work_item``. A child escalating to AWAITING_HUMAN
-    (max_review_reworks exceeded) or being CANCELLED never triggered
-    the refresh, so its parent's ``waiting_on_work_item_ids`` and claim
-    state drifted from reality. new16/app12 reproduced this: cto parent
-    ``cdb248d8`` sat in WAITING_FOR_CHILDREN for 13+ minutes with the
+    ``_finalize_review_work_item``. An explicit owner gate or CANCELLED child
+    never triggered the refresh, so its parent's ``waiting_on_work_item_ids``
+    and claim state drifted from reality. new16/app12 reproduced this: cto
+    parent ``cdb248d8`` sat in WAITING_FOR_CHILDREN for 13+ minutes with the
     claim held by an idle session, neither runnable nor orphaned.
 
     Re-entrancy is handled inside ``refresh_dependents_for_run`` via a
@@ -259,6 +280,14 @@ async def clear_session_focus_on_terminal_hook(
         )
         return
     queue_enabled = bool(getattr(store, "role_serial_queue_enabled", False))
+    item_metadata = dict(getattr(item, "metadata", {}) or {})
+    controller_owner_token = str(
+        item_metadata.get("company_run_controller_owner_token", "") or ""
+    ).strip()
+    controller_lease_generation = int(
+        item_metadata.get("company_run_controller_lease_generation", 0) or 0
+    )
+    project_id = "default"
     affected_role_session_ids: set[str] = set()
     item_role_session_id = str(
         getattr(item, "role_runtime_session_id", "") or ""
@@ -266,6 +295,11 @@ async def clear_session_focus_on_terminal_hook(
     if item_role_session_id:
         affected_role_session_ids.add(item_role_session_id)
     for session in sessions:
+        session_project_id = str(
+            getattr(session, "project_id", "") or ""
+        ).strip()
+        if session_project_id:
+            project_id = session_project_id
         if str(getattr(session, "focused_work_item_id", "") or "") != wid:
             continue
         sid = str(getattr(session, "role_session_id", "") or "").strip()
@@ -278,6 +312,8 @@ async def clear_session_focus_on_terminal_hook(
                 session.role_session_id,
                 focused_work_item_id="",
                 status=status_override,
+                controller_owner_token=controller_owner_token,
+                controller_lease_generation=controller_lease_generation,
             )
         except Exception:
             logger.opt(exception=True).debug(
@@ -294,6 +330,9 @@ async def clear_session_focus_on_terminal_hook(
             store,
             run_id,
             role_session_ids=affected_role_session_ids,
+            project_id=project_id,
+            controller_owner_token=controller_owner_token,
+            controller_lease_generation=controller_lease_generation,
         )
 
 
@@ -326,6 +365,9 @@ async def _clear_queued_marker(
     store: Any,
     *,
     expected_session_id: str | None = None,
+    project_id: str = "default",
+    controller_owner_token: str = "",
+    controller_lease_generation: int = 0,
 ) -> bool:
     metadata = dict(getattr(item, "metadata", {}) or {})
     marker = str(metadata.get("queued_behind_session", "") or "").strip()
@@ -333,21 +375,53 @@ async def _clear_queued_marker(
         return False
     if expected_session_id is not None and marker != str(expected_session_id or "").strip():
         return False
-    metadata.pop("queued_behind_session", None)
-    item.metadata = metadata
+    fenced_update = getattr(
+        store,
+        "update_work_item_serial_queue_marker_for_controller",
+        None,
+    )
     try:
-        await store.save_delegation_work_item(item)
+        if callable(fenced_update):
+            changed = await fenced_update(
+                _work_item_id(item),
+                run_id=str(getattr(item, "run_id", "") or "").strip(),
+                project_id=str(project_id or "default").strip() or "default",
+                queued_behind_session=None,
+                expected_queued_behind_session=marker,
+                controller_owner_token=str(controller_owner_token or "").strip(),
+                controller_lease_generation=int(
+                    controller_lease_generation or 0
+                ),
+            )
+            if not changed:
+                return False
+        else:
+            metadata.pop("queued_behind_session", None)
+            item.metadata = metadata
+            await store.save_delegation_work_item(item)
     except Exception:
         logger.opt(exception=True).debug(
             f"clear queued_behind_session failed wid={_work_item_id(item)}"
         )
         return False
+    metadata.pop("queued_behind_session", None)
+    item.metadata = metadata
     return True
 
 
-async def _save_role_session(store: Any, session: Any) -> bool:
+async def _save_role_session(
+    store: Any,
+    session: Any,
+    *,
+    controller_owner_token: str = "",
+    controller_lease_generation: int = 0,
+) -> bool:
     try:
-        await store.save_delegation_role_session(session)
+        await store.save_delegation_role_session(
+            session,
+            controller_owner_token=str(controller_owner_token or "").strip(),
+            controller_lease_generation=int(controller_lease_generation or 0),
+        )
         return True
     except Exception:
         logger.opt(exception=True).debug(
@@ -385,6 +459,9 @@ async def reconcile_role_serial_queues(
     run_id: str,
     *,
     role_session_ids: set[str] | list[str] | tuple[str, ...] | None = None,
+    project_id: str = "default",
+    controller_owner_token: str = "",
+    controller_lease_generation: int = 0,
 ) -> dict[str, Any]:
     """Repair derived serial-queue state for a run.
 
@@ -449,6 +526,13 @@ async def reconcile_role_serial_queues(
     }
     pending_after_by_session: dict[str, list[str]] = {}
     blocker_by_session: dict[str, str] = {}
+    effective_project_id = str(project_id or "default").strip() or "default"
+    if effective_project_id == "default" and sessions:
+        session_project_id = str(
+            getattr(sessions[0], "project_id", "") or ""
+        ).strip()
+        if session_project_id:
+            effective_project_id = session_project_id
 
     for session in sessions:
         sid = str(getattr(session, "role_session_id", "") or "").strip()
@@ -485,6 +569,9 @@ async def reconcile_role_serial_queues(
                     pending_item,
                     store,
                     expected_session_id=sid,
+                    project_id=effective_project_id,
+                    controller_owner_token=controller_owner_token,
+                    controller_lease_generation=controller_lease_generation,
                 ):
                     result["cleared_markers"].append(pending_id)
                 continue
@@ -513,6 +600,9 @@ async def reconcile_role_serial_queues(
                 promoted_item,
                 store,
                 expected_session_id=sid,
+                project_id=effective_project_id,
+                controller_owner_token=controller_owner_token,
+                controller_lease_generation=controller_lease_generation,
             ):
                 result["cleared_markers"].append(promoted)
             result["promoted_work_item_ids"].append(promoted)
@@ -526,7 +616,12 @@ async def reconcile_role_serial_queues(
                 session.focused_work_item_id = ""
                 session_changed = True
         if session_changed:
-            await _save_role_session(store, session)
+            await _save_role_session(
+                store,
+                session,
+                controller_owner_token=controller_owner_token,
+                controller_lease_generation=controller_lease_generation,
+            )
         pending_after_by_session[sid] = list(clean_pending)
         blocker_by_session[sid] = active_focus or front_unqueued or promoted
 
@@ -547,7 +642,14 @@ async def reconcile_role_serial_queues(
             valid = item_id in list(pending or []) and bool(blocker) and blocker != item_id
         if valid:
             continue
-        if await _clear_queued_marker(item, store, expected_session_id=marker):
+        if await _clear_queued_marker(
+            item,
+            store,
+            expected_session_id=marker,
+            project_id=effective_project_id,
+            controller_owner_token=controller_owner_token,
+            controller_lease_generation=controller_lease_generation,
+        ):
             result["cleared_markers"].append(item_id)
 
     if (
@@ -661,8 +763,22 @@ async def enqueue_session_work_on_runnable_hook(
         # the normal claim path proceed without queueing.
         return
     # Append to queue, stamp metadata so the claim filter skips this wid.
+    item_metadata = dict(getattr(item, "metadata", {}) or {})
     try:
-        enqueued = await store.enqueue_pending_work_item(sid, wid)
+        enqueued = await store.enqueue_pending_work_item(
+            sid,
+            wid,
+            controller_owner_token=str(
+                item_metadata.get("company_run_controller_owner_token", "") or ""
+            ).strip(),
+            controller_lease_generation=int(
+                item_metadata.get(
+                    "company_run_controller_lease_generation",
+                    0,
+                )
+                or 0
+            ),
+        )
     except Exception:
         logger.opt(exception=True).debug(
             f"enqueue_session_work_on_runnable_hook: enqueue failed "
@@ -671,19 +787,52 @@ async def enqueue_session_work_on_runnable_hook(
         return
     if not enqueued:
         return  # already in the queue — nothing more to do
-    metadata = dict(getattr(item, "metadata", {}) or {})
+    metadata = item_metadata
     if metadata.get("queued_behind_session") == sid:
         return
-    metadata["queued_behind_session"] = sid
+    marker_before = str(metadata.get("queued_behind_session", "") or "").strip()
+    fenced_update = getattr(
+        store,
+        "update_work_item_serial_queue_marker_for_controller",
+        None,
+    )
     try:
-        await store.update_delegation_work_item(
-            wid, metadata_updates={"queued_behind_session": sid}
-        )
+        if callable(fenced_update):
+            updated = await fenced_update(
+                wid,
+                run_id=str(getattr(item, "run_id", "") or "").strip(),
+                project_id=str(getattr(session, "project_id", "") or "default"),
+                queued_behind_session=sid,
+                expected_queued_behind_session=marker_before,
+                controller_owner_token=str(
+                    item_metadata.get(
+                        "company_run_controller_owner_token",
+                        "",
+                    )
+                    or ""
+                ).strip(),
+                controller_lease_generation=int(
+                    item_metadata.get(
+                        "company_run_controller_lease_generation",
+                        0,
+                    )
+                    or 0
+                ),
+            )
+            if not updated:
+                return
+        else:
+            await store.update_delegation_work_item(
+                wid, metadata_updates={"queued_behind_session": sid}
+            )
     except Exception:
         logger.opt(exception=True).debug(
             f"enqueue_session_work_on_runnable_hook: update_delegation_work_item "
             f"failed wid={wid}"
         )
+        return
+    metadata["queued_behind_session"] = sid
+    item.metadata = metadata
     # Fix 5 PR7 observability: emit a runtime event when the queue
     # crosses the attention threshold. Fires at the *crossing* so we
     # don't spam on every subsequent enqueue — dedup handled by checking

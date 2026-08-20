@@ -64,7 +64,28 @@ class StaleCheckpointSelfHealTest(unittest.IsolatedAsyncioTestCase):
                 **payload_extra,
             },
         )
-        await self.store.save_execution_checkpoint(checkpoint)
+        domain_key = f"stale-selfheal:{checkpoint.checkpoint_id}"
+        supersession_key = (
+            f"stale-selfheal:{checkpoint.project_id}:{task.id}:"
+            f"{checkpoint.checkpoint_type}"
+        )
+        checkpoint.payload["interaction"] = {
+            "kind": checkpoint.checkpoint_type,
+            "prompt": str(checkpoint.payload.get("prompt", "") or ""),
+            "domain_key": domain_key,
+            "supersession_key": supersession_key,
+            "supersession_order": [0, 0],
+            "ownership": {},
+        }
+        checkpoint, created = (
+            await self.engine.interaction_coordinator.publish_owner_checkpoint(
+                checkpoint,
+                interaction_key=domain_key,
+                supersession_key=supersession_key,
+                supersession_order=[0, 0],
+            )
+        )
+        self.assertTrue(created)
         return checkpoint
 
     async def _checkpoint_status(self, checkpoint_id: str) -> str:
@@ -125,6 +146,29 @@ class StaleCheckpointSelfHealTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result, "This request is no longer active.")
         self.assertEqual(await self._checkpoint_status(checkpoint.checkpoint_id), "stale")
 
+    async def test_explicit_reply_to_missing_task_reports_inactive(self) -> None:
+        session_id = str(uuid.uuid4())
+        task = await self._save_task(TaskStatus.AWAITING_HUMAN, session_id)
+        checkpoint = await self._save_wait_checkpoint(task, session_id)
+        # Deliberately reproduce a legacy/crash orphan: production hard-delete
+        # also removes cards, but an interrupted older controller could leave
+        # this row behind.
+        assert self.store._db is not None
+        await self.store._db.execute("DELETE FROM tasks WHERE id = ?", (task.id,))
+        await self.store._db.commit()
+
+        result = await self.engine._maybe_resume_checkpoint(
+            "continue",
+            session_id=session_id,
+            reply_metadata={
+                "response_to_checkpoint_id": checkpoint.checkpoint_id,
+                "response_to_checkpoint_type": checkpoint.checkpoint_type,
+            },
+        )
+
+        self.assertEqual(result, "This request is no longer active.")
+        self.assertEqual(await self._checkpoint_status(checkpoint.checkpoint_id), "stale")
+
     async def _link_work_item(self, task: Task, phase: Phase) -> None:
         item = DelegationWorkItem(
             work_item_id=f"review::{uuid.uuid4()}::v1",
@@ -147,6 +191,24 @@ class StaleCheckpointSelfHealTest(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(found)
         self.assertEqual(await self._checkpoint_status(checkpoint.checkpoint_id), "stale")
 
+    async def test_explicit_reply_with_closed_work_item_is_rejected_before_accept(self) -> None:
+        session_id = str(uuid.uuid4())
+        task = await self._save_task(TaskStatus.RUNNING, session_id)
+        await self._link_work_item(task, Phase.APPROVED)
+        checkpoint = await self._save_wait_checkpoint(task, session_id)
+
+        result = await self.engine._maybe_resume_checkpoint(
+            "continue",
+            session_id=session_id,
+            reply_metadata={
+                "response_to_checkpoint_id": checkpoint.checkpoint_id,
+                "response_to_checkpoint_type": checkpoint.checkpoint_type,
+            },
+        )
+
+        self.assertEqual(result, "This request is no longer active.")
+        self.assertEqual(await self._checkpoint_status(checkpoint.checkpoint_id), "stale")
+
     async def test_checkpoint_with_open_work_item_is_kept(self) -> None:
         session_id = str(uuid.uuid4())
         task = await self._save_task(TaskStatus.RUNNING, session_id)
@@ -164,9 +226,27 @@ class StaleCheckpointSelfHealTest(unittest.IsolatedAsyncioTestCase):
         task = await self._save_task(TaskStatus.AWAITING_HUMAN, session_id)
         checkpoint = await self._save_wait_checkpoint(task, session_id)
 
-        await self.engine._supersede_stale_task_wait_checkpoints(task.id, reason="test settle")
+        changed_events: list[dict] = []
+
+        async def capture_changed(event) -> None:
+            payload = dict(event.payload or {})
+            if payload.get("type") == "interaction_checkpoint_changed":
+                changed_events.append(payload)
+
+        self.engine.event_bus.subscribe("runtime_event", capture_changed)
+        await self.engine._supersede_stale_task_wait_checkpoints(
+            task.id,
+            reason="test settle",
+        )
 
         self.assertEqual(await self._checkpoint_status(checkpoint.checkpoint_id), "superseded")
+        self.assertTrue(
+            any(
+                event.get("checkpoint_id") == checkpoint.checkpoint_id
+                and event.get("status") == "superseded"
+                for event in changed_events
+            )
+        )
 
     async def test_resume_with_unresolvable_siblings_never_returns_empty(self) -> None:
         """Sibling ids that are work-item ids (not task UUIDs) must not empty the task list."""
@@ -183,7 +263,14 @@ class StaleCheckpointSelfHealTest(unittest.IsolatedAsyncioTestCase):
         self.engine._execute_multi_agent = AsyncMock(return_value="")
         self.engine._execute_company_mode = AsyncMock(return_value="")
 
-        result = await self.engine._resume_task_checkpoint(checkpoint, "继续")
+        result = await self.engine._maybe_resume_checkpoint(
+            "继续",
+            session_id=session_id,
+            reply_metadata={
+                "response_to_checkpoint_id": checkpoint.checkpoint_id,
+                "response_to_checkpoint_type": checkpoint.checkpoint_type,
+            },
+        )
 
         self.assertEqual(result, "resumed reply")
         self.engine._execute_multi_agent.assert_not_awaited()
@@ -204,7 +291,14 @@ class StaleCheckpointSelfHealTest(unittest.IsolatedAsyncioTestCase):
         self.engine._execute_company_mode = AsyncMock(return_value="company resumed")
         self.engine._execute_multi_agent = AsyncMock(return_value="")
 
-        result = await self.engine._resume_task_checkpoint(checkpoint, "继续")
+        result = await self.engine._maybe_resume_checkpoint(
+            "继续",
+            session_id=session_id,
+            reply_metadata={
+                "response_to_checkpoint_id": checkpoint.checkpoint_id,
+                "response_to_checkpoint_type": checkpoint.checkpoint_type,
+            },
+        )
 
         self.assertEqual(result, "company resumed")
         self.engine._execute_multi_agent.assert_not_awaited()
@@ -259,33 +353,6 @@ class StaleCheckpointSelfHealTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result, "answered")
         self.assertEqual(await self._checkpoint_status(checkpoint.checkpoint_id), "resolved")
-
-    async def test_explicit_reply_still_resumes_parked_approval_checkpoint(self) -> None:
-        """The approval-card click path targets the checkpoint explicitly and must keep working."""
-        session_id = str(uuid.uuid4())
-        task = await self._save_task(TaskStatus.AWAITING_HUMAN, session_id)
-        checkpoint = await self._save_wait_checkpoint(
-            task,
-            session_id,
-            runtime_v2=self._approval_runtime_payload(),
-        )
-
-        self.engine._execute_single_agent = AsyncMock(return_value="approved and resumed")
-        self.engine._execute_multi_agent = AsyncMock(return_value="")
-        self.engine._execute_company_mode = AsyncMock(return_value="")
-
-        result = await self.engine._maybe_resume_checkpoint(
-            "approve",
-            session_id=session_id,
-            reply_metadata={
-                "response_to_checkpoint_id": checkpoint.checkpoint_id,
-                "response_to_checkpoint_type": "task_user_input",
-            },
-        )
-
-        self.assertEqual(result, "approved and resumed")
-        self.assertEqual(await self._checkpoint_status(checkpoint.checkpoint_id), "resolved")
-
 
 if __name__ == "__main__":
     unittest.main()

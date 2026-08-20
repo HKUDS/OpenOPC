@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
 from typing import Any
 
@@ -457,20 +457,9 @@ class EventAdapter:
                     "content_preview": "Reply sent",
                 }))
 
-        # ── escalation_created ─────────────────────────────────────
-        elif etype == "escalation_created":
-            msg = p.get("message", "Escalation")
-            results.append(_ve("system", "message_out", {
-                "content_preview": msg[:30],
-            }))
-
         # ── execution_mode_resolved ──────────────────────────────
         elif etype == "execution_mode_resolved":
             results.append(_ve("system", "execution_mode_resolved", p))
-
-        # ── escalation_resolved / escalation_timeout ───────────────
-        elif etype in ("escalation_resolved", "escalation_timeout"):
-            pass  # No visual effect needed
 
         return results
 

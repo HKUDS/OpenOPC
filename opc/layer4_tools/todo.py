@@ -6,7 +6,7 @@ persists the task ledger in runtime session state for resume and verification.
 
 from __future__ import annotations
 
-from opc.layer4_tools.registry import ToolDefinition
+from opc.layer4_tools.registry import COMPANY_EFFECT_RUNTIME_INTERNAL, ToolDefinition
 
 
 async def _todo_noop(**kwargs):  # type: ignore[no-untyped-def]
@@ -64,6 +64,7 @@ def create_todo_tools() -> list[ToolDefinition]:
         concurrency_safe=False,
         read_only=False,
         runtime_managed=True,
+        company_effect_kind=COMPANY_EFFECT_RUNTIME_INTERNAL,
     )
 
     todo_read = ToolDefinition(
@@ -78,6 +79,7 @@ def create_todo_tools() -> list[ToolDefinition]:
         concurrency_safe=True,
         read_only=True,
         runtime_managed=True,
+        company_effect_kind=COMPANY_EFFECT_RUNTIME_INTERNAL,
     )
 
     return [todo_write, todo_read]

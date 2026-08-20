@@ -11,6 +11,7 @@ import type {
   ArchitecturePresetDetail,
   HireTalentHandler,
 } from '../types/visual'
+import type { InteractionReplyReceipt } from '../types/chat'
 import { TeamView } from './TeamView'
 import { DelegationStrategyPanel } from './DelegationStrategyPanel'
 import { ArchitectureMarketplace } from './ArchitectureMarketplace'
@@ -71,7 +72,11 @@ interface OrgTabProps {
   hiringTemplateId?: string | null
   onImportEmployee?: (employeeId: string) => void
   onRequestReorgList: () => void
-  onReorgDecide: (proposalId: string, approved: boolean, notes?: string) => void
+  onReorgDecide: (
+    proposal: ReorgProposalInfo,
+    approved: boolean,
+    notes?: string,
+  ) => Promise<InteractionReplyReceipt>
   // Market
   onMarketExport?: (data: { package_id: string; name: string; description: string; version: string }) => void
   onMarketInstall?: (path: string, strategy: string) => void

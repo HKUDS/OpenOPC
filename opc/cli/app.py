@@ -30,6 +30,7 @@ from rich.theme import Theme
 
 from opc import __version__
 from opc.core.config import OPCConfig, get_opc_home
+from opc.core.interaction_protocol import owner_interaction_actor_identity
 from opc.core.windows_ssl import (
     format_windows_sslkeylog_warning,
     pop_windows_sslkeylogfile,
@@ -99,7 +100,7 @@ def _get_config() -> OPCConfig:
 
 
 def _channel_runtime_pid_path() -> Path:
-    from opc.core.config import get_opc_home, get_project_workplace
+    from opc.core.config import get_opc_home
 
     return get_opc_home() / "run" / "channels.pid"
 
@@ -2614,7 +2615,6 @@ async def _propose_reorg(config, payload: str, project: str | None) -> None:
         console.print(f"Risk: {proposal.risk_level.value}")
         console.print(f"Summary: {proposal.summary}")
         if proposal.user_confirmation_required:
-            await engine._save_reorg_checkpoint(proposal)  # noqa: SLF001
             console.print("[warning]User confirmation is required before applying this reorg.[/warning]")
     finally:
         await engine.shutdown()
@@ -2624,6 +2624,19 @@ async def _approve_reorg(config, proposal_id: str, project: str | None, *, appro
     engine, _runtime_display = _create_cli_engine(config, project)
     try:
         await engine.initialize()
+        checkpoint = await _reorg_interaction(engine, proposal_id)
+        if checkpoint is not None:
+            receipt = await _submit_reorg_interaction(
+                engine,
+                checkpoint,
+                approved=approved,
+                notes=f"{'Approved' if approved else 'Denied'} via CLI.",
+            )
+            console.print(
+                f"[success]Submitted reorg decision:[/success] {proposal_id}"
+            )
+            console.print(f"Checkpoint status: {receipt.get('status', 'answered')}")
+            return
         proposal = await engine.approve_company_reorg(
             proposal_id,
             approved=approved,
@@ -2644,6 +2657,85 @@ async def _apply_reorg(config, proposal_id: str, project: str | None) -> None:
         console.print(json.dumps(result, ensure_ascii=False, indent=2))
     finally:
         await engine.shutdown()
+
+
+async def _reorg_interaction(engine: Any, proposal_id: str) -> Any | None:
+    """Return the proposal's durable owner card, including terminal history."""
+
+    store = getattr(engine, "store", None)
+    if store is None:
+        return None
+    project_id = _current_project_id(engine)
+    checkpoints = await store.get_execution_checkpoints(
+        project_id=project_id,
+        checkpoint_types=["company_reorg_pending"],
+    )
+    matches = [
+        checkpoint
+        for checkpoint in checkpoints
+        if str(getattr(checkpoint, "checkpoint_type", "") or "").strip()
+        == "company_reorg_pending"
+        and str(dict(getattr(checkpoint, "payload", {}) or {}).get("proposal_id", "") or "").strip()
+        == str(proposal_id or "").strip()
+        and str(getattr(checkpoint, "project_id", project_id) or project_id).strip()
+        == project_id
+    ]
+    if len(matches) > 1:
+        raise RuntimeError(
+            f"Multiple durable reorg checkpoints reference proposal {proposal_id}."
+        )
+    return matches[0] if matches else None
+
+
+async def _submit_reorg_interaction(
+    engine: Any,
+    checkpoint: Any,
+    *,
+    approved: bool,
+    notes: str,
+) -> dict[str, Any]:
+    """Submit one reorg decision through the canonical durable ingress."""
+
+    submit = getattr(engine, "submit_checkpoint_decision", None)
+    if not callable(submit):
+        raise RuntimeError("The engine does not support durable checkpoint replies.")
+    action = "approve" if approved else "deny"
+    checkpoint_status = str(
+        getattr(checkpoint, "status", "") or ""
+    ).strip().lower()
+    if checkpoint_status != "pending":
+        raise RuntimeError(
+            "The reorg decision is already durable "
+            f"({checkpoint_status or 'unknown'}); it cannot be revised."
+        )
+    requester_task_id, requester_session_id = owner_interaction_actor_identity(
+        checkpoint
+    )
+    requester_actor: dict[str, Any] | None = None
+    if not requester_task_id and not requester_session_id:
+        issue_actor = getattr(engine, "issue_project_owner_actor", None)
+        if not callable(issue_actor):
+            raise RuntimeError("The engine cannot authorize a taskless owner reply.")
+        requester_actor = issue_actor(interface="cli")
+    receipt = await submit(
+        checkpoint_id=str(getattr(checkpoint, "checkpoint_id", "") or ""),
+        checkpoint_type="company_reorg_pending",
+        decision={
+            "option_id": action,
+            "checkpoint_reply_kind": action,
+            "text": str(notes or action).strip() or action,
+        },
+        client_request_id=(
+            f"cli-reorg:{getattr(checkpoint, 'checkpoint_id', '')}:{uuid.uuid4().hex}"
+        ),
+        requester_task_id=requester_task_id,
+        requester_session_id=requester_session_id or None,
+        requester_actor=requester_actor,
+    )
+    if not bool(receipt.get("accepted")):
+        reason = str(receipt.get("reason", "") or "invalid_decision").strip()
+        raise RuntimeError(f"Reorg decision was not accepted ({reason}).")
+    return dict(receipt)
 
 
 async def _show_reorg(config, proposal_id: str, project: str | None) -> None:
@@ -4280,7 +4372,12 @@ async def _handle_session_slash(state: _InteractiveChatState, args: list[str], c
         if not rest:
             console.print("[warning]Usage: /session complete <task_id>[/warning]")
             return
-        operation = lambda svc: svc.session.complete(project_id=_current_project_id(state.engine), task_id=rest[0])
+        def operation(svc):
+            return svc.session.complete(
+                project_id=_current_project_id(state.engine),
+                task_id=rest[0],
+            )
+
         payload = await _run_chat_office_service(state, operation)
         if payload:
             console.print(f"[success]Completed session:[/success] {rest[0]}")
@@ -5343,12 +5440,31 @@ async def _handle_reorg_slash(state: _InteractiveChatState, args: list[str]) -> 
                 console.print(f"[warning]Usage: /reorg {command} <proposal_id> [--notes ...][/warning]")
                 return
             approved = command == "approve"
+            decision_notes = notes or (
+                "Approved via CLI." if approved else "Denied via CLI."
+            )
+            checkpoint = await _reorg_interaction(state.engine, rest[0])
+            if checkpoint is not None:
+                receipt = await _submit_reorg_interaction(
+                    state.engine,
+                    checkpoint,
+                    approved=approved,
+                    notes=decision_notes,
+                )
+                console.print(
+                    f"[success]Submitted reorg decision for {rest[0]} "
+                    f"({receipt.get('status', 'answered')}).[/success]"
+                )
+                return
             proposal = await state.engine.approve_company_reorg(
                 rest[0],
                 approved=approved,
-                notes=notes or ("Approved via CLI." if approved else "Denied via CLI."),
+                notes=decision_notes,
             )
-            console.print(f"[success]Reorg {proposal.proposal_id} {'approved' if approved else 'denied'}.[/success]")
+            console.print(
+                f"[success]Reorg {proposal.proposal_id} "
+                f"{'approved' if approved else 'denied'}.[/success]"
+            )
             return
         if command == "apply":
             if not rest:
@@ -5857,8 +5973,6 @@ _IMPORTANT_WORK_ITEM_EVENTS = {
     "approval_resolved",
     "checkpoint_created",
     "checkpoint_resolved",
-    "escalation_created",
-    "escalation_resolved",
     "work_item_failed",
     "work_item_blocked",
     "work_item_completed",
@@ -6070,7 +6184,7 @@ def _event_is_high_signal(event_type: str) -> bool:
         return False
     if normalized in _IMPORTANT_WORK_ITEM_EVENTS:
         return True
-    return any(token in normalized for token in ("approval", "checkpoint", "escalation", "fail", "error", "blocked"))
+    return any(token in normalized for token in ("approval", "checkpoint", "fail", "error", "blocked"))
 
 
 def _render_codex_block(content: Any, *, prefix: str = "  ", style: str = "", full: bool = False) -> None:
@@ -8189,7 +8303,7 @@ async def _show_cost_summary(config) -> None:
     try:
         costs = await store.get_total_cost()
         if costs["total_calls"] > 0:
-            console.print(f"\n[bold]Cost Summary:[/bold]")
+            console.print("\n[bold]Cost Summary:[/bold]")
             console.print(f"  Total calls: {costs['total_calls']}")
             console.print(f"  Total tokens: {costs['total_tokens_in'] + costs['total_tokens_out']}")
             console.print(f"  Total cost: ${costs['total_cost']:.4f}")
@@ -8209,7 +8323,7 @@ async def _show_autonomy_summary(config, project: str | None = None) -> None:
     await store.initialize()
     try:
         stats = await store.get_autonomy_stats(project_id=project)
-        console.print(f"\n[bold]Autonomy Summary:[/bold]")
+        console.print("\n[bold]Autonomy Summary:[/bold]")
         console.print(f"  Decisions: {stats['total']}")
         console.print(f"  Auto-approved: {stats['auto_approved']}")
         console.print(f"  Escalated: {stats['escalated']}")

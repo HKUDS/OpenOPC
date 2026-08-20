@@ -37,6 +37,10 @@ from opc.core.models import (
 )
 from opc.database.store import OPCStore
 from opc.engine import OPCEngine
+from opc.layer0_interaction.coordinator import (
+    InteractionCoordinator,
+    InteractionDecisionLease,
+)
 from opc.layer2_organization.company_mode import CompanyWorkItemExecutor
 from opc.layer2_organization.phase import Phase
 from opc.layer2_organization.work_item_links import set_linked_work_item_id
@@ -303,6 +307,15 @@ class DeliveryFeedbackConsumingTests(unittest.IsolatedAsyncioTestCase):
         await self.store.initialize()
         self.engine = OPCEngine(project_id="p")
         self.engine.store = self.store
+        self.engine.interaction_coordinator = InteractionCoordinator(
+            store=self.store,
+            project_id="p",
+        )
+        self.engine._initialized = True
+        self.engine._INTERACTION_LEASE_SECONDS = 0.05
+        # Tests drive the durable consumer explicitly so concurrent controller
+        # claims are observable without leaving background tasks behind.
+        self.engine._schedule_interaction_consumption = lambda *_args: None
 
     async def asyncTearDown(self) -> None:
         await self.store.close()
@@ -316,55 +329,143 @@ class DeliveryFeedbackConsumingTests(unittest.IsolatedAsyncioTestCase):
             checkpoint_type="company_delivery_feedback",
             task_id="task-1",
             status=status,
-            payload={"session_id": "s"},
+            payload={
+                "session_id": "s",
+                "interaction": {
+                    "kind": "company_delivery_feedback",
+                    "domain_key": "delivery-feedback:ckpt-fb",
+                    "ownership": {
+                        "waiting_task_id": "task-1",
+                        "waiting_session_id": "s",
+                        "ui_anchor_task_id": "task-1",
+                        "ui_anchor_session_id": "s",
+                    },
+                },
+            },
         )
-        await self.store.save_execution_checkpoint(checkpoint)
-        return checkpoint
+        persisted, _created = await self.store.publish_owner_interaction_checkpoint(
+            checkpoint,
+            interaction_key="delivery-feedback:ckpt-fb",
+            supersede_pending_scope=False,
+        )
+        return persisted
 
     async def test_concurrent_approve_claims_exactly_once(self) -> None:
         await self._seed_checkpoint()
-        # Both controllers hold a pending copy of the card before either
-        # acts — the DB-level CAS must let exactly one proceed. The payload
-        # has no waiting_task_id, so the winner exits right after claiming,
-        # which keeps the race observable without a full runtime.
-        first = await self.engine._load_execution_checkpoint_by_id("ckpt-fb")
-        second = await self.engine._load_execution_checkpoint_by_id("ckpt-fb")
-        replies = await asyncio.gather(
-            self.engine.run_company_delivery_self_evolution_checkpoint(first, action="approve"),
-            self.engine.run_company_delivery_self_evolution_checkpoint(second, action="approve"),
+        self.engine._run_company_delivery_self_evolution_consumed = AsyncMock(
+            return_value="self-evolution completed"
         )
-        already = [r for r in replies if r == "Self-evolution for this delivery is already running."]
-        proceeded = [r for r in replies if "delivery task reference is missing" in r]
-        self.assertEqual(len(already), 1, replies)
-        self.assertEqual(len(proceeded), 1, replies)
+
+        # Two transport requests may both receive a durable ACK for the same
+        # immutable decision, but the consumption lease admits one domain run.
+        receipts = await asyncio.gather(
+            self.engine.submit_checkpoint_decision(
+                checkpoint_id="ckpt-fb",
+                checkpoint_type="company_delivery_feedback",
+                decision={"checkpoint_reply_kind": "approve"},
+                client_request_id="approve-a",
+                requester_task_id="task-1",
+                requester_session_id="s",
+            ),
+            self.engine.submit_checkpoint_decision(
+                checkpoint_id="ckpt-fb",
+                checkpoint_type="company_delivery_feedback",
+                decision={"checkpoint_reply_kind": "approve"},
+                client_request_id="approve-b",
+                requester_task_id="task-1",
+                requester_session_id="s",
+            ),
+        )
+        self.assertTrue(all(receipt["accepted"] for receipt in receipts))
+        self.assertEqual(
+            sum(bool(receipt["deduplicated"]) for receipt in receipts),
+            1,
+        )
+        await asyncio.gather(
+            self.engine._consume_answered_interaction(
+                "ckpt-fb", "company_delivery_feedback"
+            ),
+            self.engine._consume_answered_interaction(
+                "ckpt-fb", "company_delivery_feedback"
+            ),
+        )
+        self.engine._run_company_delivery_self_evolution_consumed.assert_awaited_once()
+        persisted = await self.store.get_execution_checkpoint(
+            "ckpt-fb",
+            project_id="p",
+            checkpoint_type="company_delivery_feedback",
+        )
+        self.assertIsNotNone(persisted)
+        self.assertEqual(persisted.status, "resolved")
 
     async def test_duplicate_reply_while_consuming_is_idempotent(self) -> None:
-        await self._seed_checkpoint(status="consuming")
-        reply = await self.engine._maybe_resume_checkpoint(
-            "approve",
-            session_id="s",
-            reply_metadata={"response_to_checkpoint_id": "ckpt-fb"},
+        await self._seed_checkpoint()
+        first = await self.engine.submit_checkpoint_decision(
+            checkpoint_id="ckpt-fb",
+            checkpoint_type="company_delivery_feedback",
+            decision={"checkpoint_reply_kind": "approve"},
+            client_request_id="approve-first",
+            requester_task_id="task-1",
+            requester_session_id="s",
         )
-        self.assertEqual(reply, "Self-evolution for this delivery is already running.")
+        self.assertTrue(first["accepted"])
+        claim = await self.engine.interaction_coordinator.claim_answered(
+            checkpoint_id="ckpt-fb",
+            checkpoint_type="company_delivery_feedback",
+            consumer_id="self-evolution-consumer",
+            lease_seconds=1,
+        )
+        self.assertTrue(claim.acquired)
+        duplicate = await self.engine.submit_checkpoint_decision(
+            checkpoint_id="ckpt-fb",
+            checkpoint_type="company_delivery_feedback",
+            decision={"checkpoint_reply_kind": "approve"},
+            client_request_id="approve-retry",
+            requester_task_id="task-1",
+            requester_session_id="s",
+        )
+        self.assertTrue(duplicate["accepted"])
+        self.assertTrue(duplicate["deduplicated"])
+        self.assertEqual(duplicate["status"], "consuming")
+        await self.engine.interaction_coordinator.finish(
+            InteractionDecisionLease(
+                checkpoint=claim.checkpoint,
+                decision={"checkpoint_reply_kind": "approve"},
+                consumer_id="self-evolution-consumer",
+                claim_id=claim.claim_id,
+            )
+        )
 
-    async def test_crash_hands_the_claim_back_for_retry(self) -> None:
+    async def test_crash_after_effect_fence_is_not_replayed(self) -> None:
         await self._seed_checkpoint()
 
         async def _boom(checkpoint, *, action, feedback=""):
             raise RuntimeError("mid-flight crash")
 
-        self.engine._run_company_delivery_self_evolution_consumed = _boom
-        loaded = await self.engine._load_execution_checkpoint_by_id("ckpt-fb")
-        with self.assertRaises(RuntimeError):
-            await self.engine.run_company_delivery_self_evolution_checkpoint(
-                loaded, action="approve"
-            )
-        refreshed = await self.engine._load_execution_checkpoint_by_id("ckpt-fb")
-        self.assertEqual(refreshed.status, "pending")
-        self.assertIn(
-            "mid-flight crash",
-            str(dict(refreshed.payload or {}).get("self_evolution_consume_error", "")),
+        self.engine._run_company_delivery_self_evolution_consumed = AsyncMock(
+            side_effect=_boom
         )
+        receipt = await self.engine.submit_checkpoint_decision(
+            checkpoint_id="ckpt-fb",
+            checkpoint_type="company_delivery_feedback",
+            decision={"checkpoint_reply_kind": "approve"},
+            client_request_id="approve-crash",
+            requester_task_id="task-1",
+            requester_session_id="s",
+        )
+        self.assertTrue(receipt["accepted"])
+        await self.engine._consume_answered_interaction(
+            "ckpt-fb", "company_delivery_feedback"
+        )
+        refreshed = await self.engine._load_execution_checkpoint_by_id("ckpt-fb")
+        self.assertEqual(refreshed.status, "outcome_unknown")
+        error = dict(dict(refreshed.payload or {}).get("interaction_error", {}) or {})
+        self.assertTrue(error.get("effect_started"))
+        self.assertIn("mid-flight crash", str(error.get("message", "")))
+        await self.engine._consume_answered_interaction(
+            "ckpt-fb", "company_delivery_feedback"
+        )
+        self.engine._run_company_delivery_self_evolution_consumed.assert_awaited_once()
 
 
 class SelfEvolutionDeadlineTests(unittest.IsolatedAsyncioTestCase):

@@ -23,7 +23,6 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import MagicMock
 
 from opc.core.models import (
     DelegationWorkItem,
@@ -763,7 +762,7 @@ class RefreshDependentsForRunTests(unittest.IsolatedAsyncioTestCase):
         doomed = compute_doomed_work_item_ids(by_id)
         self.assertNotIn("alive-triage", doomed)
 
-        changed = await refresh_dependents_for_run(self.store, run_id="run-alive")
+        await refresh_dependents_for_run(self.store, run_id="run-alive")
         after_upper = await self.store.get_delegation_work_item("alive-upper")
         # The upper parent keeps waiting for the live triage card — no
         # premature settlement over it.
@@ -959,11 +958,8 @@ class RefreshDependentsForRunTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(after.metadata.get("waiting_on_work_item_ids"), [])
         self.assertIn("deleted-child", after.metadata.get("pruned_dependency_work_item_ids", []))
 
-    async def test_child_awaiting_human_triggers_refresh(self) -> None:
-        """Fix 3 regression: when max_review_reworks escalates a child to
-        AWAITING_HUMAN, the hook must fire so the parent's dep metadata
-        is updated. Previously this transition was silent and the parent
-        drifted into a zombie state."""
+    async def test_final_delivery_child_awaiting_human_triggers_refresh(self) -> None:
+        """A genuine final-delivery human wait still participates in dependency refresh."""
         parent = _make_work_item(
             work_item_id="parent-h",
             run_id="run-c",
@@ -979,15 +975,15 @@ class RefreshDependentsForRunTests(unittest.IsolatedAsyncioTestCase):
         child_h2 = _make_work_item(
             work_item_id="child-h2",
             run_id="run-c",
-            phase=Phase.AWAITING_MANAGER_REVIEW,
+            phase=Phase.RUNNING,
         )
         await self._save(parent, child_h1, child_h2)
 
         await self.store.update_delegation_work_item(
             "child-h2", phase=Phase.AWAITING_HUMAN
         )
-        # Parent stays waiting (AWAITING_HUMAN is not APPROVED), but the
-        # hook ran. Next step: a human approves → parent should unblock.
+        # Parent stays waiting (AWAITING_HUMAN is not APPROVED). Once the
+        # final delivery is accepted, the dependency hook unblocks it.
         await self.store.update_delegation_work_item(
             "child-h2", phase=Phase.APPROVED
         )

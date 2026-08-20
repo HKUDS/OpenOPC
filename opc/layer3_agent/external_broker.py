@@ -9,6 +9,7 @@ import os
 import re
 import signal
 import subprocess
+import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any, AsyncIterator, Callable, Coroutine
@@ -28,6 +29,9 @@ from opc.layer2_organization.approval import ApprovalEngine
 from opc.layer2_organization.collaboration_service import CollaborationContext, CollaborationService
 from opc.layer2_organization.communication import CommunicationManager
 from opc.layer2_organization.session_scoping import task_session_scope_id
+from opc.layer2_organization.company_runtime_identity import (
+    requires_native_company_execution,
+)
 from opc.layer2_organization.work_item_runtime import is_work_item_runtime_metadata
 from opc.layer2_organization.work_item_identity import projection_id_for_task, turn_type_for_task
 from opc.layer2_organization.work_item_links import linked_work_item_id_for_task, set_linked_work_item_id
@@ -104,6 +108,42 @@ class ExternalAgentBroker:
         self.task_preparer = task_preparer
         self.communication = communication
         self.org_engine = org_engine
+
+    async def _company_native_launch_required(
+        self,
+        *candidates: Task | None,
+    ) -> bool:
+        """Reconcile caller and durable Tasks at an external launch boundary."""
+
+        observed = [candidate for candidate in candidates if candidate is not None]
+        get_task = getattr(self.store, "get_task", None)
+        if callable(get_task):
+            for task_id in {
+                str(candidate.id or "").strip()
+                for candidate in observed
+                if str(candidate.id or "").strip()
+            }:
+                loaded = await get_task(task_id)
+                if isinstance(loaded, Task):
+                    observed.append(loaded)
+        return any(
+            requires_native_company_execution(candidate)
+            for candidate in observed
+        )
+
+    @staticmethod
+    def _company_native_launch_rejection() -> TaskResult:
+        return TaskResult(
+            status=TaskStatus.FAILED,
+            content=(
+                "Company-owned execution requires the native runtime; "
+                "unisolated external agents are disabled before launch."
+            ),
+            artifacts={
+                "company_native_execution_required": True,
+                "external_process_started": False,
+            },
+        )
 
     @staticmethod
     def _normalize_external_agent_choice(value: Any) -> str:
@@ -383,6 +423,12 @@ class ExternalAgentBroker:
         on_progress: Callable[[str], Coroutine[Any, Any, None]] | None = None,
         prepared_task: Task | None = None,
     ) -> TaskResult:
+        # External providers currently receive an unisolated shared workspace
+        # and therefore cannot participate in company artifact ownership.  This
+        # is the final launch boundary: inspect both caller objects and the
+        # durable row before restore/preparation/preflight/approval can write.
+        if await self._company_native_launch_required(task, prepared_task):
+            return self._company_native_launch_rejection()
         await self._restore_session_resume_from_store(adapter, task, on_progress=on_progress)
         agent_task = prepared_task or await self._prepare_task_for_agent(task)
         await self._clear_broker_pending_inbox(task)
@@ -392,9 +438,20 @@ class ExternalAgentBroker:
         else:
             cmd, metadata = adapter.build_invocation(agent_task, workspace_path=workspace_path)
 
+        # A provider session can host many distinct process invocations.  The
+        # session token and stream line number are therefore not a lifecycle
+        # identity: both are routinely reused after a process restart.  Stamp
+        # this concrete invocation once and persist it with the external
+        # session so every approval event below has a durable, collision-free
+        # source identity.
+        external_invocation_id = uuid.uuid4().hex
         metadata = {
             **metadata,
             "workspace": workspace_path,
+            "external_invocation_id": external_invocation_id,
+            "source_event_id": (
+                f"external-agent-invocation:{task.id}:{external_invocation_id}"
+            ),
             "explicit_user_selected_agent": self._task_explicitly_selected_external_agent(
                 task,
                 adapter.agent_type,
@@ -477,6 +534,12 @@ class ExternalAgentBroker:
 
         artifacts = {**metadata, **(result.artifacts or {})}
         result.artifacts = artifacts
+        if bool(artifacts.get("company_native_execution_required", False)):
+            # A Task converted to company scope during an approval wait must
+            # leave no external-session/resume identity behind.  Persisting a
+            # failed external row here would let a later resume path re-pin the
+            # forbidden provider even though no process was launched.
+            return result
         await self._persist_session(adapter, task, workspace_path, artifacts, result)
         return result
 
@@ -952,6 +1015,14 @@ class ExternalAgentBroker:
                 else:
                     metadata["collaboration_rpc"]["request_path"] = rpc_env.get(OPC_COLLAB_RPC_PATH, "")
         try:
+            # Approval/preflight may await human or external state.  Reload the
+            # durable Task at the actual process boundary so an ordinary Task
+            # converted into company execution during that wait cannot launch
+            # under the stale caller snapshot.
+            if await self._company_native_launch_required(task, launch_task):
+                if collab_rpc_server is not None:
+                    await collab_rpc_server.close()
+                return self._company_native_launch_rejection()
             proc = await adapter.start_process(
                 cmd,
                 workspace_path,
@@ -1161,6 +1232,12 @@ class ExternalAgentBroker:
                         stream_name=stream_name,
                         proc=proc,
                         on_progress=on_progress,
+                        source_event_id=(
+                            "external-prompt:"
+                            f"{str(metadata.get('external_invocation_id', '') or '').strip()}:"
+                            f"{stream_name}:"
+                            f"{stream_line_counts.get(stream_name, 0)}"
+                        ),
                     )
                     if prompt:
                         approval_prompts.append(prompt)
@@ -2104,6 +2181,7 @@ class ExternalAgentBroker:
         stream_name: str,
         proc: asyncio.subprocess.Process,
         on_progress: Callable[[str], Coroutine[Any, Any, None]] | None = None,
+        source_event_id: str = "",
     ) -> dict[str, Any] | None:
         request = adapter.parse_approval_request(text, stream_name)
         if not request:
@@ -2130,6 +2208,8 @@ class ExternalAgentBroker:
                 "prompt_text": request.prompt_text,
                 "run_mode": "interactive",
                 "workspace": workspace_path,
+                "source_event_id": str(source_event_id or "").strip(),
+                "non_replayable_action": True,
             }
             allowed, decision = await self.approval_engine.authorize_tool_call(
                 task=task,
@@ -2146,6 +2226,7 @@ class ExternalAgentBroker:
                 "prompt_text": request.prompt_text,
                 "run_mode": "interactive",
                 "workspace": workspace_path,
+                "source_event_id": str(source_event_id or "").strip(),
             }
             allowed, decision = await self.approval_engine.authorize_external_action(
                 task=task,
@@ -2466,6 +2547,23 @@ class ExternalAgentBroker:
                 "agent_type": adapter.agent_type,
                 "runtime_session_id": session_id,
                 "delegation_role_session_id": role_session_id,
+                "company_run_id": str(
+                    (task.metadata or {}).get("delegation_run_id", "") or ""
+                ).strip(),
+                "company_run_controller_owner_token": str(
+                    (task.metadata or {}).get(
+                        "company_run_controller_owner_token",
+                        "",
+                    )
+                    or ""
+                ).strip(),
+                "company_run_controller_lease_generation": int(
+                    (task.metadata or {}).get(
+                        "company_run_controller_lease_generation",
+                        0,
+                    )
+                    or 0
+                ),
                 "resume_session_id": str(
                     extra.get("resume_session_id")
                     or metadata.get("resume_session_id")
@@ -2531,6 +2629,23 @@ class ExternalAgentBroker:
                 "session_mode": metadata.get("session_mode", "auto"),
                 "agent_type": adapter.agent_type,
                 "delegation_role_session_id": role_session_id,
+                "company_run_id": str(
+                    (task.metadata or {}).get("delegation_run_id", "") or ""
+                ).strip(),
+                "company_run_controller_owner_token": str(
+                    (task.metadata or {}).get(
+                        "company_run_controller_owner_token",
+                        "",
+                    )
+                    or ""
+                ).strip(),
+                "company_run_controller_lease_generation": int(
+                    (task.metadata or {}).get(
+                        "company_run_controller_lease_generation",
+                        0,
+                    )
+                    or 0
+                ),
                 "resume_session_id": resume_session_id,
                 "provider_session_id": provider_session_id,
                 "runtime_session_id": self._resolve_runtime_session_id(adapter, task, metadata),
@@ -2595,6 +2710,20 @@ class ExternalAgentBroker:
                         role_session_id,
                         adapter.agent_type,
                         token_record,
+                        controller_owner_token=str(
+                            (task.metadata or {}).get(
+                                "company_run_controller_owner_token",
+                                "",
+                            )
+                            or ""
+                        ).strip(),
+                        controller_lease_generation=int(
+                            (task.metadata or {}).get(
+                                "company_run_controller_lease_generation",
+                                0,
+                            )
+                            or 0
+                        ),
                     )
                 except Exception:
                     logger.opt(exception=True).debug(
@@ -2642,6 +2771,20 @@ class ExternalAgentBroker:
                         role_session_id,
                         adapter.agent_type,
                         None,
+                        controller_owner_token=str(
+                            (task.metadata or {}).get(
+                                "company_run_controller_owner_token",
+                                "",
+                            )
+                            or ""
+                        ).strip(),
+                        controller_lease_generation=int(
+                            (task.metadata or {}).get(
+                                "company_run_controller_lease_generation",
+                                0,
+                            )
+                            or 0
+                        ),
                     )
             except Exception:
                 logger.opt(exception=True).debug(

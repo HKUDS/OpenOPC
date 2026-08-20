@@ -45,11 +45,8 @@ scheduler) wire it into the lifecycle.
 from __future__ import annotations
 
 import contextlib
-import json
 import os
 import re
-import shutil
-import tempfile
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -57,6 +54,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from opc.layer4_tools.output_budget import clip_text
+from opc.layer4_tools.workspace_fs import SecureWorkspace, WorkspaceBoundaryError
 
 try:
     import fcntl  # POSIX only — used for transcript append locking
@@ -221,18 +219,18 @@ def ensure_layout(
     Also (re)writes README.md. Safe to call on every work-item start —
     pure mkdir + small file writes.
     """
-    layout.root.mkdir(parents=True, exist_ok=True)
-    layout.inbox_root.mkdir(parents=True, exist_ok=True)
-    layout.meetings_root.mkdir(parents=True, exist_ok=True)
-    layout.shared_root.mkdir(parents=True, exist_ok=True)
-    layout.team_memory_root.mkdir(parents=True, exist_ok=True)
+    _ensure_runtime_directory(layout.root)
+    _ensure_runtime_directory(layout.inbox_root)
+    _ensure_runtime_directory(layout.meetings_root)
+    _ensure_runtime_directory(layout.shared_root)
+    _ensure_runtime_directory(layout.team_memory_root)
     for role in roles:
         if not role:
             continue
-        layout.role_new_dir(role).mkdir(parents=True, exist_ok=True)
-        layout.role_seen_dir(role).mkdir(parents=True, exist_ok=True)
-        layout.role_outbox_dir(role).mkdir(parents=True, exist_ok=True)
-        layout.role_tmp_dir(role).mkdir(parents=True, exist_ok=True)
+        _ensure_runtime_directory(layout.role_new_dir(role))
+        _ensure_runtime_directory(layout.role_seen_dir(role))
+        _ensure_runtime_directory(layout.role_outbox_dir(role))
+        _ensure_runtime_directory(layout.role_tmp_dir(role))
     _write_readme(layout)
     _ensure_team_memory_entrypoint(layout)
 
@@ -276,9 +274,9 @@ def send_message(
 
     # Make sure target dirs exist even if ensure_layout was never called
     # for the target role yet (e.g. msg arrives before that work item starts).
-    layout.role_new_dir(to_role).mkdir(parents=True, exist_ok=True)
-    layout.role_outbox_dir(from_role).mkdir(parents=True, exist_ok=True)
-    layout.role_tmp_dir(from_role).mkdir(parents=True, exist_ok=True)
+    _ensure_runtime_directory(layout.role_new_dir(to_role))
+    _ensure_runtime_directory(layout.role_outbox_dir(from_role))
+    _ensure_runtime_directory(layout.role_tmp_dir(from_role))
 
     # Idempotency: if sender already produced a message with this
     # key, return the receiver-side path (new/ if still unread, seen/
@@ -288,10 +286,10 @@ def send_message(
         existing_outbox = _find_in_outbox(layout, from_role, idempotency_key)
         if existing_outbox is not None:
             new_candidate = layout.role_new_dir(to_role) / existing_outbox.name
-            if new_candidate.exists():
+            if _runtime_file_exists(new_candidate):
                 return new_candidate
             seen_candidate = layout.role_seen_dir(to_role) / existing_outbox.name
-            if seen_candidate.exists():
+            if _runtime_file_exists(seen_candidate):
                 return seen_candidate
             # Receiver-side file vanished — fall through and re-deliver.
 
@@ -331,8 +329,8 @@ def send_message(
     _atomic_write_text(tmp_path, payload)
     # Mirror into sender outbox first so audit survives even if the
     # rename to receiver fails.
-    shutil.copy2(tmp_path, outbox_path)
-    os.replace(tmp_path, final_path)
+    _atomic_write_text(outbox_path, _read_runtime_text(tmp_path))
+    _replace_runtime_path(tmp_path, final_path)
     return final_path
 
 
@@ -354,9 +352,11 @@ def list_unread(
     """
     role_id = _safe(role_id)
     new_dir = layout.role_new_dir(role_id)
-    if not new_dir.is_dir():
-        return []
-    files = sorted(p for p in new_dir.iterdir() if p.is_file() and p.suffix == ".md")
+    files = sorted(
+        path
+        for path, is_dir in _runtime_children(new_dir)
+        if not is_dir and path.suffix == ".md"
+    )
     if limit is not None:
         files = files[:limit]
     headers: list[MessageHeader] = []
@@ -372,13 +372,100 @@ def list_unread(
 
 def list_roles(layout: CommsLayout) -> list[str]:
     """Return every role directory currently present under inbox/."""
-    if not layout.inbox_root.is_dir():
-        return []
     roles: list[str] = []
-    for child in sorted(layout.inbox_root.iterdir(), key=lambda item: item.name):
-        if child.is_dir():
+    for child, is_dir in sorted(
+        _runtime_children(layout.inbox_root),
+        key=lambda item: item[0].name,
+    ):
+        if is_dir:
             roles.append(child.name)
     return roles
+
+
+def layout_available(layout: CommsLayout) -> bool:
+    """Return whether the runtime comms root is a real in-workspace directory."""
+
+    return _runtime_directory_exists(layout.root)
+
+
+def count_role_messages(
+    layout: CommsLayout,
+    role_id: str,
+    *,
+    bucket: str,
+) -> int:
+    """Count markdown messages in one safe role mailbox bucket."""
+
+    role = _safe(role_id)
+    paths = {
+        NEW_DIRNAME: layout.role_new_dir(role),
+        SEEN_DIRNAME: layout.role_seen_dir(role),
+        OUTBOX_DIRNAME: layout.role_outbox_dir(role),
+    }
+    selected = paths.get(str(bucket or "").strip())
+    if selected is None:
+        raise ValueError("Unknown comms mailbox bucket")
+    return sum(
+        1
+        for path, is_dir in _runtime_children(selected)
+        if not is_dir and path.suffix == ".md"
+    )
+
+
+def runtime_read_path(path: str | Path) -> Path:
+    """Return a lexical runtime-internal read path without following symlinks."""
+
+    workspace, absolute = _runtime_workspace_path(Path(path))
+    with workspace:
+        target = workspace.resolve(
+            absolute,
+            use_output_root=False,
+            allow_runtime_internal_read=True,
+        )
+        return target.display_path
+
+
+def runtime_read_layout_path(layout: CommsLayout, path: str | Path) -> Path:
+    """Authorize one runtime read against an exact durable comms layout.
+
+    Unlike :func:`runtime_read_path`, this entry point does not infer the
+    workspace capability from caller-controlled path text.  UI/API callers
+    must first resolve ``layout`` from durable project/task/session identity;
+    the lexical path is then required to stay inside that exact layout.
+    """
+
+    candidate = Path(
+        os.path.abspath(os.path.normpath(os.path.expanduser(str(path))))
+    )
+    layout_root = Path(
+        os.path.abspath(os.path.normpath(str(layout.root)))
+    )
+    try:
+        relative = candidate.relative_to(layout_root)
+    except ValueError as exc:
+        raise WorkspaceBoundaryError(
+            "Comms path is outside the authorized project/session layout."
+        ) from exc
+    if not relative.parts:
+        raise WorkspaceBoundaryError("Comms path must identify a file.")
+
+    workspace = SecureWorkspace(
+        str(layout.workspace_root),
+        str(layout.workspace_root),
+    )
+    with workspace:
+        target = workspace.resolve(
+            str(candidate),
+            use_output_root=False,
+            allow_runtime_internal_read=True,
+        )
+        return target.display_path
+
+
+def runtime_file_exists(path: str | Path) -> bool:
+    """Safely probe one regular runtime-internal file."""
+
+    return _runtime_file_exists(Path(path))
 
 
 def list_role_messages(
@@ -401,15 +488,11 @@ def list_role_messages(
         buckets.append(layout.role_outbox_dir(role))
     paths: list[Path] = []
     for bucket in buckets:
-        if not bucket.is_dir():
-            continue
-        try:
-            paths.extend(
-                path for path in bucket.iterdir()
-                if path.is_file() and path.suffix == ".md"
-            )
-        except OSError:
-            continue
+        paths.extend(
+            path
+            for path, is_dir in _runtime_children(bucket)
+            if not is_dir and path.suffix == ".md"
+        )
     paths = sorted(paths, key=lambda item: item.name)
     if limit is not None:
         paths = paths[:limit]
@@ -442,11 +525,9 @@ def find_unresolved_blocking_outbox(
     """
     sender_role = _safe(sender_role)
     outbox = layout.role_outbox_dir(sender_role)
-    if not outbox.is_dir():
-        return []
     blocking: list[MessageHeader] = []
-    for path in sorted(outbox.iterdir()):
-        if not path.is_file() or path.suffix != ".md":
+    for path, is_dir in sorted(_runtime_children(outbox)):
+        if is_dir or path.suffix != ".md":
             continue
         h = read_header(path)
         if h is None or not h.blocking:
@@ -468,10 +549,8 @@ def find_reply_to(
     sender_role = _safe(sender_role)
     for sub in (NEW_DIRNAME, SEEN_DIRNAME):
         d = layout.role_inbox(sender_role) / sub
-        if not d.is_dir():
-            continue
-        for path in sorted(d.iterdir()):
-            if not path.is_file() or path.suffix != ".md":
+        for path, is_dir in sorted(_runtime_children(d)):
+            if is_dir or path.suffix != ".md":
                 continue
             h = read_header(path)
             if h is None:
@@ -484,21 +563,17 @@ def find_reply_to(
 def has_unread(layout: CommsLayout, role_id: str) -> bool:
     """Cheap existence check — `os.scandir` only, no parsing."""
     new_dir = layout.role_new_dir(_safe(role_id))
-    if not new_dir.is_dir():
-        return False
-    try:
-        with os.scandir(new_dir) as it:
-            return any(entry.is_file() and entry.name.endswith(".md") for entry in it)
-    except OSError:
-        return False
+    return any(
+        not is_dir and path.suffix == ".md"
+        for path, is_dir in _runtime_children(new_dir)
+    )
 
 
 def read_header(path: Path) -> MessageHeader | None:
     """Parse frontmatter only (cheap). Body is not loaded."""
     try:
-        with path.open("r", encoding="utf-8", errors="replace") as f:
-            chunk = f.read(8192)
-    except OSError:
+        chunk = _read_runtime_text(path)[:8192]
+    except (OSError, WorkspaceBoundaryError):
         return None
     fm, _ = _split_frontmatter(chunk)
     if fm is None:
@@ -509,8 +584,8 @@ def read_header(path: Path) -> MessageHeader | None:
 def read_message(path: Path) -> tuple[MessageHeader | None, str]:
     """Read full message: (header, body). Returns (None, "") on error."""
     try:
-        text = path.read_text(encoding="utf-8", errors="replace")
-    except OSError:
+        text = _read_runtime_text(path)
+    except (OSError, WorkspaceBoundaryError):
         return None, ""
     fm, body = _split_frontmatter(text)
     if fm is None:
@@ -530,14 +605,14 @@ def mark_seen(
     """
     role_id = _safe(role_id)
     seen_dir = layout.role_seen_dir(role_id)
-    seen_dir.mkdir(parents=True, exist_ok=True)
+    _ensure_runtime_directory(seen_dir)
     moved: list[Path] = []
     for src in paths:
         try:
-            if not src.exists():
+            if not _runtime_file_exists(src):
                 continue
             dst = seen_dir / src.name
-            os.replace(src, dst)
+            _replace_runtime_path(src, dst)
             moved.append(dst)
         except OSError:
             continue
@@ -546,18 +621,20 @@ def mark_seen(
 
 def mark_all_seen(layout: CommsLayout, role_id: str) -> list[Path]:
     new_dir = layout.role_new_dir(_safe(role_id))
-    if not new_dir.is_dir():
-        return []
-    return mark_seen(layout, role_id, list(new_dir.iterdir()))
+    return mark_seen(
+        layout,
+        role_id,
+        [path for path, is_dir in _runtime_children(new_dir) if not is_dir],
+    )
 
 
 def read_team_memory(layout: CommsLayout) -> str:
     path = layout.team_memory_path
-    if not path.exists():
+    if not _runtime_file_exists(path):
         _ensure_team_memory_entrypoint(layout)
     try:
-        return path.read_text(encoding="utf-8")
-    except OSError:
+        return _read_runtime_text(path)
+    except (OSError, WorkspaceBoundaryError):
         return ""
 
 
@@ -633,25 +710,118 @@ def _utc_iso_human() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def _atomic_write_text(path: Path, text: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_name = tempfile.mkstemp(
-        prefix=path.name + ".",
-        suffix=".tmp",
-        dir=str(path.parent),
+def _runtime_workspace_path(path: Path) -> tuple[SecureWorkspace, str]:
+    """Bind an internal comms path to its lexical workspace capability."""
+
+    absolute = Path(
+        os.path.abspath(os.path.normpath(os.path.expanduser(str(path))))
     )
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            f.write(text)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp_name, path)
-    except Exception:
-        try:
-            os.unlink(tmp_name)
-        except OSError:
-            pass
-        raise
+        comms_index = absolute.parts.index(COMMS_ROOT_NAME)
+    except ValueError as exc:
+        raise WorkspaceBoundaryError(
+            "Comms path is outside the runtime-internal namespace."
+        ) from exc
+    workspace_root = Path(*absolute.parts[:comms_index])
+    if not str(workspace_root):
+        workspace_root = Path(os.path.sep)
+    return SecureWorkspace(str(workspace_root), str(workspace_root)), str(absolute)
+
+
+def _ensure_runtime_directory(path: Path) -> None:
+    workspace, absolute = _runtime_workspace_path(path)
+    with workspace:
+        target = workspace.resolve(
+            absolute,
+            use_output_root=False,
+            allow_runtime_internal_read=True,
+        )
+        workspace.ensure_runtime_directory(target)
+
+
+def _runtime_directory_exists(path: Path) -> bool:
+    try:
+        workspace, absolute = _runtime_workspace_path(path)
+        with workspace:
+            target = workspace.resolve(
+                absolute,
+                use_output_root=False,
+                allow_runtime_internal_read=True,
+            )
+            fd = workspace.open_directory(target)
+            os.close(fd)
+        return True
+    except (FileNotFoundError, NotADirectoryError, OSError, WorkspaceBoundaryError):
+        return False
+
+
+def _read_runtime_text(path: Path) -> str:
+    workspace, absolute = _runtime_workspace_path(path)
+    with workspace:
+        target = workspace.resolve(
+            absolute,
+            use_output_root=False,
+            allow_runtime_internal_read=True,
+        )
+        return workspace.read_text(target)
+
+
+def _runtime_file_exists(path: Path) -> bool:
+    try:
+        _read_runtime_text(path)
+        return True
+    except (FileNotFoundError, IsADirectoryError, OSError, WorkspaceBoundaryError):
+        return False
+
+
+def _runtime_children(path: Path) -> list[tuple[Path, bool]]:
+    try:
+        workspace, absolute = _runtime_workspace_path(path)
+        with workspace:
+            target = workspace.resolve(
+                absolute,
+                use_output_root=False,
+                allow_runtime_internal_read=True,
+            )
+            with contextlib.closing(
+                workspace.iter_entries(target, recursive=False)
+            ) as iterator:
+                return [
+                    (target.display_path.joinpath(*entry.parts), entry.is_dir)
+                    for entry in iterator
+                ]
+    except (FileNotFoundError, NotADirectoryError, OSError, WorkspaceBoundaryError):
+        return []
+
+
+def _replace_runtime_path(source: Path, target: Path) -> None:
+    source_workspace, source_absolute = _runtime_workspace_path(source)
+    target_workspace, target_absolute = _runtime_workspace_path(target)
+    if source_workspace.root != target_workspace.root:
+        raise WorkspaceBoundaryError("Comms rename crossed workspace capabilities.")
+    with source_workspace:
+        source_path = source_workspace.resolve(
+            source_absolute,
+            use_output_root=False,
+            allow_runtime_internal_read=True,
+        )
+        target_path = source_workspace.resolve(
+            target_absolute,
+            use_output_root=False,
+            allow_runtime_internal_read=True,
+        )
+        source_workspace.rename(source_path, target_path)
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    workspace, absolute = _runtime_workspace_path(path)
+    with workspace:
+        target = workspace.resolve(
+            absolute,
+            use_output_root=False,
+            allow_runtime_internal_read=True,
+        )
+        workspace.write_runtime_text(target, text, create_dirs=True)
 
 
 def _dump_yaml(data: dict[str, Any]) -> str:
@@ -746,10 +916,8 @@ def _find_in_outbox(
     idempotency_key: str,
 ) -> Path | None:
     outbox = layout.role_outbox_dir(from_role)
-    if not outbox.is_dir():
-        return None
-    for path in outbox.iterdir():
-        if not path.is_file() or path.suffix != ".md":
+    for path, is_dir in _runtime_children(outbox):
+        if is_dir or path.suffix != ".md":
             continue
         header = read_header(path)
         if header is None:
@@ -761,7 +929,7 @@ def _find_in_outbox(
 
 def _ensure_team_memory_entrypoint(layout: CommsLayout) -> None:
     path = layout.team_memory_path
-    if path.exists():
+    if _runtime_file_exists(path):
         return
     _atomic_write_text(path, _TEAM_MEMORY_SCAFFOLD)
 
@@ -828,11 +996,11 @@ def start_meeting(
         mid = f"{_utc_iso_compact()}__{organizer or 'org'}__{uuid.uuid4().hex[:6]}"
 
     mdir = layout.meeting_dir(mid)
-    mdir.mkdir(parents=True, exist_ok=True)
+    _ensure_runtime_directory(mdir)
     manifest_path = mdir / "manifest.yaml"
     transcript_path = mdir / "transcript.md"
 
-    if manifest_path.exists():
+    if _runtime_file_exists(manifest_path):
         # Re-load existing one rather than overwriting.
         existing = read_meeting_state(layout, mid)
         if existing is not None:
@@ -862,7 +1030,7 @@ def start_meeting(
         f"\n"
         f"---\n"
     )
-    if not transcript_path.exists():
+    if not _runtime_file_exists(transcript_path):
         _atomic_write_text(transcript_path, header)
 
     state = read_meeting_state(layout, mid)
@@ -891,10 +1059,10 @@ def append_to_transcript(
     """
     mid = _safe(meeting_id)
     transcript_path = layout.meeting_dir(mid) / "transcript.md"
-    if not transcript_path.exists():
+    if not _runtime_file_exists(transcript_path):
         # Soft-bootstrap: if the meeting room exists but transcript was
         # deleted, recreate. If neither exists, raise.
-        if not layout.meeting_dir(mid).is_dir():
+        if not _runtime_directory_exists(layout.meeting_dir(mid)):
             raise FileNotFoundError(f"meeting {mid!r} not found at {transcript_path}")
         _atomic_write_text(transcript_path, f"# Meeting `{mid}`\n\n---\n")
 
@@ -913,22 +1081,26 @@ def append_to_transcript(
     )
 
     # Append with exclusive lock when fcntl is available.
-    fd = os.open(str(transcript_path), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
-    try:
-        if fcntl is not None:
-            try:
-                fcntl.flock(fd, fcntl.LOCK_EX)
-            except OSError:
-                pass
-        try:
-            os.write(fd, block.encode("utf-8"))
-            os.fsync(fd)
-        finally:
+    workspace, absolute = _runtime_workspace_path(transcript_path)
+    with workspace:
+        target = workspace.resolve(
+            absolute,
+            use_output_root=False,
+            allow_runtime_internal_read=True,
+        )
+        with workspace.open_runtime_append(target, create=True) as fd:
             if fcntl is not None:
-                with contextlib.suppress(OSError):
-                    fcntl.flock(fd, fcntl.LOCK_UN)
-    finally:
-        os.close(fd)
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX)
+                except OSError:
+                    pass
+            try:
+                os.write(fd, block.encode("utf-8"))
+                os.fsync(fd)
+            finally:
+                if fcntl is not None:
+                    with contextlib.suppress(OSError):
+                        fcntl.flock(fd, fcntl.LOCK_UN)
 
     return MeetingEntry(
         entry_id=entry_id,
@@ -949,11 +1121,11 @@ def read_transcript(
     """
     mid = _safe(meeting_id)
     path = layout.meeting_dir(mid) / "transcript.md"
-    if not path.is_file():
+    if not _runtime_file_exists(path):
         return []
     try:
-        text = path.read_text(encoding="utf-8", errors="replace")
-    except OSError:
+        text = _read_runtime_text(path)
+    except (OSError, WorkspaceBoundaryError):
         return []
     entries: list[MeetingEntry] = []
     marker_re = re.compile(
@@ -988,11 +1160,11 @@ def read_meeting_state(
     mdir = layout.meeting_dir(mid)
     manifest_path = mdir / "manifest.yaml"
     transcript_path = mdir / "transcript.md"
-    if not manifest_path.is_file():
+    if not _runtime_file_exists(manifest_path):
         return None
     try:
-        text = manifest_path.read_text(encoding="utf-8", errors="replace")
-    except OSError:
+        text = _read_runtime_text(manifest_path)
+    except (OSError, WorkspaceBoundaryError):
         return None
     if yaml is not None:
         try:
@@ -1026,12 +1198,13 @@ def list_active_meetings(
     """List meetings that are still `open`. If `role_id` is given,
     only return meetings where that role is in `participants`.
     """
-    if not layout.meetings_root.is_dir():
-        return []
     out: list[MeetingState] = []
     role = _safe(role_id) if role_id else None
-    for child in sorted(layout.meetings_root.iterdir()):
-        if not child.is_dir():
+    for child, is_dir in sorted(
+        _runtime_children(layout.meetings_root),
+        key=lambda item: item[0].name,
+    ):
+        if not is_dir:
             continue
         state = read_meeting_state(layout, child.name)
         if state is None or state.status != "open":
@@ -1040,6 +1213,19 @@ def list_active_meetings(
             continue
         out.append(state)
     return out
+
+
+def list_meeting_ids(layout: CommsLayout) -> list[str]:
+    """List meeting directory ids without traversing aliases."""
+
+    return [
+        child.name
+        for child, is_dir in sorted(
+            _runtime_children(layout.meetings_root),
+            key=lambda item: item[0].name,
+        )
+        if is_dir
+    ]
 
 
 def close_meeting(
@@ -1207,8 +1393,7 @@ def render_inbox_section(
     if not role_id:
         return ""
     role = _safe(role_id)
-    new_dir = layout.role_new_dir(role)
-    unread = list_unread(layout, role, limit=max_unread_listed) if new_dir.is_dir() else []
+    unread = list_unread(layout, role, limit=max_unread_listed)
 
     lines: list[str] = []
     lines.append("### Mailbox")

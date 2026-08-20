@@ -2,17 +2,20 @@ from __future__ import annotations
 
 import os
 import asyncio
+from contextlib import nullcontext
 from datetime import datetime, timedelta
 from functools import wraps
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
 from opc.core.active_task_runs import ActiveTaskRunRegistry
+from opc.core.company_controller import CompanyRunControllerLeaseLost
 from opc.core.models import (
     CompanyMemberSession,
+    DelegationRun,
     DelegationWorkItem,
     ExecutionCheckpoint,
     ExternalSession,
@@ -127,6 +130,133 @@ async def test_startup_creates_exactly_one_checkpoint_without_persisted_liveness
 
         assert len(checkpoints) == 1
         engine.company_executor.execute.assert_not_awaited()
+    finally:
+        await store.close()
+
+
+@_async_test
+async def test_startup_terminalizes_only_interrupted_generic_auxiliary_runtimes(
+    tmp_path: Path,
+) -> None:
+    store = OPCStore(tmp_path / "tasks.db")
+    await store.initialize()
+    try:
+        interrupted: list[tuple[Task, str]] = []
+        for kind in ("role_prompt", "meeting_turn"):
+            runtime_id = f"runtime-{kind}"
+            task = Task(
+                id=f"source::{kind}::attempt-1",
+                session_id=f"private-{kind}-session",
+                parent_session_id="source-session",
+                parent_id="source",
+                title=f"Private {kind}",
+                project_id="project-a",
+                assigned_to="executor",
+                status=TaskStatus.RUNNING,
+                execution_lock=True,
+                execution_locked_at=datetime.now(),
+                context_snapshot={"skip_session_history": True},
+                metadata={
+                    "runtime_auxiliary_task": True,
+                    "runtime_auxiliary_kind": kind,
+                    "runtime_auxiliary_source_task_id": "source",
+                    "runtime_v2": {
+                        "runtime_session_id": runtime_id,
+                        "status": "running",
+                        "audit_value": f"keep-{kind}",
+                    },
+                },
+            )
+            await store.save_task(task)
+            await store.save_runtime_session(
+                runtime_session_id=runtime_id,
+                project_id="project-a",
+                session_id=task.session_id,
+                task_id=task.id,
+                status="running",
+                metadata={
+                    "status": "running",
+                    "audit_value": f"keep-{kind}",
+                },
+            )
+            await store.save_runtime_transcript_entry(
+                runtime_session_id=runtime_id,
+                task_id=task.id,
+                session_id=task.session_id,
+                message_id=f"message-{kind}",
+                role="assistant",
+                content=f"partial {kind} answer",
+                metadata={"audit_value": f"keep-{kind}"},
+            )
+            interrupted.append((task, runtime_id))
+
+        terminal = Task(
+            id="source::role_prompt::already-terminal",
+            session_id="private-terminal-session",
+            parent_session_id="source-session",
+            parent_id="source",
+            title="Completed private role prompt",
+            project_id="project-a",
+            assigned_to="executor",
+            status=TaskStatus.DONE,
+            metadata={
+                "runtime_auxiliary_task": True,
+                "runtime_auxiliary_kind": "role_prompt",
+                "runtime_auxiliary_source_task_id": "source",
+                "runtime_v2": {
+                    "runtime_session_id": "runtime-terminal",
+                    "status": "completed",
+                },
+            },
+        )
+        await store.save_task(terminal)
+        await store.save_runtime_session(
+            runtime_session_id="runtime-terminal",
+            project_id="project-a",
+            session_id=terminal.session_id,
+            task_id=terminal.id,
+            status="completed",
+            metadata={"status": "completed", "audit_value": "keep-terminal"},
+        )
+
+        engine = OPCEngine(project_id="project-a")
+        engine.store = store
+        assert await engine._reconcile_interrupted_project_tasks() == 2
+        assert await engine._reconcile_interrupted_project_tasks() == 0
+
+        for original, runtime_id in interrupted:
+            durable = await store.get_task(original.id)
+            runtime = await store.get_runtime_session(runtime_id)
+            transcript = await store.list_runtime_transcript_entries(runtime_id)
+            assert durable is not None and durable.status == TaskStatus.FAILED
+            assert not durable.execution_lock
+            assert durable.execution_locked_at is None
+            assert durable.metadata["runtime_auxiliary_terminal_reason"] == (
+                "startup_interrupted"
+            )
+            assert durable.metadata["runtime_v2"]["status"] == "failed"
+            assert durable.metadata["runtime_v2"]["audit_value"] == (
+                f"keep-{durable.metadata['runtime_auxiliary_kind']}"
+            )
+            assert runtime is not None and runtime["status"] == "failed"
+            assert runtime["metadata"]["runtime_auxiliary_terminal_reason"] == (
+                "startup_interrupted"
+            )
+            assert runtime["metadata"]["audit_value"] == (
+                f"keep-{durable.metadata['runtime_auxiliary_kind']}"
+            )
+            assert [entry["content"] for entry in transcript] == [
+                f"partial {durable.metadata['runtime_auxiliary_kind']} answer"
+            ]
+
+        terminal_after = await store.get_task(terminal.id)
+        terminal_runtime = await store.get_runtime_session("runtime-terminal")
+        assert terminal_after is not None and terminal_after.status == TaskStatus.DONE
+        assert "runtime_auxiliary_terminal_reason" not in terminal_after.metadata
+        assert terminal_runtime is not None
+        assert terminal_runtime["status"] == "completed"
+        assert terminal_runtime["metadata"]["audit_value"] == "keep-terminal"
+        assert await store.get_pending_checkpoints(project_id="project-a") == []
     finally:
         await store.close()
 
@@ -1442,6 +1572,197 @@ async def test_separate_controllers_atomically_claim_checkpoint_once(
     finally:
         await second_store.close()
         await first_store.close()
+
+
+@_async_test
+async def test_remote_live_controller_blocks_resume_before_any_durable_mutation(
+    tmp_path: Path,
+) -> None:
+    project_dir = tmp_path / "projects" / "project-a"
+    project_dir.mkdir(parents=True)
+    db_path = project_dir / "tasks.db"
+    owner_store = OPCStore(db_path)
+    remote_store = OPCStore(db_path)
+    await owner_store.initialize()
+    await remote_store.initialize(run_startup_maintenance=False)
+    owner_lease = None
+    try:
+        await owner_store.save_delegation_run(
+            DelegationRun(
+                run_id="live-run",
+                project_id="project-a",
+                session_id="root-session",
+                execution_model="multi_team_org",
+                status="running",
+                lifecycle_status="active",
+            )
+        )
+        task = _runtime_task(
+            task_id="live-owner-task",
+            status=TaskStatus.BLOCKED,
+            metadata={
+                "delegation_run_id": "live-run",
+                "dispatch_hold": "company_runtime_suspended",
+            },
+        )
+        work_item = DelegationWorkItem(
+            work_item_id="live-owner-item",
+            run_id="live-run",
+            cell_id="team::executor",
+            role_id="executor",
+            seat_id="seat::executor",
+            title="Live owner work",
+            kind="execute",
+            projection_id="execution",
+            phase=Phase.RUNNING,
+            metadata={"dispatch_hold": "company_runtime_suspended"},
+        )
+        set_linked_work_item_id(task, work_item.work_item_id)
+        anchor = _ui_anchor(status=TaskStatus.CANCELLED)
+        await owner_store.save_task(anchor)
+        await owner_store.save_delegation_work_item(work_item)
+        await owner_store.save_task(task)
+        assert await owner_store.link_work_item_runtime_task(
+            work_item.work_item_id,
+            task.id,
+        )
+        checkpoint = ExecutionCheckpoint(
+            checkpoint_id="live-owner-checkpoint",
+            project_id="project-a",
+            session_id="root-session",
+            checkpoint_type="company_runtime_suspended",
+            status="pending",
+            task_id=task.id,
+            payload={
+                "task_ids": [task.id],
+                "parent_session_id": "root-session",
+                "company_work_item_plan": serialize_company_work_item_plan(
+                    _runtime_plan()
+                ),
+                "resume_state": "pending",
+            },
+        )
+        await owner_store.save_execution_checkpoint(checkpoint)
+        owner_lease = await owner_store.acquire_delegation_run_controller_lease(
+            "live-run",
+            project_id="project-a",
+            root_session_id="root-session",
+            owner_token="healthy-owner",
+            lease_seconds=60,
+        )
+        assert owner_lease.acquired
+
+        remote_executor = CompanyWorkItemExecutor.__new__(CompanyWorkItemExecutor)
+        remote_executor.store = remote_store
+        remote_executor._active_controller_leases = {}
+        remote_executor.execute = AsyncMock()
+        remote_executor._notify_kanban_changed = AsyncMock()
+        engine = OPCEngine(project_id="project-a")
+        engine.store = remote_store
+        engine.company_executor = remote_executor
+        engine._resolve_company_runtime_ui_anchor_task_id = AsyncMock()
+        engine._prepare_company_runtime_tasks_for_resume = AsyncMock()
+        engine._reset_company_executor_runtime_for_resume = AsyncMock()
+        engine._clear_company_runtime_parent_stop_state = AsyncMock()
+
+        before_checkpoint = await remote_store.get_execution_checkpoints(
+            project_id="project-a",
+            session_id="root-session",
+            checkpoint_types=["company_runtime_suspended"],
+            statuses=["pending"],
+        )
+        before_task = await remote_store.get_task(task.id)
+        before_item = await remote_store.get_delegation_work_item(work_item.work_item_id)
+        before_anchor = await remote_store.get_task(anchor.id)
+
+        result = await engine._resume_company_suspend_checkpoint(
+            before_checkpoint[0],
+            "continue",
+        )
+
+        after_checkpoint = await remote_store.get_execution_checkpoints(
+            project_id="project-a",
+            session_id="root-session",
+            checkpoint_types=["company_runtime_suspended"],
+            statuses=["pending"],
+        )
+        assert "live controller" in result
+        assert after_checkpoint == before_checkpoint
+        assert await remote_store.get_task(task.id) == before_task
+        assert (
+            await remote_store.get_delegation_work_item(work_item.work_item_id)
+            == before_item
+        )
+        assert await remote_store.get_task(anchor.id) == before_anchor
+        remote_executor.execute.assert_not_awaited()
+        remote_executor._notify_kanban_changed.assert_not_awaited()
+        engine._resolve_company_runtime_ui_anchor_task_id.assert_not_awaited()
+        engine._prepare_company_runtime_tasks_for_resume.assert_not_awaited()
+        engine._reset_company_executor_runtime_for_resume.assert_not_awaited()
+        engine._clear_company_runtime_parent_stop_state.assert_not_awaited()
+        assert remote_executor._active_controller_leases == {}
+    finally:
+        if owner_lease is not None and owner_lease.acquired:
+            await owner_store.release_delegation_run_controller_lease(
+                "live-run",
+                project_id="project-a",
+                root_session_id="root-session",
+                owner_token="healthy-owner",
+                generation=owner_lease.generation,
+            )
+        await remote_store.close()
+        await owner_store.close()
+
+
+@_async_test
+async def test_resume_lease_loss_does_not_restore_checkpoint_as_stale_owner() -> None:
+    task = _runtime_task(task_id="lease-lost-task", status=TaskStatus.BLOCKED)
+    checkpoint = ExecutionCheckpoint(
+        checkpoint_id="lease-lost-checkpoint",
+        project_id="project-a",
+        session_id="root-session",
+        checkpoint_type="company_runtime_suspended",
+        status="pending",
+        task_id=task.id,
+        payload={"task_ids": [task.id]},
+    )
+    admission = object()
+    release_driver = Mock()
+    driver_ownership = SimpleNamespace(
+        controller_admission=admission,
+        bind=lambda: nullcontext(),
+        release=release_driver,
+    )
+    engine = OPCEngine(project_id="project-a")
+    engine.store = object()
+    engine.company_executor = object()
+    engine._load_company_suspend_checkpoint_runtime = AsyncMock(
+        return_value=(
+            dict(checkpoint.payload),
+            "root-session",
+            _runtime_plan(),
+            [task],
+        )
+    )
+    engine._handoff_company_suspend_checkpoint = AsyncMock(
+        return_value=([task], driver_ownership),
+    )
+    engine._execute_with_company_controller_admission = AsyncMock(
+        side_effect=CompanyRunControllerLeaseLost("generation was fenced"),
+    )
+    engine._complete_company_suspend_checkpoint_resume = AsyncMock()
+    engine._restore_company_suspend_checkpoint_pending_after_cancellation = AsyncMock()
+    engine._restore_company_suspend_checkpoint_pending = AsyncMock()
+    engine._release_company_controller_admission = AsyncMock()
+
+    with pytest.raises(CompanyRunControllerLeaseLost, match="generation was fenced"):
+        await engine._resume_company_suspend_checkpoint(checkpoint, "continue")
+
+    engine._restore_company_suspend_checkpoint_pending_after_cancellation.assert_not_awaited()
+    engine._restore_company_suspend_checkpoint_pending.assert_not_awaited()
+    engine._complete_company_suspend_checkpoint_resume.assert_not_awaited()
+    engine._release_company_controller_admission.assert_awaited_once_with(admission)
+    release_driver.assert_called_once_with()
 
 
 @_async_test

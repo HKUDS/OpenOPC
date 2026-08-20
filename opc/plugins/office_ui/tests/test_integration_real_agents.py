@@ -16,8 +16,8 @@ Requires: OPENROUTER_API_KEY or the key in .opc/config/llm_config.yaml
 from __future__ import annotations
 
 import asyncio
+import importlib.util
 import os
-import textwrap
 from pathlib import Path
 from typing import Any
 
@@ -27,10 +27,8 @@ from opc.core.config import LLMConfig, OPCConfig, SystemConfig, get_opc_home
 from opc.core.events import EventBus
 from opc.core.models import (
     AgentInfo,
-    AgentStatus,
     OPCEvent,
     Task,
-    TaskResult,
     TaskStatus,
 )
 from opc.layer3_agent.native_agent import NativeAgent
@@ -80,12 +78,21 @@ def _load_llm_config() -> LLMConfig:
 
 _LLM_CFG = _load_llm_config()
 _HAS_KEY = bool(_LLM_CFG.api_key or os.environ.get(_LLM_CFG.api_key_env or "__NONE__", ""))
+_RUN_REAL_AGENT_TESTS = os.environ.get("OPENOPC_RUN_REAL_AGENT_TESTS", "").strip() == "1"
+_HAS_PYTEST_ASYNCIO = importlib.util.find_spec("pytest_asyncio") is not None
 
 pytestmark = [
-    pytest.mark.skipif(not _HAS_KEY, reason="No LLM API key configured"),
-    pytest.mark.asyncio,
+    pytest.mark.skipif(
+        not (_HAS_KEY and _RUN_REAL_AGENT_TESTS and _HAS_PYTEST_ASYNCIO),
+        reason=(
+            "Set OPENOPC_RUN_REAL_AGENT_TESTS=1 with an LLM key and install "
+            "pytest-asyncio to run real-agent tests"
+        ),
+    ),
     pytest.mark.timeout(180),
 ]
+if _HAS_PYTEST_ASYNCIO:
+    pytestmark.append(pytest.mark.asyncio)
 
 
 # ── Helpers ─────────────────────────────────────────────────────────────────

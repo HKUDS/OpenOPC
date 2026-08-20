@@ -179,6 +179,41 @@ class SnapshotClassificationTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(tasks)
         self.assertTrue(all(engine._task_uses_multi_team_org(task) for task in tasks))
 
+    async def test_runtime_model_precedes_legacy_execution_model_during_classification(self) -> None:
+        engine = OPCEngine(project_id="proj1")
+        legacy_plan = CompanyWorkItemRuntimePlan(
+            projections=[],
+            metadata={"execution_model": "multi_team_org"},
+        )
+        public_contract_plan = CompanyWorkItemRuntimePlan(
+            projections=[],
+            metadata={"execution_model": "actor_runtime"},
+        )
+        canonical_other_plan = CompanyWorkItemRuntimePlan(
+            projections=[],
+            metadata={
+                "execution_model": "multi_team_org",
+                "runtime_model": "future_scheduler",
+            },
+        )
+
+        self.assertTrue(engine._runtime_uses_multi_team_org(legacy_plan))
+        self.assertFalse(engine._runtime_uses_multi_team_org(public_contract_plan))
+        self.assertFalse(engine._runtime_uses_multi_team_org(canonical_other_plan))
+
+        legacy_task = Task(title="legacy", metadata={"execution_model": "multi_team_org"})
+        public_contract_task = Task(title="public", metadata={"execution_model": "actor_runtime"})
+        canonical_other_task = Task(
+            title="canonical",
+            metadata={
+                "execution_model": "multi_team_org",
+                "runtime_model": "future_scheduler",
+            },
+        )
+        self.assertTrue(engine._task_uses_multi_team_org(legacy_task))
+        self.assertFalse(engine._task_uses_multi_team_org(public_contract_task))
+        self.assertFalse(engine._task_uses_multi_team_org(canonical_other_task))
+
     async def test_followup_after_completed_run_never_reports_legacy(self) -> None:
         store = await self._store()
         await self._seed_completed_run(store)

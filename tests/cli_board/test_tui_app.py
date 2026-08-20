@@ -1,8 +1,14 @@
 from __future__ import annotations
 
 import unittest
+from unittest.mock import AsyncMock
 
-from opc.plugins.cli_board.state.models import BoardSnapshot, BoardTaskView, TaskDetailView
+from opc.plugins.cli_board.state.models import (
+    BoardSnapshot,
+    BoardTaskView,
+    PendingCheckpointView,
+    TaskDetailView,
+)
 
 try:  # pragma: no cover - optional dependency
     from opc.plugins.cli_board.tui.app import CliBoardApp
@@ -64,6 +70,33 @@ class _StubRepository:
 
 @unittest.skipIf(CliBoardApp is None, "textual is not installed")
 class CliBoardAppPilotTests(unittest.IsolatedAsyncioTestCase):
+    async def test_exact_permission_shortcut_cannot_approve(self) -> None:
+        app = CliBoardApp(
+            project_id="demo",
+            refresh_interval=60.0,
+            bootstrap_services=False,
+        )
+        repository = _StubRepository()
+        repository.snapshot.tasks[0].pending_checkpoint = PendingCheckpointView(
+            checkpoint_id="cp-exact",
+            checkpoint_type="tool_permission",
+            status="pending",
+            session_id="session-exact",
+            task_id="todo-1",
+            summary="Exact command",
+            prompt="if True:\n    print('<tag>')\n\n" + ("x" * 4_000),
+        )
+        app.repository = repository
+        approve = AsyncMock()
+        app.actions = type("Actions", (), {"approve_checkpoint": approve})()
+
+        async with app.run_test() as pilot:
+            app.state.replace_snapshot(await repository.load_snapshot())
+            app.action_approve_selected()
+            await pilot.pause()
+
+        approve.assert_not_awaited()
+
     async def test_keyboard_navigation_view_switching_and_modals(self) -> None:
         app = CliBoardApp(project_id="demo", refresh_interval=60.0, bootstrap_services=False)
         app.repository = _StubRepository()
@@ -109,4 +142,3 @@ class CliBoardAppPilotTests(unittest.IsolatedAsyncioTestCase):
             await pilot.press("?")
             self.assertIsInstance(app.screen, HelpScreen)
             await pilot.press("escape")
-

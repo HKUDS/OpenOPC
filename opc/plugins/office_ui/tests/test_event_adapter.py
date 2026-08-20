@@ -10,7 +10,6 @@ Event sources traced from:
   - communication.py: agent_message_sent, agent_message_replied,
                        meeting_started, meeting_ended
   - task_graph.py: task_created, task_status_changed
-  - escalation.py: escalation_created/resolved/timeout
   - company_mode.py: progress_callback strings
 """
 
@@ -22,9 +21,6 @@ from typing import Any
 from opc.plugins.office_ui.event_adapter import (
     EventAdapter,
     AgentAnimState,
-    TOOL_MAP,
-    COLLAB_SKIP_TOOLS,
-    COLLAB_DIRECT_MAP,
 )
 
 
@@ -97,7 +93,7 @@ class TestScenario1_SingleAgentBugFix:
         # 1. Agent becomes active
         ve = self._bootstrap()
         events.extend(ve)
-        assert types(ve) == ["agent_active"]
+        assert types(ve) == ["agent_active", "agent_runtime_update"]
         assert ve[0]["agent_id"] == self.agent_id
 
         # 2. First thinking iteration (iter=1) → message_in + reflect_start
@@ -106,7 +102,7 @@ class TestScenario1_SingleAgentBugFix:
             {"task_id": self.task_id, "status": "thinking", "iteration": 1},
         ))
         events.extend(ve)
-        assert types(ve) == ["message_in", "reflect_start"]
+        assert types(ve) == ["message_in", "reflect_start", "agent_runtime_update"]
 
         # 3. Executing file_read → reflect_done + tool_start(read)
         ve = self.adapter.translate(FakeEvent(
@@ -114,7 +110,7 @@ class TestScenario1_SingleAgentBugFix:
             {"task_id": self.task_id, "status": "executing", "tool": "file_read"},
         ))
         events.extend(ve)
-        assert types(ve) == ["reflect_done", "tool_start"]
+        assert types(ve) == ["reflect_done", "tool_start", "agent_runtime_update"]
         assert ve[1]["data"]["tool_name"] == "read"
 
         # 4. Thinking iter=2 → tool_done(read) + reflect_start
@@ -123,7 +119,7 @@ class TestScenario1_SingleAgentBugFix:
             {"task_id": self.task_id, "status": "thinking", "iteration": 2},
         ))
         events.extend(ve)
-        assert types(ve) == ["tool_done", "reflect_start"]
+        assert types(ve) == ["tool_done", "reflect_start", "agent_runtime_update"]
         assert ve[0]["data"]["tool_name"] == "read"
 
         # 5. Executing file_edit → reflect_done + tool_start(edit)
@@ -132,7 +128,7 @@ class TestScenario1_SingleAgentBugFix:
             {"task_id": self.task_id, "status": "executing", "tool": "file_edit"},
         ))
         events.extend(ve)
-        assert types(ve) == ["reflect_done", "tool_start"]
+        assert types(ve) == ["reflect_done", "tool_start", "agent_runtime_update"]
         assert ve[1]["data"]["tool_name"] == "edit"
 
         # 6. Thinking iter=3 → tool_done(edit) + reflect_start
@@ -141,7 +137,7 @@ class TestScenario1_SingleAgentBugFix:
             {"task_id": self.task_id, "status": "thinking", "iteration": 3},
         ))
         events.extend(ve)
-        assert types(ve) == ["tool_done", "reflect_start"]
+        assert types(ve) == ["tool_done", "reflect_start", "agent_runtime_update"]
 
         # 7. Executing shell_exec (pytest) → reflect_done + tool_start(shell)
         ve = self.adapter.translate(FakeEvent(
@@ -149,7 +145,7 @@ class TestScenario1_SingleAgentBugFix:
             {"task_id": self.task_id, "status": "executing", "tool": "shell_exec"},
         ))
         events.extend(ve)
-        assert types(ve) == ["reflect_done", "tool_start"]
+        assert types(ve) == ["reflect_done", "tool_start", "agent_runtime_update"]
         assert ve[1]["data"]["tool_name"] == "shell"
 
         # 8. Thinking iter=4 (final) → tool_done(shell) + reflect_start
@@ -158,7 +154,7 @@ class TestScenario1_SingleAgentBugFix:
             {"task_id": self.task_id, "status": "thinking", "iteration": 4},
         ))
         events.extend(ve)
-        assert types(ve) == ["tool_done", "reflect_start"]
+        assert types(ve) == ["tool_done", "reflect_start", "agent_runtime_update"]
 
         # 9. Agent goes idle → reflect_done + waiting
         ve = self.adapter.translate(FakeEvent(
@@ -166,7 +162,7 @@ class TestScenario1_SingleAgentBugFix:
             {"role_id": self.agent_id, "status": "idle"},
         ))
         events.extend(ve)
-        assert types(ve) == ["reflect_done", "waiting"]
+        assert types(ve) == ["reflect_done", "waiting", "agent_runtime_update"]
 
         # Verify final tracker state
         tracker = self.adapter._get_tracker(self.agent_id)
@@ -211,10 +207,10 @@ class TestScenario1_SingleAgentBugFix:
 #   6. agent_status_changed(idle)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-class TestScenario2_ProbeSubagent:
-    """Agent using probe tool triggers subagent_spawn + tool_start(reflect)."""
+class TestScenario2_ProbeTool:
+    """The read-only probe tool is distinct from native subagent spawning."""
 
-    def test_probe_emits_subagent_spawn(self):
+    def test_probe_renders_as_a_regular_tool(self):
         adapter = EventAdapter()
         task_id = "task-research-001"
         agent_id = "architect"
@@ -231,15 +227,16 @@ class TestScenario2_ProbeSubagent:
             {"task_id": task_id, "status": "thinking", "iteration": 1},
         ))
 
-        # Execute probe → subagent_spawn + tool_start(reflect)
+        # Native subagents have explicit agent_spawn/subagent runtime events;
+        # a read-only probe remains an ordinary tool animation.
         ve = adapter.translate(FakeEvent(
             "agent_log",
             {"task_id": task_id, "status": "executing", "tool": "probe"},
         ))
-        assert "subagent_spawn" in types(ve)
+        assert "subagent_spawn" not in types(ve)
         assert "tool_start" in types(ve)
         tool_start = [e for e in ve if e["type"] == "tool_start"][0]
-        assert tool_start["data"]["tool_name"] == "reflect"
+        assert tool_start["data"]["tool_name"] == "probe"
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -537,14 +534,14 @@ class TestScenario6_StartMeeting:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Scenario 7: B-class collaboration tools (read_inbox, annotate_task)
+# Scenario 7: B-class collaboration tools (read_inbox)
 #
-# These tools have no downstream semantic event — EventAdapter emits
-# a direct visual event (message_in for read_inbox, message_out for annotate).
+# This tool has no downstream semantic event, so EventAdapter emits a direct
+# message_in visual event.
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class TestScenario7_DirectMapCollabTools:
-    """B-class tools: read_inbox → message_in, annotate_task → message_out."""
+    """B-class tools: read_inbox → message_in."""
 
     def _setup_agent(self, adapter, agent_id, task_id):
         adapter.translate(FakeEvent(
@@ -571,19 +568,6 @@ class TestScenario7_DirectMapCollabTools:
         assert msg["data"]["content_preview"] == "Read Inbox"
         # Stays IDLE (not TOOL_ACTIVE)
         assert adapter._get_tracker("backend_dev").state == AgentAnimState.IDLE
-
-    def test_annotate_task(self):
-        adapter = EventAdapter()
-        self._setup_agent(adapter, "reviewer", "task-annotate-001")
-
-        ve = adapter.translate(FakeEvent(
-            "agent_log",
-            {"task_id": "task-annotate-001", "status": "executing", "tool": "annotate_task"},
-        ))
-        assert "message_out" in types(ve)
-        msg = [e for e in ve if e["type"] == "message_out"][0]
-        assert msg["data"]["content_preview"] == "Annotate Task"
-
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Scenario 8: COMPANY_MODE — Work-item runtime with progress callbacks
@@ -637,9 +621,10 @@ class TestScenario8_CompanyModeProgress:
         ve = self.adapter.parse_progress("[External agent heartbeat] backend_dev alive")
         assert ve[0]["type"] == "message_out"
 
-    def test_external_status_skipped(self):
+    def test_external_status_is_visible(self):
         ve = self.adapter.parse_progress("[External status] checking agent health")
-        assert ve == []
+        assert ve[0]["type"] == "message_out"
+        assert ve[0]["data"]["content_preview"] == "checking agent health"
 
     def test_tool_prefix_skipped(self):
         ve = self.adapter.parse_progress("[Tool: file_read] reading config.py")
@@ -663,15 +648,13 @@ class TestScenario8_CompanyModeProgress:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Scenario 9: Task creation and escalation
+# Scenario 9: Task creation
 #
 # task_created → task_routed (system)
-# escalation_created → message_out (system)
-# escalation_resolved / escalation_timeout → no visual
 # ═══════════════════════════════════════════════════════════════════════════════
 
-class TestScenario9_TaskAndEscalation:
-    """Task lifecycle and human escalation events."""
+class TestScenario9_TaskCreation:
+    """Task creation lifecycle events."""
 
     def test_task_created(self):
         adapter = EventAdapter()
@@ -690,32 +673,6 @@ class TestScenario9_TaskAndEscalation:
         adapter.translate(FakeEvent("task_created", {"title": "Task A"}))
         adapter.translate(FakeEvent("task_created", {"title": "Task B"}))
         assert adapter.task_display_counter == 2
-
-    def test_escalation_created(self):
-        adapter = EventAdapter()
-        ve = adapter.translate(FakeEvent(
-            "escalation_created",
-            {"message": "Agent stuck: need human approval for production deploy"},
-        ))
-        assert ve[0]["type"] == "message_out"
-        assert ve[0]["agent_id"] == "system"
-        assert len(ve[0]["data"]["content_preview"]) <= 30
-
-    def test_escalation_resolved_no_visual(self):
-        adapter = EventAdapter()
-        ve = adapter.translate(FakeEvent(
-            "escalation_resolved",
-            {"escalation_id": "esc-001"},
-        ))
-        assert ve == []
-
-    def test_escalation_timeout_no_visual(self):
-        adapter = EventAdapter()
-        ve = adapter.translate(FakeEvent(
-            "escalation_timeout",
-            {"escalation_id": "esc-001"},
-        ))
-        assert ve == []
 
     def test_task_status_changed_no_visual(self):
         adapter = EventAdapter()
@@ -840,7 +797,7 @@ class TestScenario11_EdgeCases:
             "agent_status_changed",
             {"role_id": "dev", "status": "idle"},
         ))
-        assert types(ve) == ["tool_done", "waiting"]
+        assert types(ve) == ["tool_done", "waiting", "agent_runtime_update"]
         assert ve[0]["data"]["tool_name"] == "shell"
 
     def test_consecutive_thinking_closes_previous(self):
@@ -860,7 +817,7 @@ class TestScenario11_EdgeCases:
             {"task_id": "t1", "status": "thinking", "iteration": 2},
         ))
         # Should emit reflect_done (closing first) then reflect_start (opening second)
-        assert types(ve) == ["reflect_done", "reflect_start"]
+        assert types(ve) == ["reflect_done", "reflect_start", "agent_runtime_update"]
 
     def test_unknown_tool_passes_through(self):
         """Tool not in TOOL_MAP uses raw name."""

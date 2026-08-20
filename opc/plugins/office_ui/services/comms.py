@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Any
 
 from opc.layer2_organization import comms as file_comms
@@ -120,12 +119,13 @@ class CommsService:
 
         base_payload = {
             "project_id": resolved_project_id,
+            "task_id": str(getattr(task, "id", "") or ""),
             "session_id": resolved_session_id,
             "workspace_root": workspace_root,
             "output_root": str(metadata.get("output_root") or metadata.get("target_output_dir") or "").strip(),
             "comms_root": str(layout.root),
         }
-        if not layout.root.is_dir():
+        if not file_comms.layout_available(layout):
             return ServiceResult({
                 "available": True,
                 "empty": True,
@@ -147,31 +147,29 @@ class CommsService:
 
         roles_payload: list[dict[str, Any]] = []
         try:
-            role_dirs = sorted(
-                [path for path in layout.inbox_root.iterdir() if path.is_dir()],
-                key=lambda path: path.name,
-            ) if layout.inbox_root.is_dir() else []
-        except OSError:
-            role_dirs = []
-        for role_dir in role_dirs:
-            role_id = role_dir.name
+            role_ids = file_comms.list_roles(layout)
+        except Exception:
+            role_ids = []
+        for role_id in role_ids:
             try:
                 unread_headers = file_comms.list_unread(layout, role_id, limit=8)
             except Exception:
                 unread_headers = []
             try:
-                seen_count = sum(
-                    1 for path in (role_dir / "seen").iterdir()
-                    if path.is_file() and path.suffix == ".md"
-                ) if (role_dir / "seen").is_dir() else 0
-            except OSError:
+                seen_count = file_comms.count_role_messages(
+                    layout,
+                    role_id,
+                    bucket=file_comms.SEEN_DIRNAME,
+                )
+            except Exception:
                 seen_count = 0
             try:
-                outbox_count = sum(
-                    1 for path in (role_dir / "outbox").iterdir()
-                    if path.is_file() and path.suffix == ".md"
-                ) if (role_dir / "outbox").is_dir() else 0
-            except OSError:
+                outbox_count = file_comms.count_role_messages(
+                    layout,
+                    role_id,
+                    bucket=file_comms.OUTBOX_DIRNAME,
+                )
+            except Exception:
                 outbox_count = 0
             recent_seen: list[dict[str, Any]] = []
             recent_outbox: list[dict[str, Any]] = []
@@ -227,14 +225,11 @@ class CommsService:
                     "opened_at": state.opened_at,
                     "transcript_path": str(state.transcript_path),
                 })
-            if layout.meetings_root.is_dir():
-                for child in sorted(layout.meetings_root.iterdir())[-10:]:
-                    if not child.is_dir():
-                        continue
-                    state = file_comms.read_meeting_state(layout, child.name)
-                    if state is None or state.status != "closed":
-                        continue
-                    meetings_payload.append({
+            for meeting_id in file_comms.list_meeting_ids(layout)[-10:]:
+                state = file_comms.read_meeting_state(layout, meeting_id)
+                if state is None or state.status != "closed":
+                    continue
+                meetings_payload.append({
                         "meeting_id": state.meeting_id,
                         "topic": state.topic,
                         "status": state.status,
@@ -277,18 +272,72 @@ class CommsService:
     async def read(self, *, project_id: str, task_id: str = "", path: str) -> ServiceResult:
         if not str(path or "").strip():
             raise ServiceError("path_required", "path_required")
-        candidate = Path(path).resolve()
+        request_project_id = self.context.normalize_project_id(project_id)
+        clean_task_id = str(task_id or "").strip()
+        if not clean_task_id:
+            raise ServiceError("task_required", "task_required")
+
+        engine = await self.context.engine_for_project(request_project_id)
+        store = getattr(engine, "store", None)
+        if not self.context.store_is_ready(store):
+            raise ServiceError("store_not_ready", "store_not_ready")
+        try:
+            task = await store.get_task(clean_task_id)
+        except Exception as exc:
+            raise ServiceError("task_lookup_failed", "task_lookup_failed") from exc
+        if task is None:
+            raise ServiceError("task_not_found", "task_not_found")
+
+        task_project_id = self.context.normalize_project_id(
+            getattr(task, "project_id", None)
+        )
+        if task_project_id != request_project_id:
+            raise ServiceError(
+                "task_project_mismatch",
+                "task_project_mismatch",
+                {"task_id": clean_task_id},
+            )
+        metadata = dict(getattr(task, "metadata", {}) or {})
+        workspace_root = (
+            str(metadata.get("comms_workspace_root") or "").strip()
+            or str(metadata.get("workspace_root") or "").strip()
+            or str(metadata.get("target_output_dir") or "").strip()
+        )
+        session_id = (
+            str(getattr(task, "parent_session_id", "") or "").strip()
+            or str(getattr(task, "session_id", "") or "").strip()
+        )
+        if not workspace_root:
+            raise ServiceError("no_workspace_root", "no_workspace_root")
+        if not session_id:
+            raise ServiceError("no_session_id", "no_session_id")
+        try:
+            layout = file_comms.resolve_layout(
+                workspace_root,
+                task_project_id,
+                session_id,
+            )
+        except Exception as exc:
+            raise ServiceError("layout_error", "layout_error") from exc
+        try:
+            candidate = file_comms.runtime_read_layout_path(layout, path)
+        except Exception as exc:
+            raise ServiceError(
+                "path_outside_comms",
+                "path_outside_comms",
+                {"path": path},
+            ) from exc
         if ".opc-comms" not in candidate.parts:
             raise ServiceError("path_outside_comms", "path_outside_comms", {"path": path})
-        if not candidate.is_file():
+        if not file_comms.runtime_file_exists(candidate):
             raise ServiceError("not_a_file", "not_a_file", {"path": path})
         try:
             header, body = file_comms.read_message(candidate)
         except Exception as exc:
             raise ServiceError("read_error", f"read_error: {exc}", {"path": path}) from exc
         return ServiceResult({
-            "project_id": self.context.normalize_project_id(project_id),
-            "task_id": task_id,
+            "project_id": task_project_id,
+            "task_id": clean_task_id,
             "path": str(candidate),
             "header": getattr(header, "raw_frontmatter", {}) if header else {},
             "message": self._header_payload(header),

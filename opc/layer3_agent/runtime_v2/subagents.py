@@ -12,6 +12,7 @@ from typing import Any, Callable, Awaitable
 from opc.core.config import OPCConfig, NativeSubagentProfileConfig
 from opc.core.models import OPCEvent, Task, TaskResult, TaskStatus
 from opc.layer2_organization.work_item_identity import projection_id_for_task, work_item_identity_payload_for_task
+from opc.layer2_organization.work_item_links import linked_work_item_id_for_task
 from opc.layer3_agent.runtime_v2.worktree import cleanup_worktree, create_worktree
 
 
@@ -172,7 +173,23 @@ class SubagentManager:
                 await self._save_state(state, state.status)
                 child = self._build_child_task(state, turn_prompt)
                 child.metadata["_permission_bridge_runtime_session_id"] = self.runtime_session_id
-                setattr(child, "_runtime_permission_bridge", self._build_permission_bridge(state))
+                setattr(child, "_runtime_permission_bridge", self._build_permission_bridge(state, child))
+                save_child = getattr(self.store, "save_task", None)
+                company_managed_child = bool(
+                    str(child.metadata.get("delegation_run_id", "") or "").strip()
+                    or str(child.metadata.get("execution_mode", "") or "").strip()
+                    == "company_mode"
+                )
+                if company_managed_child and callable(save_child):
+                    # The child Task is the durable execution envelope used by
+                    # both structured artifact ownership and exact opaque-tool
+                    # permits.  Persist every resident turn's fresh child ID
+                    # before any handler can perform an effect.
+                    await save_child(child)
+                elif company_managed_child:
+                    raise RuntimeError(
+                        "company native subagent has no durable Task Store"
+                    )
                 child_agent = self._build_child_agent(
                     profile=profile,
                     allowed_tools=list(state.fork_allowed_tools) or self._resolve_allowed_tools(profile, mode=effective_mode),
@@ -374,6 +391,11 @@ class SubagentManager:
             metadata["_fork_allowed_tools"] = list(state.fork_allowed_tools)
         metadata["_comms_endpoint_id"] = state.agent_id
         metadata["_comms_parent_endpoint_id"] = self._parent_endpoint_id()
+        parent_work_item_id = linked_work_item_id_for_task(parent)
+        if parent_work_item_id:
+            # Store validates this copied hint against the durable parent link
+            # before it can participate in an exact opaque-effect identity.
+            metadata["_company_parent_work_item_id"] = parent_work_item_id
         metadata["_subagent_resident"] = state.resident
         return Task(
             title=state.name or state.description or f"{state.profile} subagent",
@@ -525,15 +547,20 @@ class SubagentManager:
             return self.child_agent_factory(profile, allowed_tools, prompt_addendum, overrides)
         return self.child_agent_factory(profile, allowed_tools, prompt_addendum)
 
-    def _build_permission_bridge(self, state: SubagentState) -> Callable[..., Awaitable[tuple[bool, Any]]]:
+    def _build_permission_bridge(
+        self,
+        state: SubagentState,
+        child_task: Task | None = None,
+    ) -> Callable[..., Awaitable[tuple[bool, Any]]]:
         async def _bridge(
             *,
             tool: Any,
             arguments: dict[str, Any],
             approval_engine: Any,
             on_progress: Any = None,
+            call_context: dict[str, Any] | None = None,
         ) -> tuple[bool, Any]:
-            parent_task = self.parent_task or Task(project_id="default")
+            execution_task = child_task or self.parent_task or Task(project_id="default")
             metadata = {
                 "category": getattr(tool, "category", "general"),
                 "requires_confirmation": getattr(tool, "requires_confirmation", False),
@@ -542,14 +569,18 @@ class SubagentManager:
                 "subagent_profile": state.profile,
                 "subagent_name": state.name,
                 "subagent_mode": state.mode,
-                "bridged_runtime_session_id": self.runtime_session_id,
+                "parent_runtime_session_id": self.runtime_session_id,
             }
             return await approval_engine.authorize_tool_call(
-                task=parent_task,
+                # ToolCall/ToolResult ledger identity belongs to the child
+                # runtime.  Owner visibility is resolved separately from the
+                # child's durable parent chain when the checkpoint is built.
+                task=execution_task,
                 tool_name=getattr(tool, "name", ""),
                 arguments=arguments,
                 metadata=metadata,
                 on_progress=on_progress,
+                call_context=dict(call_context or {}),
             )
 
         return _bridge
@@ -710,9 +741,13 @@ class SubagentManager:
 
     @staticmethod
     def _resident_notification_kind(result: TaskResult) -> str:
-        if result.status in {TaskStatus.AWAITING_HUMAN, TaskStatus.AWAITING_REVIEW}:
+        if result.status == TaskStatus.AWAITING_HUMAN:
             return "permission_needed"
-        if result.status == TaskStatus.AWAITING_PEER:
+        if result.status in {
+            TaskStatus.AWAITING_PEER,
+            TaskStatus.AWAITING_MANAGER_REVIEW,
+            TaskStatus.AWAITING_REVIEW,
+        }:
             return "blocked"
         if result.status == TaskStatus.FAILED:
             return "error"
@@ -744,7 +779,7 @@ class SubagentManager:
             "venv_path": (state.worktree or {}).get("venv_path", ""),
             "python_executable": (state.worktree or {}).get("python_executable", ""),
         }
-        if state.task_result and state.task_result.status in {TaskStatus.AWAITING_HUMAN, TaskStatus.AWAITING_REVIEW}:
+        if state.task_result and state.task_result.status == TaskStatus.AWAITING_HUMAN:
             artifacts = dict(state.task_result.artifacts or {})
             payload.update(
                 {

@@ -103,5 +103,103 @@ class ToolRegistryUnknownArgumentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["result"]["echoed"], "hello")
         self.assertEqual(result["result"]["task_injected"], "True")
 
+    async def test_model_cannot_override_trusted_runtime_arguments(self) -> None:
+        registry = ToolRegistry()
+        trusted_task = object()
+
+        async def trusted_progress(*args, **kwargs):
+            _ = (args, kwargs)
+
+        async def context_tool(message: str, task=None, on_progress=None) -> dict[str, object]:
+            return {
+                "message": message,
+                "task_is_trusted": task is trusted_task,
+                "progress_is_trusted": on_progress is trusted_progress,
+            }
+
+        registry.register(
+            ToolDefinition(
+                name="context_tool",
+                description="stub",
+                parameters={
+                    "type": "object",
+                    "properties": {"message": {"type": "string"}},
+                },
+                func=context_tool,
+            )
+        )
+
+        result = await registry.invoke(
+            "context_tool",
+            {
+                "message": "hello",
+                "task": {"metadata": {"workspace_root": "/attacker"}},
+                "on_progress": "attacker-callback",
+            },
+            task=trusted_task,
+            on_progress=trusted_progress,
+        )
+
+        self.assertTrue(result["success"], result)
+        self.assertTrue(result["result"]["task_is_trusted"])
+        self.assertTrue(result["result"]["progress_is_trusted"])
+
+    async def test_reserved_runtime_argument_without_trusted_value_fails_closed(self) -> None:
+        registry = ToolRegistry()
+        called = False
+
+        async def context_tool(message: str, task=None) -> dict[str, str]:
+            nonlocal called
+            called = True
+            return {"message": message, "task": str(task)}
+
+        registry.register(
+            ToolDefinition(
+                name="context_tool",
+                description="stub",
+                parameters={
+                    "type": "object",
+                    "properties": {"message": {"type": "string"}},
+                },
+                func=context_tool,
+            )
+        )
+
+        result = await registry.invoke(
+            "context_tool",
+            {"message": "hello", "task": None},
+        )
+
+        self.assertFalse(result["success"])
+        self.assertFalse(called)
+        self.assertIn("reserved runtime argument", result["error"])
+
+    async def test_var_keyword_tool_cannot_receive_reserved_runtime_argument(self) -> None:
+        registry = ToolRegistry()
+        called = False
+
+        async def permissive_tool(**kwargs):
+            nonlocal called
+            called = True
+            return kwargs
+
+        registry.register(
+            ToolDefinition(
+                name="permissive_tool",
+                description="stub",
+                parameters={"type": "object", "properties": {}},
+                func=permissive_tool,
+            )
+        )
+
+        result = await registry.invoke(
+            "permissive_tool",
+            {"on_progress": None},
+        )
+
+        self.assertFalse(result["success"])
+        self.assertFalse(called)
+        self.assertIn("reserved runtime argument", result["error"])
+
 if __name__ == "__main__":
     unittest.main()

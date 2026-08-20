@@ -165,7 +165,11 @@ async def test_company_executor_parallel_runs_keep_context_state_isolated() -> N
 
     claimed_once: set[str] = set()
 
-    async def fake_claim_runnable_tasks(tasks: list[Task], work_items=None):
+    async def fake_claim_runnable_tasks(
+        tasks: list[Task],
+        work_items=None,
+        **_kwargs: object,
+    ):
         run_id = active_run_id()
         assert run_id == str((tasks[0].metadata or {}).get("delegation_run_id", "") or "")
         if run_id in claimed_once:
@@ -600,38 +604,6 @@ async def test_runtime_agent_message_mirror_uses_origin_project_after_ui_switch(
     assert chat_store.insert_message.await_args.kwargs["project_id"] == "project-a"
     assert chat_store.insert_message.await_args.kwargs["channel_id"] == "session:task-a"
     assert handler.broadcast.await_args_list[-1].args[0]["payload"]["project_id"] == "project-a"
-
-
-@_async_test
-async def test_runtime_escalation_mirror_uses_origin_project_after_ui_switch() -> None:
-    from opc.plugins.office_ui.ws_handler import WSHandler
-
-    task_a = Task(id="task-a", title="A", project_id="project-a", session_id="session-a")
-    task_b = Task(id="task-b", title="B", project_id="project-b", session_id="session-b")
-    engine_a = _ui_engine("project-a", _MemoryStore([task_a]))
-    engine_b = _ui_engine("project-b", _MemoryStore([task_b]))
-    chat_store = _ui_chat_store()
-    handler = WSHandler(engine_a, MagicMock(), chat_store, _ui_event_adapter())
-    handler.broadcast = AsyncMock()
-    handler.engine = engine_b
-
-    await handler.on_opc_event(
-        SimpleNamespace(
-            event_type="escalation_created",
-            payload={
-                "escalation_id": "esc-a",
-                "task_id": "task-a",
-                "message": "Approve A?",
-                "options": [{"id": "approve_once", "label": "Approve once"}],
-            },
-        ),
-        runtime_engine=engine_a,
-        project_id="project-a",
-    )
-
-    chat_store.insert_message.assert_awaited_once()
-    assert chat_store.insert_message.await_args.kwargs["project_id"] == "project-a"
-    assert chat_store.insert_message.await_args.kwargs["channel_id"] == "session:task-a"
 
 
 @_async_test

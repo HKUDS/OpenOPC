@@ -4,13 +4,24 @@ from __future__ import annotations
 
 import asyncio
 import difflib
+import fnmatch
 import re
 import shutil
+from contextlib import closing
 from pathlib import Path
 from typing import Any
 
 from opc.layer4_tools.output_budget import TextClip, clip_text
-from opc.layer4_tools.registry import ToolDefinition
+from opc.layer4_tools.registry import (
+    COMPANY_EFFECT_NO_LOCAL_FS,
+    COMPANY_EFFECT_STRUCTURED_PATHS,
+    ToolDefinition,
+)
+from opc.layer4_tools.workspace_fs import (
+    SecureWorkspace,
+    WorkspaceBoundaryError,
+    WorkspacePath,
+)
 
 
 _MAX_TEXT_CHARS = 12_000
@@ -21,6 +32,27 @@ _MAX_DIFF_CHARS = 16_000
 
 class PatchApplyError(RuntimeError):
     """Raised when an apply_patch payload cannot be applied safely."""
+
+
+def _assert_safe_path_pattern(pattern: str, *, label: str) -> None:
+    candidate = Path(str(pattern or ""))
+    if candidate.is_absolute() or ".." in candidate.parts:
+        raise WorkspaceBoundaryError(
+            f"{label} is outside the task workspace boundary: {pattern}"
+        )
+
+
+def _matches_path_pattern(path: str, pattern: str) -> bool:
+    normalized_path = str(path).replace("\\", "/")
+    normalized_pattern = str(pattern or "*").replace("\\", "/")
+    if fnmatch.fnmatchcase(normalized_path, normalized_pattern):
+        return True
+    if fnmatch.fnmatchcase(Path(normalized_path).name, normalized_pattern):
+        return True
+    # pathlib.Path.rglob("**/*.py") also matches a root-level ``demo.py``.
+    if normalized_pattern.startswith("**/"):
+        return fnmatch.fnmatchcase(normalized_path, normalized_pattern[3:])
+    return False
 
 
 def _resolve_task_path(path: str, task: Any | None = None) -> Path:
@@ -244,6 +276,74 @@ def _parse_patch_operations(patch: str) -> list[dict[str, Any]]:
     raise PatchApplyError("Patch is missing `*** End Patch`.")
 
 
+FILE_MUTATION_TOOL_NAMES: frozenset[str] = frozenset(
+    {
+        "apply_patch",
+        "file_delete",
+        "file_edit",
+        "file_move",
+        "file_write",
+    }
+)
+
+
+def file_mutation_paths(
+    tool_name: str,
+    arguments: dict[str, Any] | None,
+) -> tuple[str, ...]:
+    """Return every path one structured file ToolCall may mutate.
+
+    ``apply_patch`` deliberately reuses the executor's parser, so ownership
+    preflight and the filesystem effect cannot disagree about a source,
+    delete, or move target.  The delete/move spellings cover compatible tools
+    if they are registered in a future tool surface.
+    """
+
+    name = str(tool_name or "").strip()
+    if name not in FILE_MUTATION_TOOL_NAMES:
+        return ()
+    payload = dict(arguments or {})
+
+    def _required(*keys: str) -> str:
+        value = next(
+            (
+                str(payload.get(key, "") or "").strip()
+                for key in keys
+                if str(payload.get(key, "") or "").strip()
+            ),
+            "",
+        )
+        if not value:
+            raise ValueError(
+                f"Tool `{name}` is missing its filesystem mutation path."
+            )
+        return value
+
+    if name in {"file_write", "file_edit", "file_delete"}:
+        return (_required("path", "file_path"),)
+    if name == "file_move":
+        return tuple(
+            dict.fromkeys(
+                (
+                    _required("path", "source", "src", "file_path"),
+                    _required("destination", "dest", "target", "move_to"),
+                )
+            )
+        )
+
+    patch = str(payload.get("patch", "") or "")
+    operations = _parse_patch_operations(patch)
+    paths: list[str] = []
+    for operation in operations:
+        paths.append(str(operation.get("path", "") or "").strip())
+        move_to = str(operation.get("move_to", "") or "").strip()
+        if move_to:
+            paths.append(move_to)
+    if any(not path for path in paths):
+        raise ValueError("apply_patch contains an empty filesystem path.")
+    return tuple(dict.fromkeys(paths))
+
+
 async def file_read(
     path: str,
     offset: int = 0,
@@ -252,13 +352,28 @@ async def file_read(
     task: Any | None = None,
 ) -> dict[str, Any]:
     """Read file contents."""
-    p = _resolve_task_path(path, task)
-    if not p.exists():
-        return {"error": f"File not found: {path}", "success": False}
-    if not p.is_file():
-        return {"error": f"Not a file: {path}", "success": False}
     try:
-        text = _safe_read_text(p)
+        workspace = SecureWorkspace.for_task(task)
+        if workspace is not None:
+            with workspace:
+                # Runtime-persisted large ToolResults live below
+                # ``.opc-comms``.  Agents may read a path explicitly returned
+                # by the runtime, but listing, searching, or mutating that
+                # namespace remains forbidden.
+                target = workspace.resolve(
+                    path,
+                    allow_runtime_internal_read=True,
+                )
+                text = workspace.read_text(target)
+                rendered_path = str(target.display_path)
+        else:
+            p = _resolve_task_path(path, task)
+            if not p.exists():
+                return {"error": f"File not found: {path}", "success": False}
+            if not p.is_file():
+                return {"error": f"Not a file: {path}", "success": False}
+            text = _safe_read_text(p)
+            rendered_path = str(p.resolve())
         lines = text.splitlines(keepends=True)
         rendered = _render_file_slice(
             lines,
@@ -274,7 +389,7 @@ async def file_read(
             "next_offset": rendered["next_offset"],
             "truncated": rendered["truncated"],
             "omitted_chars": rendered["omitted_chars"],
-            "path": str(p.resolve()),
+            "path": rendered_path,
             "success": True,
         }
     except Exception as exc:
@@ -283,19 +398,33 @@ async def file_read(
 
 async def file_write(path: str, content: str, create_dirs: bool = True, task: Any | None = None) -> dict[str, Any]:
     """Write content to a file."""
-    p = _resolve_task_path(path, task)
-    existed = p.exists()
-    before = _safe_read_text(p) if existed and p.is_file() else ""
     try:
-        if create_dirs:
-            p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(content, encoding="utf-8")
+        workspace = SecureWorkspace.for_task(task)
+        if workspace is not None:
+            with workspace:
+                target = workspace.resolve(path)
+                before, created, bytes_written = workspace.write_text(
+                    target,
+                    content,
+                    create_dirs=create_dirs,
+                )
+                rendered_path = str(target.display_path)
+        else:
+            p = _resolve_task_path(path, task)
+            existed = p.exists()
+            before = _safe_read_text(p) if existed and p.is_file() else ""
+            if create_dirs:
+                p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(content, encoding="utf-8")
+            created = not existed
+            bytes_written = len(content.encode("utf-8"))
+            rendered_path = str(p.resolve())
         return {
             "success": True,
-            "path": str(p.resolve()),
-            "bytes_written": len(content.encode("utf-8")),
-            "created": not existed,
-            **_diff_fields(before, content, str(p)),
+            "path": rendered_path,
+            "bytes_written": bytes_written,
+            "created": created,
+            **_diff_fields(before, content, rendered_path),
         }
     except Exception as exc:
         return {"error": str(exc), "success": False}
@@ -309,23 +438,42 @@ async def file_edit(
     task: Any | None = None,
 ) -> dict[str, Any]:
     """Replace a specific string in a file."""
-    p = _resolve_task_path(path, task)
-    if not p.exists():
-        return {"error": f"File not found: {path}", "success": False}
     try:
-        text = _safe_read_text(p)
-        count = text.count(old_string)
-        if count == 0:
-            return {"error": "old_string not found in file", "success": False}
-        if count > 1 and not replace_all:
-            return {"error": f"old_string found {count} times; add more context or use replace_all=true.", "success": False}
-        updated = text.replace(old_string, new_string) if replace_all else text.replace(old_string, new_string, 1)
-        p.write_text(updated, encoding="utf-8")
+        replacement_count = 0
+
+        def _replace(text: str) -> str:
+            nonlocal replacement_count
+            count = text.count(old_string)
+            if count == 0:
+                raise ValueError("old_string not found in file")
+            if count > 1 and not replace_all:
+                raise ValueError(
+                    f"old_string found {count} times; add more context or use replace_all=true."
+                )
+            replacement_count = count if replace_all else 1
+            if replace_all:
+                return text.replace(old_string, new_string)
+            return text.replace(old_string, new_string, 1)
+
+        workspace = SecureWorkspace.for_task(task)
+        if workspace is not None:
+            with workspace:
+                target = workspace.resolve(path)
+                text, updated, _ = workspace.mutate_text(target, _replace)
+                rendered_path = str(target.display_path)
+        else:
+            p = _resolve_task_path(path, task)
+            if not p.exists():
+                return {"error": f"File not found: {path}", "success": False}
+            text = _safe_read_text(p)
+            updated = _replace(text)
+            p.write_text(updated, encoding="utf-8")
+            rendered_path = str(p.resolve())
         return {
             "success": True,
-            "path": str(p.resolve()),
-            "replacements": count if replace_all else 1,
-            **_diff_fields(text, updated, str(p)),
+            "path": rendered_path,
+            "replacements": replacement_count,
+            **_diff_fields(text, updated, rendered_path),
         }
     except Exception as exc:
         return {"error": str(exc), "success": False}
@@ -338,57 +486,152 @@ async def apply_patch(patch: str, task: Any | None = None) -> dict[str, Any]:
     except PatchApplyError as exc:
         return {"error": str(exc), "success": False}
 
-    changed: list[dict[str, Any]] = []
     try:
-        for operation in operations:
-            kind = operation["kind"]
-            raw_path = str(operation["path"])
-            path = _resolve_task_path(raw_path, task)
-            if kind == "add":
-                path.parent.mkdir(parents=True, exist_ok=True)
-                new_text = str(operation["content"])
-                path.write_text(new_text, encoding="utf-8")
-                changed.append({
-                    "kind": "add",
-                    "path": str(path.resolve()),
-                    **_diff_fields("", new_text, str(path)),
-                })
-                continue
-            if kind == "delete":
-                if not path.exists():
-                    raise PatchApplyError(f"Cannot delete missing file `{raw_path}`.")
-                before = _safe_read_text(path) if path.is_file() else ""
-                path.unlink()
-                changed.append({
-                    "kind": "delete",
-                    "path": str(path.resolve()),
-                    **_diff_fields(before, "", str(path)),
-                })
-                continue
-            if kind == "update":
-                if not path.exists():
-                    raise PatchApplyError(f"Cannot update missing file `{raw_path}`.")
-                before = _safe_read_text(path)
-                updated = _apply_text_patch(before, list(operation.get("patch_lines", [])), raw_path)
-                target = _resolve_task_path(str(operation.get("move_to") or raw_path), task)
-                target.parent.mkdir(parents=True, exist_ok=True)
-                if target != path:
-                    path.unlink()
-                target.write_text(updated, encoding="utf-8")
-                changed.append({
-                    "kind": "update",
-                    "path": str(target.resolve()),
-                    "moved_from": str(path.resolve()) if target != path else "",
-                    **_diff_fields(before, updated, str(target)),
-                })
-                continue
-        return {
-            "success": True,
-            "changed_files": changed,
-            "applied_operations": len(changed),
-        }
+        workspace = SecureWorkspace.for_task(task)
+        if workspace is not None:
+            with workspace:
+                secured_operations: list[dict[str, Any]] = []
+                for operation in operations:
+                    secured = dict(operation)
+                    secured["workspace_path"] = workspace.resolve(
+                        str(operation["path"])
+                    )
+                    move_to = str(operation.get("move_to") or "").strip()
+                    if move_to:
+                        secured["workspace_target"] = workspace.resolve(move_to)
+                    secured_operations.append(secured)
+                return _apply_patch_in_workspace(workspace, secured_operations)
+        return _apply_patch_unscoped(operations, task)
     except Exception as exc:
         return {"error": str(exc), "success": False}
+
+
+def _apply_patch_in_workspace(
+    workspace: SecureWorkspace,
+    operations: list[dict[str, Any]],
+) -> dict[str, Any]:
+    changed: list[dict[str, Any]] = []
+    for operation in operations:
+        kind = operation["kind"]
+        raw_path = str(operation["path"])
+        path = operation["workspace_path"]
+        rendered_path = str(path.display_path)
+        if kind == "add":
+            new_text = str(operation["content"])
+            before, _, _ = workspace.write_text(
+                path,
+                new_text,
+                create_dirs=True,
+            )
+            changed.append({
+                "kind": "add",
+                "path": rendered_path,
+                **_diff_fields(before, new_text, rendered_path),
+            })
+            continue
+        if kind == "delete":
+            try:
+                before = workspace.read_text(path)
+            except FileNotFoundError as exc:
+                raise PatchApplyError(
+                    f"Cannot delete missing file `{raw_path}`."
+                ) from exc
+            workspace.unlink(path)
+            changed.append({
+                "kind": "delete",
+                "path": rendered_path,
+                **_diff_fields(before, "", rendered_path),
+            })
+            continue
+        if kind == "update":
+            def _update(before: str) -> str:
+                return _apply_text_patch(
+                    before,
+                    list(operation.get("patch_lines", [])),
+                    raw_path,
+                )
+
+            try:
+                before, updated, _ = workspace.mutate_text(path, _update)
+            except FileNotFoundError as exc:
+                raise PatchApplyError(
+                    f"Cannot update missing file `{raw_path}`."
+                ) from exc
+            target = operation.get("workspace_target") or path
+            if target != path:
+                workspace.rename(path, target)
+            rendered_target = str(target.display_path)
+            changed.append({
+                "kind": "update",
+                "path": rendered_target,
+                "moved_from": rendered_path if target != path else "",
+                **_diff_fields(before, updated, rendered_target),
+            })
+    return {
+        "success": True,
+        "changed_files": changed,
+        "applied_operations": len(changed),
+    }
+
+
+def _apply_patch_unscoped(
+    operations: list[dict[str, Any]],
+    task: Any | None,
+) -> dict[str, Any]:
+    changed: list[dict[str, Any]] = []
+    for operation in operations:
+        kind = operation["kind"]
+        raw_path = str(operation["path"])
+        path = _resolve_task_path(raw_path, task)
+        if kind == "add":
+            path.parent.mkdir(parents=True, exist_ok=True)
+            new_text = str(operation["content"])
+            path.write_text(new_text, encoding="utf-8")
+            changed.append({
+                "kind": "add",
+                "path": str(path.resolve()),
+                **_diff_fields("", new_text, str(path)),
+            })
+            continue
+        if kind == "delete":
+            if not path.exists():
+                raise PatchApplyError(f"Cannot delete missing file `{raw_path}`.")
+            before = _safe_read_text(path) if path.is_file() else ""
+            path.unlink()
+            changed.append({
+                "kind": "delete",
+                "path": str(path.resolve()),
+                **_diff_fields(before, "", str(path)),
+            })
+            continue
+        if kind == "update":
+            if not path.exists():
+                raise PatchApplyError(f"Cannot update missing file `{raw_path}`.")
+            before = _safe_read_text(path)
+            updated = _apply_text_patch(
+                before,
+                list(operation.get("patch_lines", [])),
+                raw_path,
+            )
+            target = _resolve_task_path(
+                str(operation.get("move_to") or raw_path),
+                task,
+            )
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if target != path:
+                path.unlink()
+            target.write_text(updated, encoding="utf-8")
+            changed.append({
+                "kind": "update",
+                "path": str(target.resolve()),
+                "moved_from": str(path.resolve()) if target != path else "",
+                **_diff_fields(before, updated, str(target)),
+            })
+    return {
+        "success": True,
+        "changed_files": changed,
+        "applied_operations": len(changed),
+    }
 
 
 async def glob(
@@ -400,27 +643,57 @@ async def glob(
     task: Any | None = None,
 ) -> dict[str, Any]:
     """Return files matching a glob pattern."""
-    root = _resolve_task_path(path, task)
-    if not root.exists():
-        return {"error": f"Directory not found: {path}", "success": False}
-    iterator = root.rglob(pattern) if recursive else root.glob(pattern)
-    entries: list[str] = []
-    for item in iterator:
-        if item.is_dir() and not include_dirs:
-            continue
-        try:
-            entries.append(str(item.relative_to(root)))
-        except ValueError:
-            entries.append(str(item))
-        if len(entries) >= max_results:
-            break
-    return {
-        "success": True,
-        "path": str(root.resolve()),
-        "pattern": pattern,
-        "entries": entries,
-        "count": len(entries),
-    }
+    try:
+        workspace = SecureWorkspace.for_task(task)
+        if workspace is not None:
+            _assert_safe_path_pattern(pattern, label="Glob pattern")
+            with workspace:
+                target = workspace.resolve(path)
+                entries: list[str] = []
+                with closing(
+                    workspace.iter_entries(
+                        target,
+                        recursive=recursive,
+                    )
+                ) as iterator:
+                    for entry in iterator:
+                        if entry.is_dir and not include_dirs:
+                            continue
+                        if not _matches_path_pattern(entry.relative_path, pattern):
+                            continue
+                        entries.append(entry.relative_path)
+                        if len(entries) >= max_results:
+                            break
+                return {
+                    "success": True,
+                    "path": str(target.display_path),
+                    "pattern": pattern,
+                    "entries": entries,
+                    "count": len(entries),
+                }
+        root = _resolve_task_path(path, task)
+        if not root.exists():
+            return {"error": f"Directory not found: {path}", "success": False}
+        iterator = root.rglob(pattern) if recursive else root.glob(pattern)
+        entries: list[str] = []
+        for item in iterator:
+            if item.is_dir() and not include_dirs:
+                continue
+            try:
+                entries.append(str(item.relative_to(root)))
+            except ValueError:
+                entries.append(str(item))
+            if len(entries) >= max_results:
+                break
+        return {
+            "success": True,
+            "path": str(root.resolve()),
+            "pattern": pattern,
+            "entries": entries,
+            "count": len(entries),
+        }
+    except Exception as exc:
+        return {"error": str(exc), "success": False}
 
 
 async def grep(
@@ -437,7 +710,31 @@ async def grep(
     task: Any | None = None,
 ) -> dict[str, Any]:
     """Search file contents for a regex or fixed-string query."""
-    root = _resolve_task_path(path, task)
+    workspace = SecureWorkspace.for_task(task)
+    if workspace is not None:
+        try:
+            _assert_safe_path_pattern(file_glob, label="File glob")
+            with workspace:
+                target = workspace.resolve(path)
+                return _grep_workspace(
+                    workspace,
+                    target,
+                    query=query,
+                    file_glob=file_glob,
+                    max_results=max_results,
+                    offset=offset,
+                    head_limit=head_limit,
+                    output_mode=output_mode,
+                    case_sensitive=case_sensitive,
+                    context_before=context_before,
+                    context_after=context_after,
+                )
+        except Exception as exc:
+            return {"error": str(exc), "success": False}
+    try:
+        root = _resolve_task_path(path, task)
+    except Exception as exc:
+        return {"error": str(exc), "success": False}
     if not root.exists():
         return {"error": f"Directory not found: {path}", "success": False}
     applied_offset = max(0, int(offset or 0))
@@ -546,6 +843,93 @@ async def grep(
     return _format_output(matches)
 
 
+def _grep_workspace(
+    workspace: SecureWorkspace,
+    root: WorkspacePath,
+    *,
+    query: str,
+    file_glob: str,
+    max_results: int,
+    offset: int,
+    head_limit: int | None,
+    output_mode: str,
+    case_sensitive: bool,
+    context_before: int,
+    context_after: int,
+) -> dict[str, Any]:
+    flags = 0 if case_sensitive else re.IGNORECASE
+    pattern = re.compile(query, flags=flags)
+    all_matches: list[str] = []
+    with closing(workspace.iter_entries(root, recursive=True)) as iterator:
+        for entry in iterator:
+            if entry.is_dir or not _matches_path_pattern(entry.relative_path, file_glob):
+                continue
+            candidate = workspace.resolve(
+                str(Path(*root.parts, *entry.parts)),
+                use_output_root=False,
+            )
+            try:
+                lines = workspace.read_text(candidate).splitlines()
+            except (FileNotFoundError, WorkspaceBoundaryError):
+                continue
+            for line_index, line in enumerate(lines):
+                if not pattern.search(line):
+                    continue
+                start = max(0, line_index - max(0, context_before))
+                end = min(len(lines), line_index + max(0, context_after) + 1)
+                for idx in range(start, end):
+                    all_matches.append(
+                        _truncate_match_entry(
+                            f"{entry.relative_path}:{idx + 1}:{lines[idx]}"
+                        )
+                    )
+
+    mode = str(output_mode or "content").strip() or "content"
+    if mode not in {"content", "files_with_matches", "count"}:
+        mode = "content"
+    items = all_matches
+    if mode == "files_with_matches":
+        items = list(dict.fromkeys(entry.split(":", 1)[0] for entry in all_matches))
+    elif mode == "count":
+        counts: dict[str, int] = {}
+        for entry in all_matches:
+            file_part = entry.split(":", 1)[0]
+            counts[file_part] = counts.get(file_part, 0) + 1
+        items = [f"{name}: {count}" for name, count in sorted(counts.items())]
+
+    applied_offset = max(0, int(offset or 0))
+    effective_limit = max_results if head_limit is None else int(head_limit)
+    if effective_limit == 0:
+        paged = items[applied_offset:]
+        truncated = False
+        next_offset = None
+    else:
+        limit_value = max(0, effective_limit)
+        paged = items[applied_offset:applied_offset + limit_value]
+        truncated = applied_offset + limit_value < len(items)
+        next_offset = applied_offset + limit_value if truncated else None
+    result: dict[str, Any] = {
+        "success": True,
+        "path": str(root.display_path),
+        "query": query,
+        "output_mode": mode,
+        "matches": paged,
+        "count": len(paged),
+        "total_count": len(items),
+        "truncated": truncated,
+        "next_offset": next_offset,
+        "applied_offset": applied_offset,
+    }
+    if truncated and effective_limit != 0:
+        result["applied_limit"] = max(0, effective_limit)
+    if mode == "files_with_matches":
+        result["files"] = paged
+        result["num_files"] = len(items)
+    if mode == "count":
+        result["counts"] = paged
+    return result
+
+
 async def file_search(
     pattern: str,
     directory: str = ".",
@@ -572,7 +956,40 @@ async def file_search(
 
 async def list_dir(path: str = ".", recursive: bool = False, max_depth: int = 3, task: Any | None = None) -> dict[str, Any]:
     """List directory contents."""
-    root = _resolve_task_path(path, task)
+    try:
+        workspace = SecureWorkspace.for_task(task)
+        if workspace is not None:
+            with workspace:
+                target = workspace.resolve(path)
+                entries: list[str] = []
+                items: list[dict[str, Any]] = []
+                with closing(
+                    workspace.iter_entries(
+                        target,
+                        recursive=recursive,
+                        max_depth=max_depth,
+                    )
+                ) as iterator:
+                    for entry in iterator:
+                        rendered = entry.relative_path + ("/" if entry.is_dir else "")
+                        entries.append(rendered)
+                        items.append({
+                            "path": rendered,
+                            "is_dir": entry.is_dir,
+                            "size": entry.size,
+                        })
+                        if len(items) >= _MAX_LIST_RESULTS:
+                            break
+                return {
+                    "success": True,
+                    "path": str(target.display_path),
+                    "entries": entries,
+                    "items": items,
+                    "total": len(items),
+                }
+        root = _resolve_task_path(path, task)
+    except Exception as exc:
+        return {"error": str(exc), "success": False}
     if not root.exists():
         return {"error": f"Directory not found: {path}", "success": False}
     if not root.is_dir():
@@ -580,7 +997,11 @@ async def list_dir(path: str = ".", recursive: bool = False, max_depth: int = 3,
 
     entries: list[str] = []
     items: list[dict[str, Any]] = []
-    for item in _iter_directory(root, recursive=recursive, max_depth=max_depth):
+    for item in _iter_directory(
+        root,
+        recursive=recursive,
+        max_depth=max_depth,
+    ):
         try:
             relative = str(item.relative_to(root))
         except ValueError:
@@ -625,6 +1046,7 @@ def create_file_tools() -> list[ToolDefinition]:
             read_only=True,
             self_bounded_output=True,
             max_result_chars=80_000,
+            company_effect_kind=COMPANY_EFFECT_NO_LOCAL_FS,
         ),
         ToolDefinition(
             name="file_write",
@@ -642,6 +1064,7 @@ def create_file_tools() -> list[ToolDefinition]:
             category="file",
             concurrency_safe=False,
             read_only=False,
+            company_effect_kind=COMPANY_EFFECT_STRUCTURED_PATHS,
         ),
         ToolDefinition(
             name="file_edit",
@@ -660,6 +1083,7 @@ def create_file_tools() -> list[ToolDefinition]:
             category="file",
             concurrency_safe=False,
             read_only=False,
+            company_effect_kind=COMPANY_EFFECT_STRUCTURED_PATHS,
         ),
         ToolDefinition(
             name="apply_patch",
@@ -675,6 +1099,7 @@ def create_file_tools() -> list[ToolDefinition]:
             category="file",
             concurrency_safe=False,
             read_only=False,
+            company_effect_kind=COMPANY_EFFECT_STRUCTURED_PATHS,
         ),
         ToolDefinition(
             name="grep",
@@ -705,6 +1130,7 @@ def create_file_tools() -> list[ToolDefinition]:
             read_only=True,
             self_bounded_output=True,
             max_result_chars=80_000,
+            company_effect_kind=COMPANY_EFFECT_NO_LOCAL_FS,
         ),
         ToolDefinition(
             name="glob",
@@ -724,6 +1150,7 @@ def create_file_tools() -> list[ToolDefinition]:
             category="file",
             concurrency_safe=True,
             read_only=True,
+            company_effect_kind=COMPANY_EFFECT_NO_LOCAL_FS,
         ),
         ToolDefinition(
             name="file_search",
@@ -744,6 +1171,7 @@ def create_file_tools() -> list[ToolDefinition]:
             category="file",
             concurrency_safe=True,
             read_only=True,
+            company_effect_kind=COMPANY_EFFECT_NO_LOCAL_FS,
         ),
         ToolDefinition(
             name="list_dir",
@@ -761,5 +1189,6 @@ def create_file_tools() -> list[ToolDefinition]:
             category="file",
             concurrency_safe=True,
             read_only=True,
+            company_effect_kind=COMPANY_EFFECT_NO_LOCAL_FS,
         ),
     ]

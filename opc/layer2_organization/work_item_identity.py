@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 from typing import Any, Mapping
 
 
@@ -261,6 +263,247 @@ def work_item_identity_payload_for_task(
     )
 
 
+def company_work_item_gate_attempt(
+    task: Any,
+    gate_metadata: Mapping[str, Any] | None = None,
+) -> int:
+    """Return the durable attempt identity used by work-item gate cards."""
+
+    task_metadata = dict(getattr(task, "metadata", {}) or {})
+    gate_values = dict(gate_metadata or {})
+    values: list[int] = []
+    for value in (
+        task_metadata.get("gate_rework_count", 0),
+        task_metadata.get("review_attempt_count", 0),
+        gate_values.get("review_attempt", 0),
+        gate_values.get("gate_rework_round", 0),
+    ):
+        try:
+            values.append(max(0, int(value or 0)))
+        except (TypeError, ValueError):
+            values.append(0)
+    return max(values, default=0)
+
+
+def canonical_company_work_item_gate_envelope(
+    gate: Mapping[str, Any] | Any | None,
+) -> dict[str, Any]:
+    """Return the semantic gate policy bound to a decision checkpoint."""
+
+    if isinstance(gate, Mapping):
+        raw = dict(gate)
+        gate_type = raw.get("type", raw.get("gate_type", ""))
+        rework_projection_id = raw.get("rework_projection_id", "")
+        metadata = dict(raw.get("metadata", {}) or {})
+    elif gate is not None:
+        raw = {}
+        gate_type = getattr(gate, "gate_type", "")
+        rework_projection_id = getattr(gate, "rework_projection_id", "")
+        metadata = dict(getattr(gate, "metadata", {}) or {})
+    else:
+        raw = {}
+        gate_type = ""
+        rework_projection_id = ""
+        metadata = {}
+    rework_projection_id = _clean(
+        rework_projection_id
+        or metadata.get(GATE_REWORK_PROJECTION_ID_KEY)
+    )
+    semantic_metadata_keys = (
+        "source",
+        "recommended_action",
+        "review_level",
+        "review_target_role_id",
+        "review_chain_role_ids",
+        "constraints",
+        "blockers",
+        "blocker_types",
+        "review_attempt",
+        "gate_rework_round",
+        "target_projection_id",
+        "target_projection_ids",
+        "manager_gate_fallback",
+        "manager_gate_original_reviewer_role",
+    )
+    semantic_metadata = {
+        key: metadata[key]
+        for key in semantic_metadata_keys
+        if key in metadata
+    }
+    try:
+        max_retries = max(
+            0,
+            int(
+                raw.get("max_retries", 0)
+                if isinstance(gate, Mapping)
+                else getattr(gate, "max_retries", 0) if gate is not None else 0
+            ),
+        )
+    except (TypeError, ValueError, OverflowError):
+        max_retries = 0
+    return {
+        "type": _clean(gate_type),
+        "instructions": _clean(
+            raw.get("instructions", "")
+            if isinstance(gate, Mapping)
+            else getattr(gate, "instructions", "") if gate is not None else ""
+        ),
+        "reviewer_role": _clean(
+            raw.get("reviewer_role", "")
+            if isinstance(gate, Mapping)
+            else getattr(gate, "reviewer_role", "") if gate is not None else ""
+        ),
+        "requires_human": bool(
+            raw.get("requires_human", False)
+            if isinstance(gate, Mapping)
+            else getattr(gate, "requires_human", False) if gate is not None else False
+        ),
+        "on_reject": _clean(
+            raw.get("on_reject", "")
+            if isinstance(gate, Mapping)
+            else getattr(gate, "on_reject", "") if gate is not None else ""
+        ).lower(),
+        GATE_REWORK_PROJECTION_ID_KEY: rework_projection_id,
+        "max_retries": max_retries,
+        "metadata": semantic_metadata,
+    }
+
+
+def company_work_item_gate_human_fallback_payload(
+    gate: Mapping[str, Any] | Any | None,
+) -> dict[str, Any]:
+    """Return the sole manager-gate-to-owner fallback representation.
+
+    The original reviewer is retained in the hashed semantic envelope, while
+    ``requires_human`` and ``review_level`` describe the effective owner wait.
+    An already-human or reviewer-less policy cannot manufacture a fallback.
+    """
+
+    if isinstance(gate, Mapping):
+        raw = dict(gate)
+        metadata = dict(raw.get("metadata", {}) or {})
+        reviewer_role = _clean(raw.get("reviewer_role", ""))
+        requires_human = bool(raw.get("requires_human", False))
+        gate_type = raw.get("type", raw.get("gate_type", ""))
+    elif gate is not None:
+        metadata = dict(getattr(gate, "metadata", {}) or {})
+        reviewer_role = _clean(getattr(gate, "reviewer_role", ""))
+        requires_human = bool(getattr(gate, "requires_human", False))
+        gate_type = getattr(gate, "gate_type", "")
+        raw = {
+            "type": gate_type,
+            "instructions": getattr(gate, "instructions", ""),
+            "reviewer_role": reviewer_role,
+            "requires_human": requires_human,
+            "on_reject": getattr(gate, "on_reject", "halt"),
+            "rework_projection_id": getattr(
+                gate,
+                "rework_projection_id",
+                None,
+            ),
+            "max_retries": getattr(gate, "max_retries", 1),
+        }
+    else:
+        return {}
+    if not reviewer_role or requires_human:
+        return {}
+    metadata.update(
+        {
+            "review_level": "human",
+            "manager_gate_fallback": True,
+            "manager_gate_original_reviewer_role": reviewer_role,
+        }
+    )
+    raw["type"] = gate_type
+    raw.pop("gate_type", None)
+    raw["reviewer_role"] = None
+    raw["requires_human"] = True
+    raw["metadata"] = metadata
+    return raw
+
+
+def company_work_item_gate_basis_hash(
+    task: Any,
+    gate: Mapping[str, Any] | Any | None = None,
+) -> str:
+    """Hash the exact Task projection authorized by a work-item gate.
+
+    This lives beside canonical work-item identity so the producer and the
+    Store transaction validate one implementation rather than maintaining
+    subtly different hashes across runtime layers.
+    """
+
+    task_metadata = dict(getattr(task, "metadata", {}) or {})
+    context_snapshot = dict(getattr(task, "context_snapshot", {}) or {})
+    output_metadata = dict(
+        context_snapshot.get("work_item_owned_outputs", {}) or {}
+    )
+    result = getattr(task, "result", None)
+    if isinstance(result, dict):
+        result_content = _clean(result.get("content"))
+    elif result:
+        result_content = _clean(result)
+    else:
+        result_content = ""
+    payload = {
+        "task_id": _clean(getattr(task, "id", "")),
+        **work_item_identity_payload_for_task(task),
+        "delivery_revision": task_metadata.get("delivery_revision", ""),
+        "owner_directive_revision": task_metadata.get(
+            "owner_directive_revision", ""
+        ),
+        "work_item_attempt_seq": _clean(
+            task_metadata.get("claimed_work_item_attempt_seq", 0)
+        ),
+        "result_content": result_content,
+        "work_item_summary": _clean(
+            output_metadata.get("work_item_summary", "")
+            or task_metadata.get("work_item_summary", "")
+        ),
+        "work_item_summary_for_downstream": _clean(
+            output_metadata.get("work_item_summary_for_downstream", "")
+            or task_metadata.get("work_item_summary_for_downstream", "")
+        ),
+        "artifact_index": list(
+            output_metadata.get("work_item_artifact_index", [])
+            or task_metadata.get("work_item_artifact_index", [])
+            or []
+        ),
+        "verification_status": dict(
+            output_metadata.get("verification_status", {})
+            or task_metadata.get("verification_status", {})
+            or {}
+        ),
+        "verification_evidence": dict(
+            output_metadata.get("verification_evidence", {})
+            or task_metadata.get("verification_evidence", {})
+            or {}
+        ),
+        "verification_verdict": _clean(
+            task_metadata.get("verification_verdict", "")
+        ),
+        "delivery_package": (
+            output_metadata.get("delivery_package")
+            or task_metadata.get("delivery_package")
+            or {}
+        ),
+        "work_item_gate": canonical_company_work_item_gate_envelope(
+            task_metadata.get("work_item_gate")
+        ),
+        "checkpoint_gate": canonical_company_work_item_gate_envelope(gate),
+        "gate_harness_pending_decision": dict(
+            task_metadata.get("gate_harness_pending_decision", {}) or {}
+        ),
+    }
+    encoded = json.dumps(
+        payload,
+        sort_keys=True,
+        ensure_ascii=False,
+        default=str,
+    )
+    return hashlib.sha1(encoded.encode("utf-8")).hexdigest()
+
+
 def canonical_result_turn_id_for_task(
     task: Any,
     *,
@@ -397,6 +640,8 @@ def mark_gate_rework_projection(gate: Any, projection_id: str) -> Any:
 
 def target_projection_id_for_decision(decision: Any, *, fallback: str = "") -> str:
     """Return a gate-harness target as a work-item projection identity."""
+    if isinstance(decision, Mapping):
+        return _clean(decision.get(GATE_TARGET_PROJECTION_ID_KEY) or fallback)
     return _clean(
         getattr(decision, GATE_TARGET_PROJECTION_ID_KEY, "")
         or fallback
@@ -405,7 +650,10 @@ def target_projection_id_for_decision(decision: Any, *, fallback: str = "") -> s
 
 def target_projection_ids_for_decision(decision: Any) -> list[str]:
     """Return all gate-harness targets as work-item projection identities."""
-    raw_ids = list(getattr(decision, GATE_TARGET_PROJECTION_IDS_KEY, []) or [])
+    if isinstance(decision, Mapping):
+        raw_ids = list(decision.get(GATE_TARGET_PROJECTION_IDS_KEY, []) or [])
+    else:
+        raw_ids = list(getattr(decision, GATE_TARGET_PROJECTION_IDS_KEY, []) or [])
     if not raw_ids:
         single = target_projection_id_for_decision(decision)
         raw_ids = [single] if single else []

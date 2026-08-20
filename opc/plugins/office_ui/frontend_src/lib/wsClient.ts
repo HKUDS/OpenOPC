@@ -16,7 +16,12 @@ import type {
   WorkerNotificationPayload,
   WorkItemProgressPayload,
 } from '../types/visual'
-import type { CheckpointReplyMetadata, OutgoingAttachmentPayload } from '../types/chat'
+import type {
+  InteractionReplyReceipt,
+  InteractionReplyRequest,
+  OutgoingAttachmentPayload,
+  SessionSendMetadata,
+} from '../types/chat'
 import type { TaskPreferredAgent } from '../types/kanban'
 
 interface SocketHandlers {
@@ -126,6 +131,7 @@ export interface CommsStatePayload {
   reason?: string
   empty?: boolean
   project_id?: string
+  task_id?: string
   session_id?: string
   workspace_root?: string
   output_root?: string
@@ -169,6 +175,7 @@ const PROJECT_SCOPED_MESSAGE_TYPES = new Set([
   'run_task',
   'create_session',
   'session_send',
+  'interaction_reply',
   'session_update_config',
   'session_delete',
   'session_detail',
@@ -183,6 +190,7 @@ const PROJECT_SCOPED_MESSAGE_TYPES = new Set([
 ])
 
 const SESSION_DETAIL_REQUEST_TIMEOUT_MS = 30_000
+const INTERACTION_REPLY_TIMEOUT_MS = 30_000
 type SendDisposition = 'sent' | 'queued' | 'queue-full' | 'send-failed'
 
 export class VisualSocketClient {
@@ -205,6 +213,11 @@ export class VisualSocketClient {
     timeout: ReturnType<typeof setTimeout> | null
     resolve: (payload: Record<string, unknown>) => void
   }> = []
+  private pendingInteractionReplies = new Map<string, {
+    wireData: string
+    timeout: ReturnType<typeof setTimeout>
+    resolve: (payload: InteractionReplyReceipt) => void
+  }>()
 
   constructor(
     private url: string,
@@ -235,6 +248,7 @@ export class VisualSocketClient {
     this.ws.onclose = () => {
       this.stopHeartbeat()
       this.failPendingSessionDetailRequests('connection_closed')
+      this.requeuePendingInteractionReplies()
       this.handlers.onStatus?.('disconnected')
       this.ws = null
       if (!this.closedByUser) {
@@ -247,6 +261,7 @@ export class VisualSocketClient {
     this.closedByUser = true
     this.stopHeartbeat()
     this.failPendingSessionDetailRequests('disconnected')
+    this.failPendingInteractionReplies('disconnected')
     if (this.reconnectTimer !== null) {
       window.clearTimeout(this.reconnectTimer)
       this.reconnectTimer = null
@@ -394,7 +409,7 @@ export class VisualSocketClient {
     taskId: string,
     content: string,
     attachments?: OutgoingAttachmentPayload[],
-    metadata?: CheckpointReplyMetadata,
+    metadata?: SessionSendMetadata,
   ): void {
     const pid = this.requireProjectId(projectId, 'session_send')
     this.send({
@@ -404,6 +419,61 @@ export class VisualSocketClient {
       content,
       attachments: attachments ?? [],
       metadata,
+    })
+  }
+
+  interactionReply(
+    projectId: string,
+    request: InteractionReplyRequest,
+  ): Promise<InteractionReplyReceipt> {
+    const pid = this.requireProjectId(projectId, 'interaction_reply')
+    const payload = {
+      type: 'interaction_reply',
+      project_id: pid,
+      checkpoint_id: request.checkpointId,
+      checkpoint_type: request.checkpointType,
+      client_request_id: request.clientRequestId,
+      requester_task_id: request.requesterTaskId,
+      requester_session_id: request.requesterSessionId,
+      decision: request.decision,
+    }
+    const wireData = JSON.stringify(payload)
+    return new Promise((resolve) => {
+      const existing = this.pendingInteractionReplies.get(request.clientRequestId)
+      if (existing) {
+        clearTimeout(existing.timeout)
+        existing.resolve({
+          ok: false,
+          accepted: false,
+          error: 'duplicate_request_in_flight',
+          checkpoint_id: request.checkpointId,
+          checkpoint_type: request.checkpointType,
+          client_request_id: request.clientRequestId,
+        })
+      }
+      const timeout = setTimeout(() => {
+        const pending = this.pendingInteractionReplies.get(request.clientRequestId)
+        if (!pending) return
+        this.pendingInteractionReplies.delete(request.clientRequestId)
+        const queuedIndex = this.pendingQueue.indexOf(pending.wireData)
+        if (queuedIndex >= 0) this.pendingQueue.splice(queuedIndex, 1)
+        pending.resolve({
+          ok: false,
+          accepted: false,
+          error: 'request_timeout',
+          checkpoint_id: request.checkpointId,
+          checkpoint_type: request.checkpointType,
+          client_request_id: request.clientRequestId,
+        })
+      }, INTERACTION_REPLY_TIMEOUT_MS)
+      this.pendingInteractionReplies.set(request.clientRequestId, { wireData, timeout, resolve })
+      const disposition = this.send(payload)
+      if (disposition === 'queue-full' || disposition === 'send-failed') {
+        this.failInteractionReply(
+          request.clientRequestId,
+          disposition === 'queue-full' ? 'send_queue_full' : 'send_failed',
+        )
+      }
     })
   }
 
@@ -564,12 +634,9 @@ export class VisualSocketClient {
     this.send({ type: 'employee_detail', employee_id: employeeId })
   }
 
-  reorgList(): void {
-    this.send({ type: 'reorg_list' })
-  }
-
-  reorgDecide(proposalId: string, approved: boolean, notes?: string): void {
-    this.send({ type: 'reorg_decide', proposal_id: proposalId, approved, notes })
+  reorgList(projectId: string): void {
+    const pid = this.requireProjectId(projectId, 'reorg_list')
+    this.send({ type: 'reorg_list', project_id: pid })
   }
 
   importEmployeeAsAgent(employeeId: string, officeId?: string): void {
@@ -679,9 +746,18 @@ export class VisualSocketClient {
     this.send({ type: 'comms_state', project_id: pid, ...(opts || {}) })
   }
 
-  commsReadMessage(projectId: string, path: string): void {
+  commsReadMessage(
+    projectId: string,
+    path: string,
+    scope: Pick<CommsStatePayload, 'task_id'> | null,
+  ): void {
     const pid = this.requireProjectId(projectId, 'comms_read_message')
-    this.send({ type: 'comms_read_message', project_id: pid, path })
+    this.send({
+      type: 'comms_read_message',
+      project_id: pid,
+      task_id: String(scope?.task_id ?? ''),
+      path,
+    })
   }
 
   // ── Internal ───────────────────────────────────────────────────────────
@@ -735,9 +811,10 @@ export class VisualSocketClient {
         this.handlers.onEvent?.(parsed.payload)
         break
       case 'ack': {
-        const ackPayload = this.settleSessionDetailRequest(
+        const detailPayload = this.settleSessionDetailRequest(
           parsed.payload as unknown as Record<string, unknown>,
         )
+        const ackPayload = this.settleInteractionReply(detailPayload)
         this.handlers.onAck?.(ackPayload as typeof parsed.payload)
         break
       }
@@ -911,6 +988,74 @@ export class VisualSocketClient {
     return normalizedPayload
   }
 
+  private settleInteractionReply(payload: Record<string, unknown>): Record<string, unknown> {
+    if (String(payload.action ?? '').trim() !== 'interaction_reply') return payload
+    const clientRequestId = String(payload.client_request_id ?? '').trim()
+    if (!clientRequestId) return payload
+    const pending = this.pendingInteractionReplies.get(clientRequestId)
+    if (!pending) return payload
+    this.pendingInteractionReplies.delete(clientRequestId)
+    clearTimeout(pending.timeout)
+    const queuedIndex = this.pendingQueue.indexOf(pending.wireData)
+    if (queuedIndex >= 0) this.pendingQueue.splice(queuedIndex, 1)
+    pending.resolve({
+      ...payload,
+      ok: payload.ok === true,
+      accepted: payload.accepted === true,
+      checkpoint_id: String(payload.checkpoint_id ?? ''),
+      checkpoint_type: String(payload.checkpoint_type ?? ''),
+      client_request_id: clientRequestId,
+      error: typeof payload.error === 'string' ? payload.error : undefined,
+      reason: typeof payload.reason === 'string' ? payload.reason : undefined,
+      status: typeof payload.status === 'string' ? payload.status : undefined,
+      deduplicated: payload.deduplicated === true,
+    })
+    return payload
+  }
+
+  private failInteractionReply(clientRequestId: string, error: string): void {
+    const pending = this.pendingInteractionReplies.get(clientRequestId)
+    if (!pending) return
+    this.pendingInteractionReplies.delete(clientRequestId)
+    clearTimeout(pending.timeout)
+    const queuedIndex = this.pendingQueue.indexOf(pending.wireData)
+    if (queuedIndex >= 0) this.pendingQueue.splice(queuedIndex, 1)
+    let checkpointId = ''
+    let checkpointType = ''
+    try {
+      const payload = JSON.parse(pending.wireData) as Record<string, unknown>
+      checkpointId = String(payload.checkpoint_id ?? '')
+      checkpointType = String(payload.checkpoint_type ?? '')
+    } catch { /* already validated before serialization */ }
+    pending.resolve({
+      ok: false,
+      accepted: false,
+      error,
+      checkpoint_id: checkpointId,
+      checkpoint_type: checkpointType,
+      client_request_id: clientRequestId,
+    })
+  }
+
+  private failPendingInteractionReplies(error: string): void {
+    for (const clientRequestId of [...this.pendingInteractionReplies.keys()]) {
+      this.failInteractionReply(clientRequestId, error)
+    }
+  }
+
+  private requeuePendingInteractionReplies(): void {
+    for (const [clientRequestId, pending] of [...this.pendingInteractionReplies.entries()]) {
+      if (this.pendingQueue.includes(pending.wireData)) continue
+      if (this.pendingQueue.length >= PENDING_QUEUE_MAX) {
+        this.failInteractionReply(clientRequestId, 'send_queue_full')
+        continue
+      }
+      // Durable submit is idempotent on client_request_id, so replaying the
+      // exact wire payload after a lost connection recovers a dropped ACK.
+      this.pendingQueue.push(pending.wireData)
+    }
+  }
+
   private timeoutSessionDetailRequest(index: number): void {
     const request = this.pendingSessionDetailRequests[index]
     if (!request) return
@@ -975,11 +1120,14 @@ export class VisualSocketClient {
       const detailRequestIndex = this.pendingSessionDetailRequests.findIndex(
         request => request.queued && request.wireData === data,
       )
+      const interactionRequestId = [...this.pendingInteractionReplies.entries()]
+        .find(([, request]) => request.wireData === data)?.[0]
       try {
         this.ws.send(data)
         if (detailRequestIndex >= 0) this.pendingSessionDetailRequests[detailRequestIndex].queued = false
       } catch {
         if (detailRequestIndex >= 0) this.failSessionDetailRequest(detailRequestIndex, 'send_failed')
+        if (interactionRequestId) this.failInteractionReply(interactionRequestId, 'send_failed')
       }
     }
   }

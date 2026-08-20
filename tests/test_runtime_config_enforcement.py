@@ -51,6 +51,23 @@ def _workspace_tempdir() -> Path:
 
 
 class RuntimeConfigEnforcementTests(unittest.IsolatedAsyncioTestCase):
+    def test_native_verifier_is_opt_in_and_roundtrips_disabled_by_default(self) -> None:
+        config = OPCConfig()
+
+        self.assertFalse(config.system.native_runtime.verification_policy.enabled)
+
+        with _workspace_tempdir() as config_dir:
+            config.save(config_dir)
+            reloaded = OPCConfig.load(config_dir)
+            persisted = yaml.safe_load(
+                (config_dir / "system_config.yaml").read_text(encoding="utf-8")
+            )
+
+        self.assertFalse(
+            persisted["system"]["native_runtime"]["verification_policy"]["enabled"]
+        )
+        self.assertFalse(reloaded.system.native_runtime.verification_policy.enabled)
+
     def test_role_prompt_task_uses_skip_history_flag_not_boolean_runtime_resume(self) -> None:
         engine = OPCEngine(config=OPCConfig(), project_id="proj1")
         source_task = Task(
@@ -60,7 +77,12 @@ class RuntimeConfigEnforcementTests(unittest.IsolatedAsyncioTestCase):
             assigned_to="chao",
             project_id="proj1",
             session_id="sess1",
-            metadata={"work_item_role_id": "chao"},
+            metadata={
+                "work_item_role_id": "chao",
+                "delegation_run_id": "run-1",
+                "company_run_controller_owner_token": "owner-a",
+                "company_run_controller_lease_generation": 3,
+            },
         )
 
         prompt_task = engine._build_role_prompt_task(
@@ -73,6 +95,15 @@ class RuntimeConfigEnforcementTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertNotIn("runtime_resume", prompt_task.context_snapshot)
         self.assertTrue(prompt_task.context_snapshot["skip_session_history"])
+        self.assertEqual(prompt_task.metadata["delegation_run_id"], "run-1")
+        self.assertEqual(
+            prompt_task.metadata["company_run_controller_owner_token"],
+            "owner-a",
+        )
+        self.assertEqual(
+            prompt_task.metadata["company_run_controller_lease_generation"],
+            3,
+        )
 
     def test_external_agent_approval_mode_allows_only_three_modes(self) -> None:
         for mode in ("user-settings", "auto", "full-auto"):
@@ -778,7 +809,6 @@ class RuntimeConfigEnforcementTests(unittest.IsolatedAsyncioTestCase):
             },
         )
         engine.store = SimpleNamespace(get_task=AsyncMock(return_value=waiting_task))
-        engine._mark_company_runtime_checkpoint_status = AsyncMock()
         engine._create_company_self_evolution_root_work_item = AsyncMock()
         checkpoint = ExecutionCheckpoint(
             checkpoint_id="cp-delivery",
@@ -793,10 +823,7 @@ class RuntimeConfigEnforcementTests(unittest.IsolatedAsyncioTestCase):
             action="approve",
         )
         assert "durable org identity" in result
-        engine._mark_company_runtime_checkpoint_status.assert_awaited_once_with(
-            checkpoint,
-            status="invalid",
-        )
+        self.assertEqual(checkpoint.status, "invalid")
         engine._create_company_self_evolution_root_work_item.assert_not_awaited()
 
     async def test_delivery_self_evolution_custom_uses_durable_org_over_payload_and_config(self) -> None:
@@ -817,7 +844,6 @@ class RuntimeConfigEnforcementTests(unittest.IsolatedAsyncioTestCase):
             },
         )
         engine.store = SimpleNamespace(get_task=AsyncMock(return_value=waiting_task))
-        engine._mark_company_runtime_checkpoint_status = AsyncMock()
         engine.org_engine = None
         engine._company_followup_target_task = MagicMock(
             return_value=SimpleNamespace(assigned_to="lead", metadata={}),
@@ -968,13 +994,10 @@ class RuntimeConfigEnforcementTests(unittest.IsolatedAsyncioTestCase):
             action="approve",
         )
         assert "org identity" in result
-        engine._mark_company_runtime_checkpoint_status.assert_awaited_once_with(
-            checkpoint,
-            status="invalid",
-        )
+        self.assertEqual(checkpoint.status, "invalid")
         engine._create_company_self_evolution_root_work_item.assert_not_awaited()
 
-    async def test_company_materialized_work_item_uses_selected_agent_over_template_preference(self) -> None:
+    async def test_company_materialized_work_item_forces_native_execution(self) -> None:
         saved_tasks: list[Task] = []
 
         async def save_task(task: Task) -> None:
@@ -1034,11 +1057,21 @@ class RuntimeConfigEnforcementTests(unittest.IsolatedAsyncioTestCase):
         tasks = await executor._materialize_work_item_tasks([root_task], [work_item])
         created = next(task for task in tasks if task.id != root_task.id)
 
-        self.assertEqual(created.assigned_external_agent, "cursor")
-        self.assertEqual(created.metadata["selected_execution_agent"], "cursor")
-        self.assertEqual(created.metadata["preferred_external_agent"], "cursor")
-        self.assertEqual(created.metadata["work_item_execution_strategy"], WorkItemExecutionStrategy.EXTERNAL.value)
-        self.assertEqual(saved_tasks[0].assigned_external_agent, "cursor")
+        self.assertIsNone(created.assigned_external_agent)
+        self.assertEqual(created.metadata["selected_execution_agent"], "native")
+        self.assertIsNone(created.metadata["preferred_external_agent"])
+        self.assertEqual(
+            created.metadata["work_item_execution_strategy"],
+            WorkItemExecutionStrategy.NATIVE.value,
+        )
+        self.assertTrue(created.metadata["execution_agent_locked"])
+        self.assertTrue(created.metadata["force_native_execution"])
+        self.assertTrue(created.metadata["company_native_execution_enforced"])
+        self.assertEqual(
+            created.metadata["selected_execution_agent_source"],
+            "company_isolation_boundary",
+        )
+        self.assertIsNone(saved_tasks[0].assigned_external_agent)
 
     async def test_company_materialization_persists_durable_org_on_new_role_task(self) -> None:
         executor = CompanyWorkItemExecutor(

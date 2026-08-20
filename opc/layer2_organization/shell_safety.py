@@ -1,12 +1,15 @@
 """Flag-audited shell-command safety classification.
 
 Single source of truth for shell-command handling in the approval pipeline:
-splitting compound commands, stripping harmless redirections, analysing
-command substitution, deriving grant prefixes, and deciding whether a command
-is read-only-safe (auto-approvable without an approval card).
+detecting active shell syntax, splitting commands for approval display,
+analysing flags, deriving grant prefixes, and deciding whether a command is a
+standalone read-only command (auto-approvable without an approval card).
 
 Design rules (mirroring the codex / Claude Code permission engines):
 - Fail closed: anything unparseable, too dynamic, or unknown is NOT safe.
+- Compound commands and active shell syntax always require explicit review.
+  A safe first command must never confer trust on a pipeline, redirection,
+  substitution, subshell, background job, or subsequent command.
 - Audited commands are classified by their flags, not just their name —
   ``find .`` is read-only, ``find . -delete`` is not. For audited commands the
   built-in verdict is final; a bare config prefix cannot rescue a failing
@@ -40,7 +43,7 @@ _STRIP_LEADING_KEYWORDS = {"if", "elif", "then", "else", "do", "done", "fi", "es
 _SAFE_ENV_VARS = {
     "LANG", "LANGUAGE", "LC_ALL", "LC_CTYPE", "TZ", "TERM", "COLUMNS", "LINES",
     "NO_COLOR", "FORCE_COLOR", "CLICOLOR", "PYTHONIOENCODING", "PYTHONUNBUFFERED",
-    "NODE_ENV", "PAGER", "GIT_PAGER",
+    "NODE_ENV",
 }
 
 # Substitution results that may safely expand into another command's argument
@@ -58,25 +61,15 @@ _EXPANSION_PLACEHOLDER = "__opc_subst__"
 # flags. They print to stdout and cannot write files or execute other
 # programs through their own options.
 _GENERIC_READ_ONLY = {
-    "cat", "head", "tail", "wc", "sort", "uniq", "cut", "tr", "stat", "file",
-    "basename", "dirname", "realpath", "readlink", "du", "df", "tree", "nproc",
-    "whoami", "hostname", "date", "uname", "pwd", "ls", "id", "groups", "echo",
-    "printf", "true", "false", "test", "[", "expr", "seq", "sleep", "diff",
+    "cat", "head", "tail", "wc", "cut", "tr", "stat",
+    "basename", "dirname", "realpath", "readlink", "du", "nproc",
+    "whoami", "uname", "pwd", "ls", "id", "groups", "echo",
+    "printf", "true", "false", "test", "[", "expr", "seq", "sleep",
     "cmp", "comm", "nl", "column", "expand", "unexpand", "paste", "join",
     "strings", "hexdump", "od", "md5sum", "sha1sum", "sha256sum", "sha512sum",
     "cksum", "b2sum", "which", "type", "grep", "egrep", "fgrep", "jq", "ps",
     "free", "uptime", "lscpu", "lsblk", "whereis", "cd", "wait", "pgrep",
     "getent", "locale", "tty", "arch", "printenv",
-}
-
-# Flags that make an otherwise read-only command write somewhere.
-_BANNED_FLAGS: dict[str, set[str]] = {
-    "sort": {"-o", "--output"},
-    "date": {"-s", "--set"},
-    "tree": {"-o"},
-    "jq": set(),  # jq cannot execute or write via flags
-    "grep": set(),
-    "ps": set(),
 }
 
 _GIT_READ_ONLY_SUBCOMMANDS = {
@@ -96,6 +89,158 @@ _GIT_LIST_ONLY_SAFE_FLAGS = {
     "worktree": set(),   # only `git worktree list`
     "config": {"--get", "--get-all", "--list", "-l", "--get-regexp", "--global", "--local", "--system"},
 }
+
+# Git has options which turn an otherwise observational command into a file
+# writer or an arbitrary-program launcher.  Keep these as a second, explicit
+# approval boundary instead of relying on the subcommand name.  The short
+# ``-O`` spelling is especially context-sensitive: for ``git grep`` it opens
+# matching files in a pager, while for diff commands it reads an order file.
+# Rejecting it everywhere is intentionally conservative.
+_GIT_FORCED_REVIEW_LONG_OPTIONS = {
+    "--config-env",
+    "--exec-path",
+    "--ext-diff",
+    "--ext-grep",
+    "--filters",
+    "--open-files-in-pager",
+    "--output",
+    "--paginate",
+    "--show-signature",
+    "--textconv",
+}
+
+_GIT_GLOBAL_FLAGS = {
+    "--bare",
+    "--glob-pathspecs",
+    "--icase-pathspecs",
+    "--literal-pathspecs",
+    "--no-lazy-fetch",
+    "--no-optional-locks",
+    "--no-pager",
+    "--no-replace-objects",
+    "--noglob-pathspecs",
+    "-P",
+}
+_GIT_GLOBAL_VALUE_OPTIONS = {"-C", "--git-dir", "--namespace", "--work-tree"}
+
+_GIT_STATUS_FLAGS = {
+    "--ahead-behind", "--branch", "--ignored", "--long", "--no-ahead-behind",
+    "--no-column", "--no-renames", "--null", "--porcelain", "--renames",
+    "--short", "--show-stash", "--untracked-files", "--verbose",
+    "-b", "-M", "-s", "-u", "-v", "-z",
+}
+_GIT_STATUS_OPTIONAL_VALUES = {
+    "--column", "--find-renames", "--ignored", "--ignore-submodules",
+    "--porcelain", "--untracked-files",
+}
+
+_GIT_DIFF_FLAGS = {
+    "--binary", "--cached", "--check", "--color", "--color-moved",
+    "--color-moved-ws", "--color-words", "--compact-summary", "--default-prefix",
+    "--dirstat", "--dirstat-by-file", "--exit-code", "--find-copies-harder",
+    "--full-index", "--histogram", "--ignore-all-space", "--ignore-blank-lines",
+    "--ignore-cr-at-eol", "--ignore-space-at-eol", "--ignore-space-change",
+    "--indent-heuristic", "--irreversible-delete", "--ita-invisible-in-index",
+    "--ita-visible-in-index", "--merge-base", "--minimal", "--name-only",
+    "--name-status", "--no-color", "--no-ext-diff", "--no-index", "--no-prefix",
+    "--no-renames", "--no-textconv", "--numstat", "--patch", "--patch-with-raw",
+    "--patch-with-stat", "--patience", "--pickaxe-all", "--pickaxe-regex",
+    "--quiet", "--raw", "--relative", "--shortstat", "--staged", "--stat",
+    "--submodule", "--summary", "--text", "--word-diff", "-B", "-C", "-M",
+    "-R", "-a", "-p", "-s", "-u", "-z",
+}
+_GIT_DIFF_VALUE_OPTIONS = {
+    "--abbrev", "--anchored", "--diff-algorithm", "--diff-filter", "--dst-prefix",
+    "--find-copies", "--find-object", "--find-renames", "--ignore-matching-lines",
+    "--ignore-submodules", "--inter-hunk-context", "--line-prefix", "--src-prefix",
+    "--stat-graph-width", "--stat-name-width", "--stat-width", "--submodule",
+    "--unified", "--word-diff", "--word-diff-regex", "-G", "-S", "-U", "-l",
+}
+
+_GIT_LOG_FLAGS = {
+    "--abbrev-commit", "--all", "--all-match", "--ancestry-path", "--author-date-order",
+    "--boundary", "--branches", "--children", "--cherry", "--cherry-mark",
+    "--cherry-pick", "--date-order", "--decorate", "--do-walk", "--extended-regexp",
+    "--first-parent", "--fixed-strings", "--full-history", "--graph", "--invert-grep",
+    "--left-right", "--mailmap", "--merges", "--no-abbrev-commit", "--no-decorate",
+    "--no-ext-diff", "--no-mailmap", "--no-merges", "--no-notes", "--no-patch",
+    "--no-textconv", "--no-walk", "--notes", "--objects", "--objects-edge",
+    "--oneline", "--parents", "--patch", "--perl-regexp", "--raw", "--reflog",
+    "--regexp-ignore-case", "--relative-date", "--remotes", "--reverse", "--simplify-merges",
+    "--source", "--tags", "--topo-order", "--use-mailmap", "--walk-reflogs",
+    "-E", "-F", "-P", "-g", "-i", "-p", "-q",
+} | _GIT_DIFF_FLAGS
+_GIT_LOG_VALUE_OPTIONS = {
+    "--abbrev", "--after", "--author", "--before", "--committer", "--date",
+    "--decorate", "--decorate-refs", "--decorate-refs-exclude", "--encoding",
+    "--exclude", "--format", "--glob", "--grep", "--max-count", "--max-parents",
+    "--min-parents", "--notes", "--pretty", "--since", "--skip", "--until", "-L", "-n",
+} | _GIT_DIFF_VALUE_OPTIONS
+
+_GIT_REV_PARSE_FLAGS = {
+    "--absolute-git-dir", "--all", "--branches", "--flags", "--git-common-dir",
+    "--git-dir", "--is-bare-repository", "--is-inside-git-dir", "--is-inside-work-tree",
+    "--is-shallow-repository", "--local-env-vars", "--no-flags", "--no-revs",
+    "--parseopt", "--quiet", "--remotes", "--revs-only", "--show-cdup",
+    "--show-object-format", "--show-prefix", "--show-superproject-working-tree",
+    "--show-toplevel", "--sq", "--sq-quote", "--symbolic", "--symbolic-full-name",
+    "--tags", "--verify", "-q",
+}
+_GIT_REV_PARSE_VALUE_OPTIONS = {
+    "--abbrev-ref", "--default", "--disambiguate", "--exclude", "--exclude-hidden",
+    "--glob", "--path-format", "--short",
+}
+
+_GIT_LS_FILES_FLAGS = {
+    "--cached", "--debug", "--deduplicate", "--deleted", "--directory", "--empty-directory",
+    "--eol", "--error-unmatch", "--exclude-standard", "--full-name", "--ignored", "--killed",
+    "--modified", "--others", "--recurse-submodules", "--resolve-undo", "--stage", "--unmerged",
+    "-c", "-d", "-f", "-i", "-k", "-m", "-o", "-s", "-t", "-u", "-v", "-z",
+}
+_GIT_LS_FILES_VALUE_OPTIONS = {
+    "--abbrev", "--exclude", "--exclude-from", "--exclude-per-directory", "--with-tree", "-X", "-x",
+}
+
+_GIT_LS_TREE_FLAGS = {
+    "--full-name", "--full-tree", "--long", "--name-only", "--name-status",
+    "-d", "-l", "-r", "-t", "-z",
+}
+_GIT_LS_TREE_VALUE_OPTIONS = {"--abbrev", "--format"}
+
+_GIT_DESCRIBE_FLAGS = {
+    "--all", "--always", "--contains", "--debug", "--exact-match", "--first-parent",
+    "--long", "--tags",
+}
+_GIT_DESCRIBE_VALUE_OPTIONS = {"--abbrev", "--broken", "--candidates", "--dirty", "--exclude", "--match"}
+
+_GIT_SHORTLOG_FLAGS = {"--committer", "--email", "--numbered", "--summary", "-c", "-e", "-n", "-s"}
+_GIT_SHORTLOG_VALUE_OPTIONS = {"--group"}
+
+_GIT_CAT_FILE_FLAGS = {
+    "--allow-unknown-type", "--batch", "--batch-all-objects", "--batch-check",
+    "--batch-command", "--buffer", "--follow-symlinks", "--unordered", "-e", "-p", "-s", "-t",
+}
+_GIT_CAT_FILE_VALUE_OPTIONS = {"--batch", "--batch-check", "--batch-command", "--path"}
+
+_GIT_GREP_FLAGS = {
+    "--all-match", "--and", "--basic-regexp", "--break", "--cached", "--column",
+    "--count", "--exclude-standard", "--extended-regexp", "--files-with-matches",
+    "--files-without-match", "--fixed-strings", "--full-name", "--function-context",
+    "--heading", "--ignore-case", "--invert-match", "--line-number", "--name-only",
+    "--no-index", "--not", "--null", "--only-matching", "--or", "--perl-regexp",
+    "--quiet", "--recurse-submodules", "--recursive", "--show-function", "--text",
+    "--untracked", "--word-regexp", "-A", "-B", "-C", "-E", "-F", "-G", "-H", "-I",
+    "-L", "-P", "-W", "-a", "-c", "-e", "-f", "-h", "-i", "-l", "-n", "-o", "-p",
+    "-q", "-r", "-v", "-w", "-z",
+}
+_GIT_GREP_VALUE_OPTIONS = {"--after-context", "--before-context", "--color", "--context", "--max-depth", "--threads", "-A", "-B", "-C", "-e", "-f"}
+
+_GIT_CHECK_IGNORE_FLAGS = {"--no-index", "--non-matching", "--quiet", "--stdin", "--verbose", "-n", "-q", "-v", "-z"}
+_GIT_SHOW_REF_FLAGS = {
+    "--dereference", "--exclude-existing", "--hash", "--head", "--heads", "--quiet", "--tags", "--verify",
+    "-d", "-q", "-s",
+}
+_GIT_SHOW_REF_VALUE_OPTIONS = {"--abbrev", "--exclude-existing", "--hash"}
 
 _FIND_BANNED_PREDICATES = {
     "-delete", "-exec", "-execdir", "-ok", "-okdir",
@@ -130,6 +275,109 @@ UNGRANTABLE_PREFIX_HEADS = {
 }
 
 _SAFE_WRAPPER_HEADS = {"time", "nohup"}
+
+_SHELL_STRUCTURE_REASON_ORDER = (
+    "command substitution",
+    "shell control operator",
+    "shell newline",
+    "shell redirection",
+    "subshell or grouping",
+    "unbalanced shell quoting",
+)
+
+
+def _active_shell_syntax(command: str) -> set[str]:
+    """Return active shell constructs, ignoring quoted/escaped literals.
+
+    ``shlex`` correctly keeps quoted punctuation inside an argument but drops
+    the quote type, which makes it unsuitable for distinguishing active
+    ``$(...)`` in double quotes from the same bytes in single quotes.  This
+    small scanner only recognizes syntax that affects command structure; the
+    normal ``shlex`` parser still performs tokenization afterwards.
+    """
+    text = str(command or "")
+    found: set[str] = set()
+    quote = ""
+    escaped = False
+    index = 0
+    while index < len(text):
+        char = text[index]
+        if quote == "single":
+            if char == "'":
+                quote = ""
+            index += 1
+            continue
+        if quote == "double":
+            if escaped:
+                escaped = False
+                index += 1
+                continue
+            if char == "\\":
+                escaped = True
+                index += 1
+                continue
+            if char == '"':
+                quote = ""
+                index += 1
+                continue
+            # Command substitutions remain active inside double quotes.
+            if char == "`" or (char == "$" and text.startswith("$(", index)):
+                found.add("command substitution")
+            index += 1
+            continue
+
+        if escaped:
+            escaped = False
+            index += 1
+            continue
+        if char == "\\":
+            escaped = True
+            index += 1
+            continue
+        if char == "'":
+            quote = "single"
+            index += 1
+            continue
+        if char == '"':
+            quote = "double"
+            index += 1
+            continue
+        if char == "`" or (char == "$" and text.startswith("$(", index)):
+            found.add("command substitution")
+        if char in ";&|":
+            found.add("shell control operator")
+        elif char in "\r\n":
+            found.add("shell newline")
+        elif char in "<>":
+            found.add("shell redirection")
+        elif char == "(" and (
+            index == 0
+            or text[index - 1].isspace()
+            or text[index - 1] in ";&|()"
+        ):
+            # An opening parenthesis embedded in an ordinary argument (for
+            # example yt-dlp's ``%(title)s`` template) is data for policy
+            # purposes.  At a command boundary it starts a shell group.
+            found.add("subshell or grouping")
+        index += 1
+
+    if quote or escaped:
+        found.add("unbalanced shell quoting")
+    return found
+
+
+def shell_structure_requires_review(command: str) -> tuple[bool, str]:
+    """Whether a command contains active shell syntax requiring a checkpoint.
+
+    This is intentionally stricter than a per-segment read-only audit.  The
+    approval boundary authorizes one standalone command at a time; compound
+    execution and shell evaluation are never inferred safe from a prefix.
+    """
+    found = _active_shell_syntax(command)
+    if not found:
+        return False, "standalone command contains no active shell structure"
+    ordered = [reason for reason in _SHELL_STRUCTURE_REASON_ORDER if reason in found]
+    return True, "manual review required for " + ", ".join(ordered)
 
 
 def strip_safe_redirections(command: str) -> str:
@@ -182,9 +430,12 @@ def sanitize_expansions(command: str) -> tuple[str, bool]:
 
 
 def has_blocked_substitution(command: str) -> bool:
-    """True when the command contains substitution we refuse to auto-allow."""
-    _, all_safe = sanitize_expansions(command)
-    return not all_safe
+    """True when the command contains an active command substitution.
+
+    All substitutions now require explicit approval, including substitutions
+    whose inner command is read-only.  Single-quoted/escaped text is literal.
+    """
+    return "command substitution" in _active_shell_syntax(command)
 
 
 def split_shell_segments(command: str) -> list[list[str]] | None:
@@ -294,92 +545,414 @@ def _flags_in(tokens: Iterable[str]) -> list[str]:
     return [token for token in tokens if token.startswith("-")]
 
 
-def _git_segment_read_only(tokens: list[str]) -> bool:
-    rest = tokens[1:]
-    # consume global options that take a value
-    while rest and rest[0].startswith("-"):
-        if rest[0] in {"-C", "-c", "--git-dir", "--work-tree", "--namespace"} and len(rest) >= 2:
-            rest = rest[2:]
-            continue
-        if rest[0] in {"--no-pager", "--paginate", "-P", "-p"}:
-            rest = rest[1:]
-            continue
-        if rest[0] in {"--version", "--help"}:
-            return True
-        return False
-    if not rest:
-        return False
-    sub = rest[0]
-    if sub in _GIT_READ_ONLY_SUBCOMMANDS:
+def _git_forced_review_option(token: str) -> bool:
+    if token == "-O" or token.startswith("-O"):
         return True
-    if sub in _GIT_LIST_ONLY_SUBCOMMANDS:
-        args = rest[1:]
-        if sub == "stash":
-            return args[:1] == ["list"]
-        if sub == "worktree":
-            return args[:1] == ["list"]
-        safe_flags = _GIT_LIST_ONLY_SAFE_FLAGS.get(sub, set())
-        positionals = [a for a in args if not a.startswith("-")]
-        flags_ok = all(a.split("=", 1)[0] in safe_flags for a in args if a.startswith("-"))
-        if sub == "config":
-            # reads need --get/--list; positionals are the key names
-            has_read_flag = any(a.split("=", 1)[0] in {"--get", "--get-all", "--get-regexp", "--list", "-l"} for a in args)
-            return flags_ok and has_read_flag
-        return flags_ok and not positionals
+    head = token.split("=", 1)[0]
+    return head in _GIT_FORCED_REVIEW_LONG_OPTIONS
+
+
+def _git_parse_global_options(tokens: list[str]) -> tuple[str, list[str]] | None:
+    """Return ``(subcommand, args)`` after a strict Git global-option parse."""
+
+    rest = list(tokens[1:])
+    if rest == ["--version"] or rest == ["version"]:
+        return "version", []
+    index = 0
+    while index < len(rest) and rest[index].startswith("-"):
+        token = rest[index]
+        if _git_forced_review_option(token):
+            return None
+        # ``-c`` / ``--config-env`` can inject core.pager, diff.external,
+        # core.fsmonitor, aliases, and other arbitrary-program helpers.  They
+        # are deliberately absent from the allowlist.
+        if token in _GIT_GLOBAL_FLAGS:
+            index += 1
+            continue
+        head = token.split("=", 1)[0]
+        if head in _GIT_GLOBAL_VALUE_OPTIONS:
+            if "=" in token:
+                if not token.split("=", 1)[1]:
+                    return None
+                index += 1
+                continue
+            if index + 1 >= len(rest):
+                return None
+            index += 2
+            continue
+        return None
+    if index >= len(rest):
+        return None
+    return rest[index], rest[index + 1:]
+
+
+def _git_options_are_safe(
+    args: list[str],
+    *,
+    flags: set[str] | frozenset[str] = frozenset(),
+    value_options: set[str] | frozenset[str] = frozenset(),
+    optional_value_options: set[str] | frozenset[str] = frozenset(),
+    attached_short_patterns: tuple[str, ...] = (),
+    allow_positionals: bool = True,
+) -> bool:
+    """Validate subcommand options from explicit allowlists.
+
+    Unknown options fail closed. Values are inert argv tokens because active
+    shell syntax was rejected before this parser is reached.
+    """
+
+    after_separator = False
+    index = 0
+    while index < len(args):
+        token = args[index]
+        if token == "--":
+            after_separator = True
+            index += 1
+            continue
+        if after_separator or not token.startswith("-") or token == "-":
+            if not allow_positionals:
+                return False
+            index += 1
+            continue
+        if _git_forced_review_option(token):
+            return False
+        if token in flags:
+            index += 1
+            continue
+        head = token.split("=", 1)[0]
+        if head in optional_value_options:
+            index += 1
+            continue
+        if head in value_options:
+            if "=" in token:
+                if not token.split("=", 1)[1]:
+                    return False
+                index += 1
+                continue
+            if index + 1 >= len(args):
+                return False
+            index += 2
+            continue
+        if any(re.fullmatch(pattern, token) for pattern in attached_short_patterns):
+            index += 1
+            continue
+        return False
+    return True
+
+
+def _git_config_read_only(args: list[str]) -> bool:
+    read_actions = {"--get", "--get-all", "--get-regexp", "--get-urlmatch", "--list", "-l"}
+    flags = {
+        "--fixed-value", "--global", "--includes", "--local", "--name-only",
+        "--no-includes", "--null", "--show-names", "--show-origin", "--show-scope",
+        "--system", "--worktree", "-z",
+    } | read_actions
+    value_options = {"--blob", "--default", "--file", "--type"}
+    if not any(token.split("=", 1)[0] in read_actions for token in args):
+        return False
+    return _git_options_are_safe(
+        args,
+        flags=flags,
+        value_options=value_options,
+        allow_positionals=True,
+    )
+
+
+def _git_list_only_read_only(sub: str, args: list[str]) -> bool:
+    if sub == "branch":
+        flags = {
+            "--all", "--color", "--format", "--ignore-case", "--list", "--no-color",
+            "--no-column", "--no-contains", "--no-merged", "--points-at", "--remotes",
+            "--show-current", "--sort", "--verbose", "-a", "-l", "-r", "-v", "-vv",
+        }
+        values = {"--color", "--contains", "--format", "--merged", "--no-contains", "--no-merged", "--points-at", "--sort"}
+        positionals = [item for item in args if not item.startswith("-")]
+        permits_patterns = any(item in {"--list", "-l"} for item in args)
+        return (permits_patterns or not positionals) and _git_options_are_safe(
+            args,
+            flags=flags,
+            value_options=values,
+            optional_value_options={"--color", "--contains", "--merged", "--no-contains", "--no-merged"},
+        )
+    if sub == "tag":
+        flags = {"--color", "--column", "--ignore-case", "--list", "--no-column", "-l"}
+        values = {"--contains", "--format", "--merged", "--no-contains", "--no-merged", "--points-at", "--sort"}
+        positionals = [item for item in args if not item.startswith("-")]
+        permits_patterns = any(item in {"--list", "-l"} for item in args)
+        return (permits_patterns or not positionals) and _git_options_are_safe(
+            args,
+            flags=flags,
+            value_options=values,
+            optional_value_options={"--color", "--column", "--contains", "--merged", "--no-contains", "--no-merged"},
+            attached_short_patterns=(r"-n\d*",),
+        )
+    if sub == "remote":
+        return not args or args in (["-v"], ["--verbose"])
+    if sub == "stash":
+        return bool(args[:1] == ["list"]) and _git_options_are_safe(
+            args[1:],
+            flags=_GIT_LOG_FLAGS,
+            value_options=_GIT_LOG_VALUE_OPTIONS,
+            optional_value_options={"--decorate", "--notes"},
+            attached_short_patterns=(r"-\d+", r"-n\d+"),
+        )
+    if sub == "worktree":
+        return bool(args[:1] == ["list"]) and _git_options_are_safe(
+            args[1:],
+            flags={"--porcelain", "--verbose", "-v", "-z"},
+            value_options={"--expire"},
+            allow_positionals=False,
+        )
+    if sub == "config":
+        return _git_config_read_only(args)
     return False
+
+
+def _git_segment_read_only(tokens: list[str]) -> bool:
+    parsed = _git_parse_global_options(tokens)
+    if parsed is None:
+        return False
+    sub, args = parsed
+    if sub == "version":
+        return not args
+    if sub == "status":
+        return _git_options_are_safe(
+            args,
+            flags=_GIT_STATUS_FLAGS,
+            optional_value_options=_GIT_STATUS_OPTIONAL_VALUES,
+            attached_short_patterns=(r"-[sbuvzM]+", r"-M\d+"),
+        )
+    if sub in {"diff", "diff-tree"}:
+        return _git_options_are_safe(
+            args,
+            flags=_GIT_DIFF_FLAGS | ({"--stdin", "--root", "--cc", "-c", "-m", "-r", "-t", "-v"} if sub == "diff-tree" else set()),
+            value_options=_GIT_DIFF_VALUE_OPTIONS,
+            optional_value_options={"--color", "--color-moved", "--color-moved-ws", "--dirstat", "--relative", "--stat", "--submodule", "--word-diff"},
+            attached_short_patterns=(r"-U\d+", r"-[BMC]\d*%?", r"-l\d+", r"-[SG].+"),
+        )
+    if sub in {"log", "show", "whatchanged"}:
+        return _git_options_are_safe(
+            args,
+            flags=_GIT_LOG_FLAGS,
+            value_options=_GIT_LOG_VALUE_OPTIONS,
+            optional_value_options={"--decorate", "--notes"},
+            attached_short_patterns=(r"-\d+", r"-n\d+", r"-U\d+", r"-[BMC]\d*%?", r"-l\d+", r"-[SG].+"),
+        )
+    if sub == "blame":
+        return _git_options_are_safe(
+            args,
+            flags={
+                "--color-by-age", "--color-lines", "--incremental", "--line-porcelain",
+                "--minimal", "--porcelain", "--progress", "--root", "--score-debug",
+                "--show-email", "--show-name", "--show-number", "--show-stats",
+                "-b", "-c", "-e", "-f", "-l", "-n", "-p", "-s", "-t", "-w",
+            },
+            value_options={"--abbrev", "--contents", "--ignore-rev", "--ignore-revs-file", "-L", "-S"},
+            attached_short_patterns=(r"-[CM]\d*",),
+        )
+    if sub == "rev-parse":
+        return _git_options_are_safe(
+            args,
+            flags=_GIT_REV_PARSE_FLAGS,
+            value_options=_GIT_REV_PARSE_VALUE_OPTIONS,
+            optional_value_options={"--abbrev-ref", "--short"},
+        )
+    if sub == "ls-files":
+        return _git_options_are_safe(args, flags=_GIT_LS_FILES_FLAGS, value_options=_GIT_LS_FILES_VALUE_OPTIONS, optional_value_options={"--abbrev"})
+    if sub == "ls-tree":
+        return _git_options_are_safe(args, flags=_GIT_LS_TREE_FLAGS, value_options=_GIT_LS_TREE_VALUE_OPTIONS, optional_value_options={"--abbrev"})
+    if sub == "describe":
+        return _git_options_are_safe(args, flags=_GIT_DESCRIBE_FLAGS, value_options=_GIT_DESCRIBE_VALUE_OPTIONS, optional_value_options={"--abbrev", "--broken", "--dirty"})
+    if sub == "shortlog":
+        return _git_options_are_safe(args, flags=_GIT_SHORTLOG_FLAGS, value_options=_GIT_SHORTLOG_VALUE_OPTIONS, attached_short_patterns=(r"-w(?:\d+(?:,\d+(?:,\d+)?)?)?",))
+    if sub == "cat-file":
+        return _git_options_are_safe(args, flags=_GIT_CAT_FILE_FLAGS, value_options=_GIT_CAT_FILE_VALUE_OPTIONS, optional_value_options={"--batch", "--batch-check", "--batch-command"})
+    if sub == "grep":
+        return _git_options_are_safe(args, flags=_GIT_GREP_FLAGS, value_options=_GIT_GREP_VALUE_OPTIONS, optional_value_options={"--color"}, attached_short_patterns=(r"-\d+",))
+    if sub == "reflog":
+        if not args:
+            return True
+        if args[0] == "exists":
+            return _git_options_are_safe(args[1:], allow_positionals=True)
+        show_args = args[1:] if args[0] == "show" else args
+        return _git_options_are_safe(show_args, flags=_GIT_LOG_FLAGS, value_options=_GIT_LOG_VALUE_OPTIONS, optional_value_options={"--decorate", "--notes"}, attached_short_patterns=(r"-\d+", r"-n\d+"))
+    if sub == "count-objects":
+        return _git_options_are_safe(args, flags={"--human-readable", "--verbose", "-H", "-v"}, allow_positionals=False)
+    if sub == "rev-list":
+        return _git_options_are_safe(args, flags=_GIT_LOG_FLAGS | {"--bisect-all", "--bisect-vars", "--count", "--header", "--no-object-names", "--object-names", "--unpacked"}, value_options=_GIT_LOG_VALUE_OPTIONS, optional_value_options={"--branches", "--remotes", "--tags"}, attached_short_patterns=(r"-\d+", r"-n\d+"))
+    if sub == "merge-base":
+        return _git_options_are_safe(args, flags={"--all", "--fork-point", "--independent", "--is-ancestor", "--octopus", "-a"})
+    if sub == "name-rev":
+        return _git_options_are_safe(args, flags={"--all", "--always", "--name-only", "--stdin", "--tags", "--undefined"}, value_options={"--exclude", "--refs"})
+    if sub == "var":
+        return _git_options_are_safe(args, flags={"-l"}) and bool(args)
+    if sub == "check-ignore":
+        return _git_options_are_safe(args, flags=_GIT_CHECK_IGNORE_FLAGS)
+    if sub == "show-ref":
+        return _git_options_are_safe(args, flags=_GIT_SHOW_REF_FLAGS, value_options=_GIT_SHOW_REF_VALUE_OPTIONS, optional_value_options={"--abbrev", "--exclude-existing", "--hash"})
+    if sub == "cherry":
+        return _git_options_are_safe(args, flags={"--verbose", "-v"}, value_options={"--abbrev"}, optional_value_options={"--abbrev"})
+    if sub in _GIT_LIST_ONLY_SUBCOMMANDS:
+        return _git_list_only_read_only(sub, args)
+    return False
+
+
+_GIT_REVIEWABLE_FAMILIES = (
+    _GIT_READ_ONLY_SUBCOMMANDS
+    | _GIT_LIST_ONLY_SUBCOMMANDS
+    | {"help", "version"}
+)
+
+
+def _git_candidate_subcommand(tokens: list[str]) -> str:
+    """Best-effort subcommand extraction for a rejected global option list."""
+
+    args = list(tokens[1:])
+    index = 0
+    value_options = _GIT_GLOBAL_VALUE_OPTIONS | {"-c", "--config-env"}
+    while index < len(args):
+        token = args[index]
+        if not token.startswith("-"):
+            return token
+        head = token.split("=", 1)[0]
+        if head in value_options and "=" not in token:
+            index += 2
+        else:
+            index += 1
+    return ""
+
+
+def _git_global_options_require_review(tokens: list[str]) -> bool:
+    """Whether argv before the Git subcommand contains an unsafe global."""
+
+    rest = list(tokens[1:])
+    if not rest or rest == ["--version"]:
+        return False
+    index = 0
+    while index < len(rest) and rest[index].startswith("-"):
+        token = rest[index]
+        if token in _GIT_GLOBAL_FLAGS:
+            index += 1
+            continue
+        head = token.split("=", 1)[0]
+        if head in _GIT_GLOBAL_VALUE_OPTIONS:
+            if "=" in token:
+                if not token.split("=", 1)[1]:
+                    return True
+                index += 1
+                continue
+            if index + 1 >= len(rest):
+                return True
+            index += 2
+            continue
+        return True
+    return False
+
+
+def _git_launch_tokens(tokens: list[str]) -> tuple[list[str], bool]:
+    """Peel inert wrappers/environment prefixes while retaining env safety."""
+
+    remaining = list(tokens)
+    environment_safe = True
+    while remaining:
+        stripped, safe = _strip_env_assignments(remaining)
+        environment_safe = environment_safe and safe
+        remaining = stripped
+        if not remaining:
+            break
+        wrapped = _strip_safe_wrappers(list(remaining))
+        if wrapped != remaining:
+            remaining = wrapped
+            continue
+        if remaining[0] == "env":
+            env_args = remaining[1:]
+            # Only the two inert environment-display modifiers are consumed.
+            # Other ``env`` options fail closed but we still locate a following
+            # Git command so the durable allowlist cannot bypass review.
+            while env_args and env_args[0] in {"-i", "--ignore-environment"}:
+                env_args = env_args[1:]
+            stripped, safe = _strip_env_assignments(env_args)
+            environment_safe = environment_safe and safe
+            remaining = stripped
+            continue
+        break
+    return remaining, environment_safe
+
+
+def git_read_only_family_requires_review(command: str) -> tuple[bool, str]:
+    """Force a one-shot human checkpoint for unsafe Git read-family forms.
+
+    This guard runs before reusable permission rules.  Otherwise a historical
+    ``git diff`` grant could authorize ``git diff --output=...`` even though
+    the flag audit correctly stopped considering it read-only.
+    """
+
+    segments = split_shell_segments(str(command or ""))
+    if not segments or len(segments) != 1:
+        return False, ""
+    tokens, env_safe = _git_launch_tokens(list(segments[0]))
+    if not tokens:
+        return False, ""
+    executable = tokens[0].replace("\\", "/").rsplit("/", 1)[-1]
+    if executable != "git":
+        return False, ""
+    if not env_safe or _git_global_options_require_review(tokens):
+        return (
+            True,
+            "manual review required for Git options or environment that are not proven read-only",
+        )
+    parsed = _git_parse_global_options(tokens)
+    subcommand = parsed[0] if parsed is not None else _git_candidate_subcommand(tokens)
+    if subcommand not in _GIT_REVIEWABLE_FAMILIES:
+        return False, ""
+    if tokens[0] == "git" and _git_segment_read_only(tokens):
+        return False, ""
+    return (
+        True,
+        "manual review required for Git options or environment that are not proven read-only",
+    )
 
 
 def _sed_segment_read_only(tokens: list[str]) -> bool:
     args = tokens[1:]
-    if not any(a == "-n" or (a.startswith("-") and not a.startswith("--") and "n" in a[1:]) for a in args):
-        return False
+    quiet = False
     scripts: list[str] = []
+    positionals: list[str] = []
     index = 0
     while index < len(args):
         token = args[index]
-        if token.startswith("-"):
-            if token.split("=", 1)[0] in {"-i", "--in-place", "-f", "--file", "-s"} or token.startswith("-i"):
-                return False
-            if token in {"-e", "--expression"} and index + 1 < len(args):
-                scripts.append(args[index + 1])
-                index += 2
-                continue
+        if token in {"-n", "--quiet", "--silent"}:
+            quiet = True
             index += 1
             continue
-        if not scripts:
-            scripts.append(token)
+        if token in {"-e", "--expression"}:
+            if index + 1 >= len(args):
+                return False
+            scripts.append(args[index + 1])
+            index += 2
+            continue
+        if token.startswith("-"):
+            return False
+        positionals.append(token)
         index += 1
-    if not scripts:
+    if not scripts and positionals:
+        scripts.append(positionals.pop(0))
+    if not quiet or not scripts:
         return False
     return all(re.fullmatch(r"[0-9,$; ]*p", script.strip()) for script in scripts)
 
 
-def _awk_segment_read_only(tokens: list[str]) -> bool:
+def _df_segment_read_only(tokens: list[str]) -> bool:
+    """Only bare/path-only df invocations are proven side-effect free."""
+
+    return all(token and not token.startswith("-") for token in tokens[1:])
+
+
+def _diff_segment_read_only(tokens: list[str]) -> bool:
+    """Only the two-operand, option-free diff form is proven read-only."""
+
     args = tokens[1:]
-    program = ""
-    index = 0
-    while index < len(args):
-        token = args[index]
-        if token.startswith("-"):
-            head = token.split("=", 1)[0]
-            if head in {"-f", "--file", "-i", "--include", "-l", "--load"}:
-                return False
-            if head in {"-v", "--assign", "-F", "--field-separator"} and "=" not in token and index + 1 < len(args):
-                index += 2
-                continue
-            if head in {"-e", "--source"} and index + 1 < len(args):
-                program = program or args[index + 1]
-                index += 2
-                continue
-            index += 1
-            continue
-        if not program:
-            program = token
-        index += 1
-    if not program:
-        return False
-    banned = ("system", ">", "|", "getline", "close(", "fflush(", "print >", "printf >")
-    return not any(marker in program for marker in banned)
+    return len(args) == 2 and all(not token.startswith("-") for token in args)
 
 
 def _xxd_segment_read_only(tokens: list[str]) -> bool:
@@ -430,7 +1003,22 @@ AUDITED_COMMAND_HEADS = (
     _GENERIC_READ_ONLY
     | _NETWORK_AUDITED
     | _INTERPRETERS
-    | {"git", "find", "sed", "awk", "gawk", "mawk", "nawk", "rg", "xxd", "npm", "pip", "pip3"}
+    | {
+        "git",
+        "find",
+        "sed",
+        "df",
+        "diff",
+        "awk",
+        "gawk",
+        "mawk",
+        "nawk",
+        "rg",
+        "xxd",
+        "npm",
+        "pip",
+        "pip3",
+    }
 )
 
 
@@ -471,8 +1059,12 @@ def _segment_read_only(tokens: list[str], config_prefixes: Sequence[str]) -> boo
         return _find_segment_read_only(tokens)
     if head == "sed":
         return _sed_segment_read_only(tokens)
+    if head == "df":
+        return _df_segment_read_only(tokens)
+    if head == "diff":
+        return _diff_segment_read_only(tokens)
     if head in {"awk", "gawk", "mawk", "nawk"}:
-        return _awk_segment_read_only(tokens)
+        return False
     if head == "rg":
         return _rg_segment_read_only(tokens)
     if head == "xxd":
@@ -485,9 +1077,6 @@ def _segment_read_only(tokens: list[str], config_prefixes: Sequence[str]) -> boo
     if head in _INTERPRETERS or head in {"npm", "pip", "pip3"}:
         return len(tokens) == 2 and tokens[1] in _VERSION_ONLY_FLAGS
     if head in _GENERIC_READ_ONLY:
-        banned = _BANNED_FLAGS.get(head, set())
-        if banned and any(token.split("=", 1)[0] in banned for token in _flags_in(tokens[1:])):
-            return False
         return True
 
     # Unknown command: honor operator-configured safe prefixes.
@@ -498,22 +1087,19 @@ def is_read_only_shell_command(
     command: str,
     config_prefixes: Sequence[str] = (),
 ) -> tuple[bool, str]:
-    """Classify a (possibly compound) shell command as read-only-safe.
+    """Classify one standalone shell command as read-only-safe.
 
-    Returns ``(safe, reason)``. Every segment must independently pass; any
-    substitution we cannot prove harmless, real redirection, or unparseable
-    input fails closed.
+    Returns ``(safe, reason)``. Active shell structure and unparseable input
+    fail closed before the flag audit, even when each apparent segment would
+    be read-only in isolation.
     """
-    cleaned = " ".join(str(command or "").split()).strip()
+    cleaned = str(command or "").strip()
     if not cleaned:
         return False, "empty command"
-    sanitized, expansions_safe = sanitize_expansions(cleaned)
-    if not expansions_safe:
-        return False, "command substitution cannot be audited"
-    sanitized = strip_safe_redirections(sanitized)
-    if command_has_redirection(sanitized):
-        return False, "command performs file redirection"
-    segments = split_shell_segments(sanitized)
+    requires_review, reason = shell_structure_requires_review(cleaned)
+    if requires_review:
+        return False, reason
+    segments = split_shell_segments(cleaned)
     if segments is None:
         return False, "command could not be parsed"
     if not segments:

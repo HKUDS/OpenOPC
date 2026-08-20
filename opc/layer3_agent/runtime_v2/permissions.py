@@ -10,6 +10,7 @@ engine into the executor and maps tool results back into permission events.
 
 from __future__ import annotations
 
+import inspect
 from typing import Any
 
 from loguru import logger
@@ -106,10 +107,28 @@ class RuntimePermissionAdapter:
             source="runtime_prediction",
         )
 
-    def record_denial(self, tool_name: str, arguments: dict[str, Any] | None = None) -> None:
+    def record_denial(
+        self,
+        tool_name: str,
+        arguments: dict[str, Any] | None = None,
+        *,
+        task: Any = None,
+        denial_id: str = "",
+    ) -> None:
         if self.policy is not None and hasattr(self.policy, "record_denial"):
             try:
-                self.policy.record_denial(tool_name, arguments)
+                record = self.policy.record_denial
+                parameters = inspect.signature(record).parameters
+                accepts_kwargs = any(
+                    parameter.kind == inspect.Parameter.VAR_KEYWORD
+                    for parameter in parameters.values()
+                )
+                kwargs: dict[str, Any] = {}
+                if accepts_kwargs or "task" in parameters:
+                    kwargs["task"] = task
+                if accepts_kwargs or "denial_id" in parameters:
+                    kwargs["denial_id"] = denial_id
+                record(tool_name, arguments, **kwargs)
             except Exception:
                 logger.opt(exception=True).debug("Failed to record permission denial")
 
@@ -151,8 +170,8 @@ class RuntimePermissionAdapter:
     ) -> RuntimePermissionDecision:
         """Map a tool result back to the permission decision it reflects.
 
-        Pure event classification — grants are persisted by ApprovalEngine at
-        decision time, never here.
+        Pure event classification — grants and denials are recorded at their
+        decision points, never while classifying an already-produced result.
         """
         approval = dict(result.get("approval", {}) or {})
         action = str(approval.get("action", "") or "").strip().lower()
@@ -166,7 +185,6 @@ class RuntimePermissionAdapter:
                 metadata=approval,
             )
         if action == "reject":
-            self.record_denial(tool_name, arguments)
             return RuntimePermissionDecision(
                 resolution=PermissionResolution.DENY,
                 scope=PermissionScope.ONCE,

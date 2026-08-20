@@ -10,6 +10,7 @@ from typing import Any, Awaitable, Callable
 
 from loguru import logger
 
+from opc.core.company_controller import CompanyRunControllerLeaseLost
 from opc.core.models import (
     CompanyMemberSession,
     CommsSemanticType,
@@ -27,7 +28,6 @@ from opc.layer2_organization.collaboration_policy import render_ownership_contra
 from opc.layer2_organization.phase import (
     IN_REVIEW_PHASES,
     is_dispatchable,
-    is_report_execution_work_item_metadata,
     is_review_execution_work_item_metadata,
     is_runnable,
     is_terminal,
@@ -75,6 +75,8 @@ class CompanyRuntimeState:
     queued_work_item_ids: set[str] = field(default_factory=set)
     claimed_work_item_ids: set[str] = field(default_factory=set)
     home_team_instance_by_role: dict[str, str] = field(default_factory=dict)
+    controller_owner_token: str = ""
+    controller_lease_generation: int = 0
 
 
 # ── Canonical role_runtime_session_id generator ──────────────────────────
@@ -225,6 +227,61 @@ class CompanyRuntime:
 
     def _state(self) -> CompanyRuntimeState:
         return self._state_var.get() or self._default_state
+
+    def _controller_write_kwargs(self, run_id: str = "") -> dict[str, Any]:
+        state = self._state()
+        token = str(state.controller_owner_token or "").strip()
+        generation = int(state.controller_lease_generation or 0)
+        if not token or generation <= 0:
+            return {}
+        return {
+            "controller_run_id": str(run_id or "").strip(),
+            "controller_owner_token": token,
+            "controller_lease_generation": generation,
+        }
+
+    def _stamp_controller_authority(
+        self,
+        metadata: dict[str, Any] | None,
+        *,
+        run_id: str,
+    ) -> dict[str, Any]:
+        payload = dict(metadata or {})
+        credential = self._controller_write_kwargs(run_id)
+        token = str(credential.get("controller_owner_token", "") or "").strip()
+        if not token:
+            return payload
+        payload.update(
+            {
+                "company_run_id": str(run_id or "").strip(),
+                "company_run_controller_owner_token": token,
+                "company_run_controller_lease_generation": int(
+                    credential.get("controller_lease_generation", 0) or 0
+                ),
+            }
+        )
+        return payload
+
+    async def _save_role_session_for_controller(
+        self,
+        role_session: DelegationRoleSession,
+    ) -> None:
+        if not (
+            self.store
+            and bool(getattr(self.store, "is_ready", True))
+            and hasattr(self.store, "save_delegation_role_session")
+        ):
+            return
+        role_session.metadata = self._stamp_controller_authority(
+            role_session.metadata,
+            run_id=role_session.run_id,
+        )
+        credential = self._controller_write_kwargs(role_session.run_id)
+        credential.pop("controller_run_id", None)
+        await self.store.save_delegation_role_session(
+            role_session,
+            **credential,
+        )
 
     @property
     def member_sessions(self) -> dict[str, CompanyMemberSession]:
@@ -758,7 +815,7 @@ class CompanyRuntime:
                 )
                 self.role_sessions[role_session_id] = role_session
                 if self.store and hasattr(self.store, "save_delegation_role_session"):
-                    await self.store.save_delegation_role_session(role_session)
+                    await self._save_role_session_for_controller(role_session)
             else:
                 role_session.project_id = getattr(role_session, "project_id", "") or project_id
                 role_session.team_instance_id = getattr(role_session, "team_instance_id", "") or home_team_instance_id
@@ -826,6 +883,7 @@ class CompanyRuntime:
                 role_session = DelegationRoleSession(
                     role_session_id=role_session_id,
                     run_id=run_id,
+                    project_id=str(task.project_id or "default"),
                     role_id=role_id,
                     employee_id=employee_id,
                     manager_role_ids=manager_role_ids,
@@ -833,7 +891,7 @@ class CompanyRuntime:
                 )
                 self.role_sessions[role_session_id] = role_session
                 if self.store and hasattr(self.store, "save_delegation_role_session"):
-                    await self.store.save_delegation_role_session(role_session)
+                    await self._save_role_session_for_controller(role_session)
                 self._attach_role_session_to_task(task, role_session)
 
     def _attach_role_session_to_task(self, task: Task, role_session: DelegationRoleSession) -> None:
@@ -913,6 +971,98 @@ class CompanyRuntime:
         if not affected_task_ids and not affected_work_item_ids and not affected_role_session_ids:
             return
 
+        now = datetime.now()
+        state = self._state()
+        controller_owner_token = str(state.controller_owner_token or "").strip()
+        controller_lease_generation = int(state.controller_lease_generation or 0)
+        run_ids = {
+            str(
+                (getattr(task, "metadata", {}) or {}).get(
+                    "delegation_run_id", ""
+                )
+                or ""
+            ).strip()
+            for task in tasks
+            if str(
+                (getattr(task, "metadata", {}) or {}).get(
+                    "delegation_run_id", ""
+                )
+                or ""
+            ).strip()
+        }
+        project_ids = {
+            str(getattr(task, "project_id", "") or "default").strip()
+            or "default"
+            for task in tasks
+        }
+        if controller_owner_token or controller_lease_generation > 0:
+            if (
+                not controller_owner_token
+                or controller_lease_generation <= 0
+                or len(run_ids) != 1
+                or len(project_ids) != 1
+            ):
+                raise CompanyRunControllerLeaseLost(
+                    "company resume memory reset lacks one exact controller scope"
+                )
+            lease_is_current = getattr(
+                self.store,
+                "delegation_run_controller_lease_is_current",
+                None,
+            )
+            if not callable(lease_is_current) or not await lease_is_current(
+                next(iter(run_ids)),
+                project_id=next(iter(project_ids)),
+                owner_token=controller_owner_token,
+                generation=controller_lease_generation,
+            ):
+                raise CompanyRunControllerLeaseLost(
+                    "stale controller cannot reset company runtime memory"
+                )
+
+        update_role_session = (
+            getattr(self.store, "update_delegation_role_session", None)
+            if self.store
+            else None
+        )
+        affected_sessions: list[
+            tuple[CompanyMemberSession, DelegationRoleSession | None]
+        ] = []
+        for session in list(self.member_sessions.values()):
+            role_session_id = str(getattr(session, "role_session_id", "") or "").strip()
+            focused_work_item_id = str(getattr(session, "focused_work_item_id", "") or "").strip()
+            current_task_id = str(getattr(session, "current_task_id", "") or "").strip()
+            affected = (
+                role_session_id in affected_role_session_ids
+                or focused_work_item_id in affected_work_item_ids
+                or current_task_id in affected_task_ids
+            )
+            if not affected:
+                continue
+            role_session = self.role_sessions.get(role_session_id)
+            affected_sessions.append((session, role_session))
+            if callable(update_role_session) and role_session_id:
+                controller_kwargs = self._controller_write_kwargs(
+                    str(getattr(role_session, "run_id", "") or "")
+                )
+                controller_kwargs.pop("controller_run_id", None)
+                await update_role_session(
+                    role_session_id,
+                    focused_work_item_id="",
+                    current_work_item={},
+                    status="idle",
+                    metadata_updates={
+                        "last_resume_memory_reset_at": now.isoformat(),
+                        "last_resume_checkpoint_id": str(
+                            payload.get("checkpoint_id", "") or ""
+                        ),
+                    },
+                    **controller_kwargs,
+                )
+
+        # Do not touch controller-local scheduler state until every durable
+        # role projection has accepted this exact admission.  LeaseLost then
+        # leaves both the database and the old dispatcher's memory unchanged.
         self._claimed_task_ids.difference_update(affected_task_ids)
         self._queued_task_ids.difference_update(affected_task_ids)
         self._claimed_work_item_ids.difference_update(affected_work_item_ids)
@@ -927,22 +1077,12 @@ class CompanyRuntime:
             if not queue:
                 continue
             self.role_queues[queue_key] = deque(
-                entry for entry in queue if str(entry or "").strip() not in blocked_queue_entries
+                entry
+                for entry in queue
+                if str(entry or "").strip() not in blocked_queue_entries
             )
 
-        now = datetime.now()
-        update_role_session = getattr(self.store, "update_delegation_role_session", None) if self.store else None
-        for session in list(self.member_sessions.values()):
-            role_session_id = str(getattr(session, "role_session_id", "") or "").strip()
-            focused_work_item_id = str(getattr(session, "focused_work_item_id", "") or "").strip()
-            current_task_id = str(getattr(session, "current_task_id", "") or "").strip()
-            affected = (
-                role_session_id in affected_role_session_ids
-                or focused_work_item_id in affected_work_item_ids
-                or current_task_id in affected_task_ids
-            )
-            if not affected:
-                continue
+        for session, role_session in affected_sessions:
             session.status = "idle"
             session.resident_status = "idle"
             session.current_task_id = ""
@@ -950,26 +1090,11 @@ class CompanyRuntime:
             session.current_work_item = {}
             session.current_assignment = {}
             session.updated_at = now
-            role_session = self.role_sessions.get(role_session_id)
             if role_session is not None:
                 role_session.status = "idle"
                 role_session.focused_work_item_id = ""
                 role_session.current_work_item = {}
                 role_session.updated_at = now
-            if callable(update_role_session) and role_session_id:
-                try:
-                    await update_role_session(
-                        role_session_id,
-                        focused_work_item_id="",
-                        current_work_item={},
-                        status="idle",
-                        metadata_updates={
-                            "last_resume_memory_reset_at": now.isoformat(),
-                            "last_resume_checkpoint_id": str(payload.get("checkpoint_id", "") or ""),
-                        },
-                    )
-                except Exception:
-                    logger.opt(exception=True).debug("company runtime resume reset: role session persist failed")
 
     def _role_session_id(self, task: Task, *, role_id: str) -> str:
         explicit = str((task.metadata or {}).get("delegation_role_session_id", "") or "").strip()
@@ -1087,7 +1212,7 @@ class CompanyRuntime:
                 role_session.manager_digest = dict(session.manager_digest or {})
                 role_session.updated_at = datetime.now()
                 if self.store and bool(getattr(self.store, "is_ready", False)) and hasattr(self.store, "save_delegation_role_session"):
-                    await self.store.save_delegation_role_session(role_session)
+                    await self._save_role_session_for_controller(role_session)
             if representative_task is not None:
                 representative_task.metadata = dict(representative_task.metadata)
                 representative_task.metadata["current_turn_mode"] = str(session.current_turn_mode or "").strip()
@@ -1226,7 +1351,32 @@ class CompanyRuntime:
         self,
         tasks: list[Task],
         work_items: list[Any] | None = None,
+        *,
+        excluded_task_ids: set[str] | None = None,
+        excluded_work_item_ids: set[str] | None = None,
+        excluded_member_session_ids: set[str] | None = None,
+        excluded_role_session_ids: set[str] | None = None,
     ) -> list[tuple[CompanyMemberSession, Task]]:
+        excluded_tasks = {
+            str(item or "").strip()
+            for item in (excluded_task_ids or set())
+            if str(item or "").strip()
+        }
+        excluded_work_items = {
+            str(item or "").strip()
+            for item in (excluded_work_item_ids or set())
+            if str(item or "").strip()
+        }
+        excluded_member_sessions = {
+            str(item or "").strip()
+            for item in (excluded_member_session_ids or set())
+            if str(item or "").strip()
+        }
+        excluded_role_sessions = {
+            str(item or "").strip()
+            for item in (excluded_role_session_ids or set())
+            if str(item or "").strip()
+        }
         hydrate_links = getattr(self.store, "hydrate_task_work_item_links", None) if self.store is not None else None
         if callable(hydrate_links):
             try:
@@ -1253,6 +1403,30 @@ class CompanyRuntime:
             session_status = self._normalize_member_session_status(session)
             session_label = f"role={session.role_id} sid={session.member_session_id}"
             queue = self.role_queues.get(self._queue_key_for_session(session))
+            role_session = self._role_session_for_member_session(session)
+            # A coroutine remains the process-local owner until the dispatcher
+            # harvests it, even if complete_claim has already released its
+            # durable claim and projected the shared role session to idle.
+            # Keep that tail window out of claim admission so a self-rework
+            # wake cannot start the next attempt on the same mutable session.
+            if session.member_session_id in excluded_member_sessions:
+                _skip(
+                    "member session still owned by an unharvested coroutine",
+                    session=session_label,
+                )
+                continue
+            role_session_id = str(
+                getattr(role_session, "role_session_id", "")
+                or session.role_session_id
+                or ""
+            ).strip()
+            if role_session_id in excluded_role_sessions:
+                _skip(
+                    "role session still owned by an unharvested coroutine",
+                    session=session_label,
+                    role_session_id=role_session_id,
+                )
+                continue
             # Kanban-push soft-wake: a manager seat that is `blocked` on its
             # own AWAITING_PEER / AWAITING_* task must still be able to
             # process review tasks that arrive in its queue (otherwise the
@@ -1309,7 +1483,6 @@ class CompanyRuntime:
                         focused_phase=getattr(focused_phase, "value", None),
                     )
                     continue
-            role_session = self._role_session_for_member_session(session)
             role_session_status = ""
             if role_session is not None:
                 role_session.status = normalize_role_runtime_status(
@@ -1330,8 +1503,55 @@ class CompanyRuntime:
                 # Empty queue is expected in steady state; log only at TRACE.
                 logger.trace(f"claim skip: empty queue  session={session_label}")
                 continue
+
+            def _entry_is_excluded(entry: str) -> bool:
+                if entry.startswith("review-task::"):
+                    return entry.split("::", 1)[1] in excluded_tasks
+                if entry.startswith("review-work-item::") or entry.startswith("work-item::"):
+                    candidate_work_item_id = entry.split("::", 1)[1]
+                    if candidate_work_item_id in excluded_work_items:
+                        return True
+                    candidate_task = task_by_work_item_id.get(
+                        candidate_work_item_id
+                    )
+                    return bool(
+                        candidate_task is not None
+                        and candidate_task.id in excluded_tasks
+                    )
+                return entry in excluded_tasks
+
             while queue:
-                queued_item_id = self._pop_next_queue_entry(queue)
+                # Select without mutating first.  Excluded entries retain their
+                # exact position and review priority, while another unrelated
+                # entry in the same role queue may still run.
+                ordered_indices = [
+                    index
+                    for index, entry in enumerate(queue)
+                    if entry.startswith("review-task::")
+                    or entry.startswith("review-work-item::")
+                ]
+                ordered_indices.extend(
+                    index
+                    for index, entry in enumerate(queue)
+                    if not entry.startswith("review-task::")
+                    and not entry.startswith("review-work-item::")
+                )
+                selected_index = next(
+                    (
+                        index
+                        for index in ordered_indices
+                        if not _entry_is_excluded(queue[index])
+                    ),
+                    None,
+                )
+                if selected_index is None:
+                    _skip(
+                        "queue entries still owned by unharvested coroutines",
+                        session=session_label,
+                    )
+                    break
+                queued_item_id = queue[selected_index]
+                del queue[selected_index]
                 work_item = None
                 task = None
                 if queued_item_id.startswith("review-task::"):
@@ -1411,6 +1631,18 @@ class CompanyRuntime:
                             _skip("no task materialized for work_item this tick",
                                   session=session_label, work_item_id=work_item_id)
                             continue
+                    if task.id in excluded_tasks:
+                        # The Task link may have been hydrated only after queue
+                        # selection.  Restore the entry at its exact position;
+                        # the next selection pass can safely consider siblings.
+                        queue.insert(selected_index, queued_item_id)
+                        _skip(
+                            "linked task still owned by an unharvested coroutine",
+                            session=session_label,
+                            task_id=task.id,
+                            work_item_id=work_item_id,
+                        )
+                        continue
                 else:
                     task_id = queued_item_id
                     self._queued_task_ids.discard(task_id)
@@ -1787,7 +2019,7 @@ class CompanyRuntime:
             role_session.manager_digest = dict(session.manager_digest or {})
             role_session.updated_at = datetime.now()
             if self.store and bool(getattr(self.store, "is_ready", False)) and hasattr(self.store, "save_delegation_role_session"):
-                await self.store.save_delegation_role_session(role_session)
+                await self._save_role_session_for_controller(role_session)
         task.metadata = dict(task.metadata)
         task.metadata["member_session_state"] = self._serialize_session(session)
         task.metadata["current_turn_mode"] = str(session.current_turn_mode or "").strip()
@@ -1913,6 +2145,91 @@ class CompanyRuntime:
         await self._emit("member_idle", notification_payload)
         await self._emit("worker_notification", notification_payload)
 
+    async def release_claim_for_provider_quota(
+        self,
+        session: CompanyMemberSession,
+        task: Task,
+    ) -> None:
+        """Finish local/member cleanup after the atomic quota-park commit.
+
+        The controller Store transition has already committed READY, Task
+        PENDING, and both durable role-session mirrors as one transaction.
+        Clear the scheduler-local role/member ownership next; the remaining
+        seat/runtime-session projections are non-gating compatibility views.
+        """
+
+        work_item_id = linked_work_item_id_for_task(task)
+        role_session = self._role_session_for_member_session(session)
+        role_session_id = str(
+            getattr(role_session, "role_session_id", "")
+            or session.role_session_id
+            or ""
+        ).strip()
+        run_id = str(
+            (task.metadata or {}).get("delegation_run_id", "")
+            or getattr(role_session, "run_id", "")
+            or ""
+        ).strip()
+
+        # Legacy generation-zero runtimes have no takeover protocol and use
+        # the unfenced Store bridge.  The controller path already performed
+        # this update atomically with READY in the transition transaction.
+        if not self._controller_write_kwargs(run_id):
+            update_role_session = (
+                getattr(self.store, "update_delegation_role_session", None)
+                if self.store is not None
+                else None
+            )
+            if role_session_id and callable(update_role_session):
+                updated = await update_role_session(
+                    role_session_id,
+                    focused_work_item_id="",
+                    current_work_item={},
+                    status="idle",
+                )
+                if updated is None:
+                    raise RuntimeError(
+                        "provider quota park could not persist its role session"
+                    )
+
+        idle_at = datetime.now()
+        self._claimed_task_ids.discard(task.id)
+        if work_item_id:
+            self._claimed_work_item_ids.discard(work_item_id)
+        self._set_member_session_status(session, "idle")
+        session.current_task_id = ""
+        session.focused_work_item_id = ""
+        session.current_work_item = {}
+        session.current_assignment = {}
+        session.updated_at = idle_at
+        if role_session is not None:
+            role_session.status = "idle"
+            role_session.focused_work_item_id = ""
+            role_session.current_work_item = {}
+            role_session.updated_at = idle_at
+
+        # These projections do not gate claim admission.  Preserve a typed
+        # lease loss, but do not turn an already-committed quota park into a
+        # generic claimed-work-item crash when a compatibility sink fails.
+        try:
+            await self._persist_seat_state(session, task=task)
+            if self.save_runtime_session:
+                await self.save_runtime_session(
+                    runtime_session_id=session.member_session_id,
+                    project_id=str(task.project_id or "default"),
+                    session_id=str(task.session_id or "").strip() or None,
+                    task_id=task.id,
+                    status="idle",
+                    metadata=self._serialize_session(session),
+                    **self._controller_write_kwargs(run_id),
+                )
+        except CompanyRunControllerLeaseLost:
+            raise
+        except Exception:
+            logger.opt(exception=True).warning(
+                "provider quota park compatibility-session persistence failed"
+            )
+
     def session_for_task(self, task: Task) -> CompanyMemberSession:
         session_id = str(task.metadata.get("member_session_id", "")).strip()
         if session_id and session_id in self.member_sessions:
@@ -1970,6 +2287,14 @@ class CompanyRuntime:
         role_session_id = self._role_session_id(task, role_id=role_id)
         existing = self.role_sessions.get(role_session_id)
         if existing is not None:
+            existing_project_id = str(
+                getattr(existing, "project_id", "") or ""
+            ).strip()
+            task_project_id = str(task.project_id or "default").strip() or "default"
+            if not existing_project_id or (
+                existing_project_id == "default" and task_project_id != "default"
+            ):
+                existing.project_id = task_project_id
             existing.status = normalize_role_runtime_status(
                 existing.status,
                 existing.focused_work_item_id,
@@ -1985,6 +2310,7 @@ class CompanyRuntime:
         role_session = DelegationRoleSession(
             role_session_id=role_session_id,
             run_id=run_id,
+            project_id=str(task.project_id or "default"),
             role_id=role_id,
             employee_id=self._employee_id(task),
             manager_role_ids=self._manager_role_ids(task),
@@ -2042,6 +2368,8 @@ class CompanyRuntime:
                 seat_id=str(getattr(session, "seat_id", "") or "").strip(),
                 task_id=task.id,
                 work_item_revision=work_item_revision,
+                controller_owner_token=self._state().controller_owner_token,
+                controller_lease_generation=self._state().controller_lease_generation,
             )
             if persisted is None:
                 return False
@@ -2069,8 +2397,25 @@ class CompanyRuntime:
         task.metadata["delegation_role_session_id"] = role_session.role_session_id
         task.metadata["started_work_item_revision"] = work_item_revision
         task.metadata["claimed_work_item_revision"] = work_item_revision
+        if work_item is not None:
+            try:
+                claimed_attempt_seq = int(
+                    (getattr(work_item, "metadata", {}) or {}).get("attempt_seq", 0)
+                    or 0
+                )
+            except (TypeError, ValueError):
+                claimed_attempt_seq = 0
+            if claimed_attempt_seq > 0:
+                task.metadata["claimed_work_item_attempt_seq"] = claimed_attempt_seq
+        if self._state().controller_owner_token:
+            task.metadata["company_run_controller_owner_token"] = (
+                self._state().controller_owner_token
+            )
+            task.metadata["company_run_controller_lease_generation"] = int(
+                self._state().controller_lease_generation
+            )
         if self.store and bool(getattr(self.store, "is_ready", False)) and hasattr(self.store, "save_delegation_role_session"):
-            await self.store.save_delegation_role_session(role_session)
+            await self._save_role_session_for_controller(role_session)
         return True
 
     def ensure_role_instance_session(
@@ -2312,17 +2657,30 @@ class CompanyRuntime:
 
     async def _persist_session(self, session: CompanyMemberSession, task: Task | None = None) -> None:
         self._normalize_member_session_status(session)
+        role_session = self._role_session_for_member_session(session)
+        run_id = str(
+            (
+                (getattr(task, "metadata", {}) or {}).get("delegation_run_id", "")
+                if task is not None
+                else ""
+            )
+            or getattr(role_session, "run_id", "")
+            or ""
+        ).strip()
+        session.metadata = self._stamp_controller_authority(
+            session.metadata,
+            run_id=run_id,
+        )
         await self._persist_seat_state(session, task=task)
         if not self.save_runtime_session:
             if self.store and bool(getattr(self.store, "is_ready", False)) and hasattr(self.store, "save_delegation_role_session"):
-                role_session = self._role_session_for_member_session(session)
                 if role_session is not None:
-                    await self.store.save_delegation_role_session(role_session)
+                    await self._save_role_session_for_controller(role_session)
             return
-        role_session = self._role_session_for_member_session(session)
         project_id = str(getattr(task, "project_id", "") or getattr(role_session, "project_id", "") or "default")
         runtime_task_id = str(getattr(task, "id", "") or session.current_task_id or "").strip() or None
         runtime_session_id = str(getattr(task, "session_id", None) or "").strip() or None
+        runtime_credential = self._controller_write_kwargs(run_id)
         await self.save_runtime_session(
             runtime_session_id=session.member_session_id,
             project_id=project_id,
@@ -2330,10 +2688,11 @@ class CompanyRuntime:
             task_id=runtime_task_id,
             status=session.status,
             metadata=self._serialize_session(session),
+            **runtime_credential,
         )
         if self.store and bool(getattr(self.store, "is_ready", False)) and hasattr(self.store, "save_delegation_role_session"):
             if role_session is not None:
-                await self.store.save_delegation_role_session(role_session)
+                await self._save_role_session_for_controller(role_session)
 
     async def _emit(self, event_type: str, payload: dict[str, Any]) -> None:
         if self.emit_runtime_event is None:
@@ -2807,8 +3166,19 @@ class CompanyRuntime:
             "manager_digest": dict(seat_state.manager_digest),
             "current_turn_mode": str(session.current_turn_mode or "").strip(),
         }
+        run_id = str(
+            getattr(seat_state, "run_id", "")
+            or getattr(role_session, "run_id", "")
+            or ""
+        ).strip()
+        seat_state.metadata = self._stamp_controller_authority(
+            seat_state.metadata,
+            run_id=run_id,
+        )
         seat_state.updated_at = datetime.now()
-        await save_seat_state(seat_state)
+        credential = self._controller_write_kwargs(run_id)
+        credential.pop("controller_run_id", None)
+        await save_seat_state(seat_state, **credential)
 
     def _serialize_session(self, session: CompanyMemberSession) -> dict[str, Any]:
         self._normalize_member_session_status(session)

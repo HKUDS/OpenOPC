@@ -25,6 +25,9 @@ from typing import Any, Awaitable, Callable
 from loguru import logger
 
 from opc.core.models import Task, TaskStatus
+from opc.layer2_organization.company_runtime_identity import (
+    is_runtime_auxiliary_task,
+)
 
 
 class CommsReactivationSweeper:
@@ -114,6 +117,11 @@ class CommsReactivationSweeper:
             return
         reactivated_count = 0
         for task in done_tasks:
+            # RuntimeV2 uses durable one-shot Tasks for internal role prompts
+            # and meeting turns.  They are deliberately not schedulable work
+            # items and must never be reopened by role-wide unread mail.
+            if is_runtime_auxiliary_task(task):
+                continue
             try:
                 reactivated = await self.reactivate_fn(task)
             except Exception:
