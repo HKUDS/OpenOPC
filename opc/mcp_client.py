@@ -168,9 +168,21 @@ class MCPRemoteConnection(_MCPConnectionBase):
 
         # Strategy 1: StreamableHTTP
         try:
-            from mcp.client.streamable_http import streamablehttp_client
+            from mcp.client import streamable_http
+            streamable_client = getattr(streamable_http, "streamablehttp_client", None)
+            if streamable_client is not None:
+                transport_context = streamable_client(self.url, headers=self.headers)
+            else:
+                streamable_client = streamable_http.streamable_http_client
+                http_client_factory = getattr(streamable_http, "create_mcp_http_client", None)
+                if http_client_factory is None:
+                    raise RuntimeError("MCP StreamableHTTP client does not support headers")
+                http_client = await self._exit_stack.enter_async_context(
+                    http_client_factory(headers=self.headers)
+                )
+                transport_context = streamable_client(self.url, http_client=http_client)
             transport = await self._exit_stack.enter_async_context(
-                streamablehttp_client(self.url, headers=self.headers)
+                transport_context
             )
             read_stream, write_stream = transport[0], transport[1]
             self._session = await self._exit_stack.enter_async_context(
@@ -208,6 +220,8 @@ class MCPRemoteConnection(_MCPConnectionBase):
         except Exception as exc:
             last_error = exc
             logger.debug(f"MCP remote '{self.name}' SSE also failed: {exc}")
+            await self._exit_stack.aclose()
+            self._exit_stack = AsyncExitStack()
 
         raise ConnectionError(
             f"Failed to connect to remote MCP server '{self.name}' at {self.url}: {last_error}"
