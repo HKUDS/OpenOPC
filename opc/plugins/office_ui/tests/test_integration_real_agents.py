@@ -58,7 +58,7 @@ from opc.plugins.office_ui.event_adapter import (
 def _load_llm_config() -> LLMConfig:
     """Load LLM config from .opc/config or env."""
     try:
-        cfg = OPCConfig.load(get_opc_home() / "config")
+        cfg = OPCConfig.load(get_opc_home() / "config", trusted_source=True)
         if cfg.llm.api_key or cfg.llm.api_key_env:
             return cfg.llm
     except Exception:

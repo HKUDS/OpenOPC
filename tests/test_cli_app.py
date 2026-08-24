@@ -3596,7 +3596,9 @@ class CliBoardCommandTests(unittest.TestCase):
         self.runner = CliRunner()
 
     def test_board_command_dispatches_to_plugin_entry(self) -> None:
-        with patch("opc.plugins.cli_board.entry.launch_board") as mock_launch:
+        with patch("opc.cli.app._get_config", return_value=OPCConfig()), patch(
+            "opc.plugins.cli_board.entry.launch_board"
+        ) as mock_launch:
             result = self.runner.invoke(app, ["board", "--project", "demo", "--refresh-interval", "1.5"])
 
         self.assertEqual(result.exit_code, 0)
@@ -3613,7 +3615,9 @@ class CliBoardCommandTests(unittest.TestCase):
         )
 
     def test_board_command_accepts_inspector_options(self) -> None:
-        with patch("opc.plugins.cli_board.entry.launch_board") as mock_launch:
+        with patch("opc.cli.app._get_config", return_value=OPCConfig()), patch(
+            "opc.plugins.cli_board.entry.launch_board"
+        ) as mock_launch:
             result = self.runner.invoke(
                 app,
                 [

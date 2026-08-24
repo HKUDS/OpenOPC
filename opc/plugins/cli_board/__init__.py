@@ -27,8 +27,12 @@ def register_cli(parent_app) -> None:
         ),
     ) -> None:
         """Launch the OpenOPC terminal Kanban board."""
+        # The board initializes its engine lazily.  Resolve workspace trust at
+        # the CLI boundary first so an untrusted project never reaches the TUI.
+        from opc.cli.app import _get_config
         from opc.plugins.cli_board.entry import launch_board
 
+        _get_config()
         launch_board(
             project_id=project,
             refresh_interval=refresh_interval,

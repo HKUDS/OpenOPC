@@ -58,6 +58,17 @@ def get_project_config_dir(project_path: Path | None = None) -> Path:
     return get_opc_home()
 
 
+def get_project_config_workspace(config_dir: Path) -> Path | None:
+    """Return the workspace owning a project-local config directory, if any."""
+
+    from opc.core.workspace_trust import project_workspace_for_config
+
+    return project_workspace_for_config(
+        config_dir,
+        active_project_root=_find_project_root(),
+    )
+
+
 def _atomic_write_text(path: Path, content: str) -> None:
     """Write text via fsync and same-directory atomic replace."""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -1663,9 +1674,26 @@ class OPCConfig(BaseModel):
     capabilities: CapabilityConfig = Field(default_factory=CapabilityConfig)
 
     @classmethod
-    def load(cls, config_dir: Path | None = None) -> "OPCConfig":
+    def load(
+        cls,
+        config_dir: Path | None = None,
+        *,
+        trusted_source: bool = False,
+    ) -> "OPCConfig":
         if config_dir is None:
             config_dir = get_opc_home() / "config"
+        config_dir = Path(config_dir)
+
+        # Project-local configuration can select executables, endpoints, and
+        # credential sources.  Check its user-owned trust record before any
+        # parsing or migration: several legacy migrations intentionally write
+        # normalized config back to disk during load.
+        if not trusted_source and config_dir.exists():
+            workspace = get_project_config_workspace(config_dir)
+            if workspace is not None:
+                from opc.core.workspace_trust import WorkspaceTrustStore
+
+                WorkspaceTrustStore().require(workspace, config_dir)
 
         merged: dict[str, Any] = {}
         for name in ("system_config", "llm_config", "agent_config", "channel_config"):

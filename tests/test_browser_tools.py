@@ -194,6 +194,17 @@ class _FakePlaywrightFactory:
 
 
 class BrowserToolTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self) -> None:
+        # Browser behavior tests use an explicit trusted default instead of
+        # consulting the developer checkout's project-local configuration.
+        patcher = patch.object(
+            browser_tools.BrowserLaunchConfig,
+            "load",
+            return_value=browser_tools.BrowserLaunchConfig(),
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     async def test_browser_navigate_returns_snapshot_payload(self) -> None:
         factory = _FakePlaywrightFactory()
         runtime = browser_tools.BrowserRuntime()

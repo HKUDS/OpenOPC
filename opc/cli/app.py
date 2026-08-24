@@ -29,7 +29,7 @@ from rich.table import Table
 from rich.theme import Theme
 
 from opc import __version__
-from opc.core.config import OPCConfig, get_opc_home
+from opc.core.config import OPCConfig, get_opc_home, get_project_config_workspace
 from opc.core.interaction_protocol import owner_interaction_actor_identity
 from opc.core.windows_ssl import (
     format_windows_sslkeylog_warning,
@@ -95,8 +95,41 @@ def _current_command_label(argv: list[str] | None = None) -> str:
 def _get_config() -> OPCConfig:
     config_dir = get_opc_home() / "config"
     if config_dir.exists():
-        return OPCConfig.load(config_dir)
+        return _load_config_with_workspace_trust(config_dir)
     return OPCConfig()
+
+
+def _load_config_with_workspace_trust(config_dir: Path) -> OPCConfig:
+    """Load config, obtaining an explicit CLI trust decision when possible."""
+
+    from opc.core.workspace_trust import WorkspaceTrustRequired, WorkspaceTrustStore
+
+    try:
+        return OPCConfig.load(config_dir)
+    except WorkspaceTrustRequired as exc:
+        if not sys.stdin.isatty():
+            console.print(f"[error]{escape(str(exc))}[/error]")
+            console.print(
+                "[info]Non-interactive commands fail closed. Review the project config, then run "
+                f"[bold]opc trust add {escape(str(exc.workspace))}[/bold].[/info]"
+            )
+            raise typer.Exit(code=2) from exc
+
+        console.print(Panel(
+            "This project contains OpenOPC configuration that can start local "
+            "MCP or external-agent processes, connect to remote MCP/LLM endpoints, "
+            "and use configured credentials.\n\n"
+            f"Workspace: {exc.workspace}\n"
+            f"Config: {exc.config_dir}",
+            title="Workspace Trust Required",
+            border_style="yellow",
+        ))
+        if not typer.confirm("Trust this workspace and load its OpenOPC configuration?", default=False):
+            console.print("[warning]Workspace was not trusted; configuration was not loaded.[/warning]")
+            raise typer.Exit(code=2) from exc
+        WorkspaceTrustStore().trust(exc.workspace)
+        console.print(f"[success]Trusted workspace:[/success] {exc.workspace}")
+        return OPCConfig.load(config_dir)
 
 
 def _channel_runtime_pid_path() -> Path:
@@ -919,7 +952,9 @@ def init(
 
     opc_home = get_opc_home()
     template_dir = _project_config_template_dir()
+    config_dir_preexisting = (opc_home / "config").exists()
     already_initialized = _opc_config_initialized(opc_home)
+    created_project_config = not config_dir_preexisting
     config: OPCConfig
 
     if already_initialized:
@@ -930,7 +965,7 @@ def init(
             console.print("[warning]Init cancelled. Existing config was left unchanged.[/warning]")
             raise typer.Exit(1)
         console.print(f"[info]Existing config preserved: {opc_home / 'config'}[/info]")
-        config = OPCConfig.load(opc_home / "config")
+        config = _load_config_with_workspace_trust(opc_home / "config")
     elif template_dir is not None:
         # Use repo config template (same setup as maintainers, keys left for user to set)
         config = _load_config_template(template_dir)
@@ -1113,6 +1148,13 @@ def init(
                 EscalationRule(condition="Budget exceeds 80% of limit", action="Alert owner and await instructions"),
             ]
         config.save(opc_home / "config")
+
+    if created_project_config:
+        workspace = get_project_config_workspace(opc_home / "config")
+        if workspace is not None:
+            from opc.core.workspace_trust import WorkspaceTrustStore
+
+            WorkspaceTrustStore().trust(workspace)
 
     # Create default directories. ``agent_homes/`` and ``bin/`` get
     # provisioned lazily by the skill installer the first time an
@@ -1676,6 +1718,65 @@ async def _exec_message(
         else:
             console.print(f"[error]{escape(str(exc))}[/error]")
         raise typer.Exit(code=2) from exc
+
+
+trust_app = typer.Typer(help="Manage trust for project-local OpenOPC configuration")
+app.add_typer(trust_app, name="trust")
+
+
+@trust_app.command("add")
+def trust_add(
+    path: Path = typer.Argument(Path("."), help="Workspace, .opc, or .opc/config path"),
+) -> None:
+    """Trust a workspace after reviewing its project-local OpenOPC config."""
+
+    from opc.core.workspace_trust import WorkspaceTrustStore, workspace_from_user_path
+
+    try:
+        workspace = workspace_from_user_path(path)
+    except ValueError as exc:
+        console.print(f"[error]{escape(str(exc))}[/error]")
+        raise typer.Exit(code=2) from exc
+    WorkspaceTrustStore().trust(workspace)
+    console.print(f"[success]Trusted workspace:[/success] {workspace}")
+
+
+@trust_app.command("remove")
+def trust_remove(
+    path: Path = typer.Argument(Path("."), help="Trusted workspace path"),
+) -> None:
+    """Remove a workspace trust decision."""
+
+    from opc.core.workspace_trust import (
+        WorkspaceTrustStore,
+        canonical_workspace,
+        workspace_from_user_path,
+    )
+
+    try:
+        workspace = workspace_from_user_path(path)
+    except ValueError:
+        workspace = canonical_workspace(path)
+    if WorkspaceTrustStore().untrust(workspace):
+        console.print(f"[success]Removed workspace trust:[/success] {workspace}")
+    else:
+        console.print(f"[warning]Workspace was not trusted:[/warning] {workspace}")
+
+
+@trust_app.command("list")
+def trust_list() -> None:
+    """List trusted workspaces and the user-owned trust store location."""
+
+    from opc.core.workspace_trust import WorkspaceTrustStore
+
+    store = WorkspaceTrustStore()
+    trusted = store.list_trusted()
+    console.print(f"[info]Trust store:[/info] {store.path}")
+    if not trusted:
+        console.print("[info]No trusted workspaces.[/info]")
+        return
+    for workspace in trusted:
+        console.print(f"  - {workspace}")
 
 
 project_app = typer.Typer(help="Manage OPC projects")

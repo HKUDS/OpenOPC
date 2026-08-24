@@ -140,7 +140,7 @@ def test_load_uses_corporate_company_payload_even_when_legacy_index_points_custo
         encoding="utf-8",
     )
 
-    cfg = cfg_module.OPCConfig.load(config_dir)
+    cfg = cfg_module.OPCConfig.load(config_dir, trusted_source=True)
 
     assert cfg.org.organization_id == "corporate"
     assert cfg.org.company_profile == "corporate"
@@ -179,7 +179,7 @@ def test_company_orgs_does_not_use_company_style_fallback_files(tmp_path, monkey
         encoding="utf-8",
     )
 
-    cfg = cfg_module.OPCConfig.load(config_dir)
+    cfg = cfg_module.OPCConfig.load(config_dir, trusted_source=True)
 
     assert cfg.org.organization_id == "corporate"
     assert cfg.org.company_profile == "corporate"
@@ -392,7 +392,7 @@ def test_load_self_heals_legacy_company_org_employees_to_registry(tmp_path, monk
         encoding="utf-8",
     )
 
-    loaded = cfg_module.OPCConfig.load(config_dir)
+    loaded = cfg_module.OPCConfig.load(config_dir, trusted_source=True)
 
     healed = yaml.safe_load(org_path.read_text(encoding="utf-8"))
     assert healed["employees"] == []
