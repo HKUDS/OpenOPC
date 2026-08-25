@@ -341,6 +341,10 @@ class NativeAgent:
         """Execute a task end-to-end."""
         self.role.status = AgentStatus.RUNNING
         self.role.current_task_id = task.id
+        # Runtime-owned context used by ToolRegistry's dispatch-time scope check.
+        # It is an attribute rather than model-authored metadata so a tool call
+        # cannot claim a different role.
+        task._tool_scope_role_id = self.role.role_id
 
         await self.event_bus.publish(OPCEvent(
             event_type="agent_status_changed",
@@ -633,7 +637,7 @@ class NativeAgent:
                     tool for tool in inherited
                     if tool not in _MULTI_TEAM_COORDINATION_NATIVE_TOOL_BLOCKLIST
                 ]
-            return inherited
+            return self._apply_role_tool_scope(inherited)
 
         configured_general = self._configured_general_tool_names(list(self.role.tools or []))
         company_mode = company_collaboration_enabled_for_task(task)
@@ -650,11 +654,22 @@ class NativeAgent:
         elif configured_general:
             allowed = set(configured_general)
         else:
-            return None
+            if not self.tool_registry.has_role_scoped_tools():
+                return None
+            allowed = self._registered_general_tool_names()
 
         if turn_mode in MULTI_TEAM_COORDINATION_TURN_MODES:
             allowed.difference_update(_MULTI_TEAM_COORDINATION_NATIVE_TOOL_BLOCKLIST)
-        return sorted(allowed)
+        return sorted(self._apply_role_tool_scope(allowed))
+
+    def _apply_role_tool_scope(self, names: list[str] | set[str]) -> list[str]:
+        role_id = str(self.role.role_id or "").strip()
+        allowed: list[str] = []
+        for name in names:
+            tool = self.tool_registry.get(name)
+            if tool is None or tool.allows_role(role_id):
+                allowed.append(name)
+        return allowed
 
     async def _build_runtime_prefetch_payload(
         self,

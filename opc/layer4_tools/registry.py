@@ -77,6 +77,7 @@ class ToolDefinition:
         self_bounded_output: bool = False,
         preview_chars: int | None = None,
         company_effect_kind: str = COMPANY_EFFECT_UNKNOWN,
+        allowed_roles: list[str] | tuple[str, ...] | set[str] | None = None,
     ) -> None:
         self.name = name
         self.description = description
@@ -97,6 +98,20 @@ class ToolDefinition:
                 f"Unknown company tool-effect capability: {company_effect_kind}"
             )
         self.company_effect_kind = normalized_effect_kind
+        self.allowed_roles = frozenset(
+            str(role).strip() for role in (allowed_roles or []) if str(role).strip()
+        )
+
+    def allows_role(self, role_id: str | None) -> bool:
+        """Return whether this tool is available to a trusted runtime role."""
+
+        if not self.allowed_roles:
+            return True
+        normalized = str(role_id or "").strip()
+        return bool(
+            normalized
+            and (normalized in self.allowed_roles or "*" in self.allowed_roles)
+        )
 
     def to_schema(self) -> dict[str, Any]:
         return {
@@ -125,17 +140,31 @@ class ToolRegistry:
     def get(self, name: str) -> ToolDefinition | None:
         return self._tools.get(name)
 
-    def list_tools(self, category: str | None = None, allowed: list[str] | None = None) -> list[ToolDefinition]:
+    def list_tools(
+        self,
+        category: str | None = None,
+        allowed: list[str] | None = None,
+        role_id: str | None = None,
+    ) -> list[ToolDefinition]:
         tools = list(self._tools.values())
         if category:
             tools = [t for t in tools if t.category == category]
         if allowed:
             tools = [t for t in tools if t.name in allowed]
+        if role_id is not None:
+            tools = [t for t in tools if t.allows_role(role_id)]
         return tools
 
-    def get_schemas(self, allowed: list[str] | None = None) -> list[dict[str, Any]]:
-        tools = self.list_tools(allowed=allowed)
+    def get_schemas(
+        self,
+        allowed: list[str] | None = None,
+        role_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        tools = self.list_tools(allowed=allowed, role_id=role_id)
         return [t.to_schema() for t in tools]
+
+    def has_role_scoped_tools(self) -> bool:
+        return any(tool.allowed_roles for tool in self._tools.values())
 
     def set_approval_callback(self, callback: Any) -> None:
         self._approval_callback = callback
@@ -151,6 +180,9 @@ class ToolRegistry:
         tool = self._tools.get(name)
         if not tool:
             return {"error": f"Unknown tool: {name}", "success": False}
+        scope_error = self._role_scope_error(tool, task)
+        if scope_error:
+            return scope_error
 
         if self._approval_callback and not skip_approval:
             allowed, decision = await self._approval_callback(tool, arguments, task, on_progress)
@@ -180,6 +212,9 @@ class ToolRegistry:
         tool = self._tools.get(name)
         if not tool:
             return {"error": f"Unknown tool: {name}", "success": False}
+        scope_error = self._role_scope_error(tool, task)
+        if scope_error:
+            return scope_error
 
         try:
             call_args = self._prepare_call_args(tool, arguments, task=task, on_progress=on_progress)
@@ -203,6 +238,23 @@ class ToolRegistry:
             }
 
         return self._truncate_output(output, tool=tool, task=task)
+
+    @staticmethod
+    def _role_scope_error(tool: ToolDefinition, task: Any) -> dict[str, Any] | None:
+        if not tool.allowed_roles:
+            return None
+        role_id = str(
+            getattr(task, "_tool_scope_role_id", "") if task is not None else ""
+        ).strip()
+        if tool.allows_role(role_id):
+            return None
+        return {
+            "error": (
+                f"Tool `{tool.name}` is not available to runtime role "
+                f"`{role_id or 'unknown'}`"
+            ),
+            "success": False,
+        }
 
     def _prepare_call_args(
         self,

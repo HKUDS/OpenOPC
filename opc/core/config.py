@@ -909,6 +909,9 @@ class MCPServerConfig(BaseModel):
     enabled: bool = True
     env: dict[str, str] = Field(default_factory=dict)
     tools_filter: list[str] = Field(default_factory=list)
+    organizations: list[str] = Field(default_factory=list)
+    projects: list[str] = Field(default_factory=list)
+    roles: list[str] = Field(default_factory=list)
     startup_timeout: float = 30.0
 
 
