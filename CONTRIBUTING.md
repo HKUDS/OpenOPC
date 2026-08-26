@@ -16,7 +16,7 @@ git clone https://github.com/<your-username>/OpenOPC
 cd OpenOPC
 uv venv --python 3.12
 source .venv/bin/activate
-uv pip install -e .
+uv pip install -e ".[dev]"
 uv run opc init
 ```
 

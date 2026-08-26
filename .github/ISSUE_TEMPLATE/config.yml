@@ -1,5 +1,8 @@
 blank_issues_enabled: true
 contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/HKUDS/OpenOPC/security/advisories/new
+    about: Privately report security vulnerabilities; do not open a public issue.
   - name: Community (Feishu / WeChat)
     url: https://github.com/HKUDS/.github/blob/main/profile/README.md
     about: Ask questions and chat with the OpenOPC community.
