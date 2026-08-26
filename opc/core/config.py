@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 import yaml
-from pydantic import AliasChoices, BaseModel, Field, field_validator
+from pydantic import AliasChoices, BaseModel, Field, PrivateAttr, field_validator
 
 from opc.core.company_tools import COMPANY_APPROVAL_EXEMPT_TOOL_NAMES
 
@@ -1747,6 +1747,32 @@ class OPCConfig(BaseModel):
     channels: ChannelsConfig = Field(default_factory=ChannelsConfig)
     autonomy: AutonomyConfig = Field(default_factory=AutonomyConfig)
     capabilities: CapabilityConfig = Field(default_factory=CapabilityConfig)
+    _trusted_workspace: Path | None = PrivateAttr(default=None)
+    _trusted_config_dir: Path | None = PrivateAttr(default=None)
+
+    def bind_workspace_trust(self, workspace: Path, config_dir: Path) -> None:
+        """Attach the project trust provenance used for pre-sink rechecks."""
+
+        self._trusted_workspace = Path(workspace).resolve(strict=False)
+        self._trusted_config_dir = Path(config_dir).resolve(strict=False)
+
+    def require_workspace_trust(self, *, include_effective: bool = False) -> None:
+        """Revalidate bound project authority immediately before runtime use.
+
+        Normal runtime checks bind the source files while allowing explicit
+        host-side CLI overrides such as ``--model`` and ``--debug``.  Loading
+        and trust-grant flows additionally validate the normalized declaration.
+        """
+
+        if self._trusted_workspace is None or self._trusted_config_dir is None:
+            return
+        from opc.core.workspace_trust import WorkspaceTrustStore
+
+        WorkspaceTrustStore().require(
+            self._trusted_workspace,
+            self._trusted_config_dir,
+            self if include_effective else None,
+        )
 
     @classmethod
     def load(
@@ -1758,6 +1784,8 @@ class OPCConfig(BaseModel):
         if config_dir is None:
             config_dir = get_opc_home() / "config"
         config_dir = Path(config_dir)
+        trusted_workspace: Path | None = None
+        trust_store: Any | None = None
 
         # Project-local configuration can select executables, endpoints, and
         # credential sources.  Check its user-owned trust record before any
@@ -1768,7 +1796,9 @@ class OPCConfig(BaseModel):
             if workspace is not None:
                 from opc.core.workspace_trust import WorkspaceTrustStore
 
-                WorkspaceTrustStore().require(workspace, config_dir)
+                trust_store = WorkspaceTrustStore()
+                trust_store.require(workspace, config_dir)
+                trusted_workspace = workspace
 
         merged: dict[str, Any] = {}
         for name in ("system_config", "llm_config", "agent_config", "channel_config"):
@@ -1834,6 +1864,12 @@ class OPCConfig(BaseModel):
             )
         except Exception:
             pass
+        if trust_store is not None and trusted_workspace is not None:
+            # Recheck both the source bytes and normalized effective authority
+            # after parsing.  This catches migrations and concurrent changes
+            # before the config can reach an engine sink.
+            trust_store.require(trusted_workspace, config_dir, config)
+            config.bind_workspace_trust(trusted_workspace, config_dir)
         return config
 
     def save(self, config_dir: Path | None = None) -> None:
