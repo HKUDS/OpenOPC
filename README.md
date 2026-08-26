@@ -546,7 +546,7 @@ opc session create "Research sprint" -p demo --mode org --org hku_research_lab
 
 Run `opc init` once from the repo root. It creates `.opc/`, copies the template config from `config/`, creates memory/skills/log folders, and optionally creates the first project.
 
-Project-local `.opc/config` files can select local executables, remote endpoints, and credential sources. OpenOPC therefore asks for workspace trust before loading an existing project's config; non-interactive commands fail closed. Review the files, then use `opc trust add /path/to/workspace`. Use `opc trust list` and `opc trust remove /path/to/workspace` to inspect or revoke the user-owned decision. A workspace initialized by `opc init` is trusted automatically at creation time.
+Project-local `.opc/config` files can select local executables, remote endpoints, and credential sources. OpenOPC therefore asks for workspace trust before loading an existing project's config; non-interactive commands fail closed. Review the files, then use `opc trust add /path/to/workspace`. Trust is bound to fingerprints of the security-relevant source files and their normalized effective authority, so changes to system, LLM, agent, or channel configuration require renewal. Legacy path-only records also require one renewal. Use `opc trust list` and `opc trust remove /path/to/workspace` to inspect or revoke the user-owned decision. A workspace initialized by `opc init` is trusted automatically at creation time.
 
 <details>
 <summary><b>Expand configuration — config files, LLM keys, external agents, channels, browser/MCP, troubleshooting</b></summary>

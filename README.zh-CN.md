@@ -540,6 +540,8 @@ opc session create "Research sprint" -p demo --mode org --org hku_research_lab
 
 在仓库根目录运行一次 `opc init`。它会创建 `.opc/`、从 `config/` 复制模板配置、创建记忆/技能/日志目录，并可选地创建第一个项目。
 
+项目本地的 `.opc/config` 可以选择本地可执行文件、远程端点和凭据来源，因此 OpenOPC 在加载已有项目配置前会请求工作区信任；非交互命令会安全失败。检查配置后可运行 `opc trust add /path/to/workspace`。信任同时绑定安全相关配置源及其规范化生效权限的指纹，因此 system、LLM、Agent 或 channel 配置变化后必须重新授权；旧版仅绑定路径的信任记录也需要更新一次。可用 `opc trust list` 查看、用 `opc trust remove /path/to/workspace` 撤销。由 `opc init` 新建的工作区会在创建时自动信任。
+
 <details>
 <summary><b>展开配置 — 配置文件、LLM 密钥、外部 Agent、频道、浏览器/MCP、故障排查</b></summary>
 

@@ -120,16 +120,23 @@ def _load_config_with_workspace_trust(config_dir: Path) -> OPCConfig:
             "MCP or external-agent processes, connect to remote MCP/LLM endpoints, "
             "and use configured credentials.\n\n"
             f"Workspace: {exc.workspace}\n"
-            f"Config: {exc.config_dir}",
+            f"Config: {exc.config_dir}\n"
+            f"Reason: {exc.reason}\n"
+            f"Authority source: {exc.current_fingerprint}",
             title="Workspace Trust Required",
             border_style="yellow",
         ))
         if not typer.confirm("Trust this workspace and load its OpenOPC configuration?", default=False):
             console.print("[warning]Workspace was not trusted; configuration was not loaded.[/warning]")
             raise typer.Exit(code=2) from exc
-        WorkspaceTrustStore().trust(exc.workspace)
+        # Parsing is allowed only after the explicit decision.  Trust is bound
+        # to both the post-migration source bytes and normalized authority.
+        config = OPCConfig.load(config_dir, trusted_source=True)
+        WorkspaceTrustStore().trust(exc.workspace, config_dir, config)
+        config.bind_workspace_trust(exc.workspace, config_dir)
+        config.require_workspace_trust(include_effective=True)
         console.print(f"[success]Trusted workspace:[/success] {exc.workspace}")
-        return OPCConfig.load(config_dir)
+        return config
 
 
 def _channel_runtime_pid_path() -> Path:
@@ -1154,7 +1161,10 @@ def init(
         if workspace is not None:
             from opc.core.workspace_trust import WorkspaceTrustStore
 
-            WorkspaceTrustStore().trust(workspace)
+            # Bind the normalized on-disk form, not the pre-serialization
+            # template object, so the next load reproduces the same authority.
+            config = OPCConfig.load(opc_home / "config", trusted_source=True)
+            WorkspaceTrustStore().trust(workspace, opc_home / "config", config)
 
     # Create default directories. ``agent_homes/`` and ``bin/`` get
     # provisioned lazily by the skill installer the first time an
@@ -1737,7 +1747,13 @@ def trust_add(
     except ValueError as exc:
         console.print(f"[error]{escape(str(exc))}[/error]")
         raise typer.Exit(code=2) from exc
-    WorkspaceTrustStore().trust(workspace)
+    config_dir = workspace / ".opc" / "config"
+    try:
+        config = OPCConfig.load(config_dir, trusted_source=True)
+    except Exception as exc:
+        console.print(f"[error]Unable to load reviewed configuration: {escape(str(exc))}[/error]")
+        raise typer.Exit(code=2) from exc
+    WorkspaceTrustStore().trust(workspace, config_dir, config)
     console.print(f"[success]Trusted workspace:[/success] {workspace}")
 
 
