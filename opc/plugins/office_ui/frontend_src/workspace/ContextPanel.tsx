@@ -1059,6 +1059,7 @@ export function ContextPanel({
                           />
                         </div>
                         <MessageComposer
+                          key={sessionConversationSession?.channelId ?? session.channelId}
                           disabled={false}
                           channelId={sessionConversationSession?.channelId ?? session.channelId}
                           execMode={composerExecModeForSession(session, execMode)}
@@ -1129,6 +1130,7 @@ export function ContextPanel({
                     scrollScope={secretaryChannelId}
                   />
                   <MessageComposer
+                    key={secretaryChannelId}
                     disabled={false}
                     channelId={secretaryChannelId}
                     placeholder="Talk to Secretary about policies, rules, preferences..."
@@ -1211,6 +1213,7 @@ export function ContextPanel({
                     showRuntimeProgress={activeDetailMode === 'full'}
                   />
                   <MessageComposer
+                    key={activeConversationSession?.channelId ?? channelId}
                     disabled={!canSend}
                     channelId={activeConversationSession?.channelId ?? channelId}
                     execMode={composerExecModeForSession(activeSession, execMode)}
