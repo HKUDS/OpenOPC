@@ -763,6 +763,11 @@ class OPCEngine:
         if self._initialized:
             return
 
+        # Project-local configuration is revalidated at the runtime boundary,
+        # after CLI loading but before LLM credentials or MCP launchers can be
+        # constructed. Programmatically-created configs have no trust binding.
+        self.config.require_workspace_trust()
+
         self.opc_home.mkdir(parents=True, exist_ok=True)
         setup_logging(self.opc_home / "logs", self.config.system.log_level)
         logger.info("Initializing OPC Engine...")

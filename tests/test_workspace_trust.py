@@ -1,9 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import io
 import json
 import os
-import sys
 from pathlib import Path
 from unittest.mock import patch
 
@@ -19,6 +19,7 @@ from opc.core.workspace_trust import (
     WorkspaceTrustStore,
     canonical_workspace,
 )
+from opc.engine import OPCEngine
 
 
 def _write_project_config(workspace: Path) -> Path:
@@ -49,6 +50,12 @@ def _write_project_config(workspace: Path) -> Path:
         encoding="utf-8",
     )
     return config_dir
+
+
+def _trust_project(workspace: Path, config_dir: Path) -> OPCConfig:
+    config = OPCConfig.load(config_dir, trusted_source=True)
+    WorkspaceTrustStore().trust(workspace, config_dir, config)
+    return config
 
 
 def test_untrusted_project_config_stops_before_parse_or_migration(
@@ -83,14 +90,144 @@ def test_trusted_project_loads_without_changing_effective_config(
     config_dir = _write_project_config(workspace)
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "user-config"))
 
-    reference = OPCConfig.load(config_dir, trusted_source=True)
-    WorkspaceTrustStore().trust(workspace)
+    reference = _trust_project(workspace, config_dir)
     loaded = OPCConfig.load(config_dir)
 
     assert loaded.model_dump() == reference.model_dump()
     assert loaded.system.mcp_servers[0].command == ["python", "project_mcp.py"]
     assert loaded.llm.api_base == "https://llm.example.test/v1"
     assert loaded.llm.api_key_env == "PROJECT_SELECTED_KEY"
+
+
+@pytest.mark.parametrize(
+    ("filename", "replacement"),
+    [
+        (
+            "system_config.yaml",
+            "system: {}\nmcp_servers:\n"
+            "  - name: changed\n"
+            "    type: local\n"
+            "    command: [python, changed.py]\n",
+        ),
+        (
+            "llm_config.yaml",
+            "llm:\n"
+            "  default_model: openai/test-model\n"
+            "  api_base: https://changed.example.test/v1\n"
+            "  api_key_env: CHANGED_KEY\n",
+        ),
+    ],
+)
+def test_authority_source_change_fails_before_yaml_parse(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    filename: str,
+    replacement: str,
+) -> None:
+    workspace = tmp_path / "project"
+    config_dir = _write_project_config(workspace)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "user-config"))
+    _trust_project(workspace, config_dir)
+    (config_dir / filename).write_text(replacement, encoding="utf-8")
+
+    with patch("opc.core.config.yaml.safe_load") as safe_load:
+        with pytest.raises(WorkspaceTrustRequired) as raised:
+            OPCConfig.load(config_dir)
+
+    safe_load.assert_not_called()
+    assert raised.value.reason == "source_changed"
+
+
+def test_effective_authority_change_fails_before_runtime_use(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "project"
+    config_dir = _write_project_config(workspace)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "user-config"))
+    _trust_project(workspace, config_dir)
+    loaded = OPCConfig.load(config_dir)
+    loaded.llm.api_base = "https://in-memory-change.example.test/v1"
+
+    with pytest.raises(WorkspaceTrustRequired) as raised:
+        WorkspaceTrustStore().require(workspace, config_dir, loaded)
+
+    assert raised.value.reason == "authority_changed"
+
+
+def test_engine_rechecks_bound_authority_before_initialization_side_effects(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "project"
+    config_dir = _write_project_config(workspace)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "user-config"))
+    _trust_project(workspace, config_dir)
+    loaded = OPCConfig.load(config_dir)
+    (config_dir / "llm_config.yaml").write_text(
+        "llm:\n"
+        "  default_model: openai/test-model\n"
+        "  api_base: https://changed-before-engine.example.test/v1\n"
+        "  api_key_env: CHANGED_KEY\n",
+        encoding="utf-8",
+    )
+    runtime_home = tmp_path / "runtime-home"
+    engine = OPCEngine(config=loaded, opc_home=runtime_home)
+
+    with pytest.raises(WorkspaceTrustRequired) as raised:
+        asyncio.run(engine.initialize())
+
+    assert raised.value.reason == "source_changed"
+    assert not runtime_home.exists()
+
+
+def test_linked_authority_target_change_invalidates_effective_config(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "project"
+    config_dir = _write_project_config(workspace)
+    target = tmp_path / "linked-llm.yaml"
+    target.write_text((config_dir / "llm_config.yaml").read_text(encoding="utf-8"), encoding="utf-8")
+    (config_dir / "llm_config.yaml").unlink()
+    try:
+        (config_dir / "llm_config.yaml").symlink_to(target)
+    except OSError:
+        pytest.skip("file symlinks are unavailable")
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "user-config"))
+    _trust_project(workspace, config_dir)
+    target.write_text(
+        "llm:\n"
+        "  default_model: openai/test-model\n"
+        "  api_base: https://changed.example.test/v1\n"
+        "  api_key_env: CHANGED_KEY\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(WorkspaceTrustRequired) as raised:
+        OPCConfig.load(config_dir)
+
+    assert raised.value.reason == "authority_changed"
+
+
+def test_legacy_path_only_record_requires_fingerprint_renewal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "project"
+    config_dir = _write_project_config(workspace)
+    trust_path = tmp_path / "user-config" / "openopc" / "trusted_workspaces.json"
+    trust_path.parent.mkdir(parents=True)
+    trust_path.write_text(
+        json.dumps({"version": 1, "trusted_workspaces": [str(canonical_workspace(workspace))]}),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "user-config"))
+
+    with pytest.raises(WorkspaceTrustRequired) as raised:
+        OPCConfig.load(config_dir)
+
+    assert raised.value.reason == "legacy_record"
 
 
 def test_non_project_user_dot_opc_is_not_misclassified(
@@ -112,7 +249,8 @@ def test_non_project_user_dot_opc_is_not_misclassified(
 
 def test_trust_store_canonicalizes_paths_and_uses_private_permissions(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
-    workspace.mkdir()
+    config_dir = _write_project_config(workspace)
+    config = OPCConfig.load(config_dir, trusted_source=True)
     alias = tmp_path / "workspace-alias"
     try:
         alias.symlink_to(workspace, target_is_directory=True)
@@ -120,12 +258,17 @@ def test_trust_store_canonicalizes_paths_and_uses_private_permissions(tmp_path: 
         pytest.skip("directory symlinks are unavailable")
 
     store = WorkspaceTrustStore(tmp_path / "user-config" / "trusted.json")
-    store.trust(alias)
+    store.trust(alias, config_dir, config)
 
     assert store.is_trusted(workspace)
     assert store.list_trusted() == [canonical_workspace(workspace)]
     payload = json.loads(store.path.read_text(encoding="utf-8"))
-    assert payload["trusted_workspaces"] == [str(canonical_workspace(workspace))]
+    assert payload["version"] == 2
+    assert len(payload["trusted_workspaces"]) == 1
+    entry = payload["trusted_workspaces"][0]
+    assert entry["workspace"] == str(canonical_workspace(workspace))
+    assert entry["source_fingerprint"].startswith("sha256:")
+    assert entry["authority_fingerprint"].startswith("sha256:")
     if os.name != "nt":
         assert store.path.stat().st_mode & 0o777 == 0o600
 
@@ -138,11 +281,18 @@ def test_trust_store_ignores_relative_and_malformed_entries(tmp_path: Path) -> N
     store.path.write_text(
         json.dumps(
             {
-                "version": 1,
+                "version": 2,
                 "trusted_workspaces": [
-                    str(trusted),
-                    "relative/workspace",
-                    "",
+                    {
+                        "workspace": str(trusted),
+                        "source_fingerprint": "sha256:source",
+                        "authority_fingerprint": "sha256:authority",
+                    },
+                    {
+                        "workspace": "relative/workspace",
+                        "source_fingerprint": "sha256:source",
+                        "authority_fingerprint": "sha256:authority",
+                    },
                     None,
                 ],
             }
@@ -216,6 +366,31 @@ def test_trust_cli_add_list_and_remove(
     assert not WorkspaceTrustStore().is_trusted(workspace)
 
 
+def test_trust_cli_add_renews_changed_authority_fingerprint(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "project"
+    config_dir = _write_project_config(workspace)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "user-config"))
+    _trust_project(workspace, config_dir)
+    (config_dir / "llm_config.yaml").write_text(
+        "llm:\n"
+        "  default_model: openai/test-model\n"
+        "  api_base: https://renewed.example.test/v1\n"
+        "  api_key_env: RENEWED_KEY\n",
+        encoding="utf-8",
+    )
+    runner = CliRunner()
+
+    renewed = runner.invoke(app, ["trust", "add", str(workspace)])
+    loaded = OPCConfig.load(config_dir)
+
+    assert renewed.exit_code == 0, renewed.output
+    assert loaded.llm.api_base == "https://renewed.example.test/v1"
+    assert loaded.llm.api_key_env == "RENEWED_KEY"
+
+
 def test_init_auto_trusts_only_newly_created_project_config(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -238,6 +413,7 @@ def test_init_auto_trusts_only_newly_created_project_config(
     assert result.exit_code == 0, result.output
     assert (workspace / ".opc" / "config" / "system_config.yaml").is_file()
     assert WorkspaceTrustStore().is_trusted(workspace)
+    assert OPCConfig.load(workspace / ".opc" / "config").system.log_level == "INFO"
 
 
 def test_init_does_not_auto_trust_preexisting_empty_config_directory(

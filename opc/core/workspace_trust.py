@@ -8,15 +8,31 @@ committing files below ``.opc``.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import stat
 import sys
 import tempfile
 from pathlib import Path
 from typing import Any
 
 
-_TRUST_STORE_VERSION = 1
+_TRUST_STORE_VERSION = 2
+_AUTHORITY_SOURCE_FILES = (
+    "system_config.yaml",
+    "llm_config.yaml",
+    "agent_config.yaml",
+    "channel_config.yaml",
+)
+_AUTHORITY_CONFIG_FIELDS = (
+    "system",
+    "llm",
+    "agents",
+    "channels",
+    "autonomy",
+    "capabilities",
+)
 
 
 def canonical_workspace(path: str | Path) -> Path:
@@ -39,6 +55,74 @@ def user_config_root() -> Path:
 
 def default_trust_store_path() -> Path:
     return user_config_root() / "trusted_workspaces.json"
+
+
+def authority_source_fingerprint(config_dir: str | Path) -> str:
+    """Hash project-controlled files that can grant runtime authority.
+
+    Symlinks are represented by their link target without following it.  This
+    keeps the pre-parse gate bounded to repository metadata; the normalized
+    effective-config check below catches changes in a linked YAML target before
+    any engine sink is reached.
+    """
+
+    root = Path(config_dir).expanduser()
+    digest = hashlib.sha256()
+    digest.update(b"openopc-workspace-authority-source-v1\0")
+    for relative_name in _AUTHORITY_SOURCE_FILES:
+        path = root / relative_name
+        digest.update(relative_name.encode("utf-8"))
+        digest.update(b"\0")
+        try:
+            metadata = path.lstat()
+        except OSError as exc:
+            digest.update(f"missing:{type(exc).__name__}".encode("ascii"))
+            digest.update(b"\0")
+            continue
+
+        if stat.S_ISLNK(metadata.st_mode):
+            try:
+                target = os.readlink(path)
+            except OSError as exc:
+                target = f"unreadable:{type(exc).__name__}"
+            digest.update(b"symlink\0")
+            digest.update(os.fsencode(target))
+            digest.update(b"\0")
+            continue
+        if not stat.S_ISREG(metadata.st_mode):
+            digest.update(f"nonregular:{stat.S_IFMT(metadata.st_mode)}".encode("ascii"))
+            digest.update(b"\0")
+            continue
+
+        digest.update(b"regular\0")
+        try:
+            with path.open("rb") as handle:
+                while chunk := handle.read(1024 * 1024):
+                    digest.update(chunk)
+        except OSError as exc:
+            digest.update(f"unreadable:{type(exc).__name__}".encode("ascii"))
+        digest.update(b"\0")
+    return f"sha256:{digest.hexdigest()}"
+
+
+def effective_authority_fingerprint(config: Any) -> str:
+    """Hash normalized configuration fields that control privileged sinks."""
+
+    authority: dict[str, Any] = {}
+    for field_name in _AUTHORITY_CONFIG_FIELDS:
+        value = getattr(config, field_name, None)
+        if hasattr(value, "model_dump"):
+            authority[field_name] = value.model_dump(mode="json")
+        else:
+            authority[field_name] = value
+    serialized = json.dumps(
+        authority,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    digest = hashlib.sha256(b"openopc-effective-authority-v1\0" + serialized)
+    return f"sha256:{digest.hexdigest()}"
 
 
 def project_workspace_for_config(
@@ -93,17 +177,34 @@ def workspace_from_user_path(path: str | Path) -> Path:
 class WorkspaceTrustRequired(RuntimeError):
     """Raised before project-controlled configuration can be loaded."""
 
-    def __init__(self, workspace: Path, config_dir: Path) -> None:
+    def __init__(
+        self,
+        workspace: Path,
+        config_dir: Path,
+        *,
+        reason: str = "untrusted",
+        current_fingerprint: str = "",
+    ) -> None:
         self.workspace = workspace
         self.config_dir = config_dir
+        self.reason = reason
+        self.current_fingerprint = current_fingerprint
+        if reason == "source_changed":
+            summary = "Workspace authority configuration changed since it was trusted"
+        elif reason == "authority_changed":
+            summary = "Effective workspace authority changed since it was trusted"
+        elif reason == "legacy_record":
+            summary = "Workspace trust record must be renewed with a configuration fingerprint"
+        else:
+            summary = "Workspace is not trusted"
         super().__init__(
-            f"Workspace is not trusted: {self.workspace}. "
-            f"Review {self.config_dir} and run `opc trust add {self.workspace}`.",
+            f"{summary}: {self.workspace}. Review {self.config_dir} and run "
+            f"`opc trust add {self.workspace}`.",
         )
 
 
 class WorkspaceTrustStore:
-    """Small JSON trust store keyed by canonical workspace path."""
+    """User-owned trust store bound to workspace authority fingerprints."""
 
     def __init__(self, path: str | Path | None = None) -> None:
         self.path = Path(path) if path is not None else default_trust_store_path()
@@ -119,17 +220,33 @@ class WorkspaceTrustStore:
 
         if not isinstance(raw, dict):
             return self._empty_payload()
+        if raw.get("version") != _TRUST_STORE_VERSION:
+            return self._empty_payload()
         entries = raw.get("trusted_workspaces", [])
         if not isinstance(entries, list):
             return self._empty_payload()
-        normalized_entries: set[str] = set()
+        normalized_entries: dict[str, dict[str, str]] = {}
         for entry in entries:
-            if not isinstance(entry, str) or not entry.strip():
+            if not isinstance(entry, dict):
                 continue
-            path = Path(entry).expanduser()
-            if path.is_absolute():
-                normalized_entries.add(str(canonical_workspace(path)))
-        normalized = sorted(normalized_entries)
+            workspace = entry.get("workspace")
+            source_fingerprint = entry.get("source_fingerprint")
+            authority_fingerprint = entry.get("authority_fingerprint")
+            if not all(
+                isinstance(value, str) and value.strip()
+                for value in (workspace, source_fingerprint, authority_fingerprint)
+            ):
+                continue
+            path = Path(workspace).expanduser()
+            if not path.is_absolute():
+                continue
+            canonical = str(canonical_workspace(path))
+            normalized_entries[canonical] = {
+                "workspace": canonical,
+                "source_fingerprint": source_fingerprint,
+                "authority_fingerprint": authority_fingerprint,
+            }
+        normalized = [normalized_entries[key] for key in sorted(normalized_entries)]
         return {"version": _TRUST_STORE_VERSION, "trusted_workspaces": normalized}
 
     def _save(self, payload: dict[str, Any]) -> None:
@@ -171,19 +288,42 @@ class WorkspaceTrustStore:
                     pass
             raise
 
-    def is_trusted(self, workspace: str | Path) -> bool:
+    def _record(self, workspace: str | Path) -> dict[str, str] | None:
         key = str(canonical_workspace(workspace))
-        return key in self.load()["trusted_workspaces"]
+        return next(
+            (
+                entry
+                for entry in self.load()["trusted_workspaces"]
+                if entry["workspace"] == key
+            ),
+            None,
+        )
 
-    def trust(self, workspace: str | Path) -> Path:
+    def is_trusted(self, workspace: str | Path) -> bool:
+        return self._record(workspace) is not None
+
+    def trust(
+        self,
+        workspace: str | Path,
+        config_dir: str | Path,
+        config: Any,
+    ) -> Path:
         canonical = canonical_workspace(workspace)
         payload = self.load()
-        entries = set(payload["trusted_workspaces"])
-        entries.add(str(canonical))
+        entries = {
+            entry["workspace"]: entry
+            for entry in payload["trusted_workspaces"]
+            if entry["workspace"] != str(canonical)
+        }
+        entries[str(canonical)] = {
+            "workspace": str(canonical),
+            "source_fingerprint": authority_source_fingerprint(config_dir),
+            "authority_fingerprint": effective_authority_fingerprint(config),
+        }
         self._save(
             {
                 "version": _TRUST_STORE_VERSION,
-                "trusted_workspaces": sorted(entries),
+                "trusted_workspaces": [entries[key] for key in sorted(entries)],
             }
         )
         return canonical
@@ -191,22 +331,71 @@ class WorkspaceTrustStore:
     def untrust(self, workspace: str | Path) -> bool:
         canonical = canonical_workspace(workspace)
         payload = self.load()
-        entries = set(payload["trusted_workspaces"])
-        removed = str(canonical) in entries
-        entries.discard(str(canonical))
+        entries = {
+            entry["workspace"]: entry
+            for entry in payload["trusted_workspaces"]
+            if entry["workspace"] != str(canonical)
+        }
+        removed = len(entries) != len(payload["trusted_workspaces"])
         if removed:
             self._save(
                 {
                     "version": _TRUST_STORE_VERSION,
-                    "trusted_workspaces": sorted(entries),
+                    "trusted_workspaces": [entries[key] for key in sorted(entries)],
                 }
             )
         return removed
 
     def list_trusted(self) -> list[Path]:
-        return [Path(entry) for entry in self.load()["trusted_workspaces"]]
+        return [Path(entry["workspace"]) for entry in self.load()["trusted_workspaces"]]
 
-    def require(self, workspace: str | Path, config_dir: str | Path) -> None:
+    def require(
+        self,
+        workspace: str | Path,
+        config_dir: str | Path,
+        config: Any | None = None,
+    ) -> None:
         canonical = canonical_workspace(workspace)
-        if not self.is_trusted(canonical):
-            raise WorkspaceTrustRequired(canonical, Path(config_dir).resolve(strict=False))
+        resolved_config_dir = Path(config_dir).resolve(strict=False)
+        current_source = authority_source_fingerprint(config_dir)
+        record = self._record(canonical)
+        if record is None:
+            reason = "legacy_record" if self._has_legacy_record(canonical) else "untrusted"
+            raise WorkspaceTrustRequired(
+                canonical,
+                resolved_config_dir,
+                reason=reason,
+                current_fingerprint=current_source,
+            )
+        if record["source_fingerprint"] != current_source:
+            raise WorkspaceTrustRequired(
+                canonical,
+                resolved_config_dir,
+                reason="source_changed",
+                current_fingerprint=current_source,
+            )
+        if config is not None:
+            current_authority = effective_authority_fingerprint(config)
+            if record["authority_fingerprint"] != current_authority:
+                raise WorkspaceTrustRequired(
+                    canonical,
+                    resolved_config_dir,
+                    reason="authority_changed",
+                    current_fingerprint=current_source,
+                )
+
+    def _has_legacy_record(self, workspace: Path) -> bool:
+        try:
+            raw = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError):
+            return False
+        entries = raw.get("trusted_workspaces", []) if isinstance(raw, dict) else []
+        if not isinstance(entries, list):
+            return False
+        key = str(canonical_workspace(workspace))
+        return any(
+            isinstance(entry, str)
+            and Path(entry).expanduser().is_absolute()
+            and str(canonical_workspace(entry)) == key
+            for entry in entries
+        )
