@@ -307,6 +307,7 @@ class WorkItemExecutionCopyTests(unittest.TestCase):
                 "dispatch_hold": "company_runtime_suspended",
                 "company_runtime_stop_state": "suspended",
                 "rework_feedback": "Old rejected scope.",
+                "progress_log": ["stale task-side progress"],
             },
         )
         set_linked_work_item_id(task, "wi-game")
@@ -326,9 +327,66 @@ class WorkItemExecutionCopyTests(unittest.TestCase):
         self.assertNotIn("dispatch_hold", task.metadata)
         self.assertNotIn("company_runtime_stop_state", task.metadata)
         self.assertNotIn("rework_feedback", task.metadata)
+        self.assertNotIn("progress_log", task.metadata)
         self.assertEqual(
             task.metadata["work_item_runtime_plan"]["summary"],
             "Implement the revised Neon Rails Rush game artifact.",
+        )
+
+    def test_delivery_dependency_invalidation_clears_stale_task_package(self) -> None:
+        executor = _executor_with_store(None)
+        invalidated_at = "2026-08-25T19:31:50"
+        item = DelegationWorkItem(
+            work_item_id="delivery::one",
+            run_id="run-1",
+            cell_id="team::ceo",
+            role_id="ceo",
+            seat_id="seat::team::ceo::ceo",
+            title="Final delivery",
+            kind="delivery",
+            projection_id="ceo::delivery::one",
+            phase=Phase.READY_FOR_REWORK,
+            metadata={
+                "work_kind": "delivery",
+                "requires_user_feedback": True,
+                "delivery_inputs_invalidated_at": invalidated_at,
+                "allowed_delegate_role_ids": [],
+            },
+        )
+        task = Task(
+            id="delivery-task",
+            title="Final delivery",
+            status=TaskStatus.DONE,
+            metadata={
+                "work_item_projection_id": "ceo::delivery::one",
+                "work_item_turn_type": "deliver",
+                "delivery_package": {"content": "obsolete"},
+                "feedback_closed": True,
+                "human_review_closed": True,
+                "allowed_delegate_role_ids": ["cto", "cmo"],
+            },
+            context_snapshot={
+                "delivery_package": {"content": "obsolete"},
+                "work_item_owned_outputs": {
+                    "delivery_package": {"content": "obsolete"}
+                },
+            },
+        )
+        set_linked_work_item_id(task, "delivery::one")
+
+        changed = executor._apply_work_item_projection_to_task(task, item)
+
+        self.assertTrue(changed)
+        self.assertEqual(task.status, TaskStatus.PENDING)
+        self.assertNotIn("delivery_package", task.metadata)
+        self.assertNotIn("delivery_package", task.context_snapshot)
+        self.assertNotIn("work_item_owned_outputs", task.context_snapshot)
+        self.assertFalse(task.metadata["feedback_closed"])
+        self.assertFalse(task.metadata["human_review_closed"])
+        self.assertEqual(task.metadata["allowed_delegate_role_ids"], [])
+        self.assertEqual(
+            task.metadata["delivery_outputs_reset_for_inputs_invalidated_at"],
+            invalidated_at,
         )
 
 

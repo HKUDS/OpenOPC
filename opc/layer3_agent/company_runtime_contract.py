@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any, Literal
 
 from opc.core.company_tools import resolve_company_turn_mode
@@ -12,6 +13,21 @@ from opc.layer2_organization.work_item_links import linked_work_item_id_for_task
 from opc.layer4_tools.output_budget import clip_text
 
 ContractAudience = Literal["native", "external"]
+
+
+def _runtime_clock_block(now: datetime | None = None) -> str:
+    """Anchor relative-time work to the runtime clock for every executor."""
+
+    current = (now or datetime.now().astimezone()).astimezone()
+    timezone_name = str(current.tzname() or current.strftime("%z") or "local")
+    return "\n".join(
+        [
+            "## Runtime Clock",
+            f"- Current local date: `{current.date().isoformat()}`",
+            f"- Current local time zone: `{timezone_name}` (`{current.strftime('%z')}`)",
+            "- Resolve relative periods such as today, this week, and the last three months against this clock. State the resulting absolute date range before delegating or researching.",
+        ]
+    )
 
 _COMPANY_WORK_ITEM_GUIDELINES = """
 ## Company Work Item Contract
@@ -44,6 +60,17 @@ _MULTI_TEAM_ORG_GUIDELINES = """
 - Use mailbox tools only for coordination, questions, blockers, or handoffs.
 - Cross-team collaboration is request-based; only direct managers delegate executable work.
 - If you are the root final decider, only your finished turn is the authoritative owner-facing result.
+"""
+
+
+_OPAQUE_EXTERNAL_TEAM_GUIDELINES = """
+## Opaque External Team Contract
+- You are the single execution boundary for a JiuwenSwarm Team. OpenOPC owns one WorkItem for this whole boundary; Jiuwen may organize any internal teammates and subtasks it needs.
+- Do not create OpenOPC child WorkItems and do not model Jiuwen teammates as OpenOPC roles, Tasks, sessions, or Kanban cards.
+- Complete the whole assigned boundary described by the injected Team Capability Manifest inside this one provider session.
+- Treat OpenOPC WorkItem state as authoritative. Jiuwen `chat.final`, teammate messages, and internal task completion are telemetry; the outer run completes only when the provider reports processing finished.
+- Work only inside the supplied trusted workspace. Do not treat `.agent_teams/**`, Jiuwen caches, or internal team traces as deliverables.
+- End with one JSON object containing: `work_item_id`, `attempt_id`, `status`, `summary`, `deliverables`, `verification`, `risks`, `open_questions`, and `handoff`. Use the exact OpenOPC ids supplied below. Do not invent ids.
 """
 
 _MANAGER_RUNTIME_CONTRACT = """
@@ -654,6 +681,163 @@ def _contract_text_for_audience(text: str, audience: ContractAudience) -> str:
     return rendered
 
 
+def _string_list(value: Any) -> list[str]:
+    return [
+        str(item).strip()
+        for item in list(value or [])
+        if str(item).strip()
+    ]
+
+
+def _team_capability_manifest_block(task: Task) -> str:
+    metadata = dict(task.metadata or {})
+    binding = dict(metadata.get("external_team_binding", {}) or {})
+    manifest = dict(
+        metadata.get("capability_manifest")
+        or binding.get("capability_manifest")
+        or {}
+    )
+    if not manifest:
+        return ""
+    lines = [
+        "## Team Capability Manifest",
+        f"- organizational_target_role_id: `{manifest.get('organizational_identity', '')}`",
+        f"- display_name: `{manifest.get('display_name', '')}`",
+        f"- manifest_hash: `{manifest.get('manifest_hash', '')}`",
+        "- This manifest is compiled from OpenOPC role configuration; it is the assigned organizational boundary, not a description of Jiuwen's internal members.",
+    ]
+    covered_roles = [
+        dict(item)
+        for item in list(manifest.get("covered_roles", []) or [])
+        if isinstance(item, dict)
+    ]
+    if covered_roles:
+        lines.extend(["", "### Covered Role Responsibilities"])
+        for role in covered_roles:
+            role_id = str(role.get("role_id", "") or "").strip()
+            name = str(role.get("name", "") or role_id).strip()
+            responsibility = str(role.get("responsibility", "") or "").strip()
+            rendered = f"- `{role_id}` ({name})"
+            if responsibility:
+                rendered += ": " + clip_text(
+                    responsibility,
+                    limit=600,
+                    marker="responsibility truncated",
+                ).text
+            lines.append(rendered)
+    for heading, key in (
+        ("Declared Capabilities", "capabilities"),
+        ("Expected Deliverables", "deliverables"),
+        ("Artifact Contracts", "artifact_contract_refs"),
+        ("Out Of Scope", "out_of_scope"),
+    ):
+        values = _string_list(manifest.get(key, []))
+        if values:
+            lines.extend(["", f"### {heading}"])
+            lines.extend(f"- {item}" for item in values)
+    return "\n".join(lines)
+
+
+def _delegation_capability_catalog_block(task: Task) -> str:
+    metadata = dict(task.metadata or {})
+    catalog = [
+        dict(item)
+        for item in list(metadata.get("delegation_capability_catalog", []) or [])
+        if isinstance(item, dict)
+    ]
+    topology = dict(metadata.get("runtime_topology", {}) or {})
+    current_seat_id = str(
+        metadata.get("delegation_seat_id") or metadata.get("seat_id") or ""
+    ).strip()
+    current_role_id = str(
+        task.assigned_to or metadata.get("work_item_role_id") or ""
+    ).strip()
+    current_seat: dict[str, Any] = {}
+    seats = [
+        dict(item)
+        for item in list(topology.get("seats", []) or [])
+        if isinstance(item, dict)
+    ]
+    if not catalog:
+        current_seat = next(
+            (
+                seat
+                for seat in seats
+                if current_seat_id
+                and str(seat.get("seat_id", "") or "").strip() == current_seat_id
+            ),
+            {},
+        )
+        if not current_seat and current_role_id:
+            current_seat = next(
+                (
+                    seat
+                    for seat in seats
+                    if str(seat.get("role_id", "") or "").strip()
+                    == current_role_id
+                    and bool(seat.get("is_team_lead", False))
+                ),
+                {},
+            )
+        catalog = [
+            dict(item)
+            for item in list(
+                current_seat.get("delegation_capability_catalog", []) or []
+            )
+            if isinstance(item, dict)
+        ]
+    if not catalog:
+        allowed = set(_string_list(metadata.get("allowed_delegate_role_ids", [])))
+        catalog = [
+            dict(item)
+            for item in list(topology.get("delegation_capability_catalog", []) or [])
+            if isinstance(item, dict)
+            and str(item.get("target_role_id", "") or "").strip() in allowed
+        ]
+    if not catalog:
+        return ""
+
+    lines = [
+        "## Delegation Capability Catalog",
+        "Delegate to the organizational `target_role_id`; never delegate to the provider name. Runtime binding resolves that role to the external team.",
+    ]
+    for item in catalog:
+        target_role_id = str(item.get("target_role_id", "") or "").strip()
+        display_name = str(item.get("display_name", "") or target_role_id).strip()
+        covered = _string_list(item.get("covered_role_ids", []))
+        lines.append(
+            f"- target_role_id=`{target_role_id}` — {display_name} "
+            f"(opaque team; covers: {', '.join(covered)})"
+        )
+        responsibilities = [
+            str(role.get("responsibility", "") or "").strip()
+            for role in list(item.get("covered_roles", []) or [])
+            if isinstance(role, dict) and str(role.get("responsibility", "") or "").strip()
+        ]
+        if responsibilities:
+            lines.append(
+                "  - responsibilities: "
+                + clip_text(
+                    " | ".join(responsibilities),
+                    limit=1200,
+                    marker="team responsibilities truncated",
+                ).text
+            )
+        capabilities = _string_list(item.get("capabilities", []))
+        if capabilities:
+            lines.append("  - declared capabilities: " + ", ".join(capabilities))
+        deliverables = _string_list(item.get("deliverables", []))
+        if deliverables:
+            lines.append("  - deliverables: " + ", ".join(deliverables))
+        artifact_contracts = _string_list(item.get("artifact_contract_refs", []))
+        if artifact_contracts:
+            lines.append("  - artifact contracts: " + ", ".join(artifact_contracts))
+        out_of_scope = _string_list(item.get("out_of_scope", []))
+        if out_of_scope:
+            lines.append("  - out of scope: " + ", ".join(out_of_scope))
+    return "\n".join(lines)
+
+
 def build_company_work_item_contract(
     task: Task,
     *,
@@ -661,7 +845,47 @@ def build_company_work_item_contract(
 ) -> str:
     """Return the shared company/runtime contract for a task."""
     resolved_audience = _normalize_contract_audience(audience)
+    runtime_clock = _runtime_clock_block()
     if str(task.metadata.get("runtime_model", "") or "").strip() == "multi_team_org":
+        if str(task.metadata.get("execution_unit_kind", "") or "").strip() == "opaque_external_team":
+            work_item_id = str(
+                linked_work_item_id_for_task(task)
+                or task.metadata.get("work_item_id")
+                or ""
+            ).strip()
+            attempt_id = str(
+                task.metadata.get("external_invocation_id")
+                or task.metadata.get("attempt_id")
+                or task.metadata.get("claimed_work_item_attempt_seq")
+                or "current"
+            ).strip()
+            covered_roles = [
+                str(item).strip()
+                for item in list(task.metadata.get("covered_role_ids", []) or [])
+                if str(item).strip()
+            ]
+            identity = "\n".join(
+                [
+                    "## OpenOPC Team Boundary Identity",
+                    f"- work_item_id: `{work_item_id}`",
+                    f"- attempt_id: `{attempt_id}`",
+                    f"- covered_role_ids: `{', '.join(covered_roles)}`",
+                ]
+            )
+            manifest_block = _team_capability_manifest_block(task)
+            return _contract_text_for_audience(
+                "\n\n".join(
+                    part
+                    for part in (
+                        runtime_clock,
+                        _OPAQUE_EXTERNAL_TEAM_GUIDELINES.strip(),
+                        identity,
+                        manifest_block,
+                    )
+                    if part
+                ),
+                resolved_audience,
+            )
         # Hidden auxiliary cards are single-purpose and take precedence over
         # the generic multi-team guidelines: the seat is here for exactly
         # one job (write the report, or apply the verdict) and nothing else.
@@ -671,9 +895,12 @@ def build_company_work_item_contract(
         review_execute_block = _review_execute_block(task)
         if review_execute_block:
             return _contract_text_for_audience(review_execute_block, resolved_audience)
-        parts = [_MULTI_TEAM_ORG_GUIDELINES.strip()]
+        parts = [runtime_clock, _MULTI_TEAM_ORG_GUIDELINES.strip()]
         if _multi_team_manager_capable(task):
             parts.append(_MANAGER_RUNTIME_CONTRACT.strip())
+            capability_catalog = _delegation_capability_catalog_block(task)
+            if capability_catalog:
+                parts.append(capability_catalog)
         review_block = _review_pending_block(task)
         if review_block:
             parts.append(review_block)
@@ -687,6 +914,7 @@ def build_company_work_item_contract(
     orchestration = str(task.metadata.get("work_item_orchestration_profile", "") or "").strip()
     verification_required = bool(task.metadata.get("work_item_verification_required", False))
     header = [
+        runtime_clock,
         _COMPANY_WORK_ITEM_GUIDELINES.strip(),
         f"Current work item: `{work_item_name or 'projected work item'}`",
         f"Work item turn type: `{turn_type}`",

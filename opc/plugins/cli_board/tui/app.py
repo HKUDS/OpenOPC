@@ -917,7 +917,7 @@ class CliBoardApp(App[None]):
                 fields=[
                     PromptField("mode", "Mode", value=str(metadata.get("exec_mode") or self.exec_mode), placeholder="task / company / org"),
                     PromptField("profile", "Company Profile", value=str(metadata.get("company_profile") or self.company_profile), placeholder="corporate / custom"),
-                    PromptField("agent", "Preferred Agent", value=str(metadata.get("preferred_agent") or ""), placeholder="native / codex / claude_code"),
+                    PromptField("agent", "Preferred Agent", value=str(metadata.get("preferred_agent") or ""), placeholder="native / codex / jiuwen / jiuwenswarm"),
                     PromptField("org", "Org ID", value=str(metadata.get("org_id") or metadata.get("organization_id") or ""), placeholder="saved org id"),
                 ],
                 confirm_label="Apply",

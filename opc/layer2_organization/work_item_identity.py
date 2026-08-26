@@ -66,6 +66,28 @@ def canonical_work_item_turn_type_for_kind(value: Any, *, fallback: str = "execu
     return ""
 
 
+def initial_current_turn_mode_for_work_item(
+    turn_type: Any,
+    *,
+    manager_can_delegate: bool = False,
+    review_execution_work_item: bool = False,
+    report_execution_work_item: bool = False,
+) -> str:
+    """Return the authoritative initial driver mode for a new WorkItem."""
+    normalized_turn = canonical_work_item_turn_type_for_kind(turn_type)
+    if normalized_turn == "deliver":
+        return "deliver_required"
+    if normalized_turn == "aggregate":
+        return "synthesize_required"
+    if report_execution_work_item or normalized_turn == "report":
+        return "report_required"
+    if review_execution_work_item or normalized_turn == "review":
+        return "review_execute"
+    if manager_can_delegate:
+        return "dispatch_required"
+    return "worker_execute"
+
+
 def work_item_projection_id_from_metadata(
     metadata: Mapping[str, Any] | None,
     *,

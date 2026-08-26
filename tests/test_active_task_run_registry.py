@@ -22,7 +22,10 @@ from opc.layer0_interaction.coordinator import InteractionDecisionLease
 from opc.engine import OPCEngine
 from opc.layer2_organization.company_mode import CompanyWorkItemExecutor
 from opc.layer2_organization.custom_runtime import CustomRuntimeRunner
-from opc.layer2_organization.company_runtime_identity import is_company_runtime_task
+from opc.layer2_organization.company_runtime_identity import (
+    is_company_runtime_task,
+    requires_native_company_execution,
+)
 from opc.layer2_organization.org_work_item_planner import CompanyWorkItemRuntimePlan
 
 
@@ -68,6 +71,42 @@ def test_plain_child_task_is_not_classified_as_company_runtime_scope() -> None:
     )
 
     assert not is_company_runtime_task(task)
+
+
+def test_task_mode_role_identity_does_not_trigger_company_native_fence() -> None:
+    task = Task(
+        id="task-mode-external",
+        title="Task mode external execution",
+        project_id="project-a",
+        assigned_external_agent="jiuwen",
+        metadata={
+            "mode": "task",
+            "execution_mode": "task_mode",
+            "task_mode_contract": "single_full_capability_main_agent",
+            "work_item_role_id": "task_generalist",
+        },
+    )
+
+    assert not is_company_runtime_task(task)
+    assert not requires_native_company_execution(task)
+
+
+def test_canonical_company_work_item_marker_outranks_stale_task_mode_hint() -> None:
+    task = Task(
+        id="company-work-item",
+        title="Company work item",
+        project_id="project-a",
+        assigned_external_agent="jiuwen",
+        metadata={
+            "mode": "task",
+            "execution_mode": "task_mode",
+            "work_item_runtime": True,
+            "work_item_role_id": "engineer",
+        },
+    )
+
+    assert is_company_runtime_task(task)
+    assert requires_native_company_execution(task)
 
 
 def test_closing_admission_preserves_existing_attempts_and_rejects_new_ones() -> None:

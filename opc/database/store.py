@@ -733,7 +733,7 @@ class _SQLiteConnectionAdapter:
 
 
 class OPCStore:
-    """Async SQLite store for OPC data (WAL mode for concurrency)."""
+    """Async SQLite store for OPC data."""
 
     _DELEGATE_WORK_RESERVED_METADATA_KEYS = (
         "created_by_delegate_work",
@@ -822,7 +822,14 @@ class OPCStore:
         self._db = _SQLiteConnectionAdapter(self.db_path)
         if not run_startup_maintenance:
             return
-        await self._db.execute("PRAGMA journal_mode=WAL")
+        # Keep the project database safe when the owning UI and short-lived
+        # collaboration/CLI processes open it at the same time.  WAL relies on
+        # every process observing the same ``-wal``/``-shm`` lifetime.  That is
+        # not guaranteed for bind-mounted workspaces and can leave the owning
+        # process holding unlinked sidecars, after which controller heartbeats
+        # fail with SQLITE_IOERR.  DELETE keeps normal SQLite file locking and
+        # the existing busy timeout without a shared-memory sidecar.
+        await self._db.execute("PRAGMA journal_mode=DELETE")
         await self._db.execute("PRAGMA foreign_keys=ON")
         await self._create_tables()
         await self._ensure_schema()
@@ -5371,7 +5378,8 @@ class OPCStore:
                 )
 
             run_id = str(persisted_work_item.run_id or "").strip()
-            checked_at = datetime.now().isoformat()
+            checked_at_datetime = datetime.now()
+            checked_at = checked_at_datetime.isoformat()
             async with transaction_db.execute(
                 """SELECT 1 FROM delegation_runs
                    WHERE run_id = ? AND project_id = ?
@@ -5402,6 +5410,22 @@ class OPCStore:
                     "boundary"
                 )
             if self._task_has_company_attempt_credential(durable_metadata):
+                # Benign claim race: the scheduler loaded an unclaimed Task
+                # projection, then the dispatcher won the WorkItem claim and
+                # persisted the exact current attempt before this projection
+                # write acquired SQLite's lock.  The durable Task is newer and
+                # must win.  Treating this same-controller advancement as a
+                # run-lease loss cancels every sibling provider process and
+                # leaves their cards RUNNING.  An exact fence check keeps the
+                # no-op narrow; partial, foreign, expired, held, or superseded
+                # credentials still fail closed below.
+                if await self._company_controller_task_fence_matches(
+                    transaction_db,
+                    durable_task,
+                    checked_at=checked_at_datetime,
+                ):
+                    await transaction_db.rollback()
+                    return None
                 raise CompanyRunControllerLeaseLost(
                     "durable Task gained an attempt credential before its "
                     "unclaimed projection save"
@@ -11300,6 +11324,7 @@ class OPCStore:
         deterministic_rework_operations = {
             "pre_delivery_validation_rework",
             "executive_delivery_rework",
+            "company_followup_rework",
         }
         if operation in deterministic_rework_operations and (
             task_snapshot is None
@@ -19254,6 +19279,7 @@ class OPCStore:
         root_session_id: str,
         owner_token: str,
         generation: int,
+        adopt_released_task_ids: set[str] | None = None,
     ) -> int:
         """Settle and release claims left by the preceding controller.
 
@@ -19268,6 +19294,15 @@ class OPCStore:
         clean_root_session_id = str(root_session_id or "").strip()
         clean_owner_token = str(owner_token or "").strip()
         clean_generation = int(generation or 0)
+        released_task_ids = tuple(
+            sorted(
+                {
+                    str(task_id or "").strip()
+                    for task_id in set(adopt_released_task_ids or set())
+                    if str(task_id or "").strip()
+                }
+            )
+        )
         transaction_db = _SQLiteConnectionAdapter(self.db_path)
         settled = 0
         try:
@@ -19282,19 +19317,38 @@ class OPCStore:
                 checked_at=checked_at,
                 reject_dispatch_hold=False,
             )
+            released_task_clause = ""
+            candidate_params: list[Any] = [clean_run_id]
+            if released_task_ids:
+                placeholders = ", ".join("?" for _ in released_task_ids)
+                released_task_clause = f"""
+                          OR work_item_id IN (
+                              SELECT work_item_id
+                              FROM work_item_runtime_links
+                              WHERE runtime_task_id IN ({placeholders})
+                          )"""
+                candidate_params.extend(released_task_ids)
             async with transaction_db.execute(
-                """SELECT work_item_id, claimed_by_role_runtime_session_id,
-                          claimed_by_seat_id, metadata
-                   FROM delegation_work_items
-                   WHERE run_id = ?
-                     AND (COALESCE(claimed_by_role_runtime_session_id, '') != ''
-                          OR COALESCE(claimed_by_seat_id, '') != '')""",
-                (clean_run_id,),
+                f"""SELECT work_item_id, claimed_by_role_runtime_session_id,
+                           claimed_by_seat_id, metadata, phase, projection_id
+                    FROM delegation_work_items
+                    WHERE run_id = ?
+                      AND (COALESCE(claimed_by_role_runtime_session_id, '') != ''
+                           OR COALESCE(claimed_by_seat_id, '') != ''
+                           {released_task_clause})""",
+                tuple(candidate_params),
             ) as cursor:
                 rows = await cursor.fetchall()
             now = checked_at.isoformat()
             stale_work_item_ids: list[str] = []
-            for work_item_id, role_claim, seat_claim, metadata_json in rows:
+            for (
+                work_item_id,
+                role_claim,
+                seat_claim,
+                metadata_json,
+                work_item_phase,
+                work_item_projection_id,
+            ) in rows:
                 metadata = _json_loads(metadata_json, {})
                 prior_metadata = dict(metadata)
                 attempt_seq = int(metadata.get("attempt_seq", 0) or 0)
@@ -19358,28 +19412,65 @@ class OPCStore:
                     # the Task in this same takeover transaction, preserving
                     # every non-controller Task field.
                     async with transaction_db.execute(
-                        """SELECT task.id, task.project_id, task.metadata
-                           FROM work_item_runtime_links AS link
-                           JOIN tasks AS task
-                             ON task.id = link.runtime_task_id
-                           WHERE link.work_item_id = ?""",
+                        """SELECT runtime_task_id, link_kind
+                           FROM work_item_runtime_links
+                           WHERE work_item_id = ?""",
                         (clean_work_item_id,),
                     ) as cursor:
-                        linked_task_row = await cursor.fetchone()
-                    if linked_task_row is not None:
+                        linked_task_links = await cursor.fetchall()
+                    if len(linked_task_links) > 1:
+                        raise RuntimeError(
+                            "controller takeover found multiple linked Tasks "
+                            f"for {clean_work_item_id!r}"
+                        )
+                    if linked_task_links:
                         linked_task_id = str(
-                            linked_task_row[0] or ""
+                            linked_task_links[0][0] or ""
                         ).strip()
+                        linked_task_kind = str(
+                            linked_task_links[0][1] or ""
+                        ).strip()
+                        async with transaction_db.execute(
+                            """SELECT work_item_id
+                               FROM work_item_runtime_links
+                               WHERE runtime_task_id = ?""",
+                            (linked_task_id,),
+                        ) as cursor:
+                            reverse_task_links = await cursor.fetchall()
+                        if (
+                            len(reverse_task_links) != 1
+                            or str(reverse_task_links[0][0] or "").strip()
+                            != clean_work_item_id
+                        ):
+                            raise RuntimeError(
+                                "controller takeover found a non-bijective "
+                                f"WorkItem/Task link for {clean_work_item_id!r}"
+                            )
+                        async with transaction_db.execute(
+                            """SELECT id, project_id, status, metadata
+                               FROM tasks
+                               WHERE id = ?""",
+                            (linked_task_id,),
+                        ) as cursor:
+                            linked_task_rows = await cursor.fetchall()
+                        if len(linked_task_rows) != 1:
+                            raise RuntimeError(
+                                "controller takeover found a missing or "
+                                f"ambiguous linked Task for {clean_work_item_id!r}"
+                            )
+                        linked_task_row = linked_task_rows[0]
                         linked_task_project_id = str(
                             linked_task_row[1] or "default"
                         ).strip() or "default"
+                        linked_task_status = str(linked_task_row[2] or "").strip()
                         linked_task_metadata_json = str(
-                            linked_task_row[2] or "{}"
+                            linked_task_row[3] or "{}"
                         )
                         linked_task_metadata = _json_loads(
                             linked_task_metadata_json,
                             {},
                         )
+                        credential_numbers_valid = True
                         try:
                             linked_task_attempt = int(
                                 linked_task_metadata.get(
@@ -19402,6 +19493,7 @@ class OPCStore:
                                 or 0
                             )
                         except (TypeError, ValueError):
+                            credential_numbers_valid = False
                             linked_task_attempt = 0
                             prior_work_item_generation = 0
                             linked_task_generation = 0
@@ -19417,6 +19509,169 @@ class OPCStore:
                             )
                             or ""
                         ).strip()
+                        claimed_task_id = str(
+                            prior_metadata.get("claimed_task_id", "") or ""
+                        ).strip()
+                        released_target_identity_matches = bool(
+                            linked_task_id in released_task_ids
+                            and not str(role_claim or "").strip()
+                            and not str(seat_claim or "").strip()
+                            and claimed_task_id in {"", linked_task_id}
+                        )
+                        explicit_work_item_projection_id = str(
+                            work_item_projection_id or ""
+                        ).strip()
+                        metadata_work_item_projection_id = (
+                            work_item_projection_id_from_metadata(
+                                prior_metadata,
+                                fallback=explicit_work_item_projection_id,
+                            )
+                        )
+                        linked_task_projection_id = (
+                            work_item_projection_id_from_metadata(
+                                linked_task_metadata,
+                                fallback="",
+                            )
+                        )
+                        try:
+                            prior_phase = coerce_phase(work_item_phase)
+                        except (TypeError, ValueError):
+                            prior_phase = None
+                        expected_linked_task_status = (
+                            task_status_for_phase(prior_phase).value
+                            if prior_phase is not None
+                            else ""
+                        )
+                        legacy_work_item_attempt = bool(
+                            (
+                                "attempt_seq" not in prior_metadata
+                                and attempt_seq == 0
+                            )
+                            or (
+                                attempt_seq > 0
+                                and prior_metadata.get("attempt_settled") is True
+                            )
+                        )
+                        # Pre-controller linked rows have no controller
+                        # credential on either side and no Task attempt
+                        # credential.  Later legacy versions may have a
+                        # settled WorkItem-local attempt ledger, but they are
+                        # still not a modern mixed envelope: old runtimes
+                        # persisted the claim and primary link, then
+                        # terminalized the WorkItem/Task without controller
+                        # owner/generation fields.
+                        # Under the winning run lease it is safe to release
+                        # that exact terminal claim, but it is *not* safe to
+                        # invent a Task attempt.  A later genuine rework claim
+                        # will create the next attempt before the fenced claim
+                        # path installs the complete Task credential envelope.
+                        fully_legacy_linked_terminal = bool(
+                            credential_numbers_valid
+                            and legacy_work_item_attempt
+                            and "company_run_controller_owner_token"
+                            not in prior_metadata
+                            and "company_run_controller_lease_generation"
+                            not in prior_metadata
+                            and "claimed_work_item_attempt_seq"
+                            not in linked_task_metadata
+                            and "company_run_controller_owner_token"
+                            not in linked_task_metadata
+                            and "company_run_controller_lease_generation"
+                            not in linked_task_metadata
+                            and linked_task_attempt == 0
+                            and prior_work_item_generation == 0
+                            and linked_task_generation == 0
+                            and not prior_work_item_owner
+                            and not linked_task_owner
+                            and is_work_item_runtime_metadata(
+                                linked_task_metadata
+                            )
+                            and linked_task_project_id == clean_project_id
+                            and str(
+                                linked_task_metadata.get(
+                                    "delegation_run_id", ""
+                                )
+                                or ""
+                            ).strip()
+                            == clean_run_id
+                            and linked_task_kind == "primary"
+                            and (
+                                claimed_task_id == linked_task_id
+                                or released_target_identity_matches
+                            )
+                            and bool(explicit_work_item_projection_id)
+                            and metadata_work_item_projection_id
+                            == explicit_work_item_projection_id
+                            and linked_task_projection_id
+                            == explicit_work_item_projection_id
+                            and prior_phase in DONE_PHASES
+                            and linked_task_status
+                            == expected_linked_task_status
+                        )
+                        if fully_legacy_linked_terminal:
+                            continue
+                        # A settled WorkItem may legitimately retain its
+                        # completed attempt ledger while controller release
+                        # parks the linked Task without an attempt credential.
+                        # This includes a terminal card and a deterministic
+                        # rework card already moved back to READY.  It is not
+                        # a partial credential: all three Task credential keys
+                        # must be absent, and either the WorkItem attempt is
+                        # settled or it retains a complete in-progress
+                        # role+seat+Task claim from graceful cancellation.  The
+                        # primary link, projection, phase, status, and claim
+                        # identity must all agree.  Under the winning run lease
+                        # we can safely adopt that complete projection.
+                        fully_released_modern_linked_projection = bool(
+                            credential_numbers_valid
+                            and attempt_seq > 0
+                            and (
+                                prior_metadata.get("attempt_settled") is True
+                                or (
+                                    prior_metadata.get("attempt_settled")
+                                    is False
+                                    and bool(str(role_claim or "").strip())
+                                    and bool(str(seat_claim or "").strip())
+                                    and claimed_task_id == linked_task_id
+                                    and prior_phase in IN_PROGRESS_PHASES
+                                )
+                            )
+                            and bool(prior_work_item_owner)
+                            and prior_work_item_generation > 0
+                            and "claimed_work_item_attempt_seq"
+                            not in linked_task_metadata
+                            and "company_run_controller_owner_token"
+                            not in linked_task_metadata
+                            and "company_run_controller_lease_generation"
+                            not in linked_task_metadata
+                            and linked_task_attempt == 0
+                            and not linked_task_owner
+                            and linked_task_generation == 0
+                            and is_work_item_runtime_metadata(
+                                linked_task_metadata
+                            )
+                            and linked_task_project_id == clean_project_id
+                            and str(
+                                linked_task_metadata.get(
+                                    "delegation_run_id", ""
+                                )
+                                or ""
+                            ).strip()
+                            == clean_run_id
+                            and linked_task_kind == "primary"
+                            and (
+                                claimed_task_id == linked_task_id
+                                or released_target_identity_matches
+                            )
+                            and bool(explicit_work_item_projection_id)
+                            and metadata_work_item_projection_id
+                            == explicit_work_item_projection_id
+                            and linked_task_projection_id
+                            == explicit_work_item_projection_id
+                            and prior_phase is not None
+                            and linked_task_status
+                            == expected_linked_task_status
+                        )
                         if (
                             not linked_task_id
                             or linked_task_project_id != clean_project_id
@@ -19434,12 +19689,15 @@ class OPCStore:
                             or prior_work_item_generation <= 0
                             or linked_task_generation
                             != prior_work_item_generation
-                        ):
+                        ) and not fully_released_modern_linked_projection:
                             raise RuntimeError(
                                 "controller takeover found a mixed linked "
                                 f"Task/WorkItem attempt envelope for "
                                 f"{clean_work_item_id!r}"
                             )
+                        linked_task_metadata[
+                            "claimed_work_item_attempt_seq"
+                        ] = attempt_seq
                         linked_task_metadata[
                             "company_run_controller_owner_token"
                         ] = clean_owner_token
@@ -21410,6 +21668,7 @@ class OPCStore:
         wake_role_runtime_session_id: str = "",
         expected_role_session_focus: str = "",
         linked_task_metadata_updates: dict[str, Any] | None = None,
+        allow_approved_dependency_invalidation: bool = False,
     ) -> DelegationWorkItem | None:
         """CAS one dependency-frontier projection under the live run lease.
 
@@ -21449,7 +21708,14 @@ class OPCStore:
         previous_phase = item.phase
         if phase is not None:
             target_phase = coerce_phase(phase)
-            validate_transition(previous_phase, target_phase)
+            approved_dependency_invalidation = bool(
+                allow_approved_dependency_invalidation
+                and previous_phase == Phase.APPROVED
+                and target_phase
+                in {Phase.WAITING_DEPENDENCIES, Phase.READY_FOR_REWORK}
+            )
+            if not approved_dependency_invalidation:
+                validate_transition(previous_phase, target_phase)
             item.phase = target_phase
         if summary is not None:
             item.summary = str(summary or "")
@@ -22630,9 +22896,14 @@ class OPCStore:
             raise InvalidPhaseTransition(
                 f"executive rework can only reopen approved work items, got {previous_phase.value}"
             )
-        if target not in {Phase.READY_FOR_REWORK, Phase.READY}:
+        if target not in {
+            Phase.READY_FOR_REWORK,
+            Phase.READY,
+            Phase.WAITING_DEPENDENCIES,
+        }:
             raise InvalidPhaseTransition(
-                f"executive rework target must be ready_for_rework or ready, got {target.value}"
+                "executive rework target must be ready_for_rework, ready, "
+                f"or waiting_dependencies, got {target.value}"
             )
 
         item.phase = target

@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import re
 import shlex
+from pathlib import Path
 from typing import Iterable, Sequence
 
 SHELL_CONTROL_TOKENS = {"&&", "||", ";", ";;", "|", "|&", "&"}
@@ -1108,3 +1109,117 @@ def is_read_only_shell_command(
         if not _segment_read_only(tokens, config_prefixes):
             return False, f"segment `{ ' '.join(tokens[:6]) }` is not proven read-only"
     return True, "all segments are flag-audited read-only commands"
+
+
+_COMPANY_WORKSPACE_INSPECTION_HEADS = frozenset({
+    "basename", "b2sum", "cat", "cksum", "cmp", "comm", "cut", "diff",
+    "dirname", "du", "egrep", "fgrep", "find", "git", "grep", "head",
+    "hexdump", "jq", "ls", "md5sum", "nl", "od", "pwd", "readlink",
+    "realpath", "rg", "sed", "sha1sum", "sha256sum", "sha512sum", "stat",
+    "strings", "tail", "wc", "xxd",
+})
+
+
+def is_workspace_scoped_read_only_shell_command(
+    command: str,
+    *,
+    working_directory: str,
+    workspace_root: str,
+) -> tuple[bool, str]:
+    """Prove one shell inspection is read-only and workspace-confined.
+
+    This is deliberately narrower than :func:`is_read_only_shell_command`.
+    Company mode may bypass a human checkpoint only for a single built-in,
+    audited inspection whose cwd and every possible path operand stay under
+    the durable workspace root. Dynamic expansion, wrappers, configured
+    prefixes, and Git directory overrides fail closed.
+    """
+
+    safe, reason = is_read_only_shell_command(command)
+    if not safe:
+        return False, reason
+    segments = split_shell_segments(command)
+    if not segments or len(segments) != 1:
+        return False, "company read-only execution requires one standalone command"
+    tokens = list(segments[0])
+    if not tokens or tokens[0] not in _COMPANY_WORKSPACE_INSPECTION_HEADS:
+        return False, "command is not a company workspace inspection command"
+
+    # The POSIX shell expands these tokens after policy evaluation. Quoted
+    # literals intentionally stay conservative: exact approval remains
+    # available for unusual filenames without weakening the automatic path
+    # boundary.
+    expansion_markers = ("$", "`", "*", "?", "{", "}", "[", "]")
+    if any(
+        any(marker in token for marker in expansion_markers)
+        for token in tokens
+    ):
+        return False, "dynamic shell expansion is not workspace-confined"
+
+    if not str(workspace_root or "").strip() or not str(
+        working_directory or ""
+    ).strip():
+        return False, "company workspace boundary is unavailable"
+    try:
+        root = Path(workspace_root).expanduser().resolve(strict=True)
+        cwd = Path(working_directory).expanduser().resolve(strict=True)
+    except (OSError, RuntimeError, ValueError):
+        return False, "company workspace or working directory is unavailable"
+    if (
+        not root.is_dir()
+        or not cwd.is_dir()
+        or (cwd != root and root not in cwd.parents)
+    ):
+        return False, "working directory is outside the company workspace"
+
+    if tokens[0] == "git":
+        parsed = _git_parse_global_options(tokens)
+        if parsed is None:
+            return False, "Git invocation is not proven read-only"
+        subcommand, _ = parsed
+        if subcommand in {"config", "worktree"}:
+            return False, (
+                "Git command can inspect state outside the company workspace"
+            )
+        for token in tokens[1:]:
+            if token == subcommand:
+                break
+            if token.split("=", 1)[0] in _GIT_GLOBAL_VALUE_OPTIONS:
+                return False, "Git directory overrides are not workspace-confined"
+
+    after_separator = False
+    for token in tokens[1:]:
+        if token == "--" and not after_separator:
+            after_separator = True
+            continue
+        candidate = token
+        if not after_separator and token.startswith("-") and token != "-":
+            if "=" in token:
+                candidate = token.split("=", 1)[1]
+            else:
+                # Attached file options such as ``grep -f../rules`` cannot be
+                # separated safely without a command-specific argv parser.
+                if "/" in token or "~" in token or ".." in token:
+                    return False, (
+                        "attached option path is not workspace-auditable"
+                    )
+                continue
+        if candidate in {"", "-"}:
+            continue
+        if candidate.startswith("@") and len(candidate) > 1:
+            candidate = candidate[1:]
+        try:
+            raw_path = Path(candidate).expanduser()
+            resolved = (
+                raw_path if raw_path.is_absolute() else cwd / raw_path
+            ).resolve(strict=False)
+        except (OSError, RuntimeError, ValueError):
+            return False, "command path operand cannot be resolved safely"
+        if resolved != root and root not in resolved.parents:
+            return False, (
+                f"path operand is outside the company workspace: {candidate}"
+            )
+
+    return True, (
+        "flag-audited read-only command is confined to the company workspace"
+    )

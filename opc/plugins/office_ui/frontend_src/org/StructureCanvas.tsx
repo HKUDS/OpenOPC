@@ -113,6 +113,7 @@ function StructureCanvasInner({ roles, employees, sessionRecruitmentByRole, sele
         roleId: 'owner', name: 'You (Owner)', responsibility: '',
         icon: null, employeeCount: 0, employeeNames: [],
         isOwner: true, isSelected: false, isDropTarget: false,
+        externalTeamLabel: undefined, externalTeamBoundary: false,
       },
     }
     const roleNodes: Node<StructureCanvasNodeData>[] = roles.map(r => ({
@@ -127,6 +128,10 @@ function StructureCanvasInner({ roles, employees, sessionRecruitmentByRole, sele
         icon: r.icon ?? null, employeeCount: recruitedNamesByRole(r.role_id).length,
         employeeNames: recruitedNamesByRole(r.role_id),
         isOwner: false, isSelected: false, isDropTarget: false,
+        externalTeamLabel: r.covered_by_external_team
+          ? (r.external_team_boundary ? 'JiuwenSwarm Team' : `via ${r.external_team_boundary_role_id ?? 'team boundary'}`)
+          : undefined,
+        externalTeamBoundary: !!r.external_team_boundary,
       },
     }))
     const all = [ownerNode, ...roleNodes]
@@ -162,6 +167,10 @@ function StructureCanvasInner({ roles, employees, sessionRecruitmentByRole, sele
           employeeNames: recruitedNamesByRole(role.role_id),
           isSelected: role.role_id === selectedRoleId,
           isDropTarget: role.role_id === dropTargetId,
+          externalTeamLabel: role.covered_by_external_team
+            ? (role.external_team_boundary ? 'JiuwenSwarm Team' : `via ${role.external_team_boundary_role_id ?? 'team boundary'}`)
+            : undefined,
+          externalTeamBoundary: !!role.external_team_boundary,
         },
       }
     })

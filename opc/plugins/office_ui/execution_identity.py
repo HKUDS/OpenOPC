@@ -17,15 +17,11 @@ from dataclasses import dataclass
 from typing import Any, Mapping
 
 from opc.core.config import validate_organization_id
+from opc.core.execution_agents import EXECUTION_AGENTS, normalize_execution_agent
 from opc.layer2_organization.company_runtime_identity import is_company_runtime_task
 
-PREFERRED_AGENTS: frozenset[str] = frozenset({
-    "native",
-    "codex",
-    "claude_code",
-    "cursor",
-    "opencode",
-})
+# Backwards-compatible UI name backed by the process-wide source of truth.
+PREFERRED_AGENTS = EXECUTION_AGENTS
 
 
 @dataclass(frozen=True)
@@ -77,11 +73,7 @@ def normalize_company_profile(value: Any, *, default: str = "corporate") -> str:
 
 
 def normalize_preferred_agent(value: Any, *, default: str = "native") -> str:
-    normalized = str(value or "").strip().lower().replace("-", "_")
-    if normalized in PREFERRED_AGENTS:
-        return normalized
-    fallback = str(default or "").strip().lower().replace("-", "_")
-    return fallback if fallback in PREFERRED_AGENTS else "native"
+    return normalize_execution_agent(value, default=default) or "native"
 
 
 def normalize_org_id(value: Any) -> str:

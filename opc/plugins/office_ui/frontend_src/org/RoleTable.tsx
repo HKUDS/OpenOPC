@@ -21,9 +21,10 @@ import {
   type ColumnDef, type SortingState,
 } from '@tanstack/react-table'
 import type { OrgRole, OrgEmployee } from '../types/visual'
+import { TASK_AGENT_OPTIONS, executionAgentLabel } from '../lib/externalAgents'
 import { resolveRoleIcon } from './roleIcons'
 
-const EXTERNAL_AGENTS = ['codex', 'cursor', 'claude_code', 'opencode'] as const
+const EXTERNAL_AGENTS = TASK_AGENT_OPTIONS.filter(agent => agent !== 'native')
 
 interface RoleTableProps {
   roles: OrgRole[]
@@ -47,6 +48,9 @@ interface TableRow {
   toolCount: number
   agent: string | null
   employeeCount: number
+  coveredByExternalTeam: boolean
+  externalTeamBoundary: boolean
+  externalTeamBoundaryRoleId: string | null
 }
 
 /* ── RoleTable ───────────────────────────────────────────────── */
@@ -76,6 +80,9 @@ export function RoleTable({
       toolCount: r.tools?.length ?? 0,
       agent: r.preferred_external_agent ?? null,
       employeeCount: countByRole.get(r.role_id) ?? 0,
+      coveredByExternalTeam: Boolean(r.covered_by_external_team),
+      externalTeamBoundary: Boolean(r.external_team_boundary),
+      externalTeamBoundaryRoleId: r.external_team_boundary_role_id ?? null,
     }))
   }, [roles, employees])
 
@@ -179,6 +186,15 @@ export function RoleTable({
       accessorKey: 'reports_to',
       cell: ({ row }) => {
         const r = row.original
+        if (r.coveredByExternalTeam) {
+          return (
+            <span className="rt-team-agent" title={r.externalTeamBoundary
+              ? 'This role and its descendants execute as one opaque team.'
+              : `Covered by the team at ${r.externalTeamBoundaryRoleId ?? 'the boundary role'}`}>
+              {r.externalTeamBoundary ? 'JiuwenSwarm Team' : `Covered by ${r.externalTeamBoundaryRoleId ?? 'team'}`}
+            </span>
+          )
+        }
         return (
           <select
             className="rt-cell-select"
@@ -218,7 +234,7 @@ export function RoleTable({
             onClick={e => e.stopPropagation()}
           >
             <option value="">(auto)</option>
-            {EXTERNAL_AGENTS.map(a => <option key={a} value={a}>{a}</option>)}
+            {EXTERNAL_AGENTS.map(a => <option key={a} value={a}>{executionAgentLabel(a)}</option>)}
           </select>
         )
       },
@@ -290,7 +306,7 @@ export function RoleTable({
           >
             <option value="" disabled>Change agent…</option>
             <option value="__auto__">(auto)</option>
-            {EXTERNAL_AGENTS.map(a => <option key={a} value={a}>{a}</option>)}
+            {EXTERNAL_AGENTS.map(a => <option key={a} value={a}>{executionAgentLabel(a)}</option>)}
           </select>
           <button className="btn btn-danger btn-sm" onClick={bulkDelete}>Delete selected</button>
           <button className="btn btn-ghost btn-sm" onClick={() => setRowSelection({})}>Clear</button>

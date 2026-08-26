@@ -713,7 +713,17 @@ class TestWSHandlerSessionSend(unittest.IsolatedAsyncioTestCase):
                 "runtime_session_id": "runtime-1",
             },
         )
-        self.engine.get_latest_pending_checkpoint_for_session = AsyncMock(return_value=checkpoint)
+        migration_persistence: list[bool] = []
+
+        async def get_checkpoint(
+            _session_id: str,
+            *,
+            persist_runtime_v2_migration: bool = True,
+        ) -> Any:
+            migration_persistence.append(persist_runtime_v2_migration)
+            return checkpoint
+
+        self.engine.get_latest_pending_checkpoint_for_session = get_checkpoint
         task = await self.store.get_task(self.task_id)
         assert task is not None
         task.status = TaskStatus.AWAITING_HUMAN
@@ -727,6 +737,30 @@ class TestWSHandlerSessionSend(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(metadata["work_item_turn_type"], "deliver")
         self.assertEqual(metadata["summary"], "Ready for review.")
         self.assertEqual(metadata["runtime_session_id"], "runtime-1")
+        self.assertEqual(migration_persistence, [False])
+
+    async def test_company_lease_loss_rejects_request_without_cancelling_websocket(self) -> None:
+        from opc.core.company_controller import CompanyRunControllerLeaseLost
+
+        ws = type("FakeWS", (), {"closed": False, "closing": False})()
+        ws.send_json = AsyncMock()
+        with patch(
+            "opc.plugins.office_ui.ws_handler.build_collab_sync",
+            new=AsyncMock(
+                side_effect=CompanyRunControllerLeaseLost("stale company controller")
+            ),
+        ):
+            await self.handler._route_message(
+                ws,
+                json.dumps({"type": "collab_sync", "project_id": "test-project"}),
+            )
+
+        self.handler._send_ack.assert_awaited_once_with(
+            ws,
+            ok=False,
+            error="stale company controller",
+            action="collab_sync",
+        )
 
     async def test_session_send_inserts_user_message(self) -> None:
         """User message should be inserted into chat_store and broadcast."""
@@ -943,7 +977,7 @@ class TestWSHandlerSessionSend(unittest.IsolatedAsyncioTestCase):
         call_kwargs = self.engine.process_message.call_args.kwargs
         self.assertEqual(call_kwargs["mode"], "company")
         self.assertEqual(call_kwargs["company_profile"], "corporate")
-        self.assertIsNone(call_kwargs["preferred_agent"])
+        self.assertEqual(call_kwargs["preferred_agent"], "codex")
 
     async def test_company_session_message_broadcasts_runtime_control_running_then_idle(self) -> None:
         task = await self.store.get_task(self.task_id)
@@ -2920,6 +2954,32 @@ class TestWSHandlerSessionUpdateConfig(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(ack_kwargs["exec_mode"], "company")
         self.assertEqual(ack_kwargs["company_profile"], "corporate")
         self.assertEqual(ack_kwargs["preferred_agent"], "codex")
+
+    async def test_task_mode_update_preserves_jiuwen_agent_selection(self) -> None:
+        for agent in ("jiuwen", "jiuwenswarm"):
+            with self.subTest(agent=agent):
+                self.broadcasts.clear()
+                self.handler._send_ack.reset_mock()
+                ws = MagicMock()
+                await self.handler._handle_session_update_config(ws, {
+                    "project_id": "test-project",
+                    "task_id": self.task_id,
+                    "exec_mode": "task",
+                    "preferred_agent": agent,
+                })
+
+                task = await self.store.get_task(self.task_id)
+                self.assertEqual(task.metadata.get("preferred_agent"), agent)
+                self.assertEqual(task.metadata.get("selected_execution_agent"), agent)
+
+                updates = [b for b in self.broadcasts if b["type"] == "session_updated"]
+                self.assertEqual(len(updates), 1)
+                self.assertEqual(updates[0]["payload"]["preferred_agent"], agent)
+                self.assertEqual(updates[0]["payload"]["selected_execution_agent"], agent)
+
+                ack_kwargs = self.handler._send_ack.call_args.kwargs
+                self.assertTrue(ack_kwargs["ok"])
+                self.assertEqual(ack_kwargs["preferred_agent"], agent)
 
     async def test_update_config_persists_custom_org_id(self) -> None:
         ws = MagicMock()
@@ -5417,7 +5477,7 @@ class TestOfficeServiceExecutionIdentity(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(call_kwargs["mode"], "org")
         self.assertEqual(call_kwargs["company_profile"], "custom")
         self.assertEqual(call_kwargs["org_id"], "quantum_harbor")
-        self.assertIsNone(call_kwargs["preferred_agent"])
+        self.assertEqual(call_kwargs["preferred_agent"], "codex")
         updated = await self.store.get_task(task.id)
         self.assertEqual(updated.metadata.get("exec_mode"), "org")
         self.assertEqual(updated.metadata.get("company_profile"), "custom")
@@ -5447,7 +5507,7 @@ class TestOfficeServiceExecutionIdentity(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(call_kwargs["mode"], "company")
         self.assertEqual(call_kwargs["company_profile"], "corporate")
         self.assertIsNone(call_kwargs["org_id"])
-        self.assertIsNone(call_kwargs["preferred_agent"])
+        self.assertEqual(call_kwargs["preferred_agent"], "codex")
         updated = await self.store.get_task(task.id)
         self.assertEqual(updated.metadata.get("exec_mode"), "company")
         self.assertEqual(updated.metadata.get("company_profile"), "corporate")

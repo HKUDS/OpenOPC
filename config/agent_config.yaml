@@ -4,9 +4,38 @@ external_agents:
     - codex
     - cursor
     - opencode
+    - jiuwen
+    - jiuwenswarm
 
   # model_flag, new_session_flag, resume_session_flag depend on your CLI version.
   # Leave empty for CLI defaults, or set explicitly for deterministic behavior.
+
+  # Jiuwen and JiuwenSwarm use the same upstream runtime. `jiuwen` selects a
+  # normal single-agent mode; `jiuwenswarm` is one opaque external Team.
+  # Start `jiuwenswarm-start` before using the default gateway transport.
+  jiuwen:
+    enabled: true
+    command: jiuwenswarm
+    transport: gateway
+    gateway_url: ws://127.0.0.1:19001/tui
+    provider_mode: code.normal
+    run_mode: interactive
+    session_mode: auto
+    interactive_timeout_seconds: 21600
+    approval_mode: auto
+    extra_args: []
+
+  jiuwenswarm:
+    enabled: true
+    command: jiuwenswarm
+    transport: gateway
+    gateway_url: ws://127.0.0.1:19001/tui
+    provider_mode: team
+    run_mode: interactive
+    session_mode: auto
+    interactive_timeout_seconds: 21600
+    approval_mode: auto
+    extra_args: []
 
   codex:
     enabled: true

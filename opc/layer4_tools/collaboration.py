@@ -42,7 +42,10 @@ from opc.layer2_organization.output_contract import (
 from opc.layer2_organization.prompt_contract import prompt_contract_from_delegate_item
 from opc.layer2_organization.work_item_links import linked_work_item_id_for_task
 from opc.layer2_organization.work_item_runtime import mark_work_item_runtime
-from opc.layer2_organization.work_item_identity import mark_work_item_projection
+from opc.layer2_organization.work_item_identity import (
+    initial_current_turn_mode_for_work_item,
+    mark_work_item_projection,
+)
 from opc.layer2_organization.work_item_transition import (
     is_prunable_dependency_work_item,
     normalize_dependency_work_item_ids,
@@ -50,7 +53,11 @@ from opc.layer2_organization.work_item_transition import (
     transition_work_item,
 )
 from opc.layer4_tools.output_budget import clip_text
-from opc.layer4_tools.registry import COMPANY_EFFECT_RUNTIME_INTERNAL, ToolDefinition
+from opc.layer4_tools.registry import (
+    COMPANY_EFFECT_RUNTIME_INTERNAL,
+    ToolDefinition,
+    ToolInvocationValidationError,
+)
 
 EXTERNAL_COLLABORATION_TOOL_NAMES = COMPANY_COLLABORATION_TOOL_NAMES
 
@@ -100,6 +107,7 @@ _DELEGATE_WORK_ITEM_ALLOWED_FIELDS: frozenset[str] = frozenset(
         "prompt_brief",
         "release_on_semantic_type",
         "release_policy",
+        "required_capabilities",
         "role_id",
         "scope_key",
         "source_message_id",
@@ -232,6 +240,100 @@ def _normalize_text_list(value: Any) -> list[str]:
         for item in items
         if str(item).strip()
     ]
+
+
+def _normalize_capability_key(value: Any) -> str:
+    """Normalize machine capability tags without interpreting task prose."""
+
+    return re.sub(r"[^a-z0-9]+", "_", str(value or "").strip().lower()).strip("_")
+
+
+def _external_team_capability_match(
+    target_seat: dict[str, Any],
+    required_capabilities: list[str],
+) -> dict[str, Any]:
+    """Record a non-blocking dispatch check against an opaque Team manifest.
+
+    A capability manifest is advisory routing metadata compiled from the live
+    organization, not a second hard-coded authorization system. Missing tags
+    therefore produce a visible warning instead of rejecting otherwise valid
+    work whose fit may be described by role responsibilities.
+    """
+
+    seat_metadata = dict(target_seat.get("metadata", {}) or {})
+    binding = dict(
+        target_seat.get("external_team_binding", {})
+        or seat_metadata.get("external_team_binding", {})
+        or {}
+    )
+    manifest = dict(
+        target_seat.get("capability_manifest", {})
+        or seat_metadata.get("capability_manifest", {})
+        or binding.get("capability_manifest", {})
+        or {}
+    )
+    execution_unit_kind = str(
+        target_seat.get("execution_unit_kind", "")
+        or seat_metadata.get("execution_unit_kind", "")
+        or ""
+    ).strip()
+    is_opaque_team = bool(binding) or execution_unit_kind == "opaque_external_team"
+    if not is_opaque_team:
+        return {}
+
+    declared = _normalize_text_list(manifest.get("capabilities"))
+    for role in list(manifest.get("roles", []) or []):
+        if isinstance(role, dict):
+            declared.extend(_normalize_text_list(role.get("capabilities")))
+    declared = list(dict.fromkeys(declared))
+    declared_by_key = {
+        _normalize_capability_key(capability): capability
+        for capability in declared
+        if _normalize_capability_key(capability)
+    }
+    requested_by_key = {
+        _normalize_capability_key(capability): capability
+        for capability in required_capabilities
+        if _normalize_capability_key(capability)
+    }
+    missing = [
+        original
+        for key, original in requested_by_key.items()
+        if key not in declared_by_key
+    ]
+    matched = [
+        original
+        for key, original in requested_by_key.items()
+        if key in declared_by_key
+    ]
+    status = (
+        "not_requested"
+        if not requested_by_key
+        else "matched"
+        if not missing
+        else "partially_matched"
+        if matched
+        else "undeclared"
+    )
+    result = {
+        "status": status,
+        "execution_unit_id": str(
+            manifest.get("execution_unit_id", "")
+            or binding.get("binding_id", "")
+            or ""
+        ).strip(),
+        "manifest_hash": str(manifest.get("manifest_hash", "") or "").strip(),
+        "required_capabilities": list(requested_by_key.values()),
+        "matched_capabilities": matched,
+        "undeclared_capabilities": missing,
+    }
+    if missing:
+        result["warning"] = (
+            "The opaque external Team manifest does not declare: "
+            + ", ".join(missing)
+            + ". Dispatch remains allowed because live role responsibilities may still cover the work."
+        )
+    return result
 
 
 def _slugify_scope_key(value: str) -> str:
@@ -529,8 +631,16 @@ def _validate_delegate_dependency_dag(
                 labels_by_work_item_id.get(item_id, item_id)
                 for item_id in cycle_ids
             )
-            raise ValueError(
-                f"delegate_work dependency cycle detected within batch: {cycle}"
+            raise ToolInvocationValidationError(
+                f"delegate_work dependency cycle detected within batch: {cycle}",
+                code="delegate_dependency_cycle",
+                correction=(
+                    "Remove at least one edge from the cycle and retry the entire "
+                    "batch. Use depends_on only for one-way hard prerequisites. "
+                    "If the items merely exchange findings, leave both startable "
+                    "and describe that coordination in coordination_notes."
+                ),
+                details={"cycle": cycle, "cycle_work_item_ids": cycle_ids},
             )
         state[work_item_id] = 1
         stack.append(work_item_id)
@@ -815,6 +925,84 @@ def _base_mailbox_metadata(
     }
 
 
+def _external_team_execution_metadata(target_seat: dict[str, Any]) -> dict[str, Any]:
+    """Copy the compiled opaque-Team boundary onto a dynamic WorkItem.
+
+    Static WorkItems inherit this envelope from their compiled projection.
+    ``delegate_work`` creates WorkItems at runtime, so the canonical target
+    seat is their authoritative execution source.
+    """
+
+    seat_metadata = dict(target_seat.get("metadata", {}) or {})
+    binding = dict(
+        target_seat.get("external_team_binding", {})
+        or seat_metadata.get("external_team_binding", {})
+        or {}
+    )
+    if (
+        not binding
+        or target_seat.get("dispatchable") is not True
+        or target_seat.get("company_external_execution_capable") is not True
+    ):
+        return {}
+    provider = str(
+        target_seat.get("selected_execution_agent")
+        or target_seat.get("preferred_external_agent")
+        or binding.get("external_agent")
+        or ""
+    ).strip()
+    if not provider:
+        return {}
+    manifest = dict(
+        target_seat.get("capability_manifest", {})
+        or seat_metadata.get("capability_manifest", {})
+        or binding.get("capability_manifest", {})
+        or {}
+    )
+    return {
+        "execution_unit_kind": "opaque_external_team",
+        "external_team_binding": copy.deepcopy(binding),
+        "covered_role_ids": list(
+            target_seat.get("covered_role_ids")
+            or binding.get("covered_role_ids")
+            or []
+        ),
+        "capability_manifest": copy.deepcopy(manifest),
+        "selected_execution_agent": provider,
+        "preferred_external_agent": provider,
+        "execution_agent_locked": True,
+        "selected_execution_agent_source": "external_team_binding",
+        "force_native_execution": False,
+        "external_company_execution_allowed": True,
+        "external_company_execution_fence": str(
+            target_seat.get("external_company_execution_fence")
+            or binding.get("artifact_isolation")
+            or "validated_workspace"
+        ).strip(),
+        "external_session_scope": str(
+            target_seat.get("external_session_scope")
+            or binding.get("session_scope")
+            or "company_run"
+        ).strip(),
+        "external_max_inflight": int(
+            target_seat.get("external_max_inflight")
+            or binding.get("max_inflight")
+            or 1
+        ),
+        "external_failure_policy": str(
+            target_seat.get("external_failure_policy")
+            or binding.get("failure_policy")
+            or "fail_closed"
+        ).strip(),
+        "jiuwen_provider_mode": str(
+            target_seat.get("jiuwen_provider_mode")
+            or binding.get("provider_mode")
+            or "team"
+        ).strip(),
+        "work_item_execution_strategy": "external",
+    }
+
+
 def _coerce_semantic_type(communication: Any, raw: str, *, fallback: CommsSemanticType) -> CommsSemanticType:
     if hasattr(communication, "_coerce_semantic_type"):
         return communication._coerce_semantic_type(raw, fallback=fallback)
@@ -883,6 +1071,10 @@ def _serialize_board_item(item: DelegationWorkItem, *, include_full_summaries: b
         "planning_context": str(metadata.get("planning_context", "") or "").strip(),
         "deliverables": _normalize_text_list(metadata.get("deliverables")),
         "acceptance_criteria": _normalize_text_list(metadata.get("acceptance_criteria")),
+        "required_capabilities": _normalize_text_list(metadata.get("required_capabilities")),
+        "external_team_capability_match": dict(
+            metadata.get("external_team_capability_match", {}) or {}
+        ),
         "delegation_rationale": str(metadata.get("delegation_rationale", "") or "").strip(),
         "non_overlap_guard": str(metadata.get("non_overlap_guard", "") or "").strip(),
         "coordination_notes": str(metadata.get("coordination_notes", "") or "").strip(),
@@ -1103,7 +1295,7 @@ def build_external_cli_tool_contract_lines(
             lines.append(
                 "- `delegate_work` item fields: `role_id` (required), `title` (required), "
                 "recommended `task_brief`, `brief`/`summary` for UI, `scope_key`, `outputs`/`deliverables`, "
-                "`done_when`/`acceptance_criteria`, `depends_on`, `coordination_notes`, "
+                "`done_when`/`acceptance_criteria`, `required_capabilities`, `depends_on`, `coordination_notes`, "
                 "`non_overlap_guard`, `allow_parallel_same_role`."
             )
         notes = _EXTERNAL_BRIDGE_ARGUMENT_NOTES.get(tool_name, ())
@@ -1921,6 +2113,18 @@ def create_collaboration_tools(
                     raise ValueError(f"delegate_work may only target direct reports; `{target_role}` is not allowed")
             target_seat = _resolve_target_seat(communication, task, target_role)
             target_seat_id = str(target_seat.get("seat_id", "") or "").strip()
+            required_capabilities = _normalize_text_list(item.get("required_capabilities"))
+            capability_match = _external_team_capability_match(
+                target_seat,
+                required_capabilities,
+            )
+            external_team_execution = _external_team_execution_metadata(target_seat)
+            if capability_match.get("warning"):
+                logger.warning(
+                    "delegate_work: target role `{}` external Team capability check: {}",
+                    target_role,
+                    capability_match["warning"],
+                )
             target_team_id = str(
                 target_seat.get("team_id", "")
                 or item.get("team_id", "")
@@ -2176,6 +2380,10 @@ def create_collaboration_tools(
                 or str(target_seat.get("managed_team_id", "") or "").strip()
             )
             manager_outcome_dispatch = target_is_manager and work_kind == "execute"
+            initial_current_turn_mode = initial_current_turn_mode_for_work_item(
+                work_kind,
+                manager_can_delegate=target_is_manager,
+            )
             inherited_self_evolution: dict[str, Any] = {}
             if work_kind == "self_evolution" or bool((task.metadata or {}).get("self_evolution_work_item", False)):
                 inherited_self_evolution = {
@@ -2245,6 +2453,7 @@ def create_collaboration_tools(
                     "seat_id": target_seat_id,
                     "seat_state_id": str(target_seat.get("seat_state_id", "") or "").strip(),
                     "work_kind": work_kind,
+                    "current_turn_mode": initial_current_turn_mode,
                     "batch_id": batch_id,
                     "dependency_work_item_ids": [],
                     "dependency_specs": [dict(spec) for spec in dependency_specs],
@@ -2261,6 +2470,25 @@ def create_collaboration_tools(
                     "delegate_invocation_index": len(pending_items),
                     "created_by_seat_id": seat_id,
                     "assigned_role_runtime_id": role_runtime_session_id,
+                    **external_team_execution,
+                    **(
+                        {
+                            "required_capabilities": required_capabilities,
+                            "external_team_capability_match": capability_match,
+                            "target_execution_unit_id": str(
+                                capability_match.get("execution_unit_id", "") or ""
+                            ).strip(),
+                            "capability_manifest_hash": str(
+                                capability_match.get("manifest_hash", "") or ""
+                            ).strip(),
+                        }
+                        if capability_match
+                        else (
+                            {"required_capabilities": required_capabilities}
+                            if required_capabilities
+                            else {}
+                        )
+                    ),
                     "delegation_playbook": playbook,
                     "contact_role_ids": list(target_seat.get("contact_role_ids", []) or []),
                     "allowed_delegate_role_ids": list(target_seat.get("allowed_delegate_role_ids", []) or []),
@@ -2534,6 +2762,10 @@ def create_collaboration_tools(
                     "generated_scope_key": generated_scope_key,
                     "deliverables": list(work_item.metadata.get("deliverables", []) or []),
                     "acceptance_criteria": list(work_item.metadata.get("acceptance_criteria", []) or []),
+                    "required_capabilities": list(work_item.metadata.get("required_capabilities", []) or []),
+                    "external_team_capability_match": dict(
+                        work_item.metadata.get("external_team_capability_match", {}) or {}
+                    ),
                     "delegation_rationale": str(work_item.metadata.get("delegation_rationale", "") or "").strip(),
                     "non_overlap_guard": str(work_item.metadata.get("non_overlap_guard", "") or "").strip(),
                     "manager_outcome_dispatch": bool(work_item.metadata.get("manager_outcome_dispatch", False)),
@@ -3446,6 +3678,8 @@ def create_collaboration_tools(
                 "outputs/deliverables, done_when/acceptance_criteria, delegation_rationale, non_overlap_guard, and coordination_notes. "
                 "scope_key is idempotent per manager board: an existing scope_key is reused, not duplicated. "
                 "Dependencies must be expressed in structured depends_on; text in brief/task_brief/coordination_notes is never treated as a dependency. "
+                "The dependency graph must be acyclic. Use depends_on only for a one-way hard prerequisite; "
+                "if two items merely exchange findings, start both and describe the relationship in coordination_notes instead of adding reciprocal edges. "
                 "Prefer stable sibling scope_key or work_item_ref references in depends_on; use raw work_item_id UUIDs only when copied from manager_board_read. "
                 "depends_on may reference siblings in the same call by role_id, scope_key, id, work_item_ref, projection_id, or work_item_id; "
                 "typed strings such as scope_key:target-role-prep are accepted and resolved to work-item IDs before the batch is saved. "
@@ -3476,6 +3710,14 @@ def create_collaboration_tools(
                                 "deliverables": {"type": "array", "items": {"type": "string"}},
                                 "done_when": {"type": "array", "items": {"type": "string"}},
                                 "acceptance_criteria": {"type": "array", "items": {"type": "string"}},
+                                "required_capabilities": {
+                                    "type": "array",
+                                    "items": {"type": "string"},
+                                    "description": (
+                                        "Optional machine-readable capability tags used to check an opaque external Team's "
+                                        "live capability manifest. Undeclared tags are returned as routing warnings, not hard failures."
+                                    ),
+                                },
                                 "delegation_rationale": {"type": "string", "default": ""},
                                 "non_overlap_guard": {"type": "string", "default": ""},
                                 "coordination_notes": {"type": "string", "default": ""},
@@ -3487,6 +3729,7 @@ def create_collaboration_tools(
                                         "Structured hard dependencies. Same-call siblings are supported. Use a sibling scope_key or work_item_ref when possible; "
                                         "typed strings such as scope_key:target-role-prep are accepted. "
                                         "role_id is allowed only when unambiguous, and raw work_item_id UUIDs should only be copied from manager_board_read. "
+                                        "The graph must be acyclic; mutual information-sharing belongs in coordination_notes, not reciprocal dependencies. "
                                         "Dependency wording in brief/task_brief/coordination_notes is ignored."
                                     ),
                                 },

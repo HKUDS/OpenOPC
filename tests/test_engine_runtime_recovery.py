@@ -87,6 +87,51 @@ def _ui_anchor(*, status: TaskStatus = TaskStatus.IDLE) -> Task:
     )
 
 
+@_async_test
+async def test_checkpoint_with_tasks_but_empty_plan_restores_authoritative_plan(
+    tmp_path: Path,
+) -> None:
+    store = OPCStore(tmp_path / "tasks.db")
+    await store.initialize()
+    try:
+        await store.save_task(_ui_anchor())
+        runtime_task = _runtime_task(
+            task_id="runtime-task",
+            status=TaskStatus.BLOCKED,
+        )
+        await store.save_task(runtime_task)
+        checkpoint = ExecutionCheckpoint(
+            checkpoint_id="interrupted-checkpoint",
+            project_id="project-a",
+            session_id="root-session",
+            checkpoint_type="company_runtime_interrupted",
+            status="pending",
+            task_id=runtime_task.id,
+            payload={
+                "task_ids": [runtime_task.id],
+                "company_work_item_plan": serialize_company_work_item_plan(
+                    CompanyWorkItemRuntimePlan(
+                        profile="corporate",
+                        metadata={"execution_model": "multi_team_org"},
+                    )
+                ),
+            },
+        )
+
+        engine = OPCEngine(project_id="project-a")
+        engine.store = store
+        loaded = await engine._load_company_suspend_checkpoint_runtime(checkpoint)
+
+        assert loaded is not None
+        _payload, _session_id, loaded_plan, loaded_tasks = loaded
+        assert [projection.projection_id for projection in loaded_plan.projections] == [
+            "execution"
+        ]
+        assert [task.id for task in loaded_tasks] == [runtime_task.id]
+    finally:
+        await store.close()
+
+
 @pytest.mark.parametrize("pid", [None, os.getpid(), 99999999])
 @_async_test
 async def test_startup_creates_exactly_one_checkpoint_without_persisted_liveness(
@@ -763,6 +808,200 @@ async def test_startup_uses_nonterminal_work_item_over_terminal_task_projection(
         assert "dispatch_hold" not in terminal_after.metadata
         assert terminal_item_after is not None and terminal_item_after.phase == Phase.APPROVED
         assert "dispatch_hold" not in terminal_item_after.metadata
+    finally:
+        await store.close()
+
+
+@_async_test
+async def test_startup_reconciles_consecutive_company_runs_in_one_chat_separately(
+    tmp_path: Path,
+) -> None:
+    store = OPCStore(tmp_path / "tasks.db")
+    await store.initialize()
+    try:
+        await store.save_task(_ui_anchor(status=TaskStatus.RUNNING))
+        for run_id in ("completed-run", "interrupted-run"):
+            await store.save_delegation_run(
+                DelegationRun(
+                    run_id=run_id,
+                    project_id="project-a",
+                    session_id="root-session",
+                    execution_model="multi_team_org",
+                    status="running",
+                    lifecycle_status="active",
+                )
+            )
+
+        completed_task = _runtime_task(
+            task_id="completed-run-task",
+            status=TaskStatus.DONE,
+            metadata={"delegation_run_id": "completed-run"},
+        )
+        completed_item = DelegationWorkItem(
+            work_item_id="completed-run-item",
+            run_id="completed-run",
+            cell_id="team::executor",
+            role_id="executor",
+            seat_id="seat::executor",
+            title="Completed work",
+            kind="execute",
+            projection_id="completed-execution",
+            phase=Phase.APPROVED,
+        )
+        interrupted_task = _runtime_task(
+            task_id="interrupted-run-task",
+            status=TaskStatus.BLOCKED,
+            metadata={"delegation_run_id": "interrupted-run"},
+        )
+        interrupted_item = DelegationWorkItem(
+            work_item_id="interrupted-run-item",
+            run_id="interrupted-run",
+            cell_id="team::executor",
+            role_id="executor",
+            seat_id="seat::executor",
+            title="Interrupted work",
+            kind="execute",
+            projection_id="interrupted-execution",
+            phase=Phase.READY,
+        )
+        for task, item in (
+            (completed_task, completed_item),
+            (interrupted_task, interrupted_item),
+        ):
+            set_linked_work_item_id(task, item.work_item_id)
+            await store.save_delegation_work_item(item)
+            await store.save_task(task)
+            assert await store.link_work_item_runtime_task(
+                item.work_item_id,
+                task.id,
+            )
+
+        engine = OPCEngine(project_id="project-a")
+        engine.store = store
+
+        updated = await engine._reconcile_interrupted_project_tasks()
+
+        checkpoints = await store.get_execution_checkpoints(
+            project_id="project-a",
+            session_id="root-session",
+            checkpoint_types=["company_runtime_interrupted"],
+            statuses=["pending"],
+        )
+        completed_after = await store.get_task(completed_task.id)
+        interrupted_after = await store.get_task(interrupted_task.id)
+        assert updated >= 1
+        assert len(checkpoints) == 1
+        assert checkpoints[0].payload["task_ids"] == [interrupted_task.id]
+        assert completed_after is not None
+        assert "dispatch_hold" not in completed_after.metadata
+        assert interrupted_after is not None
+        assert interrupted_after.metadata["dispatch_hold"] == (
+            "company_runtime_suspended"
+        )
+    finally:
+        await store.close()
+
+
+@_async_test
+async def test_shutdown_checkpoints_only_the_active_run_in_a_reused_chat(
+    tmp_path: Path,
+) -> None:
+    store = OPCStore(tmp_path / "tasks.db")
+    await store.initialize()
+    registry = ActiveTaskRunRegistry()
+    try:
+        await store.save_task(_ui_anchor(status=TaskStatus.RUNNING))
+        for run_id in ("completed-run", "active-run"):
+            await store.save_delegation_run(
+                DelegationRun(
+                    run_id=run_id,
+                    project_id="project-a",
+                    session_id="root-session",
+                    execution_model="multi_team_org",
+                    status="running",
+                    lifecycle_status="active",
+                )
+            )
+
+        completed_task = _runtime_task(
+            task_id="completed-run-task",
+            status=TaskStatus.DONE,
+            metadata={
+                "delegation_run_id": "completed-run",
+                "work_item_projection_id": "completed-execution",
+            },
+        )
+        active_task = _runtime_task(
+            task_id="active-run-task",
+            status=TaskStatus.RUNNING,
+            metadata={
+                "delegation_run_id": "active-run",
+                "work_item_projection_id": "active-execution",
+            },
+        )
+        for task, run_id, phase in (
+            (completed_task, "completed-run", Phase.APPROVED),
+            (active_task, "active-run", Phase.RUNNING),
+        ):
+            item = DelegationWorkItem(
+                work_item_id=f"{run_id}-item",
+                run_id=run_id,
+                cell_id="team::executor",
+                role_id="executor",
+                seat_id="seat::executor",
+                title=task.title,
+                kind="execute",
+                projection_id=str(task.metadata["work_item_projection_id"]),
+                phase=phase,
+            )
+            set_linked_work_item_id(task, item.work_item_id)
+            await store.save_delegation_work_item(item)
+            await store.save_task(task)
+            assert await store.link_work_item_runtime_task(item.work_item_id, task.id)
+
+        owner_token = "active-controller"
+        lease = await store.acquire_delegation_run_controller_lease(
+            "active-run",
+            project_id="project-a",
+            root_session_id="root-session",
+            owner_token=owner_token,
+            lease_seconds=60,
+        )
+        assert lease.acquired
+        token = registry.register("project-a", active_task.id)
+        engine = OPCEngine(
+            project_id="project-a",
+            active_task_run_registry=registry,
+            owns_active_task_run_registry=True,
+        )
+        engine.store = store
+        engine.company_executor = SimpleNamespace(
+            controller_lease_credential=lambda run_id: (
+                {
+                    "run_id": run_id,
+                    "project_id": "project-a",
+                    "root_session_id": "root-session",
+                    "owner_token": owner_token,
+                    "generation": lease.generation,
+                }
+                if run_id == "active-run"
+                else None
+            )
+        )
+
+        prepared = await engine.prepare_active_company_runtimes_for_shutdown()
+
+        assert len(prepared) == 1
+        assert prepared[0]["task_ids"] == [active_task.id]
+        completed_after = await store.get_task(completed_task.id)
+        active_after = await store.get_task(active_task.id)
+        assert completed_after is not None
+        assert "dispatch_hold" not in completed_after.metadata
+        assert active_after is not None
+        assert active_after.metadata["dispatch_hold"] == (
+            "company_runtime_suspended"
+        )
+        registry.unregister("project-a", active_task.id, token)
     finally:
         await store.close()
 

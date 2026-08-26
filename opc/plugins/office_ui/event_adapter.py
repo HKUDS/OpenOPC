@@ -555,6 +555,8 @@ class EventAdapter:
             detail = text[bracket_end + 1:].strip() if bracket_end > 0 else ""
             parts = header.split(":")
             stream = parts[2] if len(parts) > 2 else ""
+            if stream == "thinking_snapshot":
+                stream = "thinking"
             preview = detail or stream or header
             if stream and detail:
                 preview = f"{stream}: {detail}"

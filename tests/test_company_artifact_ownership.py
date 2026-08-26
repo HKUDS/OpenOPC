@@ -764,12 +764,24 @@ class CompanyArtifactOwnershipTests(unittest.IsolatedAsyncioTestCase):
             tool_call={"id": "call-read"},
             effect=effect,
         )
-        self.assertFalse(read_only["success"])
+        self.assertTrue(read_only["success"])
+        self.assertEqual(effects, ["ran"])
+
+        outside_file = self.root.parent / "outside.txt"
+        outside_file.write_text("outside", encoding="utf-8")
+        outside_read = await fence.run(
+            task=self.owner_task,
+            tool_name="shell_exec",
+            arguments={"command": f"cat {outside_file}"},
+            tool_call={"id": "call-outside-read"},
+            effect=effect,
+        )
+        self.assertFalse(outside_read["success"])
         self.assertEqual(
-            read_only["opaque_tool_permission"]["outcome"],
+            outside_read["opaque_tool_permission"]["outcome"],
             "invalid_permit",
         )
-        self.assertEqual(effects, [])
+        self.assertEqual(effects, ["ran"])
 
         arguments = {"command": "touch artifact.txt"}
         permit = await self._executing_permit(
@@ -803,7 +815,7 @@ class CompanyArtifactOwnershipTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(approved["success"])
         self.assertFalse(replay["success"])
         self.assertEqual(replay["opaque_tool_permission"]["outcome"], "already_consumed")
-        self.assertEqual(effects, ["ran"])
+        self.assertEqual(effects, ["ran", "ran"])
 
     async def test_company_shell_wrappers_cannot_bypass_exact_approval(self) -> None:
         fence = RuntimeCompanyControllerToolFence(store=self.store)

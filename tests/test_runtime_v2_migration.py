@@ -112,6 +112,59 @@ class RuntimeV2MigrationTests(unittest.IsolatedAsyncioTestCase):
             await coordinator.shutdown()
             await store.close()
 
+    async def test_read_only_checkpoint_lookup_enriches_without_persisting(self) -> None:
+        with _workspace_tempdir() as tmpdir:
+            store = OPCStore(tmpdir / "tasks.db")
+            await store.initialize()
+            task = Task(
+                id="task-read-only",
+                title="Need approval",
+                session_id="sess-read-only",
+                project_id="proj1",
+                status=TaskStatus.AWAITING_REVIEW,
+                metadata={},
+            )
+            await store.save_task(task)
+            checkpoint = ExecutionCheckpoint(
+                project_id="proj1",
+                session_id="sess-read-only",
+                checkpoint_type="task_user_input",
+                task_id=task.id,
+                payload={
+                    "task_id": task.id,
+                    "pause_request": {"reason": "Need confirmation"},
+                },
+            )
+            coordinator, _checkpoint = await self._publish_legacy_owner_checkpoint(
+                store,
+                checkpoint,
+            )
+
+            engine = OPCEngine()
+            engine.project_id = "proj1"
+            engine.store = store
+            engine.interaction_coordinator = coordinator
+
+            enriched = await engine.get_latest_pending_checkpoint_for_session(
+                "sess-read-only",
+                persist_runtime_v2_migration=False,
+            )
+
+            assert enriched is not None
+            self.assertIn("runtime_v2", enriched.payload)
+            refreshed_task = await store.get_task(task.id)
+            assert refreshed_task is not None
+            self.assertNotIn("runtime_v2", refreshed_task.metadata)
+            persisted_checkpoint = await store.get_execution_checkpoint(
+                checkpoint.checkpoint_id,
+                project_id="proj1",
+                checkpoint_type="task_user_input",
+            )
+            assert persisted_checkpoint is not None
+            self.assertNotIn("runtime_v2", persisted_checkpoint.payload)
+            await coordinator.shutdown()
+            await store.close()
+
     async def test_migrated_runtime_state_carries_legacy_compaction_boundary(self) -> None:
         with _workspace_tempdir() as tmpdir:
             store = OPCStore(tmpdir / "tasks.db")

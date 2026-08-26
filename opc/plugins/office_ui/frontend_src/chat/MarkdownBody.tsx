@@ -3,6 +3,7 @@ import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 
 import { IconCheck, IconCopy } from './SvgIcons'
+import { restoreCollapsedMarkdown } from '../lib/markdownRepair'
 
 const CODE_BLOCK_MAX_LINES = 30
 const CODE_BLOCK_PEEK_LINES = 10
@@ -89,16 +90,19 @@ export const MarkdownBody = React.memo(function MarkdownBody({
   className?: string
   collapseMode?: MarkdownCollapseMode
 }) {
-  const collapsible = collapseMode !== 'never' && shouldCollapseContent(content)
+  // Also repairs historical Jiuwen messages already persisted before the
+  // adapter-side stream normalizer was added.
+  const normalizedContent = restoreCollapsedMarkdown(content)
+  const collapsible = collapseMode !== 'never' && shouldCollapseContent(normalizedContent)
   const [collapsed, setCollapsed] = useState(collapsible)
 
   useEffect(() => {
-    setCollapsed(collapseMode !== 'never' && shouldCollapseContent(content))
-  }, [collapseMode, content])
+    setCollapsed(collapseMode !== 'never' && shouldCollapseContent(normalizedContent))
+  }, [collapseMode, normalizedContent])
 
-  const displayContent = collapsed ? truncatePreview(content) : content
-  const lineCount = content.split('\n').length
-  const charCount = content.length
+  const displayContent = collapsed ? truncatePreview(normalizedContent) : normalizedContent
+  const lineCount = normalizedContent.split('\n').length
+  const charCount = normalizedContent.length
   const mdComponents = {
     code({ className: codeClassName, children, ...props }: any) {
       const isBlock = codeClassName?.startsWith('language-')

@@ -218,6 +218,7 @@ def test_work_item_chat_resume_uses_canonical_ui_anchor_as_engine_origin() -> No
             return_value=("company", "corporate")
         )
         handler._resolve_task_org_id = MagicMock(return_value="")
+        handler._resolve_task_preferred_agent = MagicMock(return_value="native")
         handler._extract_checkpoint_metadata = AsyncMock(return_value=None)
         handler._sync_task_transcript_messages = AsyncMock()
         handler.on_kanban_changed = AsyncMock()
@@ -276,6 +277,7 @@ def test_company_suspend_reply_routes_selected_org_to_engine() -> None:
         handler._normalize_session_company_profile = MagicMock(return_value="corporate")
         handler._resolve_task_session_config = MagicMock(return_value=("org", "custom"))
         handler._resolve_task_org_id = MagicMock(return_value="selected-org")
+        handler._resolve_task_preferred_agent = MagicMock(return_value="native")
         handler._extract_checkpoint_metadata = AsyncMock(return_value=None)
         handler._sync_task_transcript_messages = AsyncMock()
         handler.on_kanban_changed = AsyncMock()
@@ -420,6 +422,42 @@ def test_suspend_reply_identity_mismatch_and_resuming_checkpoint_fail_closed() -
             run_project_id="project-a",
         )
         assert resuming is True
+        handler._track.assert_not_called()
+
+    asyncio.run(scenario())
+
+
+def test_non_runtime_checkpoint_does_not_capture_ordinary_followup() -> None:
+    async def scenario() -> None:
+        tasks, checkpoint = _runtime_records()
+        checkpoint.checkpoint_type = "company_delivery_feedback"
+        checkpoint.status = "resolved"
+        handler = WSHandler.__new__(WSHandler)
+        handler.chat_store = None
+        handler._company_stop_finalize_tasks = {}
+        handler._company_suspend_reply_locks = {}
+        handler._track = MagicMock()
+        handler._resolve_company_runtime_target = AsyncMock(
+            return_value={
+                "runtime_session_id": "runtime-session",
+                "checkpoint": checkpoint,
+            }
+        )
+
+        handled = await handler._route_company_suspend_reply_if_pending(
+            task_id="ui-anchor",
+            content="start the next company turn",
+            session_id="runtime-session",
+            task=tasks[0],
+            attachment_refs=None,
+            message_metadata=None,
+            user_message_id=None,
+            user_message_created_at=None,
+            run_engine=SimpleNamespace(project_id="project-a"),
+            run_project_id="project-a",
+        )
+
+        assert handled is False
         handler._track.assert_not_called()
 
     asyncio.run(scenario())

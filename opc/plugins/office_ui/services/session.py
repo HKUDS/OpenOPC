@@ -823,7 +823,15 @@ class SessionService:
             mode=identity.exec_mode,
             org_id=identity.org_id or None,
             company_profile=identity.company_profile if identity.is_company_runtime else None,
-            preferred_agent=identity.preferred_agent if identity.is_task else None,
+            # Company-mode staffing consumes the session preference too.  In
+            # particular, ``jiuwenswarm`` means an opaque Team boundary for
+            # each selected/top-level subtree; dropping it here silently
+            # changed the staffing checkpoint back to native agents.
+            preferred_agent=(
+                identity.preferred_agent
+                if identity.is_task or identity.preferred_agent != "native"
+                else None
+            ),
             domains=list(domains or []),
             origin_task_id=origin_task_id,
             message_metadata=message_metadata,
@@ -1175,6 +1183,7 @@ class SessionService:
                 "response_to_checkpoint_id": str(getattr(checkpoint, "checkpoint_id", "") or ""),
                 "response_to_checkpoint_type": str(getattr(checkpoint, "checkpoint_type", "") or ""),
             })
+        resolved_preferred_agent = self.resolve_task_preferred_agent(config_task)
         response = await engine.process_message(
             message,
             project_id=self.context.normalize_project_id(project_id),
@@ -1182,7 +1191,11 @@ class SessionService:
             mode=engine_mode,
             org_id=org_id or None,
             company_profile=config_company_profile if engine_mode == "company" else None,
-            preferred_agent=self.resolve_task_preferred_agent(config_task) if engine_mode == "task" else None,
+            preferred_agent=(
+                resolved_preferred_agent
+                if engine_mode == "task" or resolved_preferred_agent != "native"
+                else None
+            ),
             origin_task_id=(str(target_info.get("ui_anchor_task_id", "") or "").strip() or None),
             message_metadata=message_metadata,
         )

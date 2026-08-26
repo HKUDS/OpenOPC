@@ -70,6 +70,7 @@ from opc.core.models import (
     CompanyProfile,
 )
 from opc.database.store import (
+    CompanyControllerWorkItemMutation,
     OPCStore,
     company_controller_task_preimage_hash,
 )
@@ -131,8 +132,10 @@ from opc.layer2_organization.company_runtime_identity import (
     resolve_company_interaction_ownership,
 )
 from opc.layer2_organization.metadata_ownership import (
+    FINAL_DELIVERY_CURRENT_OUTPUT_KEYS,
     build_company_resume_identity_restore,
     build_work_item_owner_execution_copy,
+    clear_current_final_delivery_outputs,
 )
 from opc.layer2_organization.phase import (
     DONE_PHASES,
@@ -287,7 +290,7 @@ external agents, choose the best execution agent for THIS task only.
 
 Return strict JSON:
 {
-  "selected_agent": "native" | "claude_code" | "cursor" | "codex" | "opencode",
+  "selected_agent": "native" | "claude_code" | "cursor" | "codex" | "opencode" | "jiuwen" | "jiuwenswarm",
   "reasoning": "short explanation"
 }
 
@@ -1499,6 +1502,20 @@ class OPCEngine:
             if str(item.get("template_id", "") or "").strip()
         }
         roles: list[dict[str, Any]] = []
+        external_team_by_role: dict[str, Any] = {}
+        if self.org_engine:
+            from opc.layer2_organization.external_team_compiler import (
+                compile_external_team_bindings,
+            )
+
+            staffing_topology = self.org_engine.build_runtime_delegation_topology()
+            for compiled_team in compile_external_team_bindings(
+                self.org_engine,
+                runtime_topology=staffing_topology,
+                bindings=self._durable_external_team_bindings(),
+            ):
+                for covered_role_id in compiled_team.covered_role_ids:
+                    external_team_by_role[covered_role_id] = compiled_team
         # The card's per-role agent defaults become recruitment_role_agents on
         # approve, which outrank the session-level agent choice as explicit
         # per-role overrides. They must therefore be the RESOLVED effective
@@ -1526,14 +1543,54 @@ class OPCEngine:
             role_id = str(getattr(agent, "role_id", "") or "").strip()
             if not role_id or role_id == "task_generalist":
                 continue
+            external_team = external_team_by_role.get(role_id)
+            if external_team is not None:
+                if role_id != external_team.boundary_role_id:
+                    # The organization node remains visible, but Jiuwen owns
+                    # its internal staffing and no OPC hire is requested.
+                    continue
+                roles.append(
+                    {
+                        "role_id": role_id,
+                        "role_label": str(getattr(agent, "name", "") or role_id),
+                        "role_responsibility": str(
+                            getattr(agent, "responsibility", "") or ""
+                        ),
+                        "reports_to": str(getattr(agent, "reports_to", "") or ""),
+                        "default_selection": {"kind": "fallback"},
+                        "same_role_employee_ids": [],
+                        "fallback_available": False,
+                        "default_agent": external_team.external_agent,
+                        "selected_agent": external_team.external_agent,
+                        "default_source": "external_team_binding",
+                        "staffing_locked": True,
+                        "staffing_mode": "opaque_external_team",
+                        "external_team_binding_id": external_team.binding_id,
+                        "covered_role_ids": list(external_team.covered_role_ids),
+                        "capability_manifest": copy.deepcopy(
+                            external_team.capability_manifest
+                        ),
+                    }
+                )
+                continue
             role_preferred_agent = normalize_recruitment_agent_choice(
                 getattr(agent, "preferred_external_agent", None)
             )
             if explicit_session_agent:
-                default_agent = (
+                requested_default_agent = (
                     explicit_session_agent
                     if _staffing_agent_is_runnable(explicit_session_agent)
                     else "native"
+                )
+                # A global Company selection of JiuwenSwarm means one opaque
+                # Team per top-level organizational subtree, not one nested
+                # Team on every role. Descendants are visibly covered and are
+                # removed from recruitment after approval.
+                default_agent = (
+                    "native"
+                    if requested_default_agent == "jiuwenswarm"
+                    and str(getattr(agent, "reports_to", "") or "").strip() != "owner"
+                    else requested_default_agent
                 )
             elif (
                 role_preferred_agent
@@ -1568,7 +1625,20 @@ class OPCEngine:
                     "employee_id": same_role_employees[0]["employee_id"],
                 }
                 default_source = "org"
-            selected_agent = normalize_recruitment_agent_choice(saved_agents.get(role_id), default=default_agent) or default_agent
+            # A session-level choice is the user's current explicit decision;
+            # project defaults are only fallbacks when this run did not name
+            # an execution agent.  In particular, selecting JiuwenSwarm Team
+            # for a new Company session must not be silently replaced by old
+            # per-role staffing defaults.
+            selected_agent = (
+                default_agent
+                if explicit_session_agent
+                else normalize_recruitment_agent_choice(
+                    saved_agents.get(role_id),
+                    default=default_agent,
+                )
+                or default_agent
+            )
             if not _staffing_agent_is_runnable(selected_agent):
                 selected_agent = default_agent
             roles.append(
@@ -1576,6 +1646,7 @@ class OPCEngine:
                     "role_id": role_id,
                     "role_label": str(getattr(agent, "name", "") or role_id),
                     "role_responsibility": str(getattr(agent, "responsibility", "") or ""),
+                    "reports_to": str(getattr(agent, "reports_to", "") or ""),
                     "default_selection": default_selection,
                     "same_role_employee_ids": [
                         str(item.get("employee_id", "") or "")
@@ -1597,6 +1668,9 @@ class OPCEngine:
         }
         has_employees = bool(employee_payloads)
         has_templates = bool(template_payloads)
+        external_team_count = len({
+            team.binding_id for team in external_team_by_role.values()
+        })
         if has_employees:
             staffing_strategy = "existing_staffing"
             recommended_action = "manual_approve"
@@ -1609,6 +1683,12 @@ class OPCEngine:
             staffing_strategy = "role_only_fallback"
             recommended_action = "manual_approve"
             summary = "No employees or talent templates are available. Approving will use role-only fallback execution."
+        if external_team_count:
+            summary += (
+                f" {external_team_count} external JiuwenSwarm team"
+                f"{'s are' if external_team_count != 1 else ' is'} already staffed internally; "
+                "covered roles require no separate hires."
+            )
         return {
             "original_message": original_message,
             "decision": self._serialize_router_decision(decision),
@@ -3080,6 +3160,16 @@ class OPCEngine:
     ) -> str:
         assert self.store and self.memory
         project_id = self.project_id or "default"
+        compiled_external_teams, role_agent_overrides = (
+            self._apply_staffing_external_team_bindings(
+                {"staffing_roles": []},
+                {"recruitment_role_agents": dict(role_agent_overrides or {})},
+            )
+        )
+        _, role_agent_overrides = self._filter_staffing_for_external_teams(
+            compiled_external_teams,
+            role_agent_overrides,
+        )
         attachment_refs = self._normalize_attachment_refs(attachment_refs)
         attachment_context = self._build_attachment_context(attachment_refs)
         workspace_contract = await self._resolve_workspace_contract(original_message, session_id)
@@ -3114,6 +3204,17 @@ class OPCEngine:
             fallback_role_ids=fallback_role_ids,
             role_agent_overrides=role_agent_overrides,
         )
+        # Organization structure remains visible, while configured Jiuwen
+        # Team subtrees become one dispatchable execution unit.
+        from opc.layer2_organization.external_team_compiler import (
+            apply_external_team_bindings_to_topology,
+        )
+
+        runtime_topology = apply_external_team_bindings_to_topology(
+            self.org_engine,
+            runtime_topology,
+            compiled_bindings=compiled_external_teams,
+        )
         company_profile = str(
             getattr(runtime_spec, "profile", "")
             or getattr(self.config.org, "company_profile", "")
@@ -3126,6 +3227,7 @@ class OPCEngine:
                     company_profile or CompanyProfile.CORPORATE.value,
                     runtime_topology=runtime_topology,
                     original_request=original_message,
+                    compiled_external_teams=compiled_external_teams,
                 )
                 runtime_topology["company_work_item_plan"] = serialize_company_work_item_runtime_plan(company_work_item_plan)
                 runtime_topology["runtime_blueprint_source"] = "company_work_item_runtime_plan"
@@ -3333,6 +3435,18 @@ class OPCEngine:
         if not self.org_engine:
             return runtime_topology
         enriched = copy.deepcopy(runtime_topology)
+        from opc.layer2_organization.external_team_compiler import (
+            compile_external_team_bindings,
+        )
+
+        external_team_covered_roles = {
+            role_id
+            for team in compile_external_team_bindings(
+                self.org_engine,
+                runtime_topology=enriched,
+            )
+            for role_id in team.covered_role_ids
+        }
         fallback_roles = {
             str(role_id).strip()
             for role_id in list(fallback_role_ids or [])
@@ -3351,6 +3465,14 @@ class OPCEngine:
             seat = dict(raw_seat or {})
             role_id = str(seat.get("role_id", "") or "").strip()
             if not role_id:
+                seats.append(seat)
+                continue
+            if role_id in external_team_covered_roles:
+                # Opaque teams bring their own internal staffing. The binding
+                # compiler that runs after enrichment will select the one
+                # canonical Jiuwen execution seat.
+                seat["employee_id"] = ""
+                seat["employee_assignment"] = {}
                 seats.append(seat)
                 continue
             employee_assignment: dict[str, Any] = {}
@@ -3402,6 +3524,8 @@ class OPCEngine:
                 or ("native" if force_native_execution or not preferred_external_agent else preferred_external_agent)
             )
             execution_agent_unavailable = ""
+            company_external_execution_capable = False
+            execution_unit_kind = "role"
             if (
                 selected_execution_agent
                 and selected_execution_agent != "native"
@@ -3416,6 +3540,21 @@ class OPCEngine:
                 execution_agent_unavailable = selected_execution_agent
                 selected_execution_agent = "native"
                 preferred_external_agent = None
+            if selected_execution_agent and selected_execution_agent != "native":
+                selected_adapter = (
+                    self.adapter_registry.get(selected_execution_agent)
+                    if self.adapter_registry is not None
+                    else None
+                )
+                company_external_execution_capable = bool(
+                    selected_adapter is not None
+                    and hasattr(selected_adapter, "supports_company_execution")
+                    and selected_adapter.supports_company_execution()
+                )
+                if selected_adapter is not None and hasattr(selected_adapter, "execution_unit_kind"):
+                    execution_unit_kind = selected_adapter.execution_unit_kind()
+                elif selected_adapter is not None:
+                    execution_unit_kind = "external_agent"
             execution_agent_locked = bool(selected_role_agent or explicit_agent_choice)
             selection_source = (
                 "recruitment_user_override"
@@ -3432,6 +3571,8 @@ class OPCEngine:
             seat["selected_execution_agent_source"] = selection_source
             seat["force_native_execution"] = force_native_execution
             seat["execution_agent_unavailable"] = execution_agent_unavailable
+            seat["company_external_execution_capable"] = company_external_execution_capable
+            seat["execution_unit_kind"] = execution_unit_kind
             seat["metadata"] = {
                 **dict(seat.get("metadata", {}) or {}),
                 "employee_prompt_context": str((employee_assignment or {}).get("prompt_context", "")).strip(),
@@ -3440,6 +3581,8 @@ class OPCEngine:
                 "selected_execution_agent": selected_execution_agent,
                 "execution_agent_locked": execution_agent_locked,
                 "selected_execution_agent_source": selection_source,
+                "company_external_execution_capable": company_external_execution_capable,
+                "execution_unit_kind": execution_unit_kind,
             }
             seats.append(seat)
         enriched["seats"] = seats
@@ -3590,8 +3733,22 @@ class OPCEngine:
                     )
                 )
 
-        teams = [dict(item) for item in list(runtime_topology.get("teams", []) or []) if isinstance(item, dict)]
-        seats = [dict(item) for item in list(runtime_topology.get("seats", []) or []) if isinstance(item, dict)]
+        from opc.layer2_organization.external_team_compiler import (
+            runtime_execution_seats,
+        )
+
+        seats = runtime_execution_seats(runtime_topology)
+        active_team_ids = {
+            str(seat.get("team_id", "") or "").strip()
+            for seat in seats
+            if str(seat.get("team_id", "") or "").strip()
+        }
+        teams = [
+            dict(item)
+            for item in list(runtime_topology.get("teams", []) or [])
+            if isinstance(item, dict)
+            and str(item.get("team_id", "") or "").strip() in active_team_ids
+        ]
         team_instance_ids: dict[str, str] = {}
         seats_by_id: dict[str, dict[str, Any]] = {}
 
@@ -3599,6 +3756,21 @@ class OPCEngine:
             team_id = str(team.get("team_id", "") or "").strip()
             if not team_id:
                 continue
+            active_team_seats = [
+                seat
+                for seat in seats
+                if str(seat.get("team_id", "") or "").strip() == team_id
+            ]
+            active_team_seat_ids = [
+                str(seat.get("seat_id", "") or "").strip()
+                for seat in active_team_seats
+                if str(seat.get("seat_id", "") or "").strip()
+            ]
+            active_team_role_ids = list(dict.fromkeys(
+                str(seat.get("role_id", "") or "").strip()
+                for seat in active_team_seats
+                if str(seat.get("role_id", "") or "").strip()
+            ))
             team_instance_id = str(team.get("team_instance_id", "") or f"team-instance::{run.run_id}::{team_id}").strip()
             team_instance_ids[team_id] = team_instance_id
             await self.store.save_team_instance(
@@ -3609,19 +3781,8 @@ class OPCEngine:
                     team_id=team_id,
                     session_id=session_id,
                     status="active",
-                    seat_ids=[str(item).strip() for item in list(team.get("member_seat_ids", []) or []) if str(item).strip()],
-                    role_ids=[
-                        str(item).strip()
-                        for item in {
-                            str(team.get("lead_role_id", "") or "").strip(),
-                            *[
-                                str(item).strip()
-                                for item in list(team.get("member_role_ids", []) or [])
-                                if str(item).strip()
-                            ],
-                        }
-                        if str(item).strip()
-                    ],
+                    seat_ids=active_team_seat_ids,
+                    role_ids=active_team_role_ids,
                     metadata=mark_work_item_runtime({
                         "parent_team_id": str(team.get("parent_team_id", "") or "").strip(),
                         "lead_role_id": str(team.get("lead_role_id", "") or "").strip(),
@@ -3634,14 +3795,14 @@ class OPCEngine:
                     cell_id=team_id,
                     run_id=run.run_id,
                     manager_role_id=str(team.get("lead_role_id", "") or "").strip(),
-                    member_role_ids=[str(item).strip() for item in list(team.get("member_role_ids", []) or []) if str(item).strip()],
+                    member_role_ids=active_team_role_ids,
                     status="active",
                     metadata=mark_work_item_runtime({
                         "team_id": team_id,
                         "team_instance_id": team_instance_id,
                         "parent_team_id": str(team.get("parent_team_id", "") or "").strip(),
                         "lead_role_id": str(team.get("lead_role_id", "") or "").strip(),
-                        "member_seat_ids": list(team.get("member_seat_ids", []) or []),
+                        "member_seat_ids": active_team_seat_ids,
                         **dict(team.get("metadata", {}) or {}),
                     }),
                 )
@@ -4209,7 +4370,13 @@ class OPCEngine:
                 },
             )
         employee_assignment = dict(topology_seat.get("employee_assignment", {}) or {})
-        if not employee_assignment and self.org_engine and role_id:
+        if (
+            not employee_assignment
+            and self.org_engine
+            and role_id
+            and str(topology_seat.get("execution_unit_kind", "") or "").strip()
+            != "opaque_external_team"
+        ):
             preferred_employee_id = str(topology_seat.get("employee_id", "") or "").strip() or None
             resolved_assignment = self.org_engine.resolve_employee_for_work_item(
                 role_id,
@@ -4247,6 +4414,21 @@ class OPCEngine:
             assigned_external_agent = None
         preferred_external_agent = assigned_external_agent
         work_item.metadata = dict(work_item.metadata or {})
+        work_item_metadata = dict(work_item.metadata or {})
+        external_team_binding = dict(work_item_metadata.get("external_team_binding", {}) or {})
+        company_external_execution_allowed = bool(
+            assigned_external_agent
+            and (
+                work_item_metadata.get("external_company_execution_allowed") is True
+                or topology_seat.get("company_external_execution_capable") is True
+            )
+        )
+        if company_external_execution_allowed:
+            # Jiuwen adapters attest to the same validated-workspace fence used
+            # by child company WorkItems.  The root/CEO Task must carry that
+            # contract too, otherwise the final broker boundary rejects the
+            # correctly selected external execution unit as unisolated.
+            resolved_force_native_execution = False
         if employee_assignment:
             work_item.metadata["employee_assignment"] = copy.deepcopy(employee_assignment)
         prompt_ctx = str((employee_assignment or {}).get("prompt_context", "") or "").strip()
@@ -4329,6 +4511,50 @@ class OPCEngine:
                         else ""
                     )
                 ),
+                "company_native_execution_enforced": not company_external_execution_allowed,
+                "external_company_execution_allowed": company_external_execution_allowed,
+                "external_company_execution_fence": str(
+                    work_item_metadata.get("external_company_execution_fence")
+                    or external_team_binding.get("artifact_isolation")
+                    or ("validated_workspace" if company_external_execution_allowed else "")
+                ).strip(),
+                "execution_unit_kind": str(
+                    work_item_metadata.get("execution_unit_kind")
+                    or topology_seat.get("execution_unit_kind")
+                    or ("external_agent" if company_external_execution_allowed else "role")
+                ).strip(),
+                "external_team_binding": copy.deepcopy(external_team_binding),
+                "covered_role_ids": list(work_item_metadata.get("covered_role_ids", []) or []),
+                "capability_manifest": copy.deepcopy(
+                    work_item_metadata.get("capability_manifest")
+                    or external_team_binding.get("capability_manifest")
+                    or {}
+                ),
+                "delegation_capability_catalog": copy.deepcopy(
+                    work_item_metadata.get("delegation_capability_catalog")
+                    or topology_seat.get("delegation_capability_catalog")
+                    or []
+                ),
+                "external_session_scope": str(
+                    work_item_metadata.get("external_session_scope")
+                    or external_team_binding.get("session_scope")
+                    or "work_item"
+                ).strip(),
+                "external_max_inflight": int(
+                    work_item_metadata.get("external_max_inflight")
+                    or external_team_binding.get("max_inflight")
+                    or 1
+                ),
+                "external_failure_policy": str(
+                    work_item_metadata.get("external_failure_policy")
+                    or external_team_binding.get("failure_policy")
+                    or "fail_closed"
+                ).strip(),
+                "jiuwen_provider_mode": str(
+                    work_item_metadata.get("jiuwen_provider_mode")
+                    or external_team_binding.get("provider_mode")
+                    or ""
+                ).strip(),
                 "work_item_execution_strategy": (
                     WorkItemExecutionStrategy.NATIVE.value
                     if resolved_force_native_execution
@@ -4907,6 +5133,8 @@ class OPCEngine:
         self,
         checkpoint: ExecutionCheckpoint,
         task: Task | None = None,
+        *,
+        persist: bool = True,
     ) -> ExecutionCheckpoint:
         payload = dict(checkpoint.payload or {})
         runtime_state = dict(payload.get("runtime_v2", {}) or {})
@@ -4937,7 +5165,7 @@ class OPCEngine:
         task.metadata["migration_status"] = "runtime_v2_migrated"
         task.context_snapshot = dict(task.context_snapshot)
         task.context_snapshot["runtime_v2"] = runtime_state
-        if self.store:
+        if self.store and persist:
             await self.store.save_task(task)
             if getattr(self.store, "save_runtime_session", None):
                 await self.store.save_runtime_session(
@@ -4962,7 +5190,7 @@ class OPCEngine:
         }
         checkpoint.payload = payload
         checkpoint.updated_at = datetime.now()
-        if self.store:
+        if self.store and persist:
             if checkpoint.checkpoint_type in OWNER_INTERACTION_CHECKPOINT_TYPES:
                 if self.interaction_coordinator is None:
                     raise RuntimeError("owner interaction coordinator is unavailable")
@@ -5428,6 +5656,17 @@ class OPCEngine:
                 and self.adapter_registry is not None
                 and locked_agent not in self._available_external_agents()
             ):
+                external_failure_policy = str(
+                    task.metadata.get("external_failure_policy") or "fail_closed"
+                ).strip().lower()
+                if (
+                    task.metadata.get("external_company_execution_allowed") is True
+                    and external_failure_policy != "fallback_native"
+                ):
+                    raise RuntimeError(
+                        "company work item requires unavailable external agent "
+                        f"{locked_agent!r}; binding policy is fail_closed"
+                    )
                 # A locked external backend that cannot run must not be
                 # stamped as execution identity: this attempt actually runs
                 # native (the external candidate pool is empty) and resume
@@ -5436,6 +5675,12 @@ class OPCEngine:
                 task.metadata["selected_execution_agent"] = "native"
                 task.metadata["preferred_external_agent"] = None
                 task.metadata["execution_agent_unavailable"] = locked_agent
+                task.metadata["external_fallback_from_agent"] = locked_agent
+                task.metadata["external_fallback_execution_unit_kind"] = str(
+                    task.metadata.get("execution_unit_kind") or "external_agent"
+                ).strip()
+                task.metadata["execution_unit_kind"] = "role"
+                task.metadata["company_native_execution_enforced"] = True
                 task.metadata["agent_selection"] = {
                     "selected": "native",
                     "strategy": WorkItemExecutionStrategy.NATIVE.value,
@@ -5780,6 +6025,8 @@ class OPCEngine:
     async def _load_company_runtime_snapshot(
         self,
         parent_session_id: str | None,
+        *,
+        delegation_run_id: str | None = None,
     ) -> tuple[CompanyWorkItemRuntimePlan, list[Task]] | None:
         if not self.store or not parent_session_id:
             return None
@@ -5790,6 +6037,11 @@ class OPCEngine:
         identity = identity_index.resolve(runtime_session_id=parent_session_id)
         if identity is None:
             return None
+        requested_run_id = (
+            None
+            if delegation_run_id is None
+            else str(delegation_run_id or "").strip()
+        )
         work_item_tasks = [
             task
             for task_id in identity.runtime_task_ids
@@ -5797,6 +6049,16 @@ class OPCEngine:
             for task in [identity_index.task(task_id)]
             if task is not None
             and is_company_runtime_task(task)
+            and (
+                requested_run_id is None
+                or str(
+                    (getattr(task, "metadata", {}) or {}).get(
+                        "delegation_run_id", ""
+                    )
+                    or ""
+                ).strip()
+                == requested_run_id
+            )
             and (
                 work_item_projection_id_from_metadata(getattr(task, "metadata", {}) or {})
                 or is_work_item_runtime_metadata(getattr(task, "metadata", {}) or {})
@@ -8181,6 +8443,56 @@ class OPCEngine:
         """
         if not self.store:
             return False
+
+        async def save_waiting_projection() -> None:
+            """Persist startup annotations through the active run fence.
+
+            Startup reconciliation owns the run lease but an unclaimed
+            review/delivery Task intentionally has no attempt credential.
+            Calling the broad ``save_task`` path in that state bypasses the
+            lease identity and is correctly rejected by the Store. Use its
+            narrow pre-claim projection boundary whenever this reconcile pass
+            holds a controller credential.
+            """
+
+            credential = dict(controller_credential or {})
+            owner_token = str(
+                credential.get("owner_token", "") or ""
+            ).strip()
+            try:
+                generation = int(credential.get("generation", 0) or 0)
+            except (TypeError, ValueError):
+                generation = 0
+            save_unclaimed = getattr(
+                self.store,
+                "save_unclaimed_runtime_task_projection_for_company_controller",
+                None,
+            )
+            task_metadata = dict(task.metadata or {})
+            if (
+                owner_token
+                and generation > 0
+                and callable(save_unclaimed)
+                and not str(
+                    task_metadata.get(
+                        "company_run_controller_owner_token", ""
+                    )
+                    or ""
+                ).strip()
+            ):
+                await save_unclaimed(
+                    task,
+                    project_id=str(
+                        credential.get("project_id", task.project_id)
+                        or "default"
+                    ).strip()
+                    or "default",
+                    controller_owner_token=owner_token,
+                    controller_lease_generation=generation,
+                )
+                return
+            await self.store.save_task(task)
+
         validation_required = bool(
             getattr(self, "pre_delivery_validator", None)
         )
@@ -8286,7 +8598,7 @@ class OPCEngine:
                 "status": status_value,
                 "reason": reason,
             }
-            await self.store.save_task(task)
+            await save_waiting_projection()
         restored_checkpoint = False
         if self._is_company_feedback_waiting_task(task):
             try:
@@ -8304,7 +8616,7 @@ class OPCEngine:
                 preserved["restored_checkpoint_type"] = "company_delivery_feedback"
                 preserved["restored_checkpoint_at"] = datetime.now().isoformat()
                 task.metadata["startup_reconcile_preserved_waiting_state"] = preserved
-                await self.store.save_task(task)
+                await save_waiting_projection()
                 marker_changed = True
         return marker_changed or restored_checkpoint
 
@@ -8938,9 +9250,18 @@ class OPCEngine:
             active_company_checkpoints,
         )
         task_by_id = {task.id: task for task in tasks}
-        runtime_groups: dict[str, list[Task]] = {}
-        runtime_group_run_ids: dict[str, str] = {}
-        runtime_group_anchor_ids: dict[str, str] = {}
+        # One user-facing chat session can contain multiple consecutive
+        # Company runs.  Controller leases, WorkItem claims and atomic
+        # shutdown checkpoints are run-scoped, so startup recovery must not
+        # collapse those runs back into one session-scoped task group.
+        #
+        # Keep the UI/runtime session as the resume identity while making the
+        # controller run part of the internal recovery key.  Otherwise a
+        # restart can acquire run B and try to suspend completed Tasks from
+        # run A, which correctly fails the Store's run fence and prevents the
+        # project from opening at all.
+        runtime_groups: dict[tuple[str, str], list[Task]] = {}
+        runtime_group_anchor_ids: dict[tuple[str, str], str] = {}
         runtime_task_ids: set[str] = set()
         ui_anchor_task_ids: set[str] = set()
         lease_protected_anchor_task_ids: set[str] = set()
@@ -8961,42 +9282,46 @@ class OPCEngine:
             ]
             if group:
                 runtime_task_ids.update(task.id for task in group)
-                run_ids = {
-                    str((task.metadata or {}).get("delegation_run_id", "") or "").strip()
-                    for task in group
-                    if str((task.metadata or {}).get("delegation_run_id", "") or "").strip()
-                }
-                lease_protected = False
-                if callable(controller_lease_is_current):
-                    for run_id in run_ids:
-                        if await controller_lease_is_current(
+                groups_by_run: dict[str, list[Task]] = {}
+                for candidate in group:
+                    run_id = str(
+                        (candidate.metadata or {}).get(
+                            "delegation_run_id", ""
+                        )
+                        or ""
+                    ).strip()
+                    groups_by_run.setdefault(run_id, []).append(candidate)
+                for run_id, run_group in groups_by_run.items():
+                    lease_protected = bool(
+                        run_id
+                        and callable(controller_lease_is_current)
+                        and await controller_lease_is_current(
                             run_id,
                             project_id=project_id,
                             root_session_id=identity.runtime_session_id,
-                        ):
-                            lease_protected = True
-                            break
-                if lease_protected:
-                    if identity.ui_anchor_task_id:
-                        lease_protected_anchor_task_ids.add(
-                            identity.ui_anchor_task_id
                         )
-                    logger.info(
-                        "Startup reconcile skipped live company controller scope: "
-                        "project={} session={} runs={}",
-                        project_id,
-                        identity.runtime_session_id,
-                        sorted(run_ids),
                     )
-                    continue
-                runtime_groups[identity.runtime_session_id] = group
-                runtime_group_run_ids[identity.runtime_session_id] = next(
-                    iter(sorted(run_ids)),
-                    "",
-                )
-                runtime_group_anchor_ids[identity.runtime_session_id] = str(
-                    identity.ui_anchor_task_id or ""
-                ).strip()
+                    if lease_protected:
+                        if identity.ui_anchor_task_id:
+                            lease_protected_anchor_task_ids.add(
+                                identity.ui_anchor_task_id
+                            )
+                        logger.info(
+                            "Startup reconcile skipped live company controller scope: "
+                            "project={} session={} run={}",
+                            project_id,
+                            identity.runtime_session_id,
+                            run_id,
+                        )
+                        continue
+                    recovery_scope = (
+                        identity.runtime_session_id,
+                        run_id,
+                    )
+                    runtime_groups[recovery_scope] = run_group
+                    runtime_group_anchor_ids[recovery_scope] = str(
+                        identity.ui_anchor_task_id or ""
+                    ).strip()
 
         deferred_anchor_task_ids = {
             anchor_id
@@ -9036,12 +9361,11 @@ class OPCEngine:
                 if await self._mark_task_interrupted(task, reason=reason, session=session):
                     updated += 1
 
-        for parent_session_id, group in runtime_groups.items():
+        for (parent_session_id, run_id), group in runtime_groups.items():
             async with self._active_task_run_registry.scope_lock(
                 project_id,
                 parent_session_id,
             ):
-                run_id = runtime_group_run_ids.get(parent_session_id, "")
                 owner_token = (
                     f"startup:{self._project_owner_actor_token}:"
                     f"{uuid.uuid4().hex}"
@@ -9099,7 +9423,7 @@ class OPCEngine:
                                 ),
                             )
                     anchor_id = runtime_group_anchor_ids.get(
-                        parent_session_id,
+                        (parent_session_id, run_id),
                         "",
                     )
                     anchor = task_by_id.get(anchor_id)
@@ -9183,7 +9507,11 @@ class OPCEngine:
             self.store,
             project_id,
         )
-        active_by_scope: dict[str, list[Task]] = {}
+        # Shutdown checkpoints obey the same run-scoped controller fence as
+        # startup recovery.  A chat session may contain consecutive Company
+        # runs, so the durable handoff unit is (session, run), never session
+        # alone.
+        active_by_scope: dict[tuple[str, str], list[Task]] = {}
         for task_id in active_task_ids:
             identity = identity_index.resolve(task_id=task_id)
             task = identity_index.task(task_id)
@@ -9194,28 +9522,29 @@ class OPCEngine:
                 or not is_company_runtime_task(task)
             ):
                 continue
-            active_by_scope.setdefault(identity.runtime_session_id, []).append(task)
+            run_id = str(
+                (task.metadata or {}).get("delegation_run_id", "") or ""
+            ).strip()
+            active_by_scope.setdefault(
+                (identity.runtime_session_id, run_id),
+                [],
+            ).append(task)
 
         prepared: list[dict[str, Any]] = delegate_prepared
-        for parent_session_id, active_scope_tasks in active_by_scope.items():
+        for (parent_session_id, run_id), active_scope_tasks in active_by_scope.items():
             async with self._active_task_run_registry.scope_lock(
                 project_id,
                 parent_session_id,
             ):
-                snapshot = await self._load_company_runtime_snapshot(parent_session_id)
+                snapshot = await self._load_company_runtime_snapshot(
+                    parent_session_id,
+                    delegation_run_id=run_id,
+                )
                 if snapshot is None:
                     tasks = active_scope_tasks
                     plan = self._company_runtime_plan_for_tasks(tasks)
                 else:
                     plan, tasks = snapshot
-                run_id = next(
-                    (
-                        str((task.metadata or {}).get("delegation_run_id", "") or "").strip()
-                        for task in tasks
-                        if str((task.metadata or {}).get("delegation_run_id", "") or "").strip()
-                    ),
-                    "",
-                )
                 credential_getter = getattr(
                     self.company_executor,
                     "controller_lease_credential",
@@ -9428,33 +9757,12 @@ class OPCEngine:
             return value.strip().lower() in {"1", "true", "yes", "y", "on"}
         return bool(value)
 
-    _FINAL_DELIVERY_CURRENT_OUTPUT_KEYS = {
-        "delivery_package",
-        "final_delivery_package",
-        "feedback_followup_message",
-        "ceo_pre_delivery_assessment",
-        "pre_delivery_assessment_status",
-        "pre_delivery_assessment_failure_kind",
-        "pre_delivery_rework_cap_reached",
-        "pre_delivery_rework_cap",
-        "feedback_close_user_message",
-    }
+    _FINAL_DELIVERY_CURRENT_OUTPUT_KEYS = FINAL_DELIVERY_CURRENT_OUTPUT_KEYS
 
     @classmethod
     def _clear_current_final_delivery_outputs(cls, task: Task) -> None:
         """Clear only the current delivery cache before a new owner revision."""
-        task.metadata = dict(getattr(task, "metadata", {}) or {})
-        task.context_snapshot = dict(getattr(task, "context_snapshot", {}) or {})
-        for key in cls._FINAL_DELIVERY_CURRENT_OUTPUT_KEYS:
-            task.metadata.pop(key, None)
-            task.context_snapshot.pop(key, None)
-        owned_outputs = dict(task.context_snapshot.get("work_item_owned_outputs", {}) or {})
-        for key in cls._FINAL_DELIVERY_CURRENT_OUTPUT_KEYS:
-            owned_outputs.pop(key, None)
-        if owned_outputs:
-            task.context_snapshot["work_item_owned_outputs"] = owned_outputs
-        else:
-            task.context_snapshot.pop("work_item_owned_outputs", None)
+        clear_current_final_delivery_outputs(task)
 
     @classmethod
     def _is_open_final_delivery_review_task(cls, task: Task) -> bool:
@@ -9511,20 +9819,6 @@ class OPCEngine:
             for task in tasks
             if task.status not in {TaskStatus.FAILED, TaskStatus.CANCELLED}
         ]
-        final_delivery_candidates = [
-            task for task in tasks
-            if self._is_open_final_delivery_review_task(task)
-        ]
-        if final_delivery_candidates:
-            return sorted(
-                final_delivery_candidates,
-                key=lambda task: (
-                    self._final_delivery_followup_status_priority(task),
-                    -float(task.created_at.timestamp()),
-                    str(task.id),
-                ),
-            )[0]
-
         final_decider_role_id = str(
             getattr(plan, "final_decider_role_id", "")
             or plan.metadata.get("final_decider_role_id", "")
@@ -9545,6 +9839,77 @@ class OPCEngine:
             ]
             if len(top_level_role_ids) == 1:
                 final_decider_role_id = top_level_role_ids[0]
+
+        # A final-delivery card is the right owner-facing target only after
+        # its manager board has converged. This check is independent of the
+        # delivery's feedback flags: a premature delivery attempt may already
+        # have closed or altered those flags while the intake still owns live
+        # children. Routing to a review helper in that state gives the final
+        # decider the wrong board and can create duplicate business work.
+        live_board_owners: list[Task] = []
+        for candidate in tasks:
+            metadata = dict(getattr(candidate, "metadata", {}) or {})
+            candidate_role_id = str(
+                candidate.assigned_to
+                or metadata.get("work_item_role_id", "")
+                or ""
+            ).strip()
+            if final_decider_role_id and candidate_role_id != final_decider_role_id:
+                continue
+            if turn_type_for_task(candidate, fallback="") not in {
+                "intake",
+                "dispatch",
+                "plan",
+                "aggregate",
+            }:
+                continue
+            if candidate.status in {
+                TaskStatus.DONE,
+                TaskStatus.FAILED,
+                TaskStatus.CANCELLED,
+            }:
+                continue
+            pending_child_ids = {
+                str(item).strip()
+                for key in (
+                    "delegation_pending_work_item_ids",
+                    "delegation_wait_for_work_item_ids",
+                    "waiting_on_work_item_ids",
+                    "dependency_work_item_ids",
+                )
+                for item in list(metadata.get(key, []) or [])
+                if str(item).strip()
+            }
+            if pending_child_ids or self._metadata_flag_true(
+                metadata.get("delegated_children_pending", False)
+            ):
+                live_board_owners.append(candidate)
+        if live_board_owners:
+            return sorted(
+                live_board_owners,
+                key=lambda task: (
+                    self._company_followup_status_priority(task),
+                    self._company_followup_turn_priority(task),
+                    -float(task.created_at.timestamp()),
+                    str(task.id),
+                ),
+            )[0]
+
+        final_delivery_candidates = [
+            task
+            for task in tasks
+            if self._is_open_final_delivery_review_task(task)
+        ]
+        if final_delivery_candidates:
+            return sorted(
+                final_delivery_candidates,
+                key=lambda task: (
+                    self._final_delivery_followup_status_priority(task),
+                    -float(task.created_at.timestamp()),
+                    str(task.id),
+                ),
+            )[0]
+
         if not final_decider_role_id:
             fallback_candidates = [
                 task
@@ -9567,8 +9932,36 @@ class OPCEngine:
         candidates = [
             task
             for task in tasks
-            if str(task.assigned_to or task.metadata.get("work_item_role_id", "") or "").strip() == final_decider_role_id
+            if (
+                str(
+                    task.assigned_to
+                    or task.metadata.get("work_item_role_id", "")
+                    or ""
+                ).strip()
+                == final_decider_role_id
+                and turn_type_for_task(task, fallback="")
+                in {"intake", "dispatch", "plan", "deliver", "aggregate"}
+            )
         ]
+        if not candidates:
+            # Legacy/custom plans may make an execution projection itself the
+            # final decider (there is no separate intake card).  Preserve that
+            # valid shape while still excluding review/report helpers, which
+            # are auxiliary turns and must never receive owner follow-up.
+            candidates = [
+                task
+                for task in tasks
+                if (
+                    str(
+                        task.assigned_to
+                        or task.metadata.get("work_item_role_id", "")
+                        or ""
+                    ).strip()
+                    == final_decider_role_id
+                    and turn_type_for_task(task, fallback="") == "execute"
+                    and not is_runtime_auxiliary_task(task)
+                )
+            ]
         if not candidates:
             return None
         return sorted(
@@ -9591,6 +9984,30 @@ class OPCEngine:
         metadata_updates: dict[str, Any] | None = None,
     ) -> None:
         assert self.store
+        # A resumed production company run is controller-owned before this
+        # method is entered.  Always build its broad Task replacement from the
+        # just-adopted durable row; using the pre-admission snapshot recreates
+        # the previous controller generation and is correctly rejected by the
+        # Store fence.
+        controller_context: CompanyControllerAttemptContext | None = None
+        durable_task_preimage = ""
+        execute_authoritative = getattr(
+            self.store,
+            "execute_company_controller_authoritative_command",
+            None,
+        )
+        durable_task = await self.store.get_task(task.id)
+        if durable_task is not None:
+            candidate_context = CompanyControllerAttemptContext.from_task(
+                durable_task,
+                work_item_id=linked_work_item_id_for_task(durable_task),
+            )
+            if candidate_context.complete and callable(execute_authoritative):
+                controller_context = candidate_context
+                durable_task_preimage = company_controller_task_preimage_hash(
+                    durable_task
+                )
+                task.__dict__.update(copy.deepcopy(durable_task.__dict__))
         # Terminal guard (belt to the selection-level filter): FAILED and
         # CANCELLED have no legal reopen edge. Mutating the Task projection
         # first and letting the store reject the phase write afterwards is
@@ -9664,7 +10081,8 @@ class OPCEngine:
         progress = list(task.metadata.get("progress_log", []) or [])
         progress.append(f"Company follow-up routed to final decider ({resume_source}): {reply}")
         task.metadata["progress_log"] = progress[-20:]
-        await self.store.save_task(task)
+        if controller_context is None:
+            await self.store.save_task(task)
 
         work_item_id = linked_work_item_id_for_task(task)
         work_item = None
@@ -9684,13 +10102,19 @@ class OPCEngine:
             if work_item is None and callable(get_work_item):
                 try:
                     work_item = await get_work_item(work_item_id)
-                    current_phase = getattr(work_item, "phase", None)
-                    if not isinstance(current_phase, Phase):
-                        current_phase = Phase(str(current_phase or ""))
-                    if current_phase in {Phase.AWAITING_HUMAN, Phase.AWAITING_MANAGER_REVIEW}:
-                        target_phase = Phase.READY_FOR_REWORK
                 except Exception:
-                    target_phase = Phase.READY
+                    work_item = None
+            current_phase = getattr(work_item, "phase", None) if work_item is not None else None
+            if current_phase is not None and not isinstance(current_phase, Phase):
+                current_phase = Phase(str(current_phase or ""))
+            if current_phase in {
+                Phase.APPROVED,
+                Phase.AWAITING_HUMAN,
+                Phase.AWAITING_MANAGER_REVIEW,
+            }:
+                target_phase = Phase.READY_FOR_REWORK
+            elif current_phase in {Phase.READY, Phase.READY_FOR_REWORK}:
+                target_phase = current_phase
             resume_metadata = {
                 "resume_requested_at": datetime.now().isoformat(),
                 "resume_user_reply": reply,
@@ -9728,8 +10152,43 @@ class OPCEngine:
                 if final_delivery_followup
                 else None
             )
-            current_phase = getattr(work_item, "phase", None) if work_item is not None else None
-            if current_phase == Phase.APPROVED and callable(reopen_approved):
+            if controller_context is not None:
+                if work_item is None or current_phase is None:
+                    raise CompanyRunControllerLeaseLost(
+                        "company follow-up target lost its linked WorkItem"
+                    )
+                task.status = task_status_for_phase(target_phase)
+                command_result = await execute_authoritative(
+                    controller_context,
+                    operation="company_followup_rework",
+                    mutations=(
+                        CompanyControllerWorkItemMutation(
+                            work_item_id=work_item_id,
+                            expected_phases=(current_phase,),
+                            expected_updated_at=work_item.updated_at,
+                            phase=target_phase,
+                            deliverable_summary="",
+                            blocked_reason="",
+                            clear_claim=True,
+                            metadata_updates=resume_metadata,
+                            metadata_unset=tuple(metadata_unset or ()),
+                            transition_reason="company_followup_rework",
+                            attempt_outcome="rework",
+                            allow_approved_rework=(
+                                current_phase == Phase.APPROVED
+                            ),
+                        ),
+                    ),
+                    task_snapshot=task,
+                    task_preimage_hashes={
+                        task.id: durable_task_preimage,
+                    },
+                )
+                if not bool(getattr(command_result, "applied", False)):
+                    raise CompanyRunControllerLeaseLost(
+                        "company follow-up lost its atomic Task/WorkItem fence"
+                    )
+            elif current_phase == Phase.APPROVED and callable(reopen_approved):
                 await reopen_approved(
                     work_item_id,
                     target_phase=Phase.READY_FOR_REWORK,
@@ -9750,6 +10209,12 @@ class OPCEngine:
                     claimed_by_role_runtime_session_id="",
                     claimed_by_seat_id="",
                 )
+        controller_write_kwargs: dict[str, Any] = {}
+        if controller_context is not None:
+            controller_write_kwargs = {
+                "controller_owner_token": controller_context.owner_token,
+                "controller_lease_generation": controller_context.generation,
+            }
         role_session_id = str(task.metadata.get("delegation_role_session_id", "") or "").strip()
         if role_session_id and hasattr(self.store, "update_delegation_role_session"):
             await self.store.update_delegation_role_session(
@@ -9762,6 +10227,7 @@ class OPCEngine:
                     "resume_user_reply": reply,
                     "resume_source": resume_source,
                 },
+                **controller_write_kwargs,
             )
         seat_state_id = str(task.metadata.get("seat_state_id") or task.metadata.get("delegation_seat_state_id") or "").strip()
         if seat_state_id and hasattr(self.store, "update_seat_state"):
@@ -9778,6 +10244,7 @@ class OPCEngine:
                     "resume_source": resume_source,
                     "current_turn_mode": "dispatch_required",
                 },
+                **controller_write_kwargs,
             )
 
     async def _resume_company_runtime_via_final_decider(
@@ -9798,6 +10265,48 @@ class OPCEngine:
         reply = str(user_reply or "").strip()
         if not reply:
             return None
+        initial_target = self._company_followup_target_task(plan, tasks)
+        admission = controller_admission
+        if admission is None:
+            acquire_admission = getattr(
+                self.company_executor,
+                "acquire_controller_admission",
+                None,
+            )
+            if callable(acquire_admission):
+                acquire_kwargs: dict[str, Any] = {}
+                try:
+                    acquire_signature = inspect.signature(acquire_admission)
+                    supports_targeted_adoption = bool(
+                        "adopt_released_task_ids"
+                        in acquire_signature.parameters
+                        or any(
+                            parameter.kind
+                            == inspect.Parameter.VAR_KEYWORD
+                            for parameter in acquire_signature.parameters.values()
+                        )
+                    )
+                except (TypeError, ValueError):
+                    supports_targeted_adoption = False
+                if supports_targeted_adoption and initial_target is not None:
+                    acquire_kwargs["adopt_released_task_ids"] = {
+                        initial_target.id
+                    }
+                admission = await acquire_admission(tasks, **acquire_kwargs)
+        # Controller takeover settles/adopts durable attempt credentials.  The
+        # snapshot loaded before admission necessarily still carries the old
+        # generation, so refresh it before selecting or mutating the target.
+        if admission is not None and self.store is not None:
+            refreshed_tasks: list[Task] = []
+            for existing_task in tasks:
+                durable_task = await self.store.get_task(existing_task.id)
+                if durable_task is None:
+                    continue
+                existing_task.__dict__.update(
+                    copy.deepcopy(durable_task.__dict__)
+                )
+                refreshed_tasks.append(existing_task)
+            tasks[:] = refreshed_tasks
         target_task = self._company_followup_target_task(plan, tasks)
         if target_task is None:
             # No live final-decider card remains (e.g. it failed terminally
@@ -9809,7 +10318,7 @@ class OPCEngine:
                 result = await self._execute_with_company_controller_admission(
                     plan,
                     tasks,
-                    controller_admission,
+                    admission,
                     retain_admission=not release_controller_admission_on_exit,
                 )
                 note = (
@@ -9819,6 +10328,8 @@ class OPCEngine:
                     "new task if further work is needed."
                 )
                 return f"{note}\n\n{str(result or '').strip()}".strip()
+            if release_controller_admission_on_exit and admission is not None:
+                await self._release_company_controller_admission(admission)
             return None
         projection_label = projection_id_for_task(target_task) or str(target_task.title or target_task.id).strip()
         projection_title = str(target_task.title or projection_label).strip() or projection_label
@@ -9827,19 +10338,24 @@ class OPCEngine:
             heading="## Latest Runtime Snapshot (before follow-up)",
             annotations={projection_label: "final decider follow-up"},
         )
-        await self._prepare_company_followup_target(
-            target_task,
-            reply,
-            resume_source=resume_source,
-            context_updates=context_updates,
-            metadata_updates=metadata_updates,
-        )
+        try:
+            await self._prepare_company_followup_target(
+                target_task,
+                reply,
+                resume_source=resume_source,
+                context_updates=context_updates,
+                metadata_updates=metadata_updates,
+            )
+        except BaseException:
+            if release_controller_admission_on_exit and admission is not None:
+                await self._release_company_controller_admission(admission)
+            raise
         if self.on_company_runtime_children and session_id and tasks:
             self.on_company_runtime_children(session_id, [t.id for t in tasks])
         result = await self._execute_with_company_controller_admission(
             plan,
             tasks,
-            controller_admission,
+            admission,
             retain_admission=not release_controller_admission_on_exit,
         )
         refreshed_target = target_task
@@ -11125,6 +11641,7 @@ class OPCEngine:
 
     async def _run_task_once(self, task: Task) -> TaskResult:
         attempts: list[dict[str, Any]] = []
+        policy_native_fallback_agent = ""
         candidates = self._get_external_candidates(task)
         scoped_progress = self._make_task_progress_callback(task)
         if candidates:
@@ -11140,6 +11657,11 @@ class OPCEngine:
                     run_adapter.supports_interactive() if hasattr(run_adapter, "supports_interactive") else False
                 )
                 task.metadata = dict(task.metadata)
+                task.metadata["execution_unit_kind"] = (
+                    run_adapter.execution_unit_kind()
+                    if hasattr(run_adapter, "execution_unit_kind")
+                    else "external_agent"
+                )
                 task.metadata["__external_resume_session"] = session_mode == "resume"
                 external_prompt_task = copy.deepcopy(task)
                 external_prompt_task.metadata = dict(external_prompt_task.metadata)
@@ -11250,6 +11772,22 @@ class OPCEngine:
                         )
                     break
                 if explicit_user_selected_agent:
+                    external_failure_policy = str(
+                        task.metadata.get("external_failure_policy", "fail_closed") or "fail_closed"
+                    ).strip().lower()
+                    if external_failure_policy == "fallback_native":
+                        policy_native_fallback_agent = agent_name
+                        logger.warning(
+                            f"Explicit external agent {agent_name} failed for task {task.id}; "
+                            "binding policy permits native fallback"
+                        )
+                        if scoped_progress:
+                            reason_excerpt = (result.content or "").strip().replace("\n", " ")
+                            await scoped_progress(
+                                f"[External team fallback] {agent_name} failed for task={task.title}; "
+                                f"reason={reason_excerpt or 'unknown'}; running the same boundary natively"
+                            )
+                        break
                     logger.warning(
                         f"Explicit external agent {agent_name} failed for task {task.id}; "
                         "not trying alternate agents or native fallback"
@@ -11278,6 +11816,16 @@ class OPCEngine:
                     f"[External agents exhausted] task={task.title}; falling back to native agent"
                 )
 
+        if policy_native_fallback_agent:
+            task.metadata = dict(task.metadata or {})
+            task.metadata["external_fallback_from_agent"] = policy_native_fallback_agent
+            task.metadata["external_fallback_execution_unit_kind"] = str(
+                task.metadata.get("execution_unit_kind") or "external_agent"
+            ).strip()
+            task.metadata["selected_execution_agent"] = "native"
+            task.metadata["execution_unit_kind"] = "role"
+            task.metadata["company_native_execution_enforced"] = True
+            task.assigned_external_agent = None
         native_result = await self._run_native_agent(task)
         if attempts:
             native_result.artifacts = {
@@ -12160,7 +12708,18 @@ class OPCEngine:
                 for part in (layers.attachments_state_context, external_attachment_context)
                 if str(part or "").strip()
             )
-        runtime_tool_hints = "" if (company_mode and is_report_prompt_turn(task.metadata)) else self._build_external_runtime_tool_hints(task, role_id=role_id)
+        runtime_tool_hints = (
+            ""
+            if (
+                company_mode
+                and (
+                    is_report_prompt_turn(task.metadata)
+                    or str(task.metadata.get("execution_unit_kind", "") or "").strip()
+                    == "opaque_external_team"
+                )
+            )
+            else self._build_external_runtime_tool_hints(task, role_id=role_id)
+        )
         if self.skills:
             execution_mode = str(task.metadata.get("execution_mode", "") or "").strip() or None
             skills_summary = str(
@@ -13290,11 +13849,23 @@ class OPCEngine:
     async def get_latest_pending_checkpoint_for_session(
         self,
         session_id: str | None = None,
+        *,
+        persist_runtime_v2_migration: bool = True,
     ) -> ExecutionCheckpoint | None:
         if not self.store:
             return None
         project_id = self.project_id or "default"
         requested_session_id = str(session_id or "").strip()
+
+        async def _prepare_checkpoint(
+            selected: ExecutionCheckpoint | None,
+        ) -> ExecutionCheckpoint | None:
+            if selected is None:
+                return None
+            return await self._ensure_checkpoint_runtime_v2_payload(
+                selected,
+                persist=persist_runtime_v2_migration,
+            )
         # Fast path: with no live checkpoint rows in the project there is
         # nothing to surface, so skip the parent-session resolution below.
         # Snapshot builders call this once per task on every UI sync tick, and
@@ -13322,7 +13893,7 @@ class OPCEngine:
             and company_parent_session_id
             and company_parent_session_id != requested_session_id
         ):
-            return await self._ensure_checkpoint_runtime_v2_payload(active_suspend_checkpoint)
+            return await _prepare_checkpoint(active_suspend_checkpoint)
         checkpoint = await self.store.get_latest_pending_checkpoint(
             project_id,
             session_id=requested_session_id or None,
@@ -13337,10 +13908,10 @@ class OPCEngine:
         deferred_suspend_checkpoint: ExecutionCheckpoint | None = None
         if checkpoint and self._checkpoint_is_user_visible(checkpoint):
             if not self._is_company_runtime_suspend_checkpoint(checkpoint.checkpoint_type):
-                return await self._ensure_checkpoint_runtime_v2_payload(checkpoint)
+                return await _prepare_checkpoint(checkpoint)
             deferred_suspend_checkpoint = checkpoint
         if not requested_session_id:
-            return await self._ensure_checkpoint_runtime_v2_payload(deferred_suspend_checkpoint) if deferred_suspend_checkpoint else None
+            return await _prepare_checkpoint(deferred_suspend_checkpoint)
 
         # Company-mode gates are persisted on child work-item sessions. When the
         # user comes back through the primary session, surface the newest child
@@ -13348,7 +13919,7 @@ class OPCEngine:
         snapshot = await self._load_company_runtime_snapshot(runtime_session_id)
         if not snapshot:
             selected_suspend_checkpoint = deferred_suspend_checkpoint or active_suspend_checkpoint
-            return await self._ensure_checkpoint_runtime_v2_payload(selected_suspend_checkpoint) if selected_suspend_checkpoint else None
+            return await _prepare_checkpoint(selected_suspend_checkpoint)
         _, tasks = snapshot
         visible_session_ids = {
             str(getattr(task, "session_id", "") or "").strip()
@@ -13362,7 +13933,7 @@ class OPCEngine:
         }
         if not visible_session_ids and not visible_task_ids:
             selected_suspend_checkpoint = deferred_suspend_checkpoint or active_suspend_checkpoint
-            return await self._ensure_checkpoint_runtime_v2_payload(selected_suspend_checkpoint) if selected_suspend_checkpoint else None
+            return await _prepare_checkpoint(selected_suspend_checkpoint)
 
         checkpoints = await self.store.get_pending_checkpoints(project_id=project_id)
         for pending in checkpoints:
@@ -13382,9 +13953,9 @@ class OPCEngine:
                 or ""
             ).strip()
             if pending_session_id in visible_session_ids or pending_task_id in visible_task_ids:
-                return await self._ensure_checkpoint_runtime_v2_payload(pending)
+                return await _prepare_checkpoint(pending)
         selected_suspend_checkpoint = deferred_suspend_checkpoint or active_suspend_checkpoint
-        return await self._ensure_checkpoint_runtime_v2_payload(selected_suspend_checkpoint) if selected_suspend_checkpoint else None
+        return await _prepare_checkpoint(selected_suspend_checkpoint)
 
     async def _company_runtime_parent_session_for_session_id(self, session_id: str | None) -> str:
         """Resolve any durable task session to its company runtime session."""
@@ -16487,10 +17058,17 @@ class OPCEngine:
             snapshot = await self._load_company_runtime_snapshot(parent_session_id)
             if snapshot:
                 snapshot_plan, current_tasks = snapshot
+                # Startup recovery checkpoints may intentionally carry only
+                # the interrupted task identities.  The authoritative plan is
+                # still durable on the current WorkItem projections.  Restore
+                # it whenever the checkpoint plan is empty, independently of
+                # whether the checkpoint already listed Tasks; otherwise an
+                # interrupted run can resume with real Tasks but no scheduler
+                # topology and remain stranded in ``resuming``.
+                if not plan.projections:
+                    plan = snapshot_plan
                 if not tasks:
                     tasks = current_tasks
-                    if not plan.projections:
-                        plan = snapshot_plan
                 else:
                     known_task_ids = {task.id for task in tasks}
                     held_task_ids = await self._company_suspend_resume_candidate_task_ids(
@@ -18081,6 +18659,7 @@ class OPCEngine:
         organization_id: str,
         source: dict[str, Any],
         assignments: dict[str, dict[str, Any]],
+        controller_admission: CompanyRunControllerAdmission | None = None,
     ) -> DelegationWorkItem | None:
         if not self.store or not hasattr(self.store, "save_delegation_work_item"):
             return None
@@ -18214,6 +18793,13 @@ class OPCEngine:
             "user_visible": False,
             "authoritative_output": False,
         }), projection_id=projection_id, turn_type="self_evolution")
+        if controller_admission is not None:
+            metadata["company_run_controller_owner_token"] = (
+                controller_admission.owner_token
+            )
+            metadata["company_run_controller_lease_generation"] = (
+                controller_admission.generation
+            )
         work_item = DelegationWorkItem(
             work_item_id=work_item_id,
             run_id=run_id,
@@ -18426,97 +19012,138 @@ class OPCEngine:
         if self.company_executor is None:
             checkpoint.status = "invalid"
             return "Could not run self-evolution because company runtime is not available."
-        root_work_item = await self._create_company_self_evolution_root_work_item(
-            checkpoint=checkpoint,
-            waiting_task=waiting_task,
-            tasks=tasks,
-            plan=plan,
-            root_role_id=root_role_id,
-            organization_id=organization_id,
-            source=source,
-            assignments=assignments,
+        acquire_admission = getattr(
+            self.company_executor,
+            "acquire_controller_admission",
+            None,
         )
-        if root_work_item is None:
-            checkpoint.status = "invalid"
-            return "Could not run self-evolution because the company runtime work-item state could not be restored."
-
-        await self._close_company_delivery_review_task(
-            waiting_task,
-            resolution="self_evolution_started",
-            closed_at=datetime.now().isoformat(),
-            checkpoint_id=str(getattr(checkpoint, "checkpoint_id", "") or "").strip(),
-            metadata_updates={
-                "self_evolution_review_started": True,
-                "self_evolution_review_started_at": datetime.now().isoformat(),
-                "self_evolution_root_work_item_id": root_work_item.work_item_id,
-            },
+        controller_admission = (
+            await acquire_admission(
+                tasks,
+                retry_busy_at_observed_expiry=True,
+            )
+            if callable(acquire_admission)
+            else None
         )
-        if waiting_task.id not in seen_task_ids:
-            tasks.append(waiting_task)
-            seen_task_ids.add(waiting_task.id)
-        await self._prepare_self_evolution_runtime_resume_tasks(
-            tasks=tasks,
-            root_work_item=root_work_item,
-        )
-        run_id = str(getattr(root_work_item, "run_id", "") or "").strip()
-        deadline_hit = False
         try:
-            await asyncio.wait_for(
-                self.company_executor.execute(plan, tasks),
-                timeout=self._SELF_EVOLUTION_RUN_TIMEOUT_SEC,
-            )
-        except asyncio.TimeoutError:
-            deadline_hit = True
-            await self._settle_self_evolution_deadline(run_id)
-        result = await self._collect_company_self_evolution_result(
-            checkpoint_id=checkpoint.checkpoint_id,
-            run_id=run_id,
-        )
-        if deadline_hit:
-            result.setdefault("errors", []).append({"error": "self_evolution_deadline"})
+            if controller_admission is not None:
+                # The final-delivery controller is deliberately released while
+                # waiting for owner feedback.  Self-evolution is a new company
+                # runtime pass, so every write performed before scheduler
+                # bootstrap must already carry its newly admitted generation.
+                for task in tasks:
+                    task.metadata = dict(task.metadata or {})
+                    task.metadata["company_run_controller_owner_token"] = (
+                        controller_admission.owner_token
+                    )
+                    task.metadata["company_run_controller_lease_generation"] = (
+                        controller_admission.generation
+                    )
+                await self.store.save_task(waiting_task)
 
-        waiting_task.metadata = dict(waiting_task.metadata or {})
-        review_record = {
-            "checkpoint_id": checkpoint.checkpoint_id,
-            "action": normalized_action,
-            "feedback": feedback_text,
-            "completed_at": datetime.now().isoformat(),
-            "recorded_count": len(result.get("recorded", [])),
-            "error_count": len(result.get("errors", [])),
-        }
-        history = list(waiting_task.metadata.get("self_evolution_reviews", []) or [])
-        history.append(review_record)
-        task_metadata_updates = {
-            "self_evolution_review_completed": True,
-            "self_evolution_review_completed_at": review_record["completed_at"],
-            "latest_self_evolution_review": review_record,
-            "self_evolution_reviews": history[-20:],
-        }
-        await self._terminalize_company_delivery_feedback_checkpoint(
-            checkpoint,
-            status="resolved",
-            resolution="self_evolution_review_completed",
-            payload_updates={
-                **payload,
-                "self_evolution_review": review_record,
-                "self_evolution_recorded": list(result.get("recorded", [])),
-                "self_evolution_errors": list(result.get("errors", [])),
-            },
-            task_metadata_updates=task_metadata_updates,
-        )
-        recorded_count = len(result.get("recorded", []))
-        if deadline_hit:
-            return (
-                f"Self-evolution hit its {int(self._SELF_EVOLUTION_RUN_TIMEOUT_SEC // 60)}-minute "
-                f"time budget and was closed with {recorded_count} recorded update(s); "
-                "the remaining reflection work was cancelled."
+            root_work_item = await self._create_company_self_evolution_root_work_item(
+                checkpoint=checkpoint,
+                waiting_task=waiting_task,
+                tasks=tasks,
+                plan=plan,
+                root_role_id=root_role_id,
+                organization_id=organization_id,
+                source=source,
+                assignments=assignments,
+                controller_admission=controller_admission,
             )
-        if recorded_count:
-            return f"Self-evolution completed. Recorded {recorded_count} employee experience update(s)."
-        errors = list(result.get("errors", []))
-        if errors:
-            return "Self-evolution finished without writing updates because the agents did not return valid evolution patches."
-        return "Self-evolution completed. No employee experience updates were needed."
+            if root_work_item is None:
+                checkpoint.status = "invalid"
+                return "Could not run self-evolution because the company runtime work-item state could not be restored."
+
+            await self._close_company_delivery_review_task(
+                waiting_task,
+                resolution="self_evolution_started",
+                closed_at=datetime.now().isoformat(),
+                checkpoint_id=str(getattr(checkpoint, "checkpoint_id", "") or "").strip(),
+                metadata_updates={
+                    "self_evolution_review_started": True,
+                    "self_evolution_review_started_at": datetime.now().isoformat(),
+                    "self_evolution_root_work_item_id": root_work_item.work_item_id,
+                },
+            )
+            if waiting_task.id not in seen_task_ids:
+                tasks.append(waiting_task)
+                seen_task_ids.add(waiting_task.id)
+            await self._prepare_self_evolution_runtime_resume_tasks(
+                tasks=tasks,
+                root_work_item=root_work_item,
+            )
+            run_id = str(getattr(root_work_item, "run_id", "") or "").strip()
+            deadline_hit = False
+            try:
+                execute_kwargs: dict[str, Any] = {}
+                if controller_admission is not None:
+                    execute_kwargs = {
+                        "controller_admission": controller_admission,
+                        "release_controller_admission_on_exit": False,
+                    }
+                await asyncio.wait_for(
+                    self.company_executor.execute(plan, tasks, **execute_kwargs),
+                    timeout=self._SELF_EVOLUTION_RUN_TIMEOUT_SEC,
+                )
+            except asyncio.TimeoutError:
+                deadline_hit = True
+                await self._settle_self_evolution_deadline(run_id)
+            result = await self._collect_company_self_evolution_result(
+                checkpoint_id=checkpoint.checkpoint_id,
+                run_id=run_id,
+            )
+            if deadline_hit:
+                result.setdefault("errors", []).append({"error": "self_evolution_deadline"})
+
+            waiting_task.metadata = dict(waiting_task.metadata or {})
+            review_record = {
+                "checkpoint_id": checkpoint.checkpoint_id,
+                "action": normalized_action,
+                "feedback": feedback_text,
+                "completed_at": datetime.now().isoformat(),
+                "recorded_count": len(result.get("recorded", [])),
+                "error_count": len(result.get("errors", [])),
+            }
+            history = list(waiting_task.metadata.get("self_evolution_reviews", []) or [])
+            history.append(review_record)
+            task_metadata_updates = {
+                "self_evolution_review_completed": True,
+                "self_evolution_review_completed_at": review_record["completed_at"],
+                "latest_self_evolution_review": review_record,
+                "self_evolution_reviews": history[-20:],
+            }
+            await self._terminalize_company_delivery_feedback_checkpoint(
+                checkpoint,
+                status="resolved",
+                resolution="self_evolution_review_completed",
+                payload_updates={
+                    **payload,
+                    "self_evolution_review": review_record,
+                    "self_evolution_recorded": list(result.get("recorded", [])),
+                    "self_evolution_errors": list(result.get("errors", [])),
+                },
+                task_metadata_updates=task_metadata_updates,
+            )
+            recorded_count = len(result.get("recorded", []))
+            if deadline_hit:
+                return (
+                    f"Self-evolution hit its {int(self._SELF_EVOLUTION_RUN_TIMEOUT_SEC // 60)}-minute "
+                    f"time budget and was closed with {recorded_count} recorded update(s); "
+                    "the remaining reflection work was cancelled."
+                )
+            if recorded_count:
+                return f"Self-evolution completed. Recorded {recorded_count} employee experience update(s)."
+            errors = list(result.get("errors", []))
+            if errors:
+                return "Self-evolution finished without writing updates because the agents did not return valid evolution patches."
+            return "Self-evolution completed. No employee experience updates were needed."
+        finally:
+            if controller_admission is not None and not controller_admission.released:
+                await self._release_company_controller_admission(
+                    controller_admission
+                )
 
     def _self_evolution_assignments_by_role(self, tasks: list[Task]) -> dict[str, dict[str, Any]]:
         assignments: dict[str, dict[str, Any]] = {}
@@ -18647,6 +19274,219 @@ class OPCEngine:
                     overrides[role_id] = agent
         return overrides
 
+    def _staffing_selected_team_boundaries(
+        self,
+        payload: dict[str, Any],
+        reply_metadata: dict[str, Any] | None,
+    ) -> tuple[list[str], dict[str, str]]:
+        """Interpret JiuwenSwarm in Company staffing as an opaque subtree Team.
+
+        `jiuwen` remains the single-role Codex-like executor. Selecting the
+        distinct `jiuwenswarm` execution unit on a Company role makes that
+        role the organizational boundary of one opaque Team. If both an
+        ancestor and descendant are selected, the ancestor owns the subtree.
+        """
+
+        role_agents = self._staffing_role_agent_overrides(payload, reply_metadata)
+        if not self.org_engine:
+            return [], role_agents
+        parent_by_role = {
+            str(getattr(agent, "role_id", "") or "").strip(): str(
+                getattr(agent, "reports_to", "") or ""
+            ).strip()
+            for agent in self.org_engine.list_agents()
+            if str(getattr(agent, "role_id", "") or "").strip()
+        }
+        for role in list(payload.get("staffing_roles", []) or []):
+            if not isinstance(role, dict):
+                continue
+            role_id = str(role.get("role_id", "") or "").strip()
+            reports_to = str(role.get("reports_to", "") or "").strip()
+            if role_id and reports_to:
+                parent_by_role[role_id] = reports_to
+        candidates = {
+            role_id
+            for role_id, agent in role_agents.items()
+            if agent == "jiuwenswarm" and role_id in parent_by_role
+        }
+
+        def has_selected_ancestor(role_id: str) -> bool:
+            seen: set[str] = set()
+            cursor = parent_by_role.get(role_id, "")
+            while cursor and cursor != "owner" and cursor not in seen:
+                if cursor in candidates:
+                    return True
+                seen.add(cursor)
+                cursor = parent_by_role.get(cursor, "")
+            return False
+
+        boundaries = sorted(
+            (role_id for role_id in candidates if not has_selected_ancestor(role_id)),
+            key=lambda role_id: (role_id.count("/"), role_id),
+        )
+        return boundaries, role_agents
+
+    def _durable_external_team_bindings(self) -> list[Any]:
+        """Return organization-level bindings, excluding prior run selections."""
+
+        return [
+            binding
+            for binding in list(self.config.org.external_team_bindings or [])
+            if str(dict(getattr(binding, "metadata", {}) or {}).get("source", "") or "").strip()
+            != "company_staffing_selection"
+        ]
+
+    def _apply_staffing_external_team_bindings(
+        self,
+        payload: dict[str, Any],
+        reply_metadata: dict[str, Any] | None,
+        *,
+        role_agent_overrides: dict[str, str] | None = None,
+    ) -> tuple[list[Any], dict[str, str]]:
+        """Compile approved Team choices for the current company run."""
+
+        if role_agent_overrides is None:
+            boundaries, role_agents = self._staffing_selected_team_boundaries(
+                payload,
+                reply_metadata,
+            )
+        else:
+            role_agents = {
+                str(role_id or "").strip(): normalize_recruitment_agent_choice(agent)
+                for role_id, agent in role_agent_overrides.items()
+                if str(role_id or "").strip() and normalize_recruitment_agent_choice(agent)
+            }
+            synthetic_reply = {"recruitment_role_agents": role_agents}
+            boundaries, _ = self._staffing_selected_team_boundaries(
+                {"staffing_roles": list(payload.get("staffing_roles", []) or [])},
+                synthetic_reply,
+            )
+        if not self.org_engine:
+            return [], role_agents
+        from opc.core.config import ExternalTeamBindingConfig
+        from opc.layer2_organization.external_team_compiler import (
+            compile_external_team_bindings,
+        )
+
+        topology = self.org_engine.build_runtime_delegation_topology()
+        existing = self._durable_external_team_bindings()
+        compile_external_team_bindings(
+            self.org_engine,
+            runtime_topology=topology,
+            bindings=existing,
+        )
+        parent_by_role = {
+            str(getattr(agent, "role_id", "") or "").strip(): str(
+                getattr(agent, "reports_to", "") or ""
+            ).strip()
+            for agent in self.org_engine.list_agents()
+            if str(getattr(agent, "role_id", "") or "").strip()
+        }
+
+        def is_within(role_id: str, boundary_role_id: str) -> bool:
+            if role_id == boundary_role_id:
+                return True
+            seen: set[str] = set()
+            cursor = parent_by_role.get(role_id, "")
+            while cursor and cursor != "owner" and cursor not in seen:
+                if cursor == boundary_role_id:
+                    return True
+                seen.add(cursor)
+                cursor = parent_by_role.get(cursor, "")
+            return False
+
+        # A newly approved outer boundary supersedes an older nested binding.
+        retained = [
+            binding
+            for binding in existing
+            if not any(
+                str(binding.boundary_role_id or "").strip() != boundary
+                and is_within(str(binding.boundary_role_id or "").strip(), boundary)
+                for boundary in boundaries
+            )
+        ]
+        retained_boundaries = {
+            str(binding.boundary_role_id or "").strip()
+            for binding in retained
+            if str(binding.boundary_role_id or "").strip()
+        }
+        effective_new_boundaries = [
+            boundary
+            for boundary in boundaries
+            if not any(is_within(boundary, existing_boundary) for existing_boundary in retained_boundaries)
+        ]
+        proposed = [
+            *retained,
+            *[
+                ExternalTeamBindingConfig(
+                    boundary_role_id=boundary,
+                    external_agent="jiuwenswarm",
+                    scope="subtree",
+                    collapse_subtree=True,
+                    metadata={"source": "company_staffing_selection"},
+                )
+                for boundary in effective_new_boundaries
+            ],
+        ]
+        compiled = compile_external_team_bindings(
+            self.org_engine,
+            runtime_topology=topology,
+            bindings=proposed,
+        )
+        compiled_id_by_boundary = {
+            item.boundary_role_id: item.binding_id for item in compiled
+        }
+        for binding in proposed:
+            binding.binding_id = compiled_id_by_boundary.get(
+                str(binding.boundary_role_id or "").strip(),
+                str(binding.binding_id or ""),
+            )
+
+        return compiled, role_agents
+
+    async def _publish_external_team_bindings_changed(
+        self,
+        compiled_teams: list[Any],
+    ) -> None:
+        """Tell presentation layers that the executable company roster changed."""
+
+        await self.event_bus.publish(OPCEvent(
+            event_type="runtime_event",
+            payload={
+                "type": "external_team_bindings_changed",
+                "project_id": self.project_id or "default",
+                "bindings": [
+                    team.to_dict() if hasattr(team, "to_dict") else {}
+                    for team in compiled_teams
+                ],
+            },
+        ))
+
+    @staticmethod
+    def _filter_staffing_for_external_teams(
+        compiled_teams: list[Any],
+        role_agents: dict[str, str],
+    ) -> tuple[set[str], dict[str, str]]:
+        covered = {
+            str(role_id or "").strip()
+            for team in compiled_teams
+            for role_id in list(getattr(team, "covered_role_ids", []) or [])
+            if str(role_id or "").strip()
+        }
+        boundaries = {
+            str(getattr(team, "boundary_role_id", "") or "").strip()
+            for team in compiled_teams
+            if str(getattr(team, "boundary_role_id", "") or "").strip()
+        }
+        filtered_agents = {
+            role_id: agent
+            for role_id, agent in role_agents.items()
+            if role_id not in covered or role_id in boundaries
+        }
+        for boundary in boundaries:
+            filtered_agents[boundary] = "jiuwenswarm"
+        return covered, filtered_agents
+
     async def _resume_staffing_selection_checkpoint(
         self,
         checkpoint: ExecutionCheckpoint,
@@ -18693,7 +19533,18 @@ class OPCEngine:
         attachment_refs = self._normalize_attachment_refs(payload.get("attachment_refs", []))
 
         if staffing_action == "auto_recruit" or normalized in auto_tokens:
-            role_agent_overrides = self._staffing_role_agent_overrides(payload, reply_metadata)
+            try:
+                compiled_teams, role_agent_overrides = self._apply_staffing_external_team_bindings(
+                    payload,
+                    reply_metadata,
+                )
+            except ValueError as exc:
+                return f"Could not apply JiuwenSwarm Team staffing: {exc}"
+            await self._publish_external_team_bindings_changed(compiled_teams)
+            _, role_agent_overrides = self._filter_staffing_for_external_teams(
+                compiled_teams,
+                role_agent_overrides,
+            )
             recruitment_agent = normalize_recruitment_agent_choice(
                 reply_metadata.get("recruitment_agent") or payload.get("recruitment_agent"),
                 default="native",
@@ -18733,11 +19584,24 @@ class OPCEngine:
         if not is_approve:
             return self._render_manual_staffing_summary(payload)
 
-        role_ids = {
+        try:
+            compiled_teams, role_agent_overrides = self._apply_staffing_external_team_bindings(
+                payload,
+                reply_metadata,
+            )
+        except ValueError as exc:
+            return f"Could not apply JiuwenSwarm Team staffing: {exc}"
+        await self._publish_external_team_bindings_changed(compiled_teams)
+        opaque_team_role_ids, role_agent_overrides = self._filter_staffing_for_external_teams(
+            compiled_teams,
+            role_agent_overrides,
+        )
+
+        role_ids = ({
             str(role.get("role_id", "") or "").strip()
             for role in list(payload.get("staffing_roles", []) or [])
             if str(role.get("role_id", "") or "").strip()
-        }
+        } - opaque_team_role_ids) | set(role_agent_overrides)
         selections: dict[str, dict[str, str]] = {}
         for role in list(payload.get("staffing_roles", []) or []):
             role_id = str(role.get("role_id", "") or "").strip()
@@ -18803,7 +19667,6 @@ class OPCEngine:
             session_id,
             source="manual_staffing_approved",
         )
-        role_agent_overrides = self._staffing_role_agent_overrides(payload, reply_metadata)
         self._save_project_company_staffing_defaults(
             decision,
             company_profile=str(runtime_spec.profile or payload.get("company_profile", "") or CompanyProfile.CORPORATE.value),
@@ -18929,6 +19792,19 @@ class OPCEngine:
         attachment_refs = self._normalize_attachment_refs(payload.get("attachment_refs", []))
 
         if reply_kind == "approve" or (reply_kind != "feedback" and normalized in approved_tokens):
+            try:
+                compiled_teams, role_agent_overrides = self._apply_staffing_external_team_bindings(
+                    payload,
+                    reply_metadata,
+                    role_agent_overrides=role_agent_overrides,
+                )
+            except ValueError as exc:
+                return f"Could not apply JiuwenSwarm Team staffing: {exc}"
+            await self._publish_external_team_bindings_changed(compiled_teams)
+            opaque_team_role_ids, role_agent_overrides = self._filter_staffing_for_external_teams(
+                compiled_teams,
+                role_agent_overrides,
+            )
             hired_messages: list[str] = []
             raw_staffing_selections = reply_metadata.get("staffing_selections")
             if isinstance(raw_staffing_selections, dict) and raw_staffing_selections:
@@ -18936,7 +19812,7 @@ class OPCEngine:
                     str(proposal.role_id or "").strip()
                     for proposal in list(recruitment_plan.proposals or [])
                     if str(proposal.role_id or "").strip()
-                }
+                } - opaque_team_role_ids
                 selections: dict[str, dict[str, str]] = {}
                 proposal_by_role = {
                     str(proposal.role_id or "").strip(): proposal
@@ -19023,6 +19899,8 @@ class OPCEngine:
                     )
             else:
                 for proposal in recruitment_plan.proposals:
+                    if str(proposal.role_id or "").strip() in opaque_team_role_ids:
+                        continue
                     if proposal.status != "proposed_hire" or not proposal.candidate:
                         continue
                     employee = self.talent_market.ensure_hire_template(
@@ -19036,6 +19914,21 @@ class OPCEngine:
                     hired_messages.append(f"- {employee.name} ({employee.employee_id}) -> {employee.role_id}")
                 staffing_overrides = build_staffing_overrides(recruitment_plan)
                 staffing_experience_modes = build_staffing_experience_modes(recruitment_plan)
+                staffing_overrides = {
+                    role_id: employee_id
+                    for role_id, employee_id in staffing_overrides.items()
+                    if role_id not in opaque_team_role_ids
+                }
+                staffing_experience_modes = {
+                    role_id: mode
+                    for role_id, mode in staffing_experience_modes.items()
+                    if role_id not in opaque_team_role_ids
+                }
+                fallback_role_ids = {
+                    role_id
+                    for role_id in fallback_role_ids
+                    if role_id not in opaque_team_role_ids
+                }
             self.config.save(self.opc_home / "config")
             if self.org_engine:
                 self.org_engine.reload_from_config()
@@ -19766,7 +20659,8 @@ class OPCEngine:
             mode: ``"task"`` (default), ``"company"``, or ``"org"``. Legacy
                 ``"project"`` maps to task and ``"custom"`` maps to org.
             org_id: Organization ID for isolated org mode.
-            preferred_agent: ``"native"``, ``"claude_code"``, ``"cursor"``, ``"codex"``, or ``"opencode"``.
+            preferred_agent: ``"native"``, ``"claude_code"``, ``"cursor"``, ``"codex"``,
+                ``"opencode"``, ``"jiuwen"``, or ``"jiuwenswarm"``.
             domains: Domain hints (e.g. ``["coding", "frontend"]``).
             company_profile: ``"corporate"`` for company mode or ``"custom"``
                 as a legacy org-mode alias.

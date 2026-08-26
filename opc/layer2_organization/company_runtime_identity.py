@@ -64,6 +64,10 @@ def _has_company_runtime_marker(task: Any) -> bool:
         return True
     if execution_mode in {"company", "company_mode", "multi_team_org"}:
         return True
+
+    # Canonical work-item/runtime links are stronger than a stale mode field.
+    # They identify actual company-owned execution and must retain its native
+    # isolation boundary unless the external workspace fence is enabled.
     if is_work_item_runtime_metadata(metadata):
         return True
     if linked_work_item_id_for_task(task):
@@ -76,20 +80,29 @@ def _has_company_runtime_marker(task: Any) -> bool:
             "delegation_run_id",
             "work_item_projection_id",
             "work_item_projection_ref",
-            "work_item_role_id",
             "shared_role_session",
         )
     ):
         return True
-    # Old company records may predate exec_mode.  An explicit task-mode marker
-    # wins over the legacy profile hint.
+
+    # ``work_item_role_id`` is also used by Task mode for its single
+    # ``task_generalist`` execution identity.  It is only a legacy company
+    # hint, not a canonical work-item link, so an explicit Task marker must
+    # win over it.  Previously this check happened too late and every Task-mode
+    # external agent was rejected at the company isolation fence, causing an
+    # invisible fallback to Native Runtime.
     explicitly_task_mode = (
         exec_mode in {"task", "project", "single"}
         or mode == "task"
         or execution_mode in {"task", "task_mode", "project"}
         or _text(metadata.get("task_mode_contract")) == "single_full_capability_main_agent"
     )
-    return not explicitly_task_mode and bool(_text(metadata.get("company_profile")))
+    if explicitly_task_mode:
+        return False
+    return bool(
+        _text(metadata.get("work_item_role_id"))
+        or _text(metadata.get("company_profile"))
+    )
 
 
 def is_company_runtime_task(task: Any) -> bool:
@@ -102,6 +115,15 @@ def requires_native_company_execution(task: Any) -> bool:
     """Whether an unisolated external process is forbidden for this Task."""
 
     metadata = _metadata(task)
+    assigned_external_agent = _text(getattr(task, "assigned_external_agent", ""))
+    external_fence = _text(metadata.get("external_company_execution_fence"))
+    if (
+        is_company_runtime_task(task)
+        and assigned_external_agent
+        and metadata.get("external_company_execution_allowed") is True
+        and external_fence == "validated_workspace"
+    ):
+        return False
     return bool(
         is_company_runtime_task(task)
         or metadata.get("recruitment_planning") is True

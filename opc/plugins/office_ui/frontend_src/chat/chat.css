@@ -4423,6 +4423,14 @@
   text-overflow: ellipsis;
 }
 
+.wi-projection-agent {
+  max-width: 96px;
+  overflow: hidden;
+  color: var(--text-secondary);
+  font-size: 9px;
+  text-overflow: ellipsis;
+}
+
 .wi-projection-icon {
   font-size: 10px;
   line-height: 1;
@@ -5339,3 +5347,21 @@
 
 .awp-row-terminal.awp-terminal-active .awp-row-activity { color: var(--accent); }
 .awp-row-terminal.awp-terminal-waiting .awp-row-activity { color: var(--yellow); }
+.ckpt-badge-external-team {
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+  border-color: color-mix(in srgb, var(--accent) 30%, transparent);
+}
+.ckpt-external-team-staffing {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 10px;
+  border: 1px solid color-mix(in srgb, var(--accent) 28%, var(--border));
+  border-radius: 7px;
+  background: color-mix(in srgb, var(--accent) 6%, transparent);
+  color: var(--text-secondary);
+  font-size: 11px;
+  line-height: 1.4;
+}
+.ckpt-external-team-staffing b { color: var(--accent); }

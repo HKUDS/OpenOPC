@@ -15,6 +15,7 @@ import type { OutgoingAttachmentPayload } from '../types/chat'
 import type { TaskPreferredAgent } from '../types/kanban'
 import type { SavedOrgSummary } from '../types/visual'
 import { getContextUsageMetrics } from '../lib/contextUsage'
+import { TASK_AGENT_LABELS } from '../lib/externalAgents'
 
 const MAX_FILE_SIZE = 10 * 1024 * 1024
 const MAX_TOTAL_SIZE = 20 * 1024 * 1024
@@ -25,14 +26,6 @@ type ComposerExecMode = 'task' | 'company' | 'org' | 'custom'
 type ComposerCompanyProfile = 'corporate' | 'custom'
 type ComposerModeOption = 'task' | 'company'
 type CompanyArchitectureOption = '' | 'corporate' | `org:${string}`
-
-const TASK_AGENT_LABELS: Record<TaskPreferredAgent, string> = {
-  native: 'OpenOPC Native',
-  codex: 'Codex',
-  claude_code: 'Claude Code',
-  cursor: 'Cursor',
-  opencode: 'OpenCode',
-}
 
 interface PendingAttachment {
   id: string

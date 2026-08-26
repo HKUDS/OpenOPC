@@ -5,11 +5,13 @@ from __future__ import annotations
 from loguru import logger
 
 from opc.core.config import AgentsConfig
+from opc.core.execution_agents import EXTERNAL_EXECUTION_AGENTS
 from opc.layer3_agent.adapters.base import ExternalAgentAdapter
 from opc.layer3_agent.adapters.claude_code import ClaudeCodeAdapter
 from opc.layer3_agent.adapters.cursor_adapter import CursorAdapter
 from opc.layer3_agent.adapters.codex_adapter import CodexAdapter
 from opc.layer3_agent.adapters.opencode_adapter import OpenCodeAdapter
+from opc.layer3_agent.adapters.jiuwen_adapter import JiuwenAdapter, JiuwenSwarmAdapter
 
 
 ADAPTER_CLASSES: dict[str, type[ExternalAgentAdapter]] = {
@@ -17,7 +19,17 @@ ADAPTER_CLASSES: dict[str, type[ExternalAgentAdapter]] = {
     "cursor": CursorAdapter,
     "codex": CodexAdapter,
     "opencode": OpenCodeAdapter,
+    "jiuwen": JiuwenAdapter,
+    "jiuwenswarm": JiuwenSwarmAdapter,
 }
+
+if frozenset(ADAPTER_CLASSES) != EXTERNAL_EXECUTION_AGENTS:
+    missing = sorted(EXTERNAL_EXECUTION_AGENTS.difference(ADAPTER_CLASSES))
+    unexpected = sorted(set(ADAPTER_CLASSES).difference(EXTERNAL_EXECUTION_AGENTS))
+    raise RuntimeError(
+        "External adapter registry does not match the canonical execution-agent "
+        f"catalog (missing={missing}, unexpected={unexpected})"
+    )
 
 
 class AdapterRegistry:

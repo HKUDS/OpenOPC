@@ -111,6 +111,7 @@ export interface StaffingSelectionValue {
 export interface StaffingRoleEntry {
   role_id: string
   role_label: string
+  reports_to?: string
   role_responsibility?: string
   default_selection?: StaffingSelectionValue
   same_role_employee_ids?: string[]
@@ -118,6 +119,11 @@ export interface StaffingRoleEntry {
   default_agent?: TaskPreferredAgent
   selected_agent?: TaskPreferredAgent
   default_source?: string
+  staffing_locked?: boolean
+  staffing_mode?: 'opaque_external_team' | string
+  external_team_binding_id?: string
+  covered_role_ids?: string[]
+  capability_manifest?: Record<string, unknown>
 }
 
 export interface StaffingEmployeeOption {

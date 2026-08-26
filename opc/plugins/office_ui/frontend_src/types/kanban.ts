@@ -197,6 +197,11 @@ export interface KanbanTask {
   // Employee assignment (Company Mode)
   employeeAssignment?: EmployeeAssignment
   selectedExecutionAgent?: TaskPreferredAgent
+  executionUnitKind?: string
+  externalTeamBindingId?: string
+  externalTeamBoundaryRoleId?: string
+  coveredRoleIds?: string[]
+  externalCompanyExecutionFence?: string
 
   // Origin channel (where the task originated)
   originChannel?: string
@@ -261,7 +266,7 @@ export interface WorkerNotification {
 // ── Session (merged task + channel) ──────────────────────────────────────────
 
 export type SessionMode = 'primary' | 'child'
-export type TaskPreferredAgent = 'native' | 'codex' | 'claude_code' | 'cursor' | 'opencode'
+export type TaskPreferredAgent = 'native' | 'codex' | 'claude_code' | 'cursor' | 'opencode' | 'jiuwen' | 'jiuwenswarm'
 
 export interface Session {
   projectId: string
@@ -313,6 +318,11 @@ export interface Session {
   workItemGate?: WorkItemGate
   employeeAssignment?: EmployeeAssignment
   selectedExecutionAgent?: TaskPreferredAgent
+  executionUnitKind?: string
+  externalTeamBindingId?: string
+  externalTeamBoundaryRoleId?: string
+  coveredRoleIds?: string[]
+  externalCompanyExecutionFence?: string
   originChannel?: string
   originTaskId?: string
   runtimeControlState?: 'running' | 'suspending' | 'suspended' | 'resuming' | 'idle'
@@ -416,6 +426,10 @@ export interface RoleWorkItemRow {
   executorRoleId?: string
   executorRoleName?: string
   reviewerRoleId?: string
+  selectedExecutionAgent?: TaskPreferredAgent
+  executionUnitKind?: string
+  externalTeamBindingId?: string
+  coveredRoleIds?: string[]
   /** Epoch milliseconds; sourced from ``WorkItem.created_at``. */
   createdAt: number
   /** Epoch milliseconds; sourced from ``WorkItem.updated_at`` (last phase

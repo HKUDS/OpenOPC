@@ -106,7 +106,14 @@ function orgIdForExecMode(mode: AppExecMode, orgId?: string | null): string | un
 
 function normalizeTaskPreferredAgent(value?: string): TaskPreferredAgent {
   const normalized = String(value ?? '').trim().toLowerCase().replace('-', '_')
-  if (normalized === 'codex' || normalized === 'claude_code' || normalized === 'cursor' || normalized === 'opencode') {
+  if (
+    normalized === 'codex'
+    || normalized === 'claude_code'
+    || normalized === 'cursor'
+    || normalized === 'opencode'
+    || normalized === 'jiuwen'
+    || normalized === 'jiuwenswarm'
+  ) {
     return normalized
   }
   return 'native'
@@ -2665,6 +2672,8 @@ export default function App() {
             onBulkAddRoles={(roles) => clientRef.current?.bulkAddRoles(roles)}
             onUpdateRole={(rid, updates) => clientRef.current?.updateRole(rid, updates)}
             onDeleteRole={(rid) => clientRef.current?.deleteRole(rid)}
+            onBindExternalTeam={(data) => clientRef.current?.bindExternalTeam(data)}
+            onUnbindExternalTeam={(data) => clientRef.current?.unbindExternalTeam(data)}
             onUpdateOrgStrategy={(data) => clientRef.current?.updateOrgStrategy(data)}
             onUpdateRuntimePolicy={(policy) => clientRef.current?.updateRuntimePolicy(policy)}
             onResetArchitecture={() => clientRef.current?.resetArchitecture()}

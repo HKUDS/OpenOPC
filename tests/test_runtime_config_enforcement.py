@@ -290,6 +290,33 @@ class RuntimeConfigEnforcementTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("employee_assignment", created["metadata"])
         self.assertEqual(engine._execute_single_agent.await_args.args[1], "codex")
 
+    async def test_task_mode_preserves_jiuwen_single_and_team_overrides(self) -> None:
+        for agent in ("jiuwen", "jiuwenswarm"):
+            with self.subTest(agent=agent):
+                engine = self._build_task_mode_engine()
+
+                result = await engine._continue_task_mode_execution(
+                    RouterDecision(
+                        mode=ExecutionMode.TASK_MODE,
+                        domains=[],
+                        preferred_agent=agent,
+                    ),
+                    "Run this through the selected Jiuwen execution unit.",
+                    session_id="sess-jiuwen",
+                )
+
+                self.assertEqual(result, "executed")
+                created = engine.task_scheduler.create_tasks.await_args.args[0][0]
+                self.assertEqual(created["assigned_external_agent"], agent)
+                self.assertFalse(created["metadata"]["force_native_execution"])
+                self.assertEqual(created["metadata"]["preferred_external_agent"], agent)
+                self.assertEqual(created["metadata"]["selected_execution_agent"], agent)
+                self.assertEqual(
+                    created["metadata"]["work_item_execution_strategy"],
+                    WorkItemExecutionStrategy.EXTERNAL.value,
+                )
+                self.assertEqual(engine._execute_single_agent.await_args.args[1], agent)
+
     async def test_company_root_task_uses_selected_agent_over_template_preference(self) -> None:
         engine = OPCEngine(config=OPCConfig(), project_id="proj1")
         engine.store = SimpleNamespace(

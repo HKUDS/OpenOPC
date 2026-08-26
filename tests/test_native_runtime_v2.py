@@ -20,7 +20,11 @@ from opc.layer3_agent.runtime_v2.streaming_tool_executor import StreamingToolExe
 from opc.layer3_agent.runtime_v2.subagents import SubagentManager, SubagentState
 from opc.layer3_agent.runtime_v2.tool_planner import ToolPlanner
 from opc.layer4_tools.agent_runtime import create_agent_runtime_tools
-from opc.layer4_tools.registry import ToolDefinition, ToolRegistry
+from opc.layer4_tools.registry import (
+    ToolDefinition,
+    ToolInvocationValidationError,
+    ToolRegistry,
+)
 from opc.layer4_tools.todo import create_todo_tools
 from opc.llm.provider import LLMProvider
 
@@ -654,6 +658,37 @@ class NativeRuntimeV2Tests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(metadata["visible_speaker"], "OPC")
         self.assertEqual(metadata["ui_message_id"], "runtime-v2-assistant:ui-turn:task")
         self.assertNotIn("company_runtime_raw_turn", metadata)
+
+    async def test_registry_returns_structured_model_correctable_validation_error(
+        self,
+    ) -> None:
+        registry = ToolRegistry()
+
+        async def reject_cycle() -> None:
+            raise ToolInvocationValidationError(
+                "dependency cycle: a -> b -> a",
+                code="delegate_dependency_cycle",
+                correction="Remove one hard-dependency edge and retry.",
+                details={"cycle": "a -> b -> a"},
+            )
+
+        registry.register(
+            ToolDefinition(
+                name="reject_cycle",
+                description="Reject a cyclic test graph.",
+                parameters={"type": "object", "properties": {}},
+                func=reject_cycle,
+            )
+        )
+
+        result = await registry.invoke("reject_cycle", {})
+
+        self.assertFalse(result["success"])
+        self.assertEqual(result["error_type"], "validation_error")
+        self.assertEqual(result["error_code"], "delegate_dependency_cycle")
+        self.assertTrue(result["retryable"])
+        self.assertEqual(result["details"]["cycle"], "a -> b -> a")
+        self.assertNotIn("traceback", result)
 
     async def test_runtime_executes_tool_then_returns_second_turn_answer(self) -> None:
         registry = ToolRegistry()

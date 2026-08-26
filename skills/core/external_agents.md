@@ -28,9 +28,11 @@ rules alone.
   external CLI agent.
 
 ## External CLI Agents
-- External agents such as Cursor, Claude Code, and Codex are usually strongest for complex,
+- External agents such as Cursor, Claude Code, Codex, Jiuwen, and JiuwenSwarm are usually strongest for complex,
   tool-heavy, multi-step execution where a dedicated CLI agent can work in an isolated
   workspace.
+- Treat `jiuwen` as a normal single external execution unit. Treat `jiuwenswarm` as one
+  opaque Team: its internal teammates never become OpenOPC Tasks, roles, sessions, or cards.
 - Their strengths are not limited to writing code. They can also handle bash-driven tasks
   such as generating or transforming Markdown, documents, PDFs, slide content, reports,
   scripts, and repository-wide edits.

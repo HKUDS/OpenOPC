@@ -13,7 +13,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from opc.core.config import EmployeeConfig, ExternalAgentConfig, OPCConfig, OrgConfig
 from opc.core.company_controller import CompanyRunControllerLeaseLost
@@ -3232,6 +3232,80 @@ class CompanyCollaborationTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(selections, [("execution-task", "executor")])
             await store.close()
 
+    async def test_company_executor_preserves_attested_external_team_before_selection(self) -> None:
+        with _workspace_tempdir() as tmpdir:
+            store = OPCStore(Path(tmpdir) / "tasks.db")
+            await store.initialize()
+            communication = CommunicationManager(store, EventBus())
+            observed: list[tuple[str | None, str, bool]] = []
+
+            async def agent_selector(task: Task, role) -> str | None:
+                observed.append((
+                    task.assigned_external_agent,
+                    str(task.metadata.get("selected_execution_agent", "")),
+                    bool(task.metadata.get("force_native_execution", False)),
+                ))
+                return task.assigned_external_agent
+
+            async def execute_task(task: Task) -> TaskResult:
+                self.assertEqual(task.assigned_external_agent, "jiuwenswarm")
+                task.status = TaskStatus.DONE
+                return TaskResult(status=TaskStatus.DONE, content="team result", artifacts={})
+
+            executor = CompanyWorkItemExecutor(
+                org_engine=DummyOrgEngine(),
+                communication=communication,
+                approval_engine=SimpleNamespace(),
+                memory=DummyMemory(),
+                execute_task=execute_task,
+                save_task=store.save_task,
+                agent_selector=agent_selector,
+                store=store,
+            )
+            task = Task(
+                id="external-team-task",
+                title="Opaque team execution",
+                description="Produce the delegated outcome.",
+                project_id="proj1",
+                assigned_to="executor",
+                assigned_external_agent="jiuwenswarm",
+                status=TaskStatus.PENDING,
+                metadata={
+                    "mode": "company",
+                    "runtime_model": "multi_team_org",
+                    "work_item_projection_id": "external-team-execution",
+                    "work_item_role_id": "executor",
+                    "work_item_execution_strategy": "external",
+                    "selected_execution_agent": "jiuwenswarm",
+                    "preferred_external_agent": "jiuwenswarm",
+                    "execution_agent_locked": True,
+                    "external_company_execution_allowed": True,
+                    "external_company_execution_fence": "validated_workspace",
+                    "execution_unit_kind": "opaque_external_team",
+                    "force_native_execution": False,
+                    "progress_log": [],
+                },
+            )
+            set_linked_work_item_id(task, "external-team-item")
+            await store.save_delegation_work_item(DelegationWorkItem(
+                work_item_id="external-team-item",
+                run_id="external-team-run",
+                cell_id="team::executor",
+                team_id="team::executor",
+                role_id="executor",
+                seat_id="seat::team::executor::executor",
+                title=task.title,
+                projection_id="external-team-execution",
+                phase=Phase.READY,
+                metadata={"work_kind": "execute"},
+            ))
+            await store.save_task(task)
+
+            await executor._run_work_item(task, {"external-team-execution": task})
+
+            self.assertEqual(observed, [("jiuwenswarm", "jiuwenswarm", False)])
+            await store.close()
+
     def test_project_task_completion_no_longer_writes_project_memory_or_history(self) -> None:
         with _workspace_tempdir() as tmpdir:
             manager = MemoryManager(Path(tmpdir), "proj1")
@@ -3720,6 +3794,146 @@ class CompanyCollaborationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([item.kind for item in root_items], ["self_evolution"])
         self.assertEqual(root_items[0].role_id, "reviewer")
         self.assertIsNone(await engine.store.get_latest_pending_checkpoint("proj1"))
+
+    async def test_delivery_self_evolution_holds_new_controller_through_terminalization(
+        self,
+    ) -> None:
+        events: list[str] = []
+        waiting_task = Task(
+            id="delivery-controller-fence",
+            title="Delivery",
+            session_id="root-session:delivery",
+            parent_session_id="root-session",
+            status=TaskStatus.AWAITING_HUMAN,
+            project_id="proj1",
+            assigned_to="ceo",
+            metadata={
+                "execution_mode": "company_mode",
+                "execution_model": "multi_team_org",
+                "runtime_model": "multi_team_org",
+                "delegation_run_id": "run-controller-fence",
+                "work_item_projection_id": "ceo_delivery",
+                "work_item_turn_type": "deliver",
+                "company_profile": "corporate",
+                "employee_assignment": {
+                    "employee_id": "ceo-1",
+                    "name": "CEO One",
+                    "role_id": "ceo",
+                },
+            },
+        )
+        admission = SimpleNamespace(
+            run_id="run-controller-fence",
+            project_id="proj1",
+            root_session_id="root-session",
+            owner_token="owner-generation-2",
+            generation=2,
+            released=False,
+        )
+
+        async def save_task(task: Task) -> None:
+            events.append("save_task")
+            self.assertEqual(
+                task.metadata["company_run_controller_owner_token"],
+                admission.owner_token,
+            )
+            self.assertEqual(
+                task.metadata["company_run_controller_lease_generation"],
+                admission.generation,
+            )
+
+        async def acquire(*_args: Any, **_kwargs: Any) -> Any:
+            events.append("acquire")
+            return admission
+
+        async def execute(*_args: Any, **kwargs: Any) -> str:
+            events.append("execute")
+            self.assertIs(kwargs["controller_admission"], admission)
+            self.assertFalse(kwargs["release_controller_admission_on_exit"])
+            return "self evolution complete"
+
+        async def release(value: Any) -> None:
+            events.append("release")
+            self.assertIs(value, admission)
+            admission.released = True
+
+        engine = OPCEngine(config=OPCConfig(), project_id="proj1")
+        engine.store = SimpleNamespace(
+            get_task=AsyncMock(return_value=waiting_task),
+            save_task=AsyncMock(side_effect=save_task),
+        )
+        engine.org_engine = None
+        engine._company_followup_target_task = MagicMock(
+            return_value=waiting_task,
+        )
+        engine.company_executor = SimpleNamespace(
+            acquire_controller_admission=AsyncMock(side_effect=acquire),
+            execute=AsyncMock(side_effect=execute),
+            release_controller_admission=AsyncMock(side_effect=release),
+        )
+
+        async def create_root(**kwargs: Any) -> Any:
+            events.append("create_root")
+            self.assertIs(kwargs["controller_admission"], admission)
+            return SimpleNamespace(
+                run_id="run-controller-fence",
+                work_item_id="self-evolution::checkpoint-controller-fence",
+            )
+
+        async def close_delivery(*_args: Any, **_kwargs: Any) -> None:
+            events.append("close_delivery")
+
+        async def terminalize(*_args: Any, **_kwargs: Any) -> None:
+            events.append("terminalize")
+
+        engine._create_company_self_evolution_root_work_item = AsyncMock(
+            side_effect=create_root,
+        )
+        engine._close_company_delivery_review_task = AsyncMock(
+            side_effect=close_delivery,
+        )
+        engine._prepare_self_evolution_runtime_resume_tasks = AsyncMock()
+        engine._collect_company_self_evolution_result = AsyncMock(
+            return_value={"recorded": [], "errors": []},
+        )
+        engine._terminalize_company_delivery_feedback_checkpoint = AsyncMock(
+            side_effect=terminalize,
+        )
+        checkpoint = ExecutionCheckpoint(
+            checkpoint_id="checkpoint-controller-fence",
+            project_id="proj1",
+            session_id=waiting_task.session_id,
+            checkpoint_type="company_delivery_feedback",
+            task_id=waiting_task.id,
+            payload={
+                "waiting_task_id": waiting_task.id,
+                "task_ids": [waiting_task.id],
+                "plan": {
+                    "profile": "corporate",
+                    "final_decider_role_id": "ceo",
+                    "projections": [],
+                },
+            },
+        )
+
+        result = await engine._run_company_delivery_self_evolution_consumed(
+            checkpoint,
+            action="approve",
+        )
+
+        self.assertIn("Self-evolution completed", result)
+        self.assertEqual(
+            events,
+            [
+                "acquire",
+                "save_task",
+                "create_root",
+                "close_delivery",
+                "execute",
+                "terminalize",
+                "release",
+            ],
+        )
 
     async def test_delivery_self_evolution_writes_employee_experience_sidecar(self) -> None:
         with _workspace_tempdir() as tmpdir:
@@ -5825,6 +6039,9 @@ class CompanyCollaborationTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertEqual(coo_item.metadata["dependency_specs"][0]["value"], "cto")
             cto_item = await store.get_delegation_work_item(cto_id)
+            self.assertEqual(cto_item.metadata["current_turn_mode"], "dispatch_required")
+            self.assertEqual(cmo_final_item.metadata["current_turn_mode"], "worker_execute")
+            self.assertEqual(coo_item.metadata["current_turn_mode"], "worker_execute")
             self.assertEqual(cto_item.team_instance_id, "team-instance::run-1::team::cto")
             self.assertEqual(cto_item.role_runtime_session_id, "role-runtime::run-1::cto")
             self.assertEqual(cto_item.metadata["brief"], "Build app UI/audit summary.")
@@ -6436,7 +6653,10 @@ class CompanyCollaborationTests(unittest.IsolatedAsyncioTestCase):
             )
             set_linked_work_item_id(task, "parent-item")
 
-            with self.assertRaisesRegex(ValueError, "dependency cycle detected within batch"):
+            with self.assertRaisesRegex(
+                ValueError,
+                "dependency cycle detected within batch",
+            ) as raised:
                 await delegate_tool.func(
                     planning_context="The batch must form a DAG.",
                     items=[
@@ -6457,6 +6677,15 @@ class CompanyCollaborationTests(unittest.IsolatedAsyncioTestCase):
                     ],
                     task=task,
                 )
+
+            self.assertEqual(
+                getattr(raised.exception, "code", ""),
+                "delegate_dependency_cycle",
+            )
+            self.assertIn(
+                "coordination_notes",
+                getattr(raised.exception, "correction", ""),
+            )
 
             items = await store.list_delegation_work_items("run-1")
             self.assertEqual([item.work_item_id for item in items], ["parent-item"])

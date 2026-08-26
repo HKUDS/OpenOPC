@@ -62,7 +62,10 @@ from opc.core.models import (
 )
 from opc.core.worker_envelope import classify_worker_message, worker_message_is_actionable
 from opc.layer2_organization.company_runtime import CompanyRuntime, canonical_role_session_id
-from opc.layer2_organization.company_runtime_identity import is_runtime_auxiliary_task
+from opc.layer2_organization.company_runtime_identity import (
+    is_runtime_auxiliary_task,
+    requires_native_company_execution,
+)
 from opc.layer2_organization.phase import (
     DONE_PHASES,
     IN_PROGRESS_PHASES,
@@ -102,6 +105,7 @@ from opc.layer2_organization.gate_harness import GateHarness, GateHarnessDecisio
 from opc.layer2_organization.metadata_ownership import (
     append_work_item_progress,
     build_work_item_owner_execution_copy,
+    clear_current_final_delivery_outputs,
     copy_work_item_execution_metadata,
     strip_disallowed_work_item_metadata_from_runtime_task,
     update_runtime_task_owned_metadata,
@@ -129,6 +133,7 @@ from opc.layer2_organization.seat_executor import SeatExecutor
 from opc.layer2_organization.work_item_transition import (
     DEPENDENCY_CLASS_DEFAULT,
     compute_doomed_work_item_ids,
+    has_final_delivery_dependency_drift,
     has_pending_settlement_release,
     normalize_dependency_work_item_ids,
     refresh_dependents_for_controller,
@@ -147,6 +152,7 @@ from opc.layer2_organization.work_item_gate_decision import (
 from opc.layer2_organization.work_item_identity import (
     WORK_ITEM_TURN_TYPE_KEY,
     canonical_work_item_turn_type_for_kind,
+    initial_current_turn_mode_for_work_item,
     company_work_item_gate_attempt,
     company_work_item_gate_basis_hash,
     company_work_item_gate_human_fallback_payload,
@@ -3898,11 +3904,60 @@ class CompanyWorkItemExecutor:
             )
             task.metadata[WORK_ITEM_TURN_TYPE_KEY] = canonical_turn_type
 
+        if work_kind in {"deliver", "delivery"}:
+            # Synthetic final delivery is a terminal synthesis unit.  Empty
+            # is meaningful here (and execution-copy helpers intentionally
+            # omit empty values), so clear any delegate scope retained by a
+            # pre-fix runtime Task explicitly.
+            task.metadata["allowed_delegate_role_ids"] = []
+
         execution_metadata = copy_work_item_execution_metadata(work_item)
         for key in _STALE_REWORK_TASK_METADATA_KEYS:
             if key not in execution_metadata:
                 task.metadata.pop(key, None)
         task.metadata.update(execution_metadata)
+
+        # Adding a late intake child invalidates any package and owner-review
+        # closure produced by the older dependency snapshot.  The WorkItem
+        # carries the durable invalidation marker; clear every Task-side cache
+        # exactly once before this delivery is dispatched again.
+        delivery_inputs_invalidated_at = str(
+            work_item_metadata.get("delivery_inputs_invalidated_at", "") or ""
+        ).strip()
+        if (
+            work_kind in {"deliver", "delivery"}
+            and delivery_inputs_invalidated_at
+            and str(
+                task.metadata.get(
+                    "delivery_outputs_reset_for_inputs_invalidated_at", ""
+                )
+                or ""
+            ).strip()
+            != delivery_inputs_invalidated_at
+        ):
+            clear_current_final_delivery_outputs(task)
+            for key in (
+                "feedback_closed_at",
+                "feedback_resolution",
+                "human_review_closed_at",
+                "human_review_resolution",
+                "feedback_superseded_at",
+                "self_evolution_review_completed_at",
+            ):
+                task.metadata.pop(key, None)
+            task.metadata.update(
+                {
+                    "requires_user_feedback": True,
+                    "feedback_closed": False,
+                    "feedback_resolved": False,
+                    "human_review_closed": False,
+                    "feedback_superseded": False,
+                    "self_evolution_review_completed": False,
+                    "delivery_outputs_reset_for_inputs_invalidated_at": (
+                        delivery_inputs_invalidated_at
+                    ),
+                }
+            )
 
         dispatch_hold = str(work_item_metadata.get("dispatch_hold", "") or "").strip()
         if dispatch_hold:
@@ -3935,6 +3990,11 @@ class CompanyWorkItemExecutor:
             "cell_id": work_item.cell_id,
             "parent_work_item_id": work_item.parent_work_item_id,
         }
+        # Resume/rework can reuse a legacy runtime Task that still carries
+        # WorkItem-owned journals such as ``progress_log``.  Remove those
+        # stale mirrors while projecting the authoritative WorkItem so the
+        # first resumed dispatch does not report a false ownership conflict.
+        strip_disallowed_work_item_metadata_from_runtime_task(task)
         if task.metadata != before_metadata:
             changed = True
         return changed
@@ -4133,12 +4193,14 @@ class CompanyWorkItemExecutor:
                     work_item,
                     metadata_updates=dependency_state["metadata_updates"],
                 ) or changed
-        # Failure frontier for late-created cards: a delivery/aggregate card
-        # created AFTER its dependency already failed never sees a failure
-        # transition hook, and the per-item pass above only releases on
-        # all-approved. Detection is cheap and idempotent — released cards
-        # (stamp present, phase moved) stop matching.
-        if has_pending_settlement_release(work_item_by_id):
+        # The full frontier also owns two graph-wide invariants that the
+        # per-item release loop above cannot derive: late failure settlement,
+        # and final-delivery dependency closure when intake adds a child after
+        # the delivery card already exists. Detection is cheap and idempotent.
+        if (
+            has_pending_settlement_release(work_item_by_id)
+            or has_final_delivery_dependency_drift(work_item_by_id)
+        ):
             run_id = str(work_items[0].run_id or "").strip()
             if run_id:
                 try:
@@ -4159,7 +4221,7 @@ class CompanyWorkItemExecutor:
                         changed = True
                 except Exception:
                     logger.opt(exception=True).debug(
-                        "Best-effort settlement frontier refresh failed for run "
+                        "Best-effort dependency frontier refresh failed for run "
                         f"{run_id}"
                     )
         if not changed:
@@ -4306,11 +4368,21 @@ class CompanyWorkItemExecutor:
                 )
             task.__dict__.update(copy.deepcopy(adopted.__dict__))
             if kind == "manager_review":
-                spawned = await self._ensure_report_work_item_for_work_item(
-                    work_item_id,
-                    worker_task=task,
-                    run_items=work_items,
-                )
+                opaque_completion_report = self._opaque_external_team_completion_report(item)
+                if opaque_completion_report:
+                    spawned = await self._ensure_review_work_item_for_work_item(
+                        work_item_id,
+                        worker_task=task,
+                        completion_report=opaque_completion_report,
+                        run_items=work_items,
+                        controller_task=task,
+                    )
+                else:
+                    spawned = await self._ensure_report_work_item_for_work_item(
+                        work_item_id,
+                        worker_task=task,
+                        run_items=work_items,
+                    )
                 if spawned is not None:
                     changed = True
                 continue
@@ -4528,6 +4600,7 @@ class CompanyWorkItemExecutor:
                 == "applied"
             ]
             source_report = applied_reports[-1] if applied_reports else None
+            opaque_completion_report = self._opaque_external_team_completion_report(parent)
             linked_reviews = []
             if source_report is not None:
                 linked_reviews = [
@@ -4540,6 +4613,17 @@ class CompanyWorkItemExecutor:
                         or ""
                     ).strip()
                     == source_report.work_item_id
+                ]
+            elif opaque_completion_report:
+                linked_reviews = [
+                    review
+                    for review in reviews
+                    if not str(
+                        (review.metadata or {}).get(
+                            "review_source_report_work_item_id", ""
+                        )
+                        or ""
+                    ).strip()
                 ]
             latest_linked_review = linked_reviews[-1] if linked_reviews else None
             resolution = dict(
@@ -4671,6 +4755,30 @@ class CompanyWorkItemExecutor:
                         completion_report=completion_report,
                         metadata_updates=retry_updates,
                         source_report_item=source_report,
+                        run_items=work_items,
+                        controller_task=worker_task,
+                    )
+                elif opaque_completion_report:
+                    retry_updates: dict[str, Any] = {}
+                    if linked_outcome == "verdict_parse_failed":
+                        retry_updates = {
+                            "review_retry_hint": _REVIEW_VERDICT_PARSE_RETRY_HINT,
+                            "review_retry_reason": "verdict_parse_failed",
+                            "review_retry_of_attempt": self._auxiliary_attempt_number(
+                                latest_linked_review,
+                                kind="review",
+                            ),
+                        }
+                    if controller_active and worker_task is None:
+                        raise CompanyRunControllerLeaseLost(
+                            "opaque-team review reconciliation lacks its linked "
+                            "controller Task"
+                        )
+                    spawned = await self._ensure_review_work_item_for_work_item(
+                        target_id,
+                        worker_task=worker_task,
+                        completion_report=opaque_completion_report,
+                        metadata_updates=retry_updates,
                         run_items=work_items,
                         controller_task=worker_task,
                     )
@@ -5109,14 +5217,24 @@ class CompanyWorkItemExecutor:
                 )
             )
             resolved_force_native_execution = bool((root_task.metadata or {}).get("force_native_execution", False) or role_force_native_execution)
-            # Company tasks share durable WorkItem-owned artifacts. External
-            # providers currently have no isolated capability/merge fence, so
-            # every materialized role Task is persistently native regardless
-            # of AUTO/MIXED/external/locked topology hints.
-            resolved_force_native_execution = True
-            selected_execution_agent = "native"
-            assigned_external_agent = None
-            preferred_external_agent = None
+            work_item_metadata = dict(getattr(work_item, "metadata", {}) or {})
+            external_team_binding = dict(work_item_metadata.get("external_team_binding", {}) or {})
+            company_external_execution_allowed = bool(
+                assigned_external_agent
+                and (
+                    work_item_metadata.get("external_company_execution_allowed") is True
+                    or topology_seat.get("company_external_execution_capable") is True
+                )
+            )
+            if company_external_execution_allowed:
+                resolved_force_native_execution = False
+            else:
+                # Fail closed for every provider that has not explicitly
+                # attested to the company artifact fence.
+                resolved_force_native_execution = True
+                selected_execution_agent = "native"
+                assigned_external_agent = None
+                preferred_external_agent = None
             turn_type = self._runtime_work_kind_to_work_item_turn_type(work_kind)
             current_turn_mode = self._initial_current_turn_mode_for_work_item(
                 turn_type,
@@ -5174,9 +5292,62 @@ class CompanyWorkItemExecutor:
                 "preferred_external_agent": preferred_external_agent,
                 "selected_execution_agent": selected_execution_agent,
                 "execution_agent_locked": True,
-                "selected_execution_agent_source": "company_isolation_boundary",
-                "company_native_execution_enforced": True,
-                "work_item_execution_strategy": WorkItemExecutionStrategy.NATIVE.value,
+                "selected_execution_agent_source": (
+                    "external_team_binding"
+                    if external_team_binding
+                    else "company_external_capability"
+                    if company_external_execution_allowed
+                    else "company_isolation_boundary"
+                ),
+                "company_native_execution_enforced": not company_external_execution_allowed,
+                "external_company_execution_allowed": company_external_execution_allowed,
+                "external_company_execution_fence": str(
+                    work_item_metadata.get("external_company_execution_fence")
+                    or external_team_binding.get("artifact_isolation")
+                    or ("validated_workspace" if company_external_execution_allowed else "")
+                ).strip(),
+                "execution_unit_kind": str(
+                    work_item_metadata.get("execution_unit_kind")
+                    or topology_seat.get("execution_unit_kind")
+                    or ("external_agent" if company_external_execution_allowed else "role")
+                ).strip(),
+                "external_team_binding": copy.deepcopy(external_team_binding),
+                "covered_role_ids": list(work_item_metadata.get("covered_role_ids", []) or []),
+                "capability_manifest": copy.deepcopy(
+                    work_item_metadata.get("capability_manifest")
+                    or external_team_binding.get("capability_manifest")
+                    or {}
+                ),
+                "delegation_capability_catalog": copy.deepcopy(
+                    work_item_metadata.get("delegation_capability_catalog")
+                    or topology_seat.get("delegation_capability_catalog")
+                    or []
+                ),
+                "external_session_scope": str(
+                    work_item_metadata.get("external_session_scope")
+                    or external_team_binding.get("session_scope")
+                    or "work_item"
+                ).strip(),
+                "external_max_inflight": int(
+                    work_item_metadata.get("external_max_inflight")
+                    or external_team_binding.get("max_inflight")
+                    or 1
+                ),
+                "external_failure_policy": str(
+                    work_item_metadata.get("external_failure_policy")
+                    or external_team_binding.get("failure_policy")
+                    or "fail_closed"
+                ).strip(),
+                "jiuwen_provider_mode": str(
+                    work_item_metadata.get("jiuwen_provider_mode")
+                    or external_team_binding.get("provider_mode")
+                    or ""
+                ).strip(),
+                "work_item_execution_strategy": (
+                    WorkItemExecutionStrategy.EXTERNAL.value
+                    if company_external_execution_allowed
+                    else WorkItemExecutionStrategy.NATIVE.value
+                ),
                 "adaptive": copy.deepcopy(dict((getattr(work_item, "metadata", {}) or {}).get("adaptive", {}) or {})),
                 "execution_task_ids": [work_item_id],
                 "parent_session_id": root_parent_session_id,
@@ -5367,22 +5538,18 @@ class CompanyWorkItemExecutor:
         review_execution_work_item: bool = False,
         report_execution_work_item: bool = False,
     ) -> str:
-        normalized_turn = canonical_work_item_turn_type_for_kind(turn_type)
-        if normalized_turn == "deliver":
-            return "deliver_required"
-        if normalized_turn == "aggregate":
-            return "synthesize_required"
-        if report_execution_work_item or normalized_turn == "report":
-            return "report_required"
-        if review_execution_work_item or normalized_turn == "review":
-            return "review_execute"
         seat = dict(topology_seat or {})
         direct_reports = list(seat.get("direct_report_seat_ids", []) or [])
         allowed_delegates = list(seat.get("allowed_delegate_role_ids", []) or [])
         managed_team_id = str(seat.get("managed_team_id", "") or "").strip()
-        if direct_reports or allowed_delegates or managed_team_id:
-            return "dispatch_required"
-        return "worker_execute"
+        return initial_current_turn_mode_for_work_item(
+            turn_type,
+            manager_can_delegate=bool(
+                direct_reports or allowed_delegates or managed_team_id
+            ),
+            review_execution_work_item=review_execution_work_item,
+            report_execution_work_item=report_execution_work_item,
+        )
 
     @staticmethod
     def _driver_ownership_task(
@@ -5533,6 +5700,7 @@ class CompanyWorkItemExecutor:
         tasks: list[Task],
         *,
         retry_busy_at_observed_expiry: bool = False,
+        adopt_released_task_ids: set[str] | None = None,
     ) -> CompanyRunControllerAdmission | None:
         """CAS-acquire the run controller before any caller mutates resume state.
 
@@ -5548,6 +5716,7 @@ class CompanyWorkItemExecutor:
             project_id=project_id,
             root_session_id=root_session_id,
             retry_busy_at_observed_expiry=retry_busy_at_observed_expiry,
+            adopt_released_task_ids=adopt_released_task_ids,
         )
 
     async def acquire_controller_admission_for_scope(
@@ -5557,6 +5726,7 @@ class CompanyWorkItemExecutor:
         project_id: str,
         root_session_id: str,
         retry_busy_at_observed_expiry: bool = False,
+        adopt_released_task_ids: set[str] | None = None,
     ) -> CompanyRunControllerAdmission | None:
         """CAS-acquire an exact durable run scope without a Task credential.
 
@@ -5644,6 +5814,7 @@ class CompanyWorkItemExecutor:
                     root_session_id=root_session_id,
                     owner_token=owner_token,
                     generation=generation,
+                    adopt_released_task_ids=adopt_released_task_ids,
                 )
             heartbeat = _CompanyRunControllerHeartbeat(
                 store=self.store,
@@ -5887,11 +6058,13 @@ class CompanyWorkItemExecutor:
                 registered_live_dispatcher = True
             try:
                 return await self._execute_multi_team_org_scoped(plan, tasks)
-            except CompanyRunControllerLeaseLost:
+            except CompanyRunControllerLeaseLost as exc:
                 logger.warning(
-                    "company dispatcher fenced after controller lease loss: run_id={} generation={}",
+                    "company dispatcher fenced after controller lease loss: "
+                    "run_id={} generation={} detail={}",
                     run_id,
                     lease_generation,
+                    str(exc),
                 )
                 raise
         finally:
@@ -6259,6 +6432,7 @@ class CompanyWorkItemExecutor:
                         or ""
                     ).strip()
                     if role_session_id and callable(update_role_session) and store_ready:
+                        controller_state = self._run_state()
                         await update_role_session(
                             role_session_id,
                             focused_work_item_id="",
@@ -6268,6 +6442,12 @@ class CompanyWorkItemExecutor:
                                 "last_suspend_memory_reset_at": datetime.now().isoformat(),
                                 "last_suspend_task_id": claimed_task.id,
                             },
+                            controller_owner_token=(
+                                controller_state.controller_owner_token
+                            ),
+                            controller_lease_generation=(
+                                controller_state.controller_lease_generation
+                            ),
                         )
                 except Exception:
                     logger.opt(exception=True).debug("company runtime cancellation: failed session idle reset")
@@ -6374,8 +6554,6 @@ class CompanyWorkItemExecutor:
             try:
                 exc = completed.exception()
             except CompanyRunControllerLeaseLost:
-                # A coroutine raising the lease signal is represented by
-                # asyncio as a cancelled Task; retain the typed global fence.
                 raise
             except asyncio.CancelledError:
                 # Ordinary local cancellation is already settled by the
@@ -7215,26 +7393,30 @@ class CompanyWorkItemExecutor:
             target_status_or_phase=Phase.RUNNING,
             reason="pre_execution_claim",
         )
-        task.assigned_external_agent = None
-        task.metadata.update(
-            {
-                "force_native_execution": True,
-                "selected_execution_agent": "native",
-                "preferred_external_agent": None,
-                "work_item_execution_strategy": WorkItemExecutionStrategy.NATIVE.value,
-                "execution_agent_locked": True,
-                "selected_execution_agent_source": "company_isolation_boundary",
-                "company_native_execution_enforced": True,
-            }
-        )
-        for key in (
-            "_company_runtime_resume_execution_agent_pin",
-            "external_resume_session_id",
-            "external_resume_session_scope_id",
-            "external_resume_agent_type",
-            "__external_resume_session",
-        ):
-            task.metadata.pop(key, None)
+        if requires_native_company_execution(task):
+            task.assigned_external_agent = None
+            task.metadata.update(
+                {
+                    "force_native_execution": True,
+                    "selected_execution_agent": "native",
+                    "preferred_external_agent": None,
+                    "work_item_execution_strategy": WorkItemExecutionStrategy.NATIVE.value,
+                    "execution_agent_locked": True,
+                    "selected_execution_agent_source": "company_isolation_boundary",
+                    "company_native_execution_enforced": True,
+                }
+            )
+            for key in (
+                "_company_runtime_resume_execution_agent_pin",
+                "external_resume_session_id",
+                "external_resume_session_scope_id",
+                "external_resume_agent_type",
+                "__external_resume_session",
+            ):
+                task.metadata.pop(key, None)
+        else:
+            task.metadata["force_native_execution"] = False
+            task.metadata["company_native_execution_enforced"] = False
         await self.save_task(task)
         if self.agent_selector:
             # The selector also owns checkpoint attempt pins.  Forced-native
@@ -7741,6 +7923,7 @@ class CompanyWorkItemExecutor:
         # spawn / refresh side effects if the transition actually landed
         # at our requested target.
         persisted_phase: Phase | None = None
+        refreshed_item: DelegationWorkItem | None = None
         if hasattr(self.store, "get_delegation_work_item"):
             try:
                 refreshed_item = await self.store.get_delegation_work_item(work_item_id)
@@ -7750,20 +7933,25 @@ class CompanyWorkItemExecutor:
                 persisted_phase = None
 
         if persisted_phase == Phase.AWAITING_MANAGER_REVIEW:
-            # Two-turn worker→review handoff: spawn a hidden report card
-            # first (NOT the review card directly). The same worker session
-            # resumes under a report-generation prompt to produce a clean
-            # structured handoff. Only after the report card completes
-            # (handled in _apply_report_done_transition) do we spawn the
-            # actual review card. The completion_report we just stamped
-            # onto the parent metadata is the worker's last execute-turn
-            # prose — used as fallback if the report turn never produces
-            # output; it will be overwritten by the report turn's content
-            # when that turn finishes.
-            await self._ensure_report_work_item_for_work_item(
-                work_item_id,
-                worker_task=task,
-            )
+            review_item = refreshed_item if refreshed_item is not None else linked_work_item
+            opaque_completion_report = self._opaque_external_team_completion_report(review_item)
+            if opaque_completion_report:
+                # The provider envelope is already the opaque team's durable
+                # handoff. Review it directly instead of invoking Jiuwen a
+                # second time merely to restate the same report.
+                await self._ensure_review_work_item_for_work_item(
+                    work_item_id,
+                    worker_task=task,
+                    completion_report=opaque_completion_report,
+                    controller_task=task,
+                )
+            else:
+                # Ordinary workers keep the two-turn worker→report→review
+                # flow so their execute prose is converted to a clean handoff.
+                await self._ensure_report_work_item_for_work_item(
+                    work_item_id,
+                    worker_task=task,
+                )
 
         # Delegation audit event. Best-effort — never let persistence
         # failure propagate into the state machine.
@@ -8300,6 +8488,31 @@ class CompanyWorkItemExecutor:
             if getattr(item, "phase", None) not in DONE_PHASES
         ]
         return active[-1] if active else None
+
+    @staticmethod
+    def _opaque_external_team_completion_report(
+        item: DelegationWorkItem | None,
+    ) -> str:
+        """Return the provider-owned handoff already present on an opaque team.
+
+        A JiuwenSwarm Team finishes its single provider run with a structured
+        OpenOPC envelope. That envelope is already the worker handoff report,
+        so resuming the external team in a second hidden ``report`` WorkItem
+        would violate the opaque-boundary contract. The manager still receives
+        an independent review turn.
+        """
+        metadata = dict(getattr(item, "metadata", {}) or {})
+        envelope = metadata.get("opaque_external_team_result")
+        if not isinstance(envelope, dict) or not envelope:
+            return ""
+        return str(
+            envelope.get("summary")
+            or metadata.get("completion_report")
+            or metadata.get("work_item_summary_for_downstream")
+            or metadata.get("work_item_summary")
+            or getattr(item, "deliverable_summary", "")
+            or ""
+        ).strip()
 
     @classmethod
     def _consecutive_failed_auxiliary_attempts(
@@ -9067,6 +9280,26 @@ class CompanyWorkItemExecutor:
         session_scope_id = str(worker_metadata.get("session_scope_id", "") or "").strip()
         if worker_task is not None:
             session_scope_id = task_session_scope_id(worker_task) or session_scope_id
+        runtime_topology = dict(
+            worker_metadata.get("runtime_topology")
+            or task_metadata.get("runtime_topology")
+            or {}
+        )
+        manager_assignment: dict[str, Any] = {}
+        for raw_seat in list(runtime_topology.get("seats", []) or []):
+            if not isinstance(raw_seat, dict):
+                continue
+            candidate_seat_id = str(raw_seat.get("seat_id", "") or "").strip()
+            candidate_role_id = str(raw_seat.get("role_id", "") or "").strip()
+            if (
+                (manager_seat_id and candidate_seat_id == manager_seat_id)
+                or candidate_role_id == manager_role_id
+            ):
+                manager_assignment = copy.deepcopy(
+                    dict(raw_seat.get("employee_assignment", {}) or {})
+                )
+                if manager_assignment:
+                    break
         review_metadata: dict[str, Any] = mark_work_item_projection(mark_work_item_runtime({
             "runtime_model": "multi_team_org",
             "session_scope_id": session_scope_id,
@@ -9095,6 +9328,11 @@ class CompanyWorkItemExecutor:
             "user_visible": False,
             "authoritative_output": False,
             "skip_work_item_sync": True,
+            **(
+                {"employee_assignment": manager_assignment}
+                if manager_assignment
+                else {}
+            ),
             **{
                 key: copy.deepcopy(updates[key])
                 for key in (
@@ -12371,11 +12609,22 @@ class CompanyWorkItemExecutor:
             "waiting_on_work_item_ids": list(dependency_ids),
             "assigned_role_runtime_id": str(getattr(intake_work_item, "role_runtime_session_id", "") or intake_meta.get("assigned_role_runtime_id", "") or "").strip(),
             "contact_role_ids": list(intake_meta.get("contact_role_ids", []) or []),
-            "allowed_delegate_role_ids": list(intake_meta.get("allowed_delegate_role_ids", []) or []),
+            # Delivery is a terminal synthesis/handoff turn, not a second
+            # planning pass.  Rework is routed through the review protocol;
+            # inheriting intake delegates here lets the final decider create
+            # duplicate sibling work after the approved frontier converges.
+            "allowed_delegate_role_ids": [],
             "delegation_playbook": dict(intake_meta.get("delegation_playbook", {}) or {}),
             "comms_workspace_root": str(intake_meta.get("comms_workspace_root", "") or "").strip(),
             "target_output_dir": str(intake_meta.get("target_output_dir", "") or "").strip(),
             "review_owner_kind": "human",
+            "current_turn_mode": "deliver_required",
+            **(
+                {"employee_assignment": copy.deepcopy(intake_meta["employee_assignment"])}
+                if isinstance(intake_meta.get("employee_assignment"), dict)
+                and intake_meta.get("employee_assignment")
+                else {}
+            ),
             "original_message": original_message,
             "intake_work_item_id": intake_work_item_id,
             "user_visible": bool(delivery_policy.get("user_visible", True)),
@@ -12411,8 +12660,9 @@ class CompanyWorkItemExecutor:
             title=delivery_title,
             summary=(
                 "Synthesise all sub-team approved outputs and hand a final, "
-                "user-facing result back to the requester. Do not re-delegate unless "
-                "a critical gap is discovered — the team's work is done."
+                "user-facing result back to the requester. Do not delegate new work. "
+                "If a critical gap is discovered, report it through the delivery "
+                "review/rework protocol — the team's execution work is done."
             ),
             kind="delivery",
             projection_id=delivery_projection_id,
@@ -12423,6 +12673,13 @@ class CompanyWorkItemExecutor:
             manager_role_id=delivery_metadata["manager_role_id"],
             manager_seat_id=delivery_metadata["manager_seat_id"],
             metadata=delivery_metadata,
+        )
+        self._ensure_prompt_contract_on_work_item(
+            delivery_work_item,
+            task_metadata=dict(task.metadata or {}),
+            task_description=str(
+                delivery_work_item.summary or original_message
+            ).strip(),
         )
         controller_context = self._controller_attempt_context_for_task(task)
         if controller_context is not None:
@@ -14899,7 +15156,13 @@ class CompanyWorkItemExecutor:
         return None
 
     def _capture_work_item_outputs(self, task: Task, result: TaskResult) -> WorkItemOutputBundle:
-        summary = (result.content or "").strip()
+        result_artifacts = dict(result.artifacts or {})
+        opaque_team_result = dict(result_artifacts.get("opaque_external_team_result", {}) or {})
+        summary = str(
+            opaque_team_result.get("summary")
+            or result.content
+            or ""
+        ).strip()
         runtime_state = self._extract_runtime_state(result)
         structured_payload = self._extract_structured_work_item_payload(summary, result.artifacts)
         existing_artifacts = list(task.metadata.get("artifacts", []) or [])
@@ -14915,6 +15178,7 @@ class CompanyWorkItemExecutor:
             "delivery_package",
             "follow_up_actions",
             "downstream_assignments",
+            "opaque_external_team_result",
         ):
             task.metadata.pop(key, None)
         work_item_updates: dict[str, Any] = {}
@@ -14960,6 +15224,31 @@ class CompanyWorkItemExecutor:
         review_verdict = self._normalize_review_verdict(structured_payload.get("review_verdict"))
         if review_verdict:
             work_item_updates["structured_review_verdict"] = review_verdict
+        if opaque_team_result:
+            work_item_updates["opaque_external_team_result"] = copy.deepcopy(opaque_team_result)
+            team_risks = [
+                str(item).strip()
+                for item in list(opaque_team_result.get("risks", []) or [])
+                if str(item or "").strip()
+            ]
+            if team_risks:
+                work_item_updates["risks"] = self._merge_unique_items(
+                    list(work_item_updates.get("risks", [])),
+                    team_risks,
+                )
+            team_questions = [
+                str(item).strip()
+                for item in list(opaque_team_result.get("open_questions", []) or [])
+                if str(item or "").strip()
+            ]
+            if team_questions:
+                work_item_updates["open_questions"] = self._merge_unique_items(
+                    list(work_item_updates.get("open_questions", [])),
+                    team_questions,
+                )
+            handoff = opaque_team_result.get("handoff")
+            if handoff not in (None, "", [], {}):
+                work_item_updates["handoff_context"] = copy.deepcopy(handoff)
         verification = result.artifacts.get("verification", []) if result.artifacts else []
         verification_evidence = dict(result.artifacts.get("verification_evidence", {}) if result.artifacts else {})
         if verification_evidence:
@@ -15046,6 +15335,7 @@ class CompanyWorkItemExecutor:
             "completion_report",
             "handoff_context",
             "context_preview",
+            "opaque_external_team_result",
         )
         updates = {
             key: copy.deepcopy(source.get(key))

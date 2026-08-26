@@ -18,6 +18,7 @@ from opc.layer4_tools.opaque_execution import (
     OpaqueExecutionPlan,
     build_company_opaque_execution_plan,
     company_opaque_execution_identity,
+    company_workspace_read_only_shell_decision,
     install_opaque_execution_plan,
     reset_opaque_execution_plan,
 )
@@ -373,6 +374,14 @@ class RuntimeCompanyControllerToolFence:
     ) -> dict[str, Any] | None:
         if tool_name not in {"shell_exec", "python_exec"}:
             return None
+        if tool_name == "shell_exec":
+            read_only, _ = company_workspace_read_only_shell_decision(
+                task,
+                arguments,
+                execution_plan=execution_plan,
+            )
+            if read_only:
+                return None
 
         work_item_id = linked_work_item_id_for_task(task)
         runtime_task_id = str(getattr(task, "id", "") or "").strip()

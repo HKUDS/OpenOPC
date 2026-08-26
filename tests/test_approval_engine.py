@@ -282,6 +282,74 @@ class ApprovalEngineHeuristicTests(unittest.TestCase):
         self.assertEqual(other_role.resolution, PermissionResolution.ASK)
         self.assertEqual(other_role.source, "shell_structure_guard")
 
+    def test_company_workspace_read_only_shell_skips_exact_checkpoint(self) -> None:
+        tool = SimpleNamespace(
+            name="shell_exec",
+            requires_confirmation=True,
+            read_only=False,
+        )
+        with _workspace_tempdir() as workspace:
+            report = workspace / "report.md"
+            report.write_text("approved result\n", encoding="utf-8")
+            outside = workspace.parent / f"outside-{uuid.uuid4().hex}.md"
+            outside.write_text("private\n", encoding="utf-8")
+            try:
+                task = Task(
+                    id="company-read-only",
+                    project_id="company-project",
+                    assigned_to="ceo",
+                    metadata={
+                        "execution_mode": "company_mode",
+                        "work_item_role_id": "ceo",
+                        "workspace_root": str(workspace),
+                    },
+                )
+                for command in (
+                    "pwd",
+                    f"ls -la {workspace}",
+                    f"wc -w {report}",
+                    "git status --short",
+                ):
+                    with self.subTest(command=command):
+                        decision = self.engine.predict(
+                            tool,
+                            {
+                                "command": command,
+                                "working_directory": str(workspace),
+                            },
+                            task=task,
+                        )
+                        self.assertEqual(
+                            decision.resolution,
+                            PermissionResolution.ALLOW,
+                        )
+                        self.assertEqual(decision.source, "shell_read_only")
+
+                for command in (
+                    f"cat {outside}",
+                    "ls *.md",
+                    "touch report.md",
+                ):
+                    with self.subTest(command=command):
+                        decision = self.engine.predict(
+                            tool,
+                            {
+                                "command": command,
+                                "working_directory": str(workspace),
+                            },
+                            task=task,
+                        )
+                        self.assertEqual(
+                            decision.resolution,
+                            PermissionResolution.ASK,
+                        )
+                        self.assertEqual(
+                            decision.source,
+                            "company_exact_tool_permission",
+                        )
+            finally:
+                outside.unlink(missing_ok=True)
+
     def test_runtime_prediction_requires_review_for_git_side_effect_options(self) -> None:
         tool = SimpleNamespace(
             name="shell_exec",

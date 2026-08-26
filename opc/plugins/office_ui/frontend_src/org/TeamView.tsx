@@ -145,10 +145,13 @@ interface TeamViewProps {
   /** role_id -> recruited names for the selected session (canvas display only). */
   sessionRecruitmentByRole?: Record<string, string[]> | null
   isCustomMode?: boolean
+  organizationId?: string
   onAddRole: (roleId: string, name: string, responsibility: string, reportsTo: string, icon?: string | null) => void
   onBulkAddRoles?: (roles: Array<{ role_id: string; name: string; responsibility: string; reports_to: string }>) => void
   onUpdateRole: (roleId: string, updates: { name?: string; responsibility?: string; reports_to?: string; can_spawn?: string[]; icon?: string | null; execution_strategy?: string; preferred_external_agent?: string | null; prompt_refs?: string[] }) => void
   onDeleteRole: (roleId: string) => void
+  onBindExternalTeam?: (data: { boundary_role_id: string; organization_id?: string; scope: 'subtree' }) => void
+  onUnbindExternalTeam?: (data: { binding_id?: string; boundary_role_id?: string; organization_id?: string }) => void
   onExport: (data: { package_id: string; name: string; description: string; version: string }) => void
   onImportEmployee?: (employeeId: string) => void
   onResetArchitecture?: () => void
@@ -165,8 +168,8 @@ interface TeamViewProps {
 }
 
 export function TeamView({
-  roles, employees, sessionRecruitmentByRole, isCustomMode,
-  onAddRole, onBulkAddRoles, onUpdateRole, onDeleteRole, onExport,
+  roles, employees, sessionRecruitmentByRole, isCustomMode, organizationId,
+  onAddRole, onBulkAddRoles, onUpdateRole, onDeleteRole, onBindExternalTeam, onUnbindExternalTeam, onExport,
   onImportEmployee,
   onResetArchitecture, onSwitchToTab,
   savedOrgsList, activeSavedOrg, currentOrgVersion, versionAtLoad,
@@ -252,7 +255,7 @@ export function TeamView({
   const assignedRoleCount = useMemo(() => {
     let count = 0
     for (const role of roles) {
-      if ((empByRole.get(role.role_id) ?? []).length > 0) count += 1
+      if (role.covered_by_external_team || (empByRole.get(role.role_id) ?? []).length > 0) count += 1
     }
     return count
   }, [roles, empByRole])
@@ -260,7 +263,9 @@ export function TeamView({
     () => employees.filter(e => e.linked_agent_id).length,
     [employees],
   )
-  const vacantRoleCount = Math.max(0, roles.length - assignedRoleCount)
+  const vacantRoleCount = Math.max(0, roles.filter(role =>
+    !role.covered_by_external_team && (empByRole.get(role.role_id) ?? []).length === 0,
+  ).length)
 
   // Show wizard only in org mode when no roles exist
   if (isCustomMode && roles.length === 0) {
@@ -310,7 +315,7 @@ export function TeamView({
 
       {!isCustomMode && (
         <div className="team-readonly-strip">
-          Corporate is fixed and read-only; saved company architectures are edited separately.
+          Corporate role structure is fixed. Execution scope can still bind a role subtree to one JiuwenSwarm Team.
         </div>
       )}
 
@@ -320,9 +325,12 @@ export function TeamView({
         employees={employees}
         sessionRecruitmentByRole={sessionRecruitmentByRole}
         isCustomMode={isCustomMode}
+        organizationId={organizationId}
         onAddRole={onAddRole}
         onUpdateRole={onUpdateRole}
         onDeleteRole={onDeleteRole}
+        onBindExternalTeam={onBindExternalTeam}
+        onUnbindExternalTeam={onUnbindExternalTeam}
         savedOrgsList={savedOrgsList ?? null}
         activeSavedOrg={activeSavedOrg ?? null}
         currentOrgVersion={currentOrgVersion ?? 0}
@@ -363,14 +371,22 @@ export function TeamView({
         <div className="team-roster-grid">
           {roles.map(r => {
             const emps = empByRole.get(r.role_id) || []
+            const externallyCovered = Boolean(r.covered_by_external_team)
             return (
-              <div key={r.role_id} className="team-roster-card">
+              <div key={r.role_id} className={`team-roster-card${externallyCovered ? ' team-roster-card--external' : ''}`}>
                 <div className="team-roster-card-header">
                   <img src={resolveRoleIcon(r.icon)} alt="" className="team-roster-card-icon" />
                   <span className="team-roster-role-name">{r.name}</span>
-                  <span className="team-roster-count">{emps.length || 'vacant'}</span>
+                  <span className="team-roster-count">{externallyCovered ? 'team' : (emps.length || 'vacant')}</span>
                 </div>
-                {emps.length > 0 ? emps.map(e => (
+                {externallyCovered ? (
+                  <div className="team-roster-external">
+                    <b>{r.external_team_boundary ? 'JiuwenSwarm Team boundary' : 'Covered by external team'}</b>
+                    <span>{r.external_team_boundary
+                      ? 'No separate role recruitment; Jiuwen manages internal staffing.'
+                      : `Inherited from ${r.external_team_boundary_role_id ?? 'team boundary'}.`}</span>
+                  </div>
+                ) : emps.length > 0 ? emps.map(e => (
                   <div key={e.employee_id} className="team-roster-emp">
                     <img src={ICON.person} alt="" className="team-roster-emp-avatar" />
                     <div className="team-roster-emp-info">

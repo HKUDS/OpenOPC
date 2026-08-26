@@ -697,6 +697,32 @@ export class VisualSocketClient {
     this.send({ type: 'update_role', role_id: roleId, ...updates })
   }
 
+  bindExternalTeam(data: {
+    boundary_role_id: string
+    organization_id?: string
+    scope?: 'role' | 'subtree'
+    collapse_subtree?: boolean
+    external_agent?: 'jiuwenswarm'
+    provider_mode?: string
+  }): void {
+    this.send({
+      type: 'bind_external_team',
+      external_agent: 'jiuwenswarm',
+      scope: 'subtree',
+      collapse_subtree: true,
+      provider_mode: 'team',
+      ...data,
+    })
+  }
+
+  unbindExternalTeam(data: {
+    binding_id?: string
+    boundary_role_id?: string
+    organization_id?: string
+  }): void {
+    this.send({ type: 'unbind_external_team', ...data })
+  }
+
   deleteRole(roleId: string): void {
     this.send({ type: 'delete_role', role_id: roleId })
   }

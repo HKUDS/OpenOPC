@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
+from opc.layer2_organization import shell_safety
 from opc.layer2_organization.work_item_identity import (
     work_item_turn_type_from_metadata,
 )
@@ -466,6 +467,66 @@ class OpaqueExecutionPlan:
     @property
     def sandbox(self) -> dict[str, Any]:
         return json.loads(self.sandbox_json)
+
+
+def company_workspace_read_only_shell_decision(
+    task: Any,
+    arguments: Mapping[str, Any] | None,
+    *,
+    execution_plan: OpaqueExecutionPlan | None = None,
+) -> tuple[bool, str]:
+    """Classify the one company shell path that needs no durable permit.
+
+    Prediction uses the lightweight task context. The final effect fence
+    passes its frozen plan, so a context change between those boundaries
+    fails closed instead of widening the automatic grant.
+    """
+
+    normalized_arguments = dict(arguments or {})
+    command = str(
+        normalized_arguments.get("command", "")
+        or normalized_arguments.get("cmd", "")
+        or ""
+    ).strip()
+    if not command:
+        return False, "empty shell command"
+    try:
+        if execution_plan is not None:
+            if execution_plan.tool_name != "shell_exec":
+                return False, "execution plan is not for shell_exec"
+            envelope = execution_plan.envelope
+            roots = dict(envelope.get("roots", {}) or {})
+            cwd = execution_plan.cwd
+            shell_kind = str(envelope.get("shell_kind", "") or "")
+            active_prefix = execution_plan.active_prefix
+            if execution_plan.preparation_error:
+                return False, execution_plan.preparation_error
+        else:
+            context = _json_normalize(resolve_task_execution_context(task))
+            roots = _resolved_roots(task, context)
+            cwd = _resolved_cwd(normalized_arguments, roots=roots)
+            shell_kind, _ = _resolve_shell(normalized_arguments)
+            active_prefix, _ = _active_shell_prefix(
+                task,
+                powershell=shell_kind == "powershell",
+            )
+    except (
+        OpaqueExecutionEnvelopeError,
+        OSError,
+        RuntimeError,
+        TypeError,
+        ValueError,
+    ) as exc:
+        return False, f"company shell context cannot be resolved safely: {exc}"
+    if shell_kind not in {"bash", "sh"}:
+        return False, "only audited POSIX shell inspection can bypass approval"
+    if active_prefix:
+        return False, "shell environment prefix requires exact approval"
+    return shell_safety.is_workspace_scoped_read_only_shell_command(
+        command,
+        working_directory=cwd,
+        workspace_root=str(roots.get("workspace_root", "") or ""),
+    )
 
 
 def build_company_opaque_execution_plan(

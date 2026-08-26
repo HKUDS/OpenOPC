@@ -1607,6 +1607,140 @@ class CompanyRuntimeSuspendResumeTests(unittest.IsolatedAsyncioTestCase):
         assert target is not None
         self.assertEqual(target.id, "task-delivery")
 
+    async def test_followup_target_prefers_live_board_owner_over_open_delivery(self) -> None:
+        engine = self._engine(await self._store())
+        plan = CompanyWorkItemRuntimePlan(
+            profile="corporate",
+            metadata={
+                "execution_model": "multi_team_org",
+                "runtime_model": "multi_team_org",
+                "final_decider_role_id": "ceo",
+                "top_level_role_ids": ["ceo"],
+            },
+        )
+        intake = Task(
+            id="task-intake",
+            title="CEO Intake",
+            status=TaskStatus.BLOCKED,
+            project_id="proj1",
+            assigned_to="ceo",
+            metadata=mark_work_item_projection(
+                {
+                    "work_item_runtime": True,
+                    "delegated_children_pending": True,
+                    "delegation_pending_work_item_ids": ["wi-cto", "wi-cmo"],
+                    "delegation_wait_for_work_item_ids": ["wi-cto", "wi-cmo"],
+                },
+                projection_id="ceo-intake",
+                turn_type="intake",
+            ),
+        )
+        delivery = Task(
+            id="task-delivery",
+            title="CEO Delivery",
+            status=TaskStatus.AWAITING_HUMAN,
+            project_id="proj1",
+            assigned_to="ceo",
+            metadata=mark_work_item_projection(
+                {
+                    "work_item_runtime": True,
+                    "execution_mode": "company_mode",
+                    "authoritative_output": True,
+                    "user_visible": True,
+                    "requires_user_feedback": True,
+                    "feedback_scope": "final",
+                },
+                projection_id="ceo-delivery",
+                turn_type="deliver",
+            ),
+        )
+        cto = Task(
+            id="task-cto",
+            title="CTO Team",
+            status=TaskStatus.AWAITING_MANAGER_REVIEW,
+            project_id="proj1",
+            assigned_to="cto",
+            metadata=mark_work_item_projection(
+                {"work_item_runtime": True},
+                projection_id="cto-execute",
+                turn_type="execute",
+            ),
+        )
+
+        target = engine._company_followup_target_task(
+            plan,
+            [delivery, cto, intake],
+        )
+
+        assert target is not None
+        self.assertEqual(target.id, "task-intake")
+
+    async def test_followup_target_never_selects_review_helper_when_delivery_flags_are_closed(self) -> None:
+        engine = self._engine(await self._store())
+        plan = CompanyWorkItemRuntimePlan(
+            profile="corporate",
+            metadata={
+                "execution_model": "multi_team_org",
+                "runtime_model": "multi_team_org",
+                "final_decider_role_id": "ceo",
+                "top_level_role_ids": ["ceo"],
+            },
+        )
+        intake = Task(
+            id="task-intake",
+            title="CEO Intake",
+            status=TaskStatus.BLOCKED,
+            project_id="proj1",
+            assigned_to="ceo",
+            metadata=mark_work_item_projection(
+                {
+                    "work_item_runtime": True,
+                    "dependency_work_item_ids": ["wi-cto", "wi-cmo"],
+                },
+                projection_id="ceo-intake",
+                turn_type="intake",
+            ),
+        )
+        premature_delivery = Task(
+            id="task-delivery",
+            title="CEO Delivery",
+            status=TaskStatus.RUNNING,
+            project_id="proj1",
+            assigned_to="ceo",
+            metadata=mark_work_item_projection(
+                {
+                    "work_item_runtime": True,
+                    "execution_mode": "company_mode",
+                    "authoritative_output": True,
+                    "user_visible": True,
+                    "requires_user_feedback": False,
+                    "feedback_scope": "final",
+                },
+                projection_id="ceo-delivery",
+                turn_type="deliver",
+            ),
+        )
+        review = Task(
+            id="task-review-cmo",
+            title="Review CMO",
+            status=TaskStatus.PENDING,
+            project_id="proj1",
+            assigned_to="ceo",
+            metadata=mark_work_item_projection(
+                {"work_item_runtime": True},
+                projection_id="review-cmo",
+                turn_type="review",
+            ),
+        )
+
+        target = engine._company_followup_target_task(
+            plan,
+            [review, premature_delivery, intake],
+        )
+
+        assert target is not None
+        self.assertEqual(target.id, "task-intake")
+
     async def test_final_delivery_followup_preserves_delivery_identity(self) -> None:
         store = await self._store()
         engine = self._engine(store)

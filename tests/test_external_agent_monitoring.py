@@ -347,6 +347,14 @@ class ExternalAgentMonitoringTests(unittest.IsolatedAsyncioTestCase):
             )
         )
 
+        self.assertTrue(
+            ExternalAgentBroker._should_emit_stream_progress(
+                "[External:jiuwenswarm:thinking_snapshot] readable accumulated text",
+                now_monotonic=1.1,
+                last_progress_monotonic=1.0,
+            )
+        )
+
     async def test_runtime_session_save_skips_closed_store(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             store = OPCStore(Path(tmpdir) / "tasks.db")
@@ -484,6 +492,48 @@ class ExternalAgentMonitoringTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(session.status, TaskStatus.DONE.value)
             self.assertGreaterEqual(int(session.metadata.get("activity_count", 0)), 1)
             self.assertTrue(any("started pid=" in text for text in progress))
+            await store.close()
+
+    async def test_stream_progress_does_not_wait_for_external_session_persistence(self) -> None:
+        class _BlockingWorkingSessionStore(_SessionStoreStub):
+            def __init__(self) -> None:
+                super().__init__()
+                self.release_working_save = asyncio.Event()
+                self.working_save_started = asyncio.Event()
+
+            async def save_external_session(self, session) -> None:
+                if session.status == "working":
+                    self.working_save_started.set()
+                    await self.release_working_save.wait()
+                await super().save_external_session(session)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = _BlockingWorkingSessionStore()
+            broker = ExternalAgentBroker(store, _ApprovalStub())
+            task = Task(title="nonblocking stream", project_id="proj1")
+            adapter = _ScriptAdapter(
+                "import sys,time\n"
+                "print('provider event')\n"
+                "sys.stdout.flush()\n"
+                "time.sleep(0.2)\n",
+            )
+            progress_seen = asyncio.Event()
+
+            async def on_progress(text: str) -> None:
+                if "provider event" in text:
+                    progress_seen.set()
+
+            run_task = asyncio.create_task(
+                broker.run(adapter, task, tmpdir, on_progress=on_progress)
+            )
+            await asyncio.wait_for(store.working_save_started.wait(), timeout=1)
+            # The store write is still blocked, but draining/formatting the
+            # provider stream must have already reached the UI callback.
+            await asyncio.wait_for(progress_seen.wait(), timeout=1)
+            store.release_working_save.set()
+            result = await asyncio.wait_for(run_task, timeout=3)
+
+            self.assertEqual(result.status, TaskStatus.DONE, result.content)
             await store.close()
 
     async def test_external_agent_long_single_line_output_does_not_crash_monitor(self) -> None:

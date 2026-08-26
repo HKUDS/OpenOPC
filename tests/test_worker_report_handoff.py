@@ -176,6 +176,56 @@ class WorkerExecuteDoneSpawnsReportTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 await store.close()
 
+    async def test_opaque_external_team_envelope_spawns_review_without_report_turn(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            store = OPCStore(root / "tasks.db")
+            await store.initialize()
+            try:
+                executor = _build_executor(store, _make_org_engine(root))
+                parent = _build_child_work_item()
+                parent.metadata = {
+                    **dict(parent.metadata or {}),
+                    "execution_unit_kind": "opaque_external_team",
+                    "opaque_external_team_result": {
+                        "work_item_id": "wi-child",
+                        "attempt_id": "1",
+                        "status": "completed",
+                        "summary": "Jiuwen team completed the delegated outcome.",
+                        "deliverables": [],
+                        "verification": "verified",
+                        "risks": [],
+                        "open_questions": [],
+                        "handoff": None,
+                    },
+                }
+                await store.save_delegation_work_item(parent)
+                worker_task = _build_worker_task()
+                worker_task.metadata["execution_unit_kind"] = "opaque_external_team"
+                await store.save_task(worker_task)
+
+                await executor._apply_done_transition(
+                    worker_task,
+                    result=TaskResult(status=TaskStatus.DONE, content="provider envelope"),
+                )
+
+                self.assertIsNone(
+                    await store.get_delegation_work_item(
+                        report_work_item_id_for_attempt("wi-child", 1)
+                    )
+                )
+                review = await store.get_delegation_work_item(
+                    review_work_item_id_for_attempt("wi-child", 1)
+                )
+                self.assertIsNotNone(review)
+                self.assertEqual(review.kind, "review")
+                self.assertEqual(
+                    review.metadata.get("review_completion_report"),
+                    "Jiuwen team completed the delegated outcome.",
+                )
+            finally:
+                await store.close()
+
     async def test_dispatch_kind_skips_report_step(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -447,6 +497,35 @@ class ReviewChainRecoveryTests(unittest.IsolatedAsyncioTestCase):
             or str((item.metadata or {}).get("review_target_work_item_id", "") or "").strip()
             == "wi-child"
         ]
+
+    async def test_reconcile_opaque_team_envelope_recovers_direct_review(self) -> None:
+        parent = await self._save_awaiting_parent()
+        await self.store.update_delegation_work_item(
+            parent.work_item_id,
+            metadata_updates={
+                "execution_unit_kind": "opaque_external_team",
+                "opaque_external_team_result": {
+                    "status": "completed",
+                    "summary": "Durable Jiuwen team handoff.",
+                },
+            },
+        )
+
+        await self._run_reconcile()
+
+        self.assertIsNone(
+            await self.store.get_delegation_work_item(
+                report_work_item_id_for_attempt("wi-child", 1)
+            )
+        )
+        review = await self.store.get_delegation_work_item(
+            review_work_item_id_for_attempt("wi-child", 1)
+        )
+        self.assertIsNotNone(review)
+        self.assertEqual(
+            review.metadata.get("review_completion_report"),
+            "Durable Jiuwen team handoff.",
+        )
 
     async def _setup_running_report(
         self,

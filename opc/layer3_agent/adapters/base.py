@@ -140,6 +140,10 @@ class ExternalAgentAdapter(abc.ABC):
             "idle_timeout_seconds": self.config.idle_timeout_seconds,
             "status_heartbeat_seconds": self.config.status_heartbeat_seconds,
             "extra_args": list(self.config.extra_args),
+            "transport": str(getattr(self.config, "transport", "cli") or "cli"),
+            "provider_mode": str(getattr(self.config, "provider_mode", "") or ""),
+            "execution_unit_kind": self.execution_unit_kind(),
+            "capabilities": self.capabilities(),
         }
 
     def describe(self) -> dict[str, Any]:
@@ -158,6 +162,36 @@ class ExternalAgentAdapter(abc.ABC):
             "new_session_flag": self.config.new_session_flag or "",
             "resume_session_flag": self.config.resume_session_flag or "",
             "extra_args": list(self.config.extra_args),
+            "transport": str(getattr(self.config, "transport", "cli") or "cli"),
+            "gateway_url": str(getattr(self.config, "gateway_url", "") or ""),
+            "provider_mode": str(getattr(self.config, "provider_mode", "") or ""),
+            "project_dir": str(getattr(self.config, "project_dir", "") or ""),
+            "trusted_dirs": list(getattr(self.config, "trusted_dirs", []) or []),
+            "agent_group_name": str(getattr(self.config, "agent_group_name", "") or ""),
+            "execution_unit_kind": self.execution_unit_kind(),
+            "capabilities": self.capabilities(),
+        }
+
+    def execution_unit_kind(self) -> str:
+        """Runtime projection kind exposed to CLI/UI capability discovery."""
+
+        return "external_agent"
+
+    def supports_company_execution(self) -> bool:
+        """Whether the adapter implements the company artifact safety fence."""
+
+        return False
+
+    def capabilities(self) -> dict[str, bool]:
+        """Stable, serializable feature discovery for non-hardcoded clients."""
+
+        return {
+            "interactive": self.supports_interactive(),
+            "session_resume": self.supports_session_resume(),
+            "live_inbox": self.supports_live_inbox_delivery(),
+            "company_mode": self.supports_company_execution(),
+            "task_mode": True,
+            "opaque_team": self.execution_unit_kind() == "opaque_external_team",
         }
 
     def supports_interactive(self) -> bool:
@@ -303,6 +337,13 @@ class ExternalAgentAdapter(abc.ABC):
     def normalize_result_output(self, output: str) -> str:
         """Convert raw stdout into the user-facing task result text."""
         return output
+
+    def validate_result_output(self, output: str, task: Task) -> str | None:
+        """Return a fail-closed validation reason, or ``None`` when valid."""
+
+        _ = output
+        _ = task
+        return None
 
     def extract_structured_result_fields(self, output: str) -> dict[str, Any]:
         payload: dict[str, Any] = {}

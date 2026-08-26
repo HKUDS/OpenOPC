@@ -626,6 +626,13 @@ class TestScenario8_CompanyModeProgress:
         assert ve[0]["type"] == "message_out"
         assert ve[0]["data"]["content_preview"] == "checking agent health"
 
+    def test_jiuwen_thinking_snapshot_has_normal_office_preview(self):
+        ve = self.adapter.parse_progress(
+            "[External:jiuwenswarm:thinking_snapshot] 正在核对论文来源",
+        )
+        assert ve[0]["type"] == "message_out"
+        assert ve[0]["data"]["content_preview"] == "thinking: 正在核对论文来源"
+
     def test_tool_prefix_skipped(self):
         ve = self.adapter.parse_progress("[Tool: file_read] reading config.py")
         assert ve == []

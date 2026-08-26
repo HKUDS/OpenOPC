@@ -25,6 +25,9 @@ from opc.core.models import (
 from opc.core.worker_envelope import classify_worker_message
 from opc.layer2_organization import comms as _comms
 from opc.layer2_organization.collaboration_policy import render_ownership_contract
+from opc.layer2_organization.external_team_compiler import (
+    is_opaque_external_team_shadow_seat,
+)
 from opc.layer2_organization.phase import (
     IN_REVIEW_PHASES,
     is_dispatchable,
@@ -644,7 +647,6 @@ class CompanyRuntime:
             run = await self.store.get_delegation_run(run_id)
             if run is not None:
                 runtime_topology = dict((getattr(run, "metadata", {}) or {}).get("runtime_topology", {}) or runtime_topology)
-        await self._bootstrap_role_sessions(runtime_tasks)
         seats: list[dict[str, Any]] = []
         list_seat_states = getattr(self.store, "list_delegation_seat_states", None)
         if callable(list_seat_states) and run_id:
@@ -660,6 +662,23 @@ class CompanyRuntime:
                     seats.append(seat_data)
         if not seats:
             seats = [dict(item) for item in list(runtime_topology.get("seats", []) or []) if isinstance(item, dict)]
+        # The persisted org topology retains covered seats for architecture
+        # inspection.  They are not OPC workers: the canonical boundary seat
+        # is the sole runtime identity for an opaque external Team.
+        seats = [
+            seat
+            for seat in seats
+            if not is_opaque_external_team_shadow_seat(seat)
+        ]
+        active_role_ids = {
+            str(seat.get("role_id", "") or "").strip()
+            for seat in seats
+            if str(seat.get("role_id", "") or "").strip()
+        }
+        await self._bootstrap_role_sessions(
+            runtime_tasks,
+            allowed_role_ids=active_role_ids,
+        )
         task_by_seat = {
             self._seat_id(task): task
             for task in runtime_tasks
@@ -848,7 +867,12 @@ class CompanyRuntime:
                 seat_task.metadata["member_session_state"] = self._serialize_session(session)
                 seat_task.metadata["delegation_role_session_id"] = role_session.role_session_id
 
-    async def _bootstrap_role_sessions(self, tasks: list[Task]) -> None:
+    async def _bootstrap_role_sessions(
+        self,
+        tasks: list[Task],
+        *,
+        allowed_role_ids: set[str] | None = None,
+    ) -> None:
         if self.store is not None and not bool(getattr(self.store, "is_ready", False)):
             return
         run_ids = {
@@ -859,6 +883,14 @@ class CompanyRuntime:
         if not run_ids:
             return
         for run_id in sorted(run_ids):
+            if allowed_role_ids is not None:
+                for role_session_id, role_session in list(self.role_sessions.items()):
+                    if (
+                        str(getattr(role_session, "run_id", "") or "").strip() == run_id
+                        and str(getattr(role_session, "role_id", "") or "").strip()
+                        not in allowed_role_ids
+                    ):
+                        self.role_sessions.pop(role_session_id, None)
             existing_sessions: list[DelegationRoleSession] = []
             if self.store and hasattr(self.store, "list_delegation_role_sessions"):
                 existing_sessions = await self.store.list_delegation_role_sessions(run_id)
@@ -867,9 +899,16 @@ class CompanyRuntime:
                 if str((task.metadata or {}).get("delegation_run_id", "") or "").strip() != run_id:
                     continue
                 role_id = self._role_id(task)
+                if allowed_role_ids is not None and role_id not in allowed_role_ids:
+                    continue
                 if role_id and role_id not in task_by_role:
                     task_by_role[role_id] = task
             for session in existing_sessions:
+                if (
+                    allowed_role_ids is not None
+                    and str(session.role_id or "").strip() not in allowed_role_ids
+                ):
+                    continue
                 self.role_sessions[session.role_session_id] = session
                 role_task = task_by_role.get(session.role_id)
                 if role_task is not None:

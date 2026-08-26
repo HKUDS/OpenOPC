@@ -14,6 +14,8 @@ export interface StructureCanvasNodeData {
   isOwner: boolean
   isSelected: boolean
   isDropTarget: boolean
+  externalTeamLabel?: string
+  externalTeamBoundary?: boolean
 }
 
 /**
@@ -29,6 +31,7 @@ export const StructureCanvasNode = memo(function StructureCanvasNode({ data }: {
     data.isOwner && 'is-owner',
     data.isSelected && 'is-selected',
     data.isDropTarget && 'is-drop-target',
+    data.externalTeamBoundary && 'is-external-team-boundary',
   ].filter(Boolean).join(' ')
 
   const iconSrc = resolveRoleIcon(data.icon)
@@ -49,6 +52,11 @@ export const StructureCanvasNode = memo(function StructureCanvasNode({ data }: {
         </div>
         <div className="oc-canvas-node-text">
           <span className="oc-canvas-node-name">{data.name}</span>
+          {data.externalTeamLabel && (
+            <span className="oc-canvas-node-team" title={data.externalTeamLabel}>
+              {data.externalTeamBoundary ? 'JiuwenSwarm Team' : data.externalTeamLabel}
+            </span>
+          )}
           <div className="oc-canvas-node-meta">
             {data.employeeNames.length > 0 ? (
               <span

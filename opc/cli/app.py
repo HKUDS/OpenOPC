@@ -30,6 +30,7 @@ from rich.theme import Theme
 
 from opc import __version__
 from opc.core.config import OPCConfig, get_opc_home, get_project_config_workspace
+from opc.core.execution_agents import EXECUTION_AGENTS
 from opc.core.interaction_protocol import owner_interaction_actor_identity
 from opc.core.windows_ssl import (
     format_windows_sslkeylog_warning,
@@ -584,7 +585,7 @@ def chat(
     project: Optional[str] = typer.Option(None, "--project", "-p", help="Project ID to work in"),
     model: Optional[str] = typer.Option(None, "--model", "-m", help="Override default LLM model"),
     mode: str = typer.Option("task", "--mode", help="Execution mode: task or company"),
-    agent: Optional[str] = typer.Option(None, "--agent", help="Preferred agent: native, claude_code, codex, cursor, opencode"),
+    agent: Optional[str] = typer.Option(None, "--agent", help="Preferred agent: native, claude_code, codex, cursor, opencode, jiuwen, jiuwenswarm"),
     company_profile: str = typer.Option("corporate", "--company-profile", help="Company profile for company mode"),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Show detailed logs"),
     no_markdown: bool = typer.Option(False, "--no-markdown", help="Plain text output"),
@@ -626,7 +627,7 @@ def exec_command(
     project: Optional[str] = typer.Option(None, "--project", "-p", help="Project ID to work in"),
     mode: str = typer.Option("task", "--mode", help="Execution mode: task, company, or org"),
     company_profile: str = typer.Option("corporate", "--company-profile", help="Company profile for company mode"),
-    agent: Optional[str] = typer.Option(None, "--agent", help="Preferred agent: native, claude_code, codex, cursor, opencode"),
+    agent: Optional[str] = typer.Option(None, "--agent", help="Preferred agent: native, claude_code, codex, cursor, opencode, jiuwen, jiuwenswarm"),
     org_id: Optional[str] = typer.Option(None, "--org", "--org-id", help="Saved org id for org/custom mode"),
     session_id: Optional[str] = typer.Option(None, "--session-id", help="Existing task-backed session id to reuse"),
     resume: bool = typer.Option(False, "--resume", help="Resume the latest task-backed session in the project"),
@@ -1028,6 +1029,11 @@ def init(
                     responsibility="Strategic intake, high-level routing, final aggregation and delivery to the owner",
                     reports_to="owner",
                     can_spawn=["cto", "cmo", "coo"],
+                    capabilities=[
+                        "strategic_planning", "work_delegation",
+                        "cross_team_coordination", "final_synthesis",
+                        "delivery_review",
+                    ],
                     tools=planning_tools,
                 ),
                 RoleConfig(
@@ -1037,6 +1043,11 @@ def init(
                     responsibility="Technical planning, architecture decisions, code review, and engineering oversight",
                     reports_to="ceo",
                     can_spawn=["senior_engineer", "devops_engineer"],
+                    capabilities=[
+                        "technical_planning", "architecture_design",
+                        "technical_research", "engineering_oversight",
+                        "code_review", "research_synthesis",
+                    ],
                     tools=[*planning_tools, "shell_exec", "web_search", "web_fetch"],
                 ),
                 RoleConfig(
@@ -1046,6 +1057,12 @@ def init(
                     responsibility="Marketing strategy, content planning, UX review, and brand oversight",
                     reports_to="ceo",
                     can_spawn=["content_specialist", "designer"],
+                    capabilities=[
+                        "market_research", "industry_analysis",
+                        "marketing_strategy", "content_strategy",
+                        "user_research", "brand_strategy",
+                        "research_synthesis",
+                    ],
                     tools=[
                         *planning_tools,
                         "web_search",
@@ -1065,6 +1082,11 @@ def init(
                     responsibility="Operations coordination, process management, cross-team alignment, and quality assurance",
                     reports_to="ceo",
                     can_spawn=["qa_analyst"],
+                    capabilities=[
+                        "operational_planning", "cross_team_coordination",
+                        "quality_assurance", "source_acquisition",
+                        "compliance_review", "research_synthesis",
+                    ],
                     tools=[
                         *planning_tools,
                         "shell_exec",
@@ -1083,6 +1105,10 @@ def init(
                     responsibility="Code implementation, system development, and technical execution",
                     reports_to="cto",
                     preferred_external_agent="codex",
+                    capabilities=[
+                        "software_implementation", "system_development",
+                        "technical_execution", "testing",
+                    ],
                     tools=engineering_tools,
                 ),
                 RoleConfig(
@@ -1092,6 +1118,10 @@ def init(
                     responsibility="Infrastructure, deployment, CI/CD, monitoring, and operational hardening",
                     reports_to="cto",
                     preferred_external_agent="cursor",
+                    capabilities=[
+                        "infrastructure_engineering", "ci_cd", "deployment",
+                        "monitoring", "operational_hardening",
+                    ],
                     tools=engineering_tools,
                 ),
                 RoleConfig(
@@ -1100,6 +1130,10 @@ def init(
                     icon="writing",
                     responsibility="Documentation, copywriting, presentations, and user-facing writing",
                     reports_to="cmo",
+                    capabilities=[
+                        "documentation", "copywriting", "presentation_design",
+                        "user_facing_writing",
+                    ],
                     tools=[
                         "file_read",
                         "file_write",
@@ -1119,6 +1153,10 @@ def init(
                     icon="design",
                     responsibility="Visual design, UX artifacts, wireframes, and design system work",
                     reports_to="cmo",
+                    capabilities=[
+                        "visual_design", "ux_design", "wireframing",
+                        "design_systems",
+                    ],
                     tools=[
                         "file_read",
                         "file_write",
@@ -1138,6 +1176,10 @@ def init(
                     icon="bug",
                     responsibility="Testing, security review, compliance checks, and acceptance validation",
                     reports_to="coo",
+                    capabilities=[
+                        "testing", "security_review", "compliance_review",
+                        "acceptance_validation", "quality_assurance",
+                    ],
                     tools=review_tools,
                 ),
             ]
@@ -2065,6 +2107,75 @@ def agent_move(agent_id: str = typer.Argument(...), office_id: str = typer.Argum
     asyncio.run(_run_service_command(project, lambda svc: svc.agent.move(agent_id=agent_id, office_id=office_id, seat_zone=seat_zone, desk_id=desk_id), json_output=json_output))
 
 
+agents_app = typer.Typer(help="Inspect external execution agents")
+app.add_typer(agents_app, name="agents")
+
+
+@agents_app.command("list")
+def external_agents_list(json_output: bool = typer.Option(False, "--json")):
+    from opc.layer3_agent.adapters.registry import ADAPTER_CLASSES
+
+    config = _get_config()
+
+    async def collect_profiles() -> list[dict[str, Any]]:
+        profiles: list[dict[str, Any]] = []
+        for name, adapter_cls in ADAPTER_CLASSES.items():
+            adapter = adapter_cls(config=config.agents.agents.get(name))
+            profile = adapter.describe()
+            profile["available"] = await adapter.is_available()
+            profiles.append(profile)
+        return profiles
+
+    profiles = asyncio.run(collect_profiles())
+    if json_output:
+        console.print_json(data={"agents": profiles})
+        return
+    table = Table(title="External Agents")
+    table.add_column("Agent")
+    table.add_column("Available")
+    table.add_column("Execution unit")
+    table.add_column("Task")
+    table.add_column("Company")
+    table.add_column("Transport / mode")
+    for profile in profiles:
+        capabilities = dict(profile.get("capabilities", {}) or {})
+        table.add_row(
+            str(profile.get("agent") or ""),
+            "yes" if profile.get("available") else "no",
+            str(profile.get("execution_unit_kind") or "external_agent"),
+            "yes" if capabilities.get("task_mode") else "no",
+            "yes" if capabilities.get("company_mode") else "no",
+            f"{profile.get('transport', 'cli')} / {profile.get('provider_mode') or profile.get('run_mode', '')}",
+        )
+    console.print(table)
+
+
+@agents_app.command("preflight")
+def external_agents_preflight(
+    agent: Optional[str] = typer.Argument(None),
+    project: str = typer.Option("default", "--project", "-p"),
+    probe_commands: bool = typer.Option(True, "--probe-commands/--no-probe-commands"),
+    json_output: bool = typer.Option(False, "--json"),
+):
+    from opc.layer3_agent.preflight import run_external_agent_preflight
+
+    results = run_external_agent_preflight(
+        _get_config(),
+        project_id=project,
+        probe_commands=probe_commands,
+        prepare_surfaces=True,
+    )
+    if agent:
+        results = [item for item in results if item.agent == agent]
+        if not results:
+            console.print(f"[error]Unknown external agent: {agent}[/error]")
+            raise typer.Exit(code=2)
+    if json_output:
+        console.print_json(data={"agents": [item.as_dict() for item in results]})
+        return
+    _render_external_agent_preflight_table(results)
+
+
 org_app = typer.Typer(help="Manage organization configuration")
 app.add_typer(org_app, name="org")
 
@@ -2088,6 +2199,79 @@ def org_import(
 ):
     raw = Path(path).read_text(encoding="utf-8")
     asyncio.run(_run_service_command(project, lambda svc: svc.org.import_config(raw, dry_run=dry_run), json_output=json_output))
+
+
+@org_app.command("team-bind")
+def org_team_bind(
+    role_id: str = typer.Option(..., "--role", help="Boundary role id, for example cto or cmo"),
+    organization_id: Optional[str] = typer.Option(None, "--org", help="Expected active organization id"),
+    binding_id: str = typer.Option("", "--binding-id", help="Stable binding id (auto-generated when omitted)"),
+    agent: str = typer.Option("jiuwenswarm", "--agent"),
+    scope: str = typer.Option("subtree", "--scope", help="role or subtree"),
+    collapse_subtree: bool = typer.Option(True, "--collapse-subtree/--no-collapse-subtree"),
+    provider_mode: str = typer.Option("team", "--provider-mode"),
+    session_scope: str = typer.Option("company_run", "--session-scope"),
+    max_inflight: int = typer.Option(1, "--max-inflight", min=1),
+    failure_policy: str = typer.Option("fail_closed", "--failure-policy", help="fail_closed or fallback_native"),
+    review_owner_role_id: str = typer.Option("", "--review-owner", help="Reviewer role; defaults to the boundary manager"),
+    artifact_isolation: str = typer.Option("validated_workspace", "--artifact-isolation"),
+    project: Optional[str] = typer.Option(None, "--project", "-p"),
+    json_output: bool = typer.Option(False, "--json"),
+):
+    payload = {
+        "organization_id": organization_id,
+        "binding_id": binding_id,
+        "boundary_role_id": role_id,
+        "external_agent": agent,
+        "scope": scope,
+        "collapse_subtree": collapse_subtree,
+        "provider_mode": provider_mode,
+        "session_scope": session_scope,
+        "max_inflight": max_inflight,
+        "failure_policy": failure_policy,
+        "review_owner_role_id": review_owner_role_id,
+        "artifact_isolation": artifact_isolation,
+    }
+    asyncio.run(
+        _run_service_command(
+            project,
+            lambda svc: svc.org.bind_external_team(payload),
+            json_output=json_output,
+        )
+    )
+
+
+@org_app.command("team-bindings")
+def org_team_bindings(
+    project: Optional[str] = typer.Option(None, "--project", "-p"),
+    json_output: bool = typer.Option(False, "--json"),
+):
+    asyncio.run(
+        _run_service_command(
+            project,
+            lambda svc: svc.org.list_external_team_bindings(),
+            json_output=json_output,
+        )
+    )
+
+
+@org_app.command("team-unbind")
+def org_team_unbind(
+    role_or_binding: str = typer.Option(..., "--role", "--binding"),
+    organization_id: Optional[str] = typer.Option(None, "--org", help="Expected active organization id"),
+    project: Optional[str] = typer.Option(None, "--project", "-p"),
+    json_output: bool = typer.Option(False, "--json"),
+):
+    asyncio.run(
+        _run_service_command(
+            project,
+            lambda svc: svc.org.unbind_external_team(
+                role_or_binding,
+                organization_id=organization_id,
+            ),
+            json_output=json_output,
+        )
+    )
 
 
 org_saved_app = typer.Typer(help="Manage saved org architectures")
@@ -2866,7 +3050,7 @@ _SLASH_DEFAULT_LIMIT = 20
 _SLASH_MAX_LIMIT = 100
 _VALID_CHAT_MODES = {"task", "company"}
 _VALID_COMPANY_PROFILES = {"corporate", "custom"}
-_VALID_PREFERRED_AGENTS = {"native", "codex", "claude_code", "cursor", "opencode"}
+_VALID_PREFERRED_AGENTS = EXECUTION_AGENTS
 
 
 @dataclass(frozen=True)
@@ -3142,7 +3326,7 @@ _SLASH_COMMANDS: tuple[_SlashCommandSpec, ...] = (
     _SlashCommandSpec("Chat", "/queue list|drop|clear", "Inspect or edit queued prompts while a turn is running.", ("list", "drop", "clear")),
     _SlashCommandSpec("Context", "/status", "Show project, session, mode, agent, domains, model, and cost."),
     _SlashCommandSpec("Context", "/mode [task|company] [corporate|custom]", "Set execution mode for future messages.", ("task", "company", "corporate", "custom")),
-    _SlashCommandSpec("Context", "/agent [native|codex|claude_code|cursor|opencode|none]", "Set preferred external agent.", ("native", "codex", "claude_code", "cursor", "opencode", "none")),
+    _SlashCommandSpec("Context", "/agent [native|codex|jiuwen|jiuwenswarm|claude_code|cursor|opencode|none]", "Set preferred external agent.", ("native", "codex", "jiuwen", "jiuwenswarm", "claude_code", "cursor", "opencode", "none")),
     _SlashCommandSpec("Context", "/domains [domain ...|clear]", "Set domain hints for future messages.", ("clear",)),
     _SlashCommandSpec("Project", "/project", "Show current project, known projects, and switch/create/delete usage.", ("list", "switch", "create", "rename", "delete")),
     _SlashCommandSpec("Project", "/project list", "List known projects."),
@@ -6798,7 +6982,7 @@ async def _handle_agent_slash(state: _InteractiveChatState, args: list[str]) -> 
         table.add_column("Agent", style="cyan")
         table.add_column("Current", justify="center")
         table.add_column("Command")
-        for agent in ["native", "codex", "claude_code", "cursor", "opencode"]:
+        for agent in ["native", "codex", "jiuwen", "jiuwenswarm", "claude_code", "cursor", "opencode"]:
             table.add_row(agent, "*" if state.preferred_agent == agent else "", f"/agent {agent}")
         table.add_row("system default", "*" if state.preferred_agent is None else "", "/agent none")
         console.print(table)
@@ -7017,7 +7201,7 @@ def _company_staffing_agent_choices(state: _InteractiveChatState) -> list[dict[s
             available.update(str(item).strip().lower().replace("-", "_") for item in registry.list_available())
         except Exception:
             pass
-    ordered = ["native", "codex", "claude_code", "cursor", "opencode"]
+    ordered = ["native", "codex", "jiuwen", "jiuwenswarm", "claude_code", "cursor", "opencode"]
     return [
         {
             "agent": agent,

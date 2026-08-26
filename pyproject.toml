@@ -36,6 +36,7 @@ dependencies = [
 browser = []
 # Optional legacy CLI board/TUI inspector; not installed by default.
 cli-board = ["textual>=8.1.1"]
+jiuwen = ["websockets>=12.0", "json-repair>=0.58.4"]
 channels-telegram = ["python-telegram-bot>=21.0"]
 channels-whatsapp = ["websockets>=12.0"]
 channels-discord = ["discord.py>=2.3"]

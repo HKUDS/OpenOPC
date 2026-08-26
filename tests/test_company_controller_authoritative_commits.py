@@ -959,6 +959,26 @@ class CompanyControllerAuthoritativeCommitTests(unittest.IsolatedAsyncioTestCase
             winner_task.metadata["claimed_work_item_attempt_seq"],
             1,
         )
+        # A projection pass can hold a clean pre-claim Task snapshot while the
+        # dispatcher concurrently persists the exact claimed attempt.  The
+        # stale projection is a benign loser, not a run-controller lease loss.
+        stale_unclaimed_projection = copy.deepcopy(durable_pending)
+        await self.store2.save_task(winner_task)
+        persisted.summary = "projection refresh raced with a live claim"
+        await self.executor2._sync_task_projection_from_work_items(
+            [stale_unclaimed_projection],
+            [persisted],
+        )
+        durable_after_race = await self.store2.get_task(winner_task.id)
+        assert durable_after_race is not None
+        self.assertEqual(
+            durable_after_race.metadata["company_run_controller_owner_token"],
+            "owner-b",
+        )
+        self.assertEqual(
+            durable_after_race.metadata["claimed_work_item_attempt_seq"],
+            1,
+        )
         await self.executor2._sync_task_projection_from_work_items(
             [winner_task],
             [persisted],

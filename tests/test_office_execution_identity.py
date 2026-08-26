@@ -2,7 +2,10 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+from opc.core.execution_agents import EXECUTION_AGENTS, EXTERNAL_EXECUTION_AGENTS
+from opc.layer3_agent.adapters.registry import ADAPTER_CLASSES
 from opc.plugins.office_ui.execution_identity import (
+    PREFERRED_AGENTS,
     canonicalize_execution_identity,
     execution_identity_from_task,
 )
@@ -61,6 +64,22 @@ def test_task_identity_clears_company_and_org_fields() -> None:
     assert identity.company_profile == "corporate"
     assert identity.org_id == ""
     assert identity.preferred_agent == "claude_code"
+
+
+def test_jiuwen_agents_are_valid_task_execution_identities() -> None:
+    for agent in ("jiuwen", "jiuwenswarm"):
+        assert agent in PREFERRED_AGENTS
+        identity = canonicalize_execution_identity(
+            exec_mode="task",
+            preferred_agent=agent,
+            explicit_exec_mode=True,
+        )
+        assert identity.preferred_agent == agent
+
+
+def test_office_identity_allowlist_matches_external_adapter_registry() -> None:
+    assert PREFERRED_AGENTS == EXECUTION_AGENTS
+    assert frozenset(ADAPTER_CLASSES) == EXTERNAL_EXECUTION_AGENTS
 
 
 def test_task_metadata_identity_prefers_explicit_company_over_stale_custom_profile() -> None:

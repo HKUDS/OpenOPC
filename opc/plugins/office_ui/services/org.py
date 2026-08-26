@@ -7,6 +7,7 @@ and CLI surfaces.
 
 from __future__ import annotations
 
+import copy
 from typing import Any
 
 from opc.core.models import normalize_role_runtime_status
@@ -25,6 +26,7 @@ from opc.core.org_config import (
     write_org_index,
 )
 from opc.layer2_organization.org_work_item_planner import build_custom_org_work_item_blueprint
+from opc.layer2_organization.external_team_compiler import apply_external_team_bindings_to_topology
 from opc.layer2_organization.phase import kanban_column, should_hide_work_item_from_company_kanban
 from opc.layer2_organization.work_item_identity import (
     work_item_identity_payload,
@@ -85,12 +87,23 @@ class OrgService:
             "project_recovery": {},
             "org_version": 0,
             "runtime_topology_version": 0,
+            "external_team_bindings": [],
+            "external_execution_units": [],
+            "external_agent_profiles": [],
         }
         cfg_org = getattr(getattr(engine, "config", None), "org", None)
         if cfg_org is not None:
             result["organization_id"] = str(getattr(cfg_org, "organization_id", "") or "")
             result["organization_name"] = str(getattr(cfg_org, "organization_name", "") or "")
             result["organization_config_file"] = str(getattr(cfg_org, "organization_config_file", "") or "")
+            result["external_team_bindings"] = [
+                binding.model_dump() if hasattr(binding, "model_dump") else dict(binding)
+                for binding in list(getattr(cfg_org, "external_team_bindings", []) or [])
+            ]
+        try:
+            result["external_agent_profiles"] = list(engine.adapter_registry.describe_all())
+        except Exception:
+            pass
 
         org = getattr(engine, "org_engine", None)
         agents: list[Any] = []
@@ -122,6 +135,13 @@ class OrgService:
                         else "auto",
                         "preferred_external_agent": agent.preferred_external_agent,
                         "prompt_refs": list(agent.prompt_refs) if agent.prompt_refs else [],
+                        "skill_refs": list(getattr(agent, "skill_refs", []) or []),
+                        "capabilities": [
+                            item.strip()
+                            for item in str(getattr(agent, "capabilities", "") or "").split(",")
+                            if item.strip()
+                        ],
+                        "artifact_contract_ref": getattr(agent, "artifact_contract_ref", None),
                     }
                     for agent in agents
                 ]
@@ -205,8 +225,43 @@ class OrgService:
             except Exception:
                 pass
             try:
-                preview_topology = org.build_runtime_delegation_topology()
+                preview_topology = apply_external_team_bindings_to_topology(
+                    org,
+                    org.build_runtime_delegation_topology(),
+                )
                 result["runtime_topology_preview"] = preview_topology
+                units = [
+                    dict(unit)
+                    for unit in list(preview_topology.get("external_execution_units", []) or [])
+                    if isinstance(unit, dict)
+                ]
+                result["external_execution_units"] = units
+                unit_by_role = {
+                    str(role_id): unit
+                    for unit in units
+                    for role_id in list(unit.get("covered_role_ids", []) or [])
+                    if str(role_id).strip()
+                }
+                for role_payload in result["roles"]:
+                    unit = unit_by_role.get(str(role_payload.get("role_id", "") or ""))
+                    if unit is None:
+                        continue
+                    boundary = str(unit.get("boundary_role_id", "") or "")
+                    role_payload.update({
+                        "execution_unit_kind": "opaque_external_team",
+                        "external_team_binding_id": unit.get("binding_id"),
+                        "external_team_boundary_role_id": boundary,
+                        "external_team_boundary": role_payload.get("role_id") == boundary,
+                        "covered_by_external_team": True,
+                        "selected_execution_agent": unit.get("external_agent"),
+                        "staffing_locked": True,
+                        "staffing_mode": "opaque_external_team",
+                        "external_team_capability_manifest": (
+                            dict(unit.get("capability_manifest", {}) or {})
+                            if role_payload.get("role_id") == boundary
+                            else None
+                        ),
+                    })
                 if org.get_company_profile() == "custom":
                     policy = org.get_runtime_policy("custom")
                     policy_payload = policy.model_dump() if hasattr(policy, "model_dump") else dict(policy or {})
@@ -835,9 +890,14 @@ class OrgService:
         if not role_id:
             raise ServiceError("missing_role_id", "role_id required")
         cfg = self.context.engine.config.org
-        target = next((role for role in cfg.roles if self._role_id(role) == role_id), None)
+        target_index = next(
+            (index for index, role in enumerate(cfg.roles) if self._role_id(role) == role_id),
+            None,
+        )
+        target = cfg.roles[target_index] if target_index is not None else None
         if target is None:
             raise ServiceError("role_not_found", "Role not found", {"role_id": role_id})
+        previous_target = copy.deepcopy(target)
         if str(updates.get("reports_to", "") or "").strip() == role_id:
             raise ServiceError("role_cycle", "Role cannot report to itself", {"role_id": role_id})
         for key in ("name", "responsibility", "reports_to", "icon", "preferred_external_agent"):
@@ -867,6 +927,11 @@ class OrgService:
             strategy = str(updates.get("execution_strategy") or "auto").strip()
             if strategy:
                 target.runtime_policy.execution_strategy = strategy
+        try:
+            self._validate_configured_external_team_bindings()
+        except ServiceError:
+            cfg.roles[target_index] = previous_target
+            raise
         async with self.context.config_lock:
             await self._persist_and_reload()
         info = await self.info(include_events=True)
@@ -880,6 +945,16 @@ class OrgService:
         if len(cfg.roles) == before:
             raise ServiceError("role_not_found", "Role not found", {"role_id": role_id})
         cfg.employees = [employee for employee in cfg.employees if getattr(employee, "role_id", "") != role_id]
+        retained_bindings = []
+        removed_binding_ids: list[str] = []
+        for binding in list(cfg.external_team_bindings or []):
+            if str(binding.boundary_role_id or "").strip() == role_id:
+                removed_binding_ids.append(str(binding.binding_id or role_id).strip())
+                continue
+            if str(binding.review_owner_role_id or "").strip() == role_id:
+                binding.review_owner_role_id = None
+            retained_bindings.append(binding)
+        cfg.external_team_bindings = retained_bindings
         for role in cfg.roles:
             role.can_spawn = [item for item in list(getattr(role, "can_spawn", []) or []) if item != role_id]
             if getattr(role, "reports_to", "") == role_id:
@@ -893,7 +968,14 @@ class OrgService:
         if self.context.mode_state.exec_mode in {"org", "custom"}:
             await self.context.agent_store.sync_custom_shadow()
         info = await self.info(include_events=True)
-        return ServiceResult({"role_id": role_id, "action": "role_deleted"}, info.events)
+        return ServiceResult(
+            {
+                "role_id": role_id,
+                "action": "role_deleted",
+                "removed_external_team_bindings": removed_binding_ids,
+            },
+            info.events,
+        )
 
     async def update_runtime_policy(self, policy: dict[str, Any], *, profile: str = "custom") -> ServiceResult:
         from opc.core.config import RuntimePolicyConfig
@@ -909,6 +991,115 @@ class OrgService:
         return ServiceResult(
             {"profile": profile, "policy": self.context.engine.config.org.runtime_policies[profile].model_dump(), "action": "runtime_policy_updated"},
             info.events,
+        )
+
+    async def list_external_team_bindings(self) -> ServiceResult:
+        bindings = [
+            binding.model_dump() if hasattr(binding, "model_dump") else dict(binding)
+            for binding in list(self.context.engine.config.org.external_team_bindings or [])
+        ]
+        return ServiceResult({"bindings": bindings, "count": len(bindings)})
+
+    async def bind_external_team(self, payload: dict[str, Any]) -> ServiceResult:
+        from opc.core.config import ExternalTeamBindingConfig
+        from opc.layer2_organization.external_team_compiler import (
+            compile_external_team_bindings,
+        )
+
+        expected_org_id = str((payload or {}).get("organization_id") or "").strip()
+        active_org_id = str(self.context.engine.config.org.organization_id or "").strip()
+        if expected_org_id and expected_org_id != active_org_id:
+            raise ServiceError(
+                "organization_mismatch",
+                "The requested organization is not active",
+                {"requested": expected_org_id, "active": active_org_id},
+            )
+        try:
+            candidate = ExternalTeamBindingConfig.model_validate(dict(payload or {}))
+        except ValueError as exc:
+            raise ServiceError("invalid_external_team_binding", str(exc)) from exc
+        if candidate.external_agent != "jiuwenswarm":
+            raise ServiceError(
+                "invalid_external_team_agent",
+                "Opaque organization team bindings currently require external_agent=jiuwenswarm",
+            )
+        org = getattr(self.context.engine, "org_engine", None)
+        if org is None or org.get_agent(candidate.boundary_role_id) is None:
+            raise ServiceError(
+                "role_not_found",
+                "External team boundary role not found",
+                {"role_id": candidate.boundary_role_id},
+            )
+        cfg_org = self.context.engine.config.org
+        candidate_id = str(candidate.binding_id or "").strip()
+        retained = []
+        for binding in list(cfg_org.external_team_bindings or []):
+            same_id = candidate_id and str(binding.binding_id or "").strip() == candidate_id
+            same_boundary = str(binding.boundary_role_id or "").strip() == candidate.boundary_role_id
+            if not same_id and not same_boundary:
+                retained.append(binding)
+        proposed = [*retained, candidate]
+        topology = org.build_runtime_delegation_topology()
+        try:
+            compiled = compile_external_team_bindings(
+                org,
+                runtime_topology=topology,
+                bindings=proposed,
+            )
+        except ValueError as exc:
+            raise ServiceError("invalid_external_team_binding", str(exc)) from exc
+        selected = next(
+            item for item in compiled if item.boundary_role_id == candidate.boundary_role_id
+        )
+        candidate.binding_id = selected.binding_id
+        async with self.context.config_lock:
+            cfg_org.external_team_bindings = proposed
+            await self._persist_and_reload()
+        return ServiceResult(
+            {
+                "binding": selected.to_dict(),
+                "action": "external_team_bound",
+            },
+            [ServiceEvent("org_info", (await self.info()).payload)],
+        )
+
+    async def unbind_external_team(
+        self,
+        boundary_or_binding_id: str,
+        *,
+        organization_id: str | None = None,
+    ) -> ServiceResult:
+        expected_org_id = str(organization_id or "").strip()
+        active_org_id = str(self.context.engine.config.org.organization_id or "").strip()
+        if expected_org_id and expected_org_id != active_org_id:
+            raise ServiceError(
+                "organization_mismatch",
+                "The requested organization is not active",
+                {"requested": expected_org_id, "active": active_org_id},
+            )
+        token = str(boundary_or_binding_id or "").strip()
+        if not token:
+            raise ServiceError("missing_external_team_binding", "binding id or boundary role required")
+        cfg_org = self.context.engine.config.org
+        existing = list(cfg_org.external_team_bindings or [])
+        retained = [
+            binding
+            for binding in existing
+            if str(binding.binding_id or "").strip() != token
+            and str(binding.boundary_role_id or "").strip() != token
+        ]
+        if len(retained) == len(existing):
+            raise ServiceError(
+                "external_team_binding_not_found",
+                "External team binding not found",
+                {"binding": token},
+            )
+        async with self.context.config_lock:
+            cfg_org.external_team_bindings = retained
+            await self._persist_and_reload()
+        return ServiceResult(
+            {"binding": token, "action": "external_team_unbound"},
+            [ServiceEvent("org_info", (await self.info()).payload)],
         )
 
     async def update_org_strategy(self, *, final_decider_role_id: str | None = None) -> ServiceResult:
@@ -937,6 +1128,7 @@ class OrgService:
             self.context.engine.config.org.roles = []
             self.context.engine.config.org.employees = []
             self.context.engine.config.org.installed_packages = []
+            self.context.engine.config.org.external_team_bindings = []
             self.context.engine.config.org.runtime_policies.pop("custom", None)
             await self._persist_and_reload()
         try:
@@ -957,6 +1149,31 @@ class OrgService:
         org = getattr(self.context.engine, "org_engine", None)
         if org and hasattr(org, "reload_from_config"):
             org.reload_from_config()
+
+    def _validate_configured_external_team_bindings(self) -> None:
+        """Reject hierarchy edits that would make persisted Team scopes overlap."""
+
+        bindings = list(self.context.engine.config.org.external_team_bindings or [])
+        if not bindings:
+            return
+        from opc.layer2_organization.external_team_compiler import (
+            compile_external_team_bindings,
+        )
+        from opc.layer2_organization.org_engine import OrgEngine
+
+        try:
+            preview_org = OrgEngine(self.context.engine.config)
+            compile_external_team_bindings(
+                preview_org,
+                runtime_topology=preview_org.build_runtime_delegation_topology(),
+                bindings=bindings,
+            )
+        except ValueError as exc:
+            raise ServiceError(
+                "invalid_external_team_binding",
+                "This hierarchy change would invalidate an external Team binding",
+                {"validation_error": str(exc)},
+            ) from exc
 
     async def _ensure_custom_role_agents(self) -> list[dict[str, Any]]:
         if self.context.ensure_custom_role_agents is not None:

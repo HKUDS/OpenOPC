@@ -13,6 +13,7 @@ import type {
 import { IconWorkItem } from './SvgIcons'
 import { getWorkItemAssignmentLabel, humanizeWorkItemRoleId } from '../lib/workItemIdentity'
 import { getExecutionTurnId } from '../lib/workItemRuntimeIds'
+import { executionAgentLabel } from '../lib/externalAgents'
 
 interface WorkItemProgressCardProps {
   workItemLog: WorkItemProgressEntry[]
@@ -43,6 +44,7 @@ interface WorkItemInfo {
   roleName?: string
   status: WorkItemStatus
   executionTurnId?: string
+  executionAgent?: string
 }
 
 interface RoleTurnInfo {
@@ -135,14 +137,6 @@ function aggregateStatus(statuses: WorkItemStatus[]): WorkItemStatus {
   return best
 }
 
-const EXECUTION_AGENT_LABELS: Record<string, string> = {
-  native: 'Native',
-  codex: 'Codex',
-  claude_code: 'Claude Code',
-  cursor: 'Cursor',
-  opencode: 'OpenCode',
-}
-
 /** Check if a string looks like a UUID or long hex id */
 function isUuidLike(s: string): boolean {
   return s.length > 12 && /^[0-9a-f-]+$/i.test(s.replace(/_/g, ''))
@@ -163,7 +157,7 @@ function firstNonEmpty(...values: unknown[]): string {
 function formatExecutionAgent(value?: string): string {
   const normalized = trimString(value)
   if (!normalized) return ''
-  return EXECUTION_AGENT_LABELS[normalized] ?? humanizeWorkItemRoleId(normalized)
+  return executionAgentLabel(normalized) || humanizeWorkItemRoleId(normalized)
 }
 
 function renderProjectionIcon(status: WorkItemStatus): ReactNode {
@@ -379,6 +373,7 @@ export function WorkItemProgressCard({
       const aggregatedStatus = AGGREGATED_TO_WORK_ITEM_STATUS[summary.aggregatedStatus] ?? 'pending'
       const aggregatedColumnId = workItemStatusToColumnId(aggregatedStatus)
       const latest = turns[turns.length - 1]
+      const opaqueTeamRow = ordered.find(row => row.executionUnitKind === 'opaque_external_team')
       // Chip click target: prefer the latest turn's runtime task. When the
       // last work item has no execution turn yet (queued / never dispatched),
       // walk back to find the most recent dispatched turn.
@@ -386,13 +381,16 @@ export function WorkItemProgressCard({
       summaries.push({
         roleKey: summary.roleKey,
         executionTurnId: latest.executionTurnId || fallbackExecutionTurnId,
-        title: summary.roleName || summary.roleId,
+        title: opaqueTeamRow
+          ? `${summary.roleName || summary.roleId} · JiuwenSwarm Team`
+          : (summary.roleName || summary.roleId),
         status: aggregatedStatus,
         statusLabel: labelForColumnId(aggregatedColumnId),
         roleName: summary.roleName,
         updatedAt: turns.reduce((max, t) => Math.max(max, t.updatedAt), 0),
         turns,
         runtimeStatus: summary.runtimeStatus,
+        executionAgent: formatExecutionAgent(opaqueTeamRow?.selectedExecutionAgent),
       })
     }
     // Stable order: roles first appearing in time go left.
@@ -537,6 +535,7 @@ export function WorkItemProgressCard({
         roleName: role.roleName,
         status: role.status,
         executionTurnId: role.executionTurnId,
+        executionAgent: role.executionAgent,
       }))
     }
     return isCompanyRuntime ? [] : workItemLogWorkItems
@@ -563,6 +562,9 @@ export function WorkItemProgressCard({
                 title={`Open Runtime Session${workItem.roleName ? `: ${workItem.title} (${workItem.roleName})` : `: ${workItem.title}`}`}
               >
                 <span className="wi-projection-label">{workItem.title}</span>
+                {workItem.executionAgent && (
+                  <span className="wi-projection-agent">{workItem.executionAgent}</span>
+                )}
                 {renderProjectionIcon(workItem.status)}
               </button>
               {i < workItems.length - 1 && <span className="wi-projection-connector">&rarr;</span>}

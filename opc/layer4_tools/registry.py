@@ -58,6 +58,28 @@ _PARAM_ALIASES: dict[str, str] = {
 _TRUSTED_RUNTIME_ARGUMENTS = ("task", "on_progress")
 
 
+class ToolInvocationValidationError(ValueError):
+    """Expected, model-correctable tool input validation failure.
+
+    These failures are part of the tool protocol rather than implementation
+    crashes.  Returning a stable correction payload lets the agent repair its
+    call without exposing an internal Python traceback in the conversation.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: str = "tool_input_validation",
+        correction: str = "Correct the tool arguments and retry.",
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.code = str(code or "tool_input_validation").strip()
+        self.correction = str(correction or "").strip()
+        self.details = dict(details or {})
+
+
 class ToolDefinition:
     """Metadata and callable for a single tool."""
 
@@ -185,6 +207,22 @@ class ToolRegistry:
             call_args = self._prepare_call_args(tool, arguments, task=task, on_progress=on_progress)
             result = await tool.func(**call_args)
             output = {"result": result, "success": True}
+        except ToolInvocationValidationError as e:
+            logger.warning(
+                "Tool {} rejected model-authored input ({}): {}",
+                name,
+                e.code,
+                e,
+            )
+            output = {
+                "error": str(e),
+                "error_type": "validation_error",
+                "error_code": e.code,
+                "retryable": True,
+                "correction": e.correction,
+                "details": dict(e.details),
+                "success": False,
+            }
         except Exception as e:
             # Loguru has no stdlib-style ``exc_info`` kwarg: extra kwargs are
             # format() arguments, which forces str.format() on the message — an

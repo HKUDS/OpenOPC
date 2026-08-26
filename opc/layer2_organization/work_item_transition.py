@@ -839,6 +839,144 @@ def has_pending_settlement_release(
     return False
 
 
+def _final_delivery_dependency_closure(
+    work_item: DelegationWorkItem | Any,
+    work_items: list[DelegationWorkItem | Any],
+    work_item_by_id: dict[str, DelegationWorkItem | Any],
+) -> list[str] | None:
+    """Return the complete dependency set for a synthetic final delivery.
+
+    Intake creates the delivery card from the children visible at that exact
+    moment. A manager can legitimately add another direct child later (for
+    example, while handling an owner follow-up). The delivery card is a
+    sibling of those children, so merely updating the intake's dependency
+    metadata leaves the delivery runnable against an obsolete snapshot.
+
+    The durable graph is the authority: preserve any dependencies already on
+    the delivery (including children delegated directly from a later delivery
+    turn), then include the intake parent's dependency list and every visible
+    direct sibling. Hidden attention helpers and obsolete manager-deleted
+    cards are not business deliverables and therefore do not gate delivery.
+    """
+
+    metadata = dict(getattr(work_item, "metadata", {}) or {})
+    if _work_item_kind(work_item, metadata) not in {"deliver", "delivery"}:
+        return None
+    intake_work_item_id = str(
+        metadata.get("intake_work_item_id", "") or ""
+    ).strip()
+    if not intake_work_item_id:
+        return None
+    if (
+        str(getattr(work_item, "parent_work_item_id", "") or "").strip()
+        != intake_work_item_id
+    ):
+        return None
+    intake_work_item = work_item_by_id.get(intake_work_item_id)
+    if intake_work_item is None:
+        return None
+
+    current_ids = [
+        str(item).strip()
+        for item in list(metadata.get("dependency_work_item_ids", []) or [])
+        if str(item).strip()
+    ]
+    intake_metadata = dict(getattr(intake_work_item, "metadata", {}) or {})
+    intake_dependency_ids = [
+        str(item).strip()
+        for item in list(
+            intake_metadata.get("dependency_work_item_ids", []) or []
+        )
+        if str(item).strip()
+    ]
+    sibling_ids: list[str] = []
+    delivery_work_item_id = _work_item_id(work_item)
+    for sibling in work_items:
+        sibling_id = _work_item_id(sibling)
+        if not sibling_id or sibling_id == delivery_work_item_id:
+            continue
+        if (
+            str(getattr(sibling, "parent_work_item_id", "") or "").strip()
+            != intake_work_item_id
+        ):
+            continue
+        sibling_metadata = dict(getattr(sibling, "metadata", {}) or {})
+        if (
+            _work_item_kind(sibling, sibling_metadata) in {"deliver", "delivery"}
+            and str(sibling_metadata.get("intake_work_item_id", "") or "").strip()
+            == intake_work_item_id
+        ):
+            continue
+        if bool(sibling_metadata.get("hidden_from_company_kanban", False)):
+            continue
+        if (
+            str(sibling_metadata.get("upstream_visibility", "") or "")
+            .strip()
+            .lower()
+            == "hidden"
+        ):
+            continue
+        if is_prunable_dependency_work_item(sibling):
+            continue
+        sibling_ids.append(sibling_id)
+
+    dependency_ids, _pruned = normalize_dependency_work_item_ids(
+        [*current_ids, *intake_dependency_ids, *sibling_ids],
+        work_item_by_id,
+        owner_work_item_id=delivery_work_item_id,
+    )
+    return dependency_ids
+
+
+def has_final_delivery_dependency_drift(
+    work_item_by_id: dict[str, DelegationWorkItem | Any],
+) -> bool:
+    """Whether a final delivery is stale against its current intake graph."""
+
+    work_items = list(work_item_by_id.values())
+    for work_item in work_items:
+        closure = _final_delivery_dependency_closure(
+            work_item,
+            work_items,
+            work_item_by_id,
+        )
+        if closure is None:
+            continue
+        metadata = dict(getattr(work_item, "metadata", {}) or {})
+        current_ids = [
+            str(item).strip()
+            for item in list(metadata.get("dependency_work_item_ids", []) or [])
+            if str(item).strip()
+        ]
+        if closure != current_ids:
+            return True
+        if list(metadata.get("allowed_delegate_role_ids", []) or []):
+            return True
+        reconciled_at = str(
+            metadata.get("delivery_dependency_reconciled_at", "") or ""
+        ).strip()
+        invalidated_for = str(
+            metadata.get(
+                "delivery_inputs_invalidated_for_reconciled_at", ""
+            )
+            or ""
+        ).strip()
+        delivery_was_closed = bool(
+            metadata.get("feedback_closed", False)
+            or metadata.get("human_review_closed", False)
+            or metadata.get("feedback_superseded", False)
+            or metadata.get("self_evolution_review_completed", False)
+            or not bool(metadata.get("requires_user_feedback", True))
+        )
+        if (
+            reconciled_at
+            and delivery_was_closed
+            and invalidated_for != reconciled_at
+        ):
+            return True
+    return False
+
+
 def _should_enter_synthesis_turn(
     item: DelegationWorkItem,
     metadata: dict[str, Any],
@@ -1025,10 +1163,35 @@ async def _refresh_dependents_for_run(
         **kwargs: Any,
     ) -> tuple[bool, DelegationWorkItem | None]:
         if controller_credential is None:
-            updated = await store.update_delegation_work_item(
-                expected_item.work_item_id,
-                **kwargs,
+            target_phase = kwargs.get("phase")
+            approved_dependency_invalidation = bool(
+                expected_item.phase == Phase.APPROVED
+                and target_phase
+                in {Phase.WAITING_DEPENDENCIES, Phase.READY_FOR_REWORK}
             )
+            if approved_dependency_invalidation:
+                reopen = getattr(
+                    store,
+                    "reopen_approved_delegation_work_item_for_rework",
+                    None,
+                )
+                if not callable(reopen):
+                    raise RuntimeError(
+                        "Store cannot invalidate an approved final delivery"
+                    )
+                updated = await reopen(
+                    expected_item.work_item_id,
+                    target_phase=target_phase,
+                    summary=kwargs.get("summary"),
+                    blocked_reason=kwargs.get("blocked_reason"),
+                    metadata_updates=kwargs.get("metadata_updates"),
+                    release_claim=True,
+                )
+            else:
+                updated = await store.update_delegation_work_item(
+                    expected_item.work_item_id,
+                    **kwargs,
+                )
             # Preserve the historical generic-store contract: lightweight
             # test/admin stores sometimes return None after a successful
             # write. Controller writes, by contrast, require a positive CAS
@@ -1074,6 +1237,17 @@ async def _refresh_dependents_for_run(
                 for item in list(metadata.get("dependency_work_item_ids", []) or [])
                 if str(item).strip()
             ]
+            delivery_dependency_ids = _final_delivery_dependency_closure(
+                work_item,
+                work_items,
+                work_item_by_id,
+            )
+            delivery_dependencies_changed = bool(
+                delivery_dependency_ids is not None
+                and delivery_dependency_ids != raw_dependency_ids
+            )
+            if delivery_dependency_ids is not None:
+                raw_dependency_ids = delivery_dependency_ids
             if not raw_dependency_ids:
                 continue
             dependency_ids, pruned_dependency_ids = normalize_dependency_work_item_ids(
@@ -1096,11 +1270,81 @@ async def _refresh_dependents_for_run(
             settlement_release = False
             target_phase = work_item.phase
             metadata_updates: dict[str, Any] = {}
+            linked_task_metadata_updates: dict[str, Any] = {}
             summary_update: str | None = None
             entered_synthesis_turn = False
-            if dependency_ids != raw_dependency_ids:
+            if delivery_dependencies_changed or dependency_ids != raw_dependency_ids:
                 metadata_updates["dependency_work_item_ids"] = list(dependency_ids)
+            if (
+                delivery_dependency_ids is not None
+                and list(metadata.get("allowed_delegate_role_ids", []) or [])
+            ):
+                metadata_updates["allowed_delegate_role_ids"] = []
+            if dependency_ids != raw_dependency_ids:
                 metadata_updates["dependency_pruned_at"] = datetime.now().isoformat()
+            delivery_reconciled_at = str(
+                metadata.get("delivery_dependency_reconciled_at", "") or ""
+            ).strip()
+            if delivery_dependencies_changed:
+                delivery_reconciled_at = datetime.now().isoformat()
+                metadata_updates["delivery_dependency_reconciled_at"] = (
+                    delivery_reconciled_at
+                )
+            delivery_was_closed = bool(
+                metadata.get("feedback_closed", False)
+                or metadata.get("human_review_closed", False)
+                or metadata.get("feedback_superseded", False)
+                or metadata.get("self_evolution_review_completed", False)
+                or not bool(metadata.get("requires_user_feedback", True))
+            )
+            invalidated_for = str(
+                metadata.get(
+                    "delivery_inputs_invalidated_for_reconciled_at", ""
+                )
+                or ""
+            ).strip()
+            delivery_feedback_is_stale = bool(
+                delivery_dependency_ids is not None
+                and (
+                    delivery_dependencies_changed
+                    or (
+                        delivery_reconciled_at
+                        and delivery_was_closed
+                        and invalidated_for != delivery_reconciled_at
+                    )
+                )
+            )
+            if delivery_feedback_is_stale:
+                invalidated_at = datetime.now().isoformat()
+                try:
+                    next_revision = int(metadata.get("delivery_revision", 0) or 0) + 1
+                except (TypeError, ValueError):
+                    next_revision = 1
+                delivery_reset_updates = {
+                    "review_owner_kind": "human",
+                    "feedback_scope": "final",
+                    "requires_user_feedback": True,
+                    "authoritative_output": True,
+                    "user_visible": True,
+                    "feedback_closed": False,
+                    "feedback_resolved": False,
+                    "human_review_closed": False,
+                    "feedback_superseded": False,
+                    "self_evolution_review_completed": False,
+                    "feedback_closed_at": "",
+                    "feedback_resolution": "",
+                    "human_review_closed_at": "",
+                    "human_review_resolution": "",
+                    "feedback_superseded_at": "",
+                    "self_evolution_review_completed_at": "",
+                    "delivery_revision": next_revision,
+                    "delivery_inputs_invalidated_at": invalidated_at,
+                    "delivery_inputs_invalidated_for_reconciled_at": (
+                        delivery_reconciled_at
+                    ),
+                }
+                metadata_updates.update(delivery_reset_updates)
+                linked_task_metadata_updates.update(delivery_reset_updates)
             if pruned_dependency_ids:
                 previous_pruned = [
                     str(item).strip()
@@ -1242,11 +1486,19 @@ async def _refresh_dependents_for_run(
                     if metadata.get("delegated_children_pending"):
                         metadata_updates["delegated_children_pending"] = False
             else:
-                if work_item.phase == Phase.READY:
+                if work_item.phase == Phase.APPROVED and delivery_feedback_is_stale:
+                    target_phase = Phase.WAITING_DEPENDENCIES
+                elif work_item.phase == Phase.READY:
                     target_phase = Phase.WAITING_DEPENDENCIES
                 elif work_item.phase == Phase.RUNNING:
                     target_phase = Phase.WAITING_FOR_CHILDREN
                 metadata_updates["waiting_on_work_item_ids"] = dependency_ids
+            if (
+                all_approved
+                and work_item.phase == Phase.APPROVED
+                and delivery_feedback_is_stale
+            ):
+                target_phase = Phase.READY_FOR_REWORK
             # Waking a parent out of WAITING_FOR_CHILDREN must orphan it so
             # the dispatcher can re-pick it. For READY targets the store's
             # phase-write invariant releases ownership; only the direct
@@ -1270,6 +1522,24 @@ async def _refresh_dependents_for_run(
                         summary=summary_update,
                         claimed_by_role_runtime_session_id="" if clear_claim_on_wake else None,
                         claimed_by_seat_id="" if clear_claim_on_wake else None,
+                        **(
+                            {
+                                "linked_task_metadata_updates": (
+                                    linked_task_metadata_updates
+                                ),
+                                "allow_approved_dependency_invalidation": (
+                                    work_item.phase == Phase.APPROVED
+                                    and target_phase
+                                    in {
+                                        Phase.WAITING_DEPENDENCIES,
+                                        Phase.READY_FOR_REWORK,
+                                    }
+                                ),
+                            }
+                            if controller_credential is not None
+                            and linked_task_metadata_updates
+                            else {}
+                        ),
                     )
                     changed = changed or did_update
                     if controller_credential is not None and not did_update:

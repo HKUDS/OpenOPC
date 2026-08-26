@@ -118,6 +118,7 @@ _ORG_RUNTIME_KEYS = (
     "talent_templates",
     "teams",
     "team_runtime",
+    "external_team_bindings",
     "installed_packages",
     "role_serial_queue_enabled",
 )
@@ -371,10 +372,19 @@ class ExternalAgentConfig(BaseModel):
     status_heartbeat_seconds: int = 30
     approval_mode: ExternalAgentApprovalMode = "auto"
     show_thinking: bool = False
+    # Optional provider-specific transport/runtime settings.  They are kept
+    # on the shared external-agent model so project-local YAML can configure
+    # Jiuwen without importing Jiuwen/OpenJiuwen into the OpenOPC process.
+    transport: Literal["cli", "gateway"] = "cli"
+    gateway_url: str = ""
+    provider_mode: str = ""
+    project_dir: str = ""
+    trusted_dirs: list[str] = Field(default_factory=list)
+    agent_group_name: str = ""
 
 
 class AgentsConfig(BaseModel):
-    preferred_order: list[str] = Field(default_factory=lambda: ["claude_code", "cursor", "codex", "opencode"])
+    preferred_order: list[str] = Field(default_factory=lambda: ["claude_code", "cursor", "codex", "opencode", "jiuwen", "jiuwenswarm"])
     agents: dict[str, ExternalAgentConfig] = Field(default_factory=lambda: {
         "claude_code": ExternalAgentConfig(command="claude", run_mode="interactive", approval_mode="full-auto"),
         "cursor": ExternalAgentConfig(command="cursor-agent", run_mode="interactive", approval_mode="full-auto"),
@@ -385,6 +395,25 @@ class AgentsConfig(BaseModel):
             run_mode="interactive",
             approval_mode="full-auto",
             show_thinking=True,
+        ),
+        # ``jiuwen`` is a normal single external agent. ``jiuwenswarm`` is an
+        # opaque execution team: OpenOPC owns one Task/WorkItem while Jiuwen
+        # owns every internal teammate and subtask.
+        "jiuwen": ExternalAgentConfig(
+            command="jiuwenswarm",
+            run_mode="interactive",
+            transport="gateway",
+            gateway_url="ws://127.0.0.1:19001/tui",
+            provider_mode="code.normal",
+            interactive_timeout_seconds=21600,
+        ),
+        "jiuwenswarm": ExternalAgentConfig(
+            command="jiuwenswarm",
+            run_mode="interactive",
+            transport="gateway",
+            gateway_url="ws://127.0.0.1:19001/tui",
+            provider_mode="team",
+            interactive_timeout_seconds=21600,
         ),
     })
     native_subagents: dict[str, "NativeSubagentProfileConfig"] = Field(default_factory=dict)
@@ -866,6 +895,48 @@ class TeamRuntimeConfig(BaseModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
+class ExternalTeamBindingConfig(BaseModel):
+    """Bind one organization boundary (optionally its subtree) to one opaque team."""
+
+    binding_id: str = ""
+    boundary_role_id: str
+    external_agent: str = "jiuwenswarm"
+    scope: Literal["role", "subtree"] = "subtree"
+    enabled: bool = True
+    collapse_subtree: bool = True
+    session_scope: Literal["work_item", "company_run"] = "company_run"
+    max_inflight: int = Field(default=1, ge=1)
+    failure_policy: Literal["fail_closed", "fallback_native"] = "fail_closed"
+    review_owner_role_id: str = ""
+    artifact_isolation: Literal["validated_workspace"] = "validated_workspace"
+    provider_mode: str = "team"
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("boundary_role_id")
+    @classmethod
+    def _validate_external_team_boundary(cls, value: str) -> str:
+        normalized = str(value or "").strip()
+        if not normalized:
+            raise ValueError("external team boundary_role_id must not be empty")
+        return normalized
+
+    @field_validator("external_agent")
+    @classmethod
+    def _validate_external_team_agent(cls, value: str) -> str:
+        normalized = str(value or "").strip().lower()
+        if normalized != "jiuwenswarm":
+            raise ValueError("opaque external team bindings require external_agent=jiuwenswarm")
+        return normalized
+
+    @field_validator("provider_mode")
+    @classmethod
+    def _validate_external_team_provider_mode(cls, value: str) -> str:
+        normalized = str(value or "team").strip().lower() or "team"
+        if "team" not in normalized.split("."):
+            raise ValueError("opaque external team bindings require a Jiuwen team provider_mode")
+        return normalized
+
+
 class OrgConfig(BaseModel):
     organization_id: str = DEFAULT_ORGANIZATION_ID
     organization_name: str = "My One-Person Company"
@@ -883,6 +954,7 @@ class OrgConfig(BaseModel):
     employees: list[EmployeeConfig] = Field(default_factory=list)
     teams: list[TeamConfig] = Field(default_factory=list)
     team_runtime: TeamRuntimeConfig = Field(default_factory=TeamRuntimeConfig)
+    external_team_bindings: list[ExternalTeamBindingConfig] = Field(default_factory=list)
     escalation_rules: list[EscalationRule] = Field(default_factory=list)
     installed_packages: list[Any] = Field(default_factory=list)
     # Fix 5 PR3 feature flag. When ON, runnable work items for a role
@@ -1291,6 +1363,7 @@ def build_company_org_payload_from_config(
         "talent_templates": [],
         "teams": [team.model_dump() for team in org.teams],
         "team_runtime": org.team_runtime.model_dump(),
+        "external_team_bindings": [binding.model_dump() for binding in org.external_team_bindings],
         "installed_packages": _dump_config_list(org.installed_packages),
         "role_serial_queue_enabled": bool(org.role_serial_queue_enabled),
         "metadata": {
@@ -1429,6 +1502,7 @@ def _legacy_company_org_payload(config_dir: Path) -> dict[str, Any]:
         "talent_templates": [],
         "teams": org_runtime_data.get("teams") or [],
         "team_runtime": org_runtime_data.get("team_runtime") or {},
+        "external_team_bindings": org_runtime_data.get("external_team_bindings") or [],
         "installed_packages": org_runtime_data.get("installed_packages") or [],
         "role_serial_queue_enabled": bool(org_runtime_data.get("role_serial_queue_enabled", True)),
         "metadata": {"source": "legacy_migration"},
@@ -1466,6 +1540,7 @@ def _normalize_corporate_company_org_payload(data: dict[str, Any]) -> dict[str, 
     payload["talent_templates"] = []
     payload.setdefault("teams", [])
     payload.setdefault("team_runtime", {})
+    payload.setdefault("external_team_bindings", [])
     payload.setdefault("installed_packages", [])
     payload.setdefault("role_serial_queue_enabled", True)
     payload.setdefault("metadata", {})

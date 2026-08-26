@@ -21,6 +21,7 @@ from opc.core.active_task_runs import (
     ActiveTaskRunAdmissionClosed,
     ActiveTaskRunRegistry,
 )
+from opc.core.company_controller import CompanyRunControllerLeaseLost
 from opc.core.config import (
     OPCConfig,
     get_project_workplace,
@@ -1040,6 +1041,10 @@ class WSHandler:
                     pass
                 elif msg.type == 8:  # ERROR
                     logger.warning(f"WS error: {ws.exception()}")
+        except asyncio.CancelledError:
+            if not self._shutting_down:
+                logger.warning("WS connection task cancelled unexpectedly")
+            raise
         except Exception as e:
             if self._is_expected_shutdown_error(e) or self._is_ws_disconnect_error(e):
                 logger.debug(f"WS handler closed during disconnect/shutdown: {type(e).__name__}: {e!r}")
@@ -1555,6 +1560,26 @@ class WSHandler:
         payload = self._enrich_runtime_progress_payload(payload, engine=runtime_engine)
         runtime_type = str(payload.get("type", "") or "").strip()
         raw_task_id = str(payload.get("task_id", "") or "").strip()
+        if runtime_type == "external_team_bindings_changed":
+            # Staffing changes the executable roster, not the source org
+            # architecture. Rebuild the visual projection immediately so
+            # covered provider-internal roles do not linger until reconnect.
+            snapshot = await build_snapshot(
+                runtime_engine,
+                self.agent_store,
+                self.chat_store,
+                self.event_adapter,
+            )
+            snapshot["project_id"] = pid
+            snapshot["exec_mode"] = "company"
+            snapshot["company_profile"] = str(
+                getattr(getattr(runtime_engine, "config", None), "org", None).company_profile
+                if getattr(getattr(runtime_engine, "config", None), "org", None) is not None
+                else self._company_profile
+            )
+            snapshot["task_preferred_agent"] = self._task_preferred_agent
+            await self.broadcast({"type": "snapshot", "payload": snapshot})
+            return
         if runtime_type == "interaction_checkpoint_changed":
             cards: list[dict[str, Any]] = []
             changed_checkpoint_id = str(payload.get("checkpoint_id", "") or "").strip()
@@ -2105,7 +2130,7 @@ class WSHandler:
                 parts = header.split(":")
                 agent = parts[1] if len(parts) > 1 else "external"
                 stream = parts[2] if len(parts) > 2 else ""
-                if stream == "thinking":
+                if stream in {"thinking", "thinking_snapshot"}:
                     thinking_summary = detail[:120] if detail else f"{agent} thinking"
                     if len(detail) > 120:
                         thinking_summary = thinking_summary.rstrip() + "..."
@@ -3071,6 +3096,23 @@ class WSHandler:
                         await handler(self, ws, data)
                 else:
                     await handler(self, ws, data)
+            except CompanyRunControllerLeaseLost as e:
+                # Lease loss is implemented as a CancelledError subclass so it
+                # can stop stale Company execution coroutines immediately.  At
+                # the WebSocket request boundary it is a domain rejection, not
+                # cancellation of the connection itself.
+                logger.warning(f"WS request lost Company controller lease for {msg_type}: {e}")
+                try:
+                    await self._send_ack(
+                        ws,
+                        ok=False,
+                        error=str(e) or "company_controller_lease_lost",
+                        action=msg_type,
+                    )
+                except Exception:
+                    pass
+            except asyncio.CancelledError:
+                raise
             except Exception as e:
                 if self._is_ws_disconnect_error(e) or self._is_expected_shutdown_error(e):
                     logger.debug(
@@ -4779,7 +4821,14 @@ class WSHandler:
                     )
             content = f"{title}\n{description}".strip()
             engine_mode, company_profile = self._resolve_engine_mode(mode, profile)
-            engine_preferred_agent = preferred_agent if engine_mode == "project" else None
+            # The Company router uses this preference to seed staffing.  A
+            # JiuwenSwarm Team choice must therefore cross the same ingress
+            # boundary as a Task-mode external-agent choice.
+            engine_preferred_agent = (
+                preferred_agent
+                if engine_mode == "project" or preferred_agent != "native"
+                else None
+            )
             if task_id:
                 # Per-task lock: same session serialized, different sessions concurrent
                 async with self._get_task_lock(task_id):
@@ -6584,6 +6633,15 @@ class WSHandler:
                     "This company runtime checkpoint is no longer active. Refresh before retrying.",
                 )
             return False
+        checkpoint_type = str(
+            getattr(checkpoint, "checkpoint_type", "") or ""
+        ).strip()
+        if checkpoint_type not in COMPANY_RUNTIME_CHECKPOINT_TYPES:
+            # This router owns only Stop/Continue runtime handoffs.  A completed
+            # delivery-feedback (or any other ordinary interaction) may remain
+            # the latest durable checkpoint after the company run ends; it must
+            # not capture and reject the next normal conversation turn.
+            return False
         checkpoint_status = str(
             getattr(checkpoint, "status", "") or ""
         ).strip().lower()
@@ -6703,6 +6761,11 @@ class WSHandler:
                 self._session_to_task[runtime_session_id] = (
                     execution_anchor_task_id or ui_task_id
                 )
+                resolved_preferred_agent = (
+                    self._resolve_task_preferred_agent(config_task)
+                    if config_task is not None
+                    else self._task_preferred_agent
+                )
                 await run_engine.process_message(
                     content,
                     project_id=pid,
@@ -6710,7 +6773,11 @@ class WSHandler:
                     mode=engine_mode,
                     org_id=session_org_id or None,
                     company_profile=company_profile,
-                    preferred_agent=None,
+                    preferred_agent=(
+                        resolved_preferred_agent
+                        if resolved_preferred_agent != "native"
+                        else None
+                    ),
                     origin_task_id=execution_anchor_task_id or None,
                     attachment_refs=attachment_refs,
                     message_metadata=engine_message_metadata or None,
@@ -7153,7 +7220,11 @@ class WSHandler:
                     session_exec_mode,
                     session_company_profile,
                 )
-                engine_preferred_agent = session_preferred_agent if session_exec_mode == "task" else None
+                engine_preferred_agent = (
+                    session_preferred_agent
+                    if session_exec_mode == "task" or session_preferred_agent != "native"
+                    else None
+                )
                 engine_message_metadata = dict(message_metadata or {})
                 engine_message_metadata.update(_ui_message_identity_metadata(
                     message_id=user_message_id,
@@ -7391,7 +7462,7 @@ class WSHandler:
         if checkpoint_type == "company_work_item_gate":
             return self._build_company_work_item_gate_meta(checkpoint)
         if checkpoint_type == "company_staffing_selection":
-            return self._build_staffing_selection_meta(checkpoint)
+            return self._build_staffing_selection_meta(checkpoint, engine=engine)
         if checkpoint_type == "company_recruitment_confirmation":
             return self._build_recruitment_meta(checkpoint, engine=engine)
         if checkpoint_type == "company_reorg_pending":
@@ -7836,6 +7907,13 @@ class WSHandler:
         employee_payloads: list[dict[str, Any]] = []
         template_payloads: list[dict[str, Any]] = []
         org_engine = getattr(runtime_engine, "org_engine", None)
+        reports_to_by_role = {
+            str(getattr(agent, "role_id", "") or "").strip(): str(
+                getattr(agent, "reports_to", "") or ""
+            ).strip()
+            for agent in (org_engine.list_agents() if org_engine else [])
+            if str(getattr(agent, "role_id", "") or "").strip()
+        }
         talent_market = getattr(runtime_engine, "talent_market", None)
         is_placeholder = getattr(runtime_engine, "_is_placeholder_staffing_employee", lambda _employee: False)
         employee_payload = getattr(runtime_engine, "_staffing_employee_payload", None)
@@ -7974,6 +8052,7 @@ class WSHandler:
                         "role_id": role_id,
                         "role_label": role_label,
                         "role_responsibility": "",
+                        "reports_to": reports_to_by_role.get(role_id, ""),
                         "default_selection": default_selection,
                         "same_role_employee_ids": sorted(same_role_ids),
                         "fallback_available": True,
@@ -8019,9 +8098,23 @@ class WSHandler:
             "staffing_selections": staffing_selections,
         }
 
-    def _build_staffing_selection_meta(self, cp: Any) -> dict[str, Any]:
+    def _build_staffing_selection_meta(
+        self,
+        cp: Any,
+        *,
+        engine: Any | None = None,
+    ) -> dict[str, Any]:
         """Extract manual staffing data into frontend-friendly metadata."""
         payload = dict(cp.payload or {})
+        runtime_engine = engine or self.engine
+        org_engine = getattr(runtime_engine, "org_engine", None)
+        reports_to_by_role = {
+            str(getattr(agent, "role_id", "") or "").strip(): str(
+                getattr(agent, "reports_to", "") or ""
+            ).strip()
+            for agent in (org_engine.list_agents() if org_engine else [])
+            if str(getattr(agent, "role_id", "") or "").strip()
+        }
         raw_role_agents = payload.get("recruitment_role_agents")
         payload_role_agents = raw_role_agents if isinstance(raw_role_agents, dict) else {}
         recruitment_agent = self._normalize_session_preferred_agent(
@@ -8041,6 +8134,9 @@ class WSHandler:
             )
             if role_id:
                 role["selected_agent"] = selected_agent
+                role["reports_to"] = str(
+                    role.get("reports_to") or reports_to_by_role.get(role_id, "")
+                ).strip()
                 recruitment_role_agents[role_id] = selected_agent
             staffing_roles.append(role)
         return {
@@ -9014,6 +9110,50 @@ class WSHandler:
             logger.warning(f"Failed to update role: {exc}")
             await self._send_ack(ws, ok=False, error=str(exc))
 
+    async def _handle_bind_external_team(self, ws: Any, data: dict) -> None:
+        """Bind a role boundary (and optionally its subtree) to JiuwenSwarm."""
+        try:
+            result = await self._ensure_office_services().org.bind_external_team(data)
+            await self._publish_service_result(result)
+            binding = dict(result.payload.get("binding", {}) or {})
+            await self._send_ack(
+                ws,
+                ok=True,
+                action="external_team_bound",
+                binding_id=binding.get("binding_id"),
+                boundary_role_id=binding.get("boundary_role_id"),
+            )
+            await self._broadcast_org_info()
+        except ServiceError as exc:
+            await self._send_service_error(ws, exc, action="bind_external_team")
+        except Exception as exc:
+            logger.warning(f"Failed to bind external team: {exc}")
+            await self._send_ack(ws, ok=False, action="bind_external_team", error=str(exc))
+
+    async def _handle_unbind_external_team(self, ws: Any, data: dict) -> None:
+        """Remove an opaque external-team binding from an org boundary."""
+        try:
+            token = str(
+                data.get("binding_id") or data.get("boundary_role_id") or ""
+            ).strip()
+            result = await self._ensure_office_services().org.unbind_external_team(
+                token,
+                organization_id=str(data.get("organization_id", "") or "").strip() or None,
+            )
+            await self._publish_service_result(result)
+            await self._send_ack(
+                ws,
+                ok=True,
+                action="external_team_unbound",
+                binding=token,
+            )
+            await self._broadcast_org_info()
+        except ServiceError as exc:
+            await self._send_service_error(ws, exc, action="unbind_external_team")
+        except Exception as exc:
+            logger.warning(f"Failed to unbind external team: {exc}")
+            await self._send_ack(ws, ok=False, action="unbind_external_team", error=str(exc))
+
     async def _handle_update_org_strategy(self, ws: Any, data: dict) -> None:
         try:
             result = await self._ensure_office_services().org.update_org_strategy(
@@ -9144,6 +9284,8 @@ class WSHandler:
         "bulk_add_roles":      _handle_bulk_add_roles,
         "add_role":            _handle_add_role,
         "update_role":         _handle_update_role,
+        "bind_external_team":  _handle_bind_external_team,
+        "unbind_external_team": _handle_unbind_external_team,
         "update_org_strategy": _handle_update_org_strategy,
         "delete_role":         _handle_delete_role,
         "update_runtime_policy": _handle_update_runtime_policy,

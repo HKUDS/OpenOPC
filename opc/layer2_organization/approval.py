@@ -42,6 +42,7 @@ from opc.layer4_tools.opaque_execution import (
     OpaqueExecutionEnvelopeError,
     build_company_opaque_execution_plan,
     company_opaque_execution_identity,
+    company_workspace_read_only_shell_decision,
     exact_tool_call_fingerprint,
     opaque_envelope_display,
 )
@@ -380,6 +381,12 @@ class ApprovalEngine:
                 "Company Python execution is opaque and requires exact "
                 "one-shot human approval for this ToolCall."
             )
+        read_only, _ = company_workspace_read_only_shell_decision(
+            task,
+            dict(metadata.get("arguments", {}) or {}),
+        )
+        if read_only:
+            return ""
         return (
             "Company shell execution requires exact one-shot human approval "
             "for its frozen launch envelope."

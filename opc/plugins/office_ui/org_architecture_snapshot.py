@@ -18,6 +18,7 @@ _RUNTIME_KEYS = (
     "talent_templates",
     "teams",
     "team_runtime",
+    "external_team_bindings",
     "installed_packages",
     "role_serial_queue_enabled",
 )
@@ -72,6 +73,7 @@ def build_active_org_runtime_payload(config: OPCConfig) -> dict[str, Any]:
         "talent_templates": [],
         "teams": [team.model_dump() for team in config.org.teams],
         "team_runtime": config.org.team_runtime.model_dump(),
+        "external_team_bindings": [binding.model_dump() for binding in config.org.external_team_bindings],
         "installed_packages": _dump_list(config.org.installed_packages),
         "runtime_policies": _runtime_policy_payload(config),
         "role_serial_queue_enabled": bool(config.org.role_serial_queue_enabled),
@@ -163,6 +165,7 @@ def apply_org_architecture_snapshot(
         merged_org["talent_templates"] = []
         merged_org["teams"] = snapshot.get("teams") or []
         merged_org["team_runtime"] = snapshot.get("team_runtime") or {}
+        merged_org["external_team_bindings"] = snapshot.get("external_team_bindings") or []
         merged_org["installed_packages"] = snapshot.get("installed_packages") or []
         merged_org["role_serial_queue_enabled"] = bool(
             snapshot.get("role_serial_queue_enabled", True),

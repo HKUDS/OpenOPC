@@ -41,7 +41,12 @@ roles:
     signal_capabilities: []
     parallelism_constraints: []
     gate_preferences: {}
-  capabilities: []
+  capabilities:
+  - strategic_planning
+  - work_delegation
+  - cross_team_coordination
+  - final_synthesis
+  - delivery_review
   role_type: worker
   coordinator_policy: null
 - id: cto
@@ -72,7 +77,13 @@ roles:
     signal_capabilities: []
     parallelism_constraints: []
     gate_preferences: {}
-  capabilities: []
+  capabilities:
+  - technical_planning
+  - architecture_design
+  - technical_research
+  - engineering_oversight
+  - code_review
+  - research_synthesis
   role_type: worker
   coordinator_policy: null
 - id: cmo
@@ -102,7 +113,14 @@ roles:
     signal_capabilities: []
     parallelism_constraints: []
     gate_preferences: {}
-  capabilities: []
+  capabilities:
+  - market_research
+  - industry_analysis
+  - marketing_strategy
+  - content_strategy
+  - user_research
+  - brand_strategy
+  - research_synthesis
   role_type: worker
   coordinator_policy: null
 - id: coo
@@ -133,7 +151,13 @@ roles:
     signal_capabilities: []
     parallelism_constraints: []
     gate_preferences: {}
-  capabilities: []
+  capabilities:
+  - operational_planning
+  - cross_team_coordination
+  - quality_assurance
+  - source_acquisition
+  - compliance_review
+  - research_synthesis
   role_type: worker
   coordinator_policy: null
 - id: acquisition_specialist
@@ -165,7 +189,11 @@ roles:
     signal_capabilities: []
     parallelism_constraints: []
     gate_preferences: {}
-  capabilities: []
+  capabilities:
+  - source_discovery
+  - source_verification
+  - data_acquisition
+  - workspace_preparation
   role_type: worker
   coordinator_policy: null
 - id: senior_engineer
@@ -193,7 +221,11 @@ roles:
     signal_capabilities: []
     parallelism_constraints: []
     gate_preferences: {}
-  capabilities: []
+  capabilities:
+  - software_implementation
+  - system_development
+  - technical_execution
+  - testing
   role_type: worker
   coordinator_policy: null
 - id: devops_engineer
@@ -221,7 +253,12 @@ roles:
     signal_capabilities: []
     parallelism_constraints: []
     gate_preferences: {}
-  capabilities: []
+  capabilities:
+  - infrastructure_engineering
+  - ci_cd
+  - deployment
+  - monitoring
+  - operational_hardening
   role_type: worker
   coordinator_policy: null
 - id: content_specialist
@@ -249,7 +286,11 @@ roles:
     signal_capabilities: []
     parallelism_constraints: []
     gate_preferences: {}
-  capabilities: []
+  capabilities:
+  - documentation
+  - copywriting
+  - presentation_design
+  - user_facing_writing
   role_type: worker
   coordinator_policy: null
 - id: designer
@@ -277,7 +318,11 @@ roles:
     signal_capabilities: []
     parallelism_constraints: []
     gate_preferences: {}
-  capabilities: []
+  capabilities:
+  - visual_design
+  - ux_design
+  - wireframing
+  - design_systems
   role_type: worker
   coordinator_policy: null
 - id: qa_analyst
@@ -305,7 +350,12 @@ roles:
     signal_capabilities: []
     parallelism_constraints: []
     gate_preferences: {}
-  capabilities: []
+  capabilities:
+  - testing
+  - security_review
+  - compliance_review
+  - acceptance_validation
+  - quality_assurance
   role_type: worker
   coordinator_policy: null
 - id: env_engineer
@@ -350,7 +400,12 @@ roles:
     signal_capabilities: []
     parallelism_constraints: []
     gate_preferences: {}
-  capabilities: []
+  capabilities:
+  - environment_probing
+  - dependency_installation
+  - workspace_preparation
+  - runtime_configuration
+  - environment_verification
   role_type: worker
   coordinator_policy: null
 employees: []
@@ -435,6 +490,7 @@ team_runtime:
   allow_shared_role_sessions: true
   seat_refresh_interval_seconds: 30
   metadata: {}
+external_team_bindings: []
 installed_packages: []
 role_serial_queue_enabled: true
 metadata:

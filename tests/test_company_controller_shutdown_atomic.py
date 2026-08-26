@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 from datetime import datetime, timedelta
 from functools import wraps
 from pathlib import Path
@@ -73,6 +74,51 @@ def _runtime_plan() -> CompanyWorkItemRuntimePlan:
         ],
         metadata={"execution_model": "multi_team_org"},
     )
+
+
+@_async_test
+async def test_project_store_survives_secondary_connection_close_during_controller_lease(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "tasks.db"
+    store = OPCStore(db_path)
+    await store.initialize()
+    try:
+        await store.save_delegation_run(
+            DelegationRun(
+                run_id="run-journal-safety",
+                project_id="project-a",
+                session_id="root-session",
+                status="running",
+            )
+        )
+        receipt = await store.acquire_delegation_run_controller_lease(
+            "run-journal-safety",
+            project_id="project-a",
+            root_session_id="root-session",
+            owner_token="controller-a",
+            lease_seconds=30.0,
+        )
+        assert receipt.outcome == "acquired"
+
+        secondary = sqlite3.connect(db_path)
+        try:
+            assert secondary.execute("PRAGMA journal_mode").fetchone()[0] == "delete"
+            assert secondary.execute("SELECT COUNT(*) FROM delegation_runs").fetchone()[0] == 1
+        finally:
+            secondary.close()
+
+        assert not Path(f"{db_path}-shm").exists()
+        assert store.renew_delegation_run_controller_lease_sync(
+            "run-journal-safety",
+            project_id="project-a",
+            root_session_id="root-session",
+            owner_token="controller-a",
+            generation=receipt.generation,
+            lease_seconds=30.0,
+        )
+    finally:
+        await store.close()
 
 
 async def _seed_owned_scope(

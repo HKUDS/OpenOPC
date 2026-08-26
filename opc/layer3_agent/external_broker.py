@@ -52,6 +52,12 @@ from opc.layer3_agent.skill_installer import (
     opc_collab_executable,
     prepend_to_path,
 )
+from opc.layer3_agent.company_workspace_fence import (
+    CompanyWorkspaceFenceError,
+    capture_company_workspace,
+    company_external_fence_enabled,
+    validate_company_workspace,
+)
 from opc.layer5_memory.markdown_memory import MarkdownMemoryStore
 from opc.layer4_tools.collaboration_rpc import (
     OPC_COLLAB_RPC_HOST,
@@ -108,6 +114,7 @@ class ExternalAgentBroker:
         self.task_preparer = task_preparer
         self.communication = communication
         self.org_engine = org_engine
+        self._external_execution_limiters: dict[tuple[str, int], asyncio.Semaphore] = {}
 
     async def _company_native_launch_required(
         self,
@@ -148,6 +155,68 @@ class ExternalAgentBroker:
     @staticmethod
     def _normalize_external_agent_choice(value: Any) -> str:
         return re.sub(r"[\s\-]+", "_", str(value or "").strip()).strip("_").lower()
+
+    @staticmethod
+    def _external_role_resume_session_id(task: Task) -> str:
+        """Return the role-level provider session key when policy allows it."""
+
+        metadata = dict(task.metadata or {})
+        if str(metadata.get("external_session_scope") or "").strip() == "work_item":
+            return ""
+        return str(metadata.get("delegation_role_session_id") or "").strip()
+
+    @staticmethod
+    def _external_work_item_resume_session_id(task: Task) -> str:
+        metadata = dict(task.metadata or {})
+        if str(metadata.get("external_session_scope") or "").strip() != "work_item":
+            return ""
+        work_item_id = str(
+            linked_work_item_id_for_task(task)
+            or metadata.get("work_item_id")
+            or ""
+        ).strip()
+        if not work_item_id:
+            return ""
+        project_id = str(task.project_id or "default").strip() or "default"
+        return f"external-work-item::{project_id}::{work_item_id}"
+
+    @classmethod
+    def _external_resume_scope_id(cls, task: Task) -> str:
+        return str(
+            cls._external_work_item_resume_session_id(task)
+            or cls._external_role_resume_session_id(task)
+            or task_session_scope_id(task)
+        ).strip()
+
+    def _external_execution_limiter(
+        self,
+        task: Task,
+    ) -> tuple[asyncio.Semaphore | None, str, int]:
+        metadata = dict(task.metadata or {})
+        binding = dict(metadata.get("external_team_binding", {}) or {})
+        if str(metadata.get("execution_unit_kind") or "").strip() != "opaque_external_team":
+            return None, "", 0
+        limit = max(1, int(metadata.get("external_max_inflight") or binding.get("max_inflight") or 1))
+        binding_id = str(
+            binding.get("binding_id")
+            or metadata.get("external_team_binding_id")
+            or metadata.get("work_item_role_id")
+            or task.assigned_to
+            or "jiuwenswarm"
+        ).strip()
+        limiter_key = "::".join(
+            (
+                str(task.project_id or "default").strip() or "default",
+                str(task.org_id or metadata.get("organization_id") or "default").strip() or "default",
+                binding_id,
+            )
+        )
+        storage_key = (limiter_key, limit)
+        limiter = self._external_execution_limiters.get(storage_key)
+        if limiter is None:
+            limiter = asyncio.Semaphore(limit)
+            self._external_execution_limiters[storage_key] = limiter
+        return limiter, limiter_key, limit
 
     async def _best_resume_external_session(
         self,
@@ -498,19 +567,20 @@ class ExternalAgentBroker:
             await self._persist_session(adapter, task, workspace_path, result.artifacts or {}, result)
             return result
 
-        if mode == "interactive" and adapter.supports_interactive():
-            result = await self._run_interactive(
-                adapter,
-                task,
-                agent_task,
-                workspace_path,
-                cmd,
-                metadata,
-                on_progress,
-            )
-        elif mode == "interactive":
-            metadata["interactive_fallback"] = True
-            result = await self._run_monitored_process(
+        async def launch_authorized_process() -> TaskResult:
+            if mode == "interactive" and adapter.supports_interactive():
+                return await self._run_interactive(
+                    adapter,
+                    task,
+                    agent_task,
+                    workspace_path,
+                    cmd,
+                    metadata,
+                    on_progress,
+                )
+            if mode == "interactive":
+                metadata["interactive_fallback"] = True
+            return await self._run_monitored_process(
                 adapter=adapter,
                 task=task,
                 launch_task=agent_task,
@@ -520,17 +590,20 @@ class ExternalAgentBroker:
                 on_progress=on_progress,
                 allow_prompt_handling=True,
             )
+
+        limiter, limiter_key, concurrency_limit = self._external_execution_limiter(task)
+        if limiter is not None:
+            metadata["external_concurrency_key"] = limiter_key
+            metadata["external_concurrency_limit"] = concurrency_limit
+            if limiter.locked() and on_progress:
+                await on_progress(
+                    f"[External:{adapter.agent_type}:queued] waiting for team capacity "
+                    f"({concurrency_limit})"
+                )
+            async with limiter:
+                result = await launch_authorized_process()
         else:
-            result = await self._run_monitored_process(
-                adapter=adapter,
-                task=task,
-                launch_task=agent_task,
-                workspace_path=workspace_path,
-                cmd=cmd,
-                metadata=metadata,
-                on_progress=on_progress,
-                allow_prompt_handling=True,
-            )
+            result = await launch_authorized_process()
 
         artifacts = {**metadata, **(result.artifacts or {})}
         result.artifacts = artifacts
@@ -587,9 +660,9 @@ class ExternalAgentBroker:
         # role (e.g. CMO's delegate turn and her review-of-designer turn
         # share the same codex session). Fall back to task.id for
         # non-company-mode tasks that have no role_session_id.
-        role_session_id = str(
-            (task.metadata or {}).get("delegation_role_session_id", "") or ""
-        ).strip()
+        role_session_id = self._external_role_resume_session_id(task)
+        work_item_session_id = self._external_work_item_resume_session_id(task)
+        resume_lookup_session_id = work_item_session_id or role_session_id
 
         # Fix 5 PR6: canonical source is ``role_runtime_session.adapter_session_state[agent_type]``.
         # Check it first; the ExternalSession table is a compatibility
@@ -673,19 +746,20 @@ class ExternalAgentBroker:
             prior = await self._best_resume_external_session(
                 adapter=adapter,
                 task=task,
-                role_session_id=role_session_id,
+                role_session_id=resume_lookup_session_id,
             )
-            if role_session_id:
+            if resume_lookup_session_id:
                 if prior is None:
                     try:
                         prior = await store.get_external_session(
                             adapter.agent_type,
                             project_id,
-                            opc_session_id=role_session_id,
+                            opc_session_id=resume_lookup_session_id,
                         )
                     except Exception:
                         logger.opt(exception=True).debug(
-                            f"External resume restore: get_external_session by role failed for {adapter.agent_type}/{role_session_id}",
+                            "External resume restore: get_external_session by scope failed "
+                            f"for {adapter.agent_type}/{resume_lookup_session_id}",
                         )
                         prior = None
             if prior is None:
@@ -730,7 +804,7 @@ class ExternalAgentBroker:
         if session_token:
             task.metadata = dict(task.metadata)
             task.metadata["external_resume_session_id"] = session_token
-            task.metadata["external_resume_session_scope_id"] = task_session_scope_id(task)
+            task.metadata["external_resume_session_scope_id"] = self._external_resume_scope_id(task)
             task.metadata["external_resume_agent_type"] = adapter.agent_type
 
         if on_progress:
@@ -772,7 +846,7 @@ class ExternalAgentBroker:
         task.metadata = dict(task.metadata or {})
         task.metadata["external_resume_session_id"] = token
         task.metadata["external_resume_agent_type"] = adapter.agent_type
-        task.metadata["external_resume_session_scope_id"] = task_session_scope_id(task)
+        task.metadata["external_resume_session_scope_id"] = self._external_resume_scope_id(task)
         discovered_at = datetime.now().isoformat()
         await self._save_runtime_session(
             adapter=adapter,
@@ -788,9 +862,7 @@ class ExternalAgentBroker:
                 "provider_session_discovered_at": discovered_at,
             },
         )
-        role_session_id = str(
-            task.metadata.get("delegation_role_session_id", "") or ""
-        ).strip()
+        role_session_id = self._external_role_resume_session_id(task)
         update_role_state = getattr(
             self.store,
             "update_role_session_adapter_state",
@@ -812,6 +884,20 @@ class ExternalAgentBroker:
                         "source": "provider_stream",
                         "status": "working",
                     },
+                    controller_owner_token=str(
+                        (task.metadata or {}).get(
+                            "company_run_controller_owner_token",
+                            "",
+                        )
+                        or ""
+                    ).strip(),
+                    controller_lease_generation=int(
+                        (task.metadata or {}).get(
+                            "company_run_controller_lease_generation",
+                            0,
+                        )
+                        or 0
+                    ),
                 )
             except Exception:
                 logger.opt(exception=True).debug(
@@ -914,6 +1000,36 @@ class ExternalAgentBroker:
             # collaboration tools such as manager_board_read consume WorkItem
             # IDs only.
             comms_env["OPC_WORK_ITEM_ID"] = current_work_item_id
+        company_workspace_snapshot = None
+        if company_external_fence_enabled(task):
+            try:
+                company_workspace_snapshot = await asyncio.to_thread(
+                    capture_company_workspace,
+                    workspace_path,
+                )
+                metadata["company_workspace_fence"] = {
+                    "type": str(
+                        task.metadata.get("external_company_execution_fence")
+                        or "validated_workspace"
+                    ),
+                    "workspace": str(company_workspace_snapshot.root),
+                    "captured": True,
+                }
+            except CompanyWorkspaceFenceError as exc:
+                if collab_rpc_server is not None:
+                    await collab_rpc_server.close()
+                return TaskResult(
+                    status=TaskStatus.FAILED,
+                    content=f"Company external workspace preflight failed: {exc}",
+                    artifacts={
+                        **metadata,
+                        "company_workspace_fence": {
+                            "captured": False,
+                            "validated": False,
+                            "error": str(exc),
+                        },
+                    },
+                )
         # Install the ``opc-collab`` skill + CLI shim into the agent's
         # isolated home, then wire the agent to it. Adapters that opt
         # into the skill path (return an ``agent_isolation_home_slug``)
@@ -1048,6 +1164,17 @@ class ExternalAgentBroker:
         hard_timeout_seconds, idle_timeout_seconds, startup_timeout_seconds = self._resolve_timeout_settings(adapter, task)
         heartbeat_seconds = max(1, int(adapter.config.status_heartbeat_seconds))
         loop = asyncio.get_running_loop()
+        configured_provider_session_id = str(
+            metadata.get("provider_session_id")
+            or metadata.get("resume_session_id")
+            or ""
+        ).strip()
+        if not is_provider_session_token(
+            configured_provider_session_id,
+            agent_type=adapter.agent_type,
+            project_id=str(task.project_id or "default").strip() or "default",
+        ):
+            configured_provider_session_id = ""
         state: dict[str, Any] = {
             "status": "starting",
             "last_activity_monotonic": loop.time(),
@@ -1061,7 +1188,15 @@ class ExternalAgentBroker:
             "timeout_reason": "",
             "fatal_reason": "",
             "process_cleanup": {},
-            "provider_session_id": "",
+            # Some transports, including the Jiuwen Gateway bridge, allocate
+            # their resumable provider session before launch. Treat that token
+            # as already discovered: otherwise the first stdout frame
+            # synchronously re-persists the same token before it can count as
+            # activity. A contended company-store write can then stall the
+            # stream consumer long enough for the independent startup watcher
+            # to report a false "no observable output/activity" timeout even
+            # while the provider is actively streaming.
+            "provider_session_id": configured_provider_session_id,
         }
         provider_session_lock = asyncio.Lock()
         stream_line_counts: dict[str, int] = {}
@@ -1091,6 +1226,42 @@ class ExternalAgentBroker:
                 f"(startup timeout {startup_timeout_seconds}s, idle timeout {idle_timeout_seconds}s, hard timeout {hard_timeout_seconds}s)"
             )
 
+        # Stream reads must never wait for SQLite. Company-mode work-item
+        # transitions and external-session observability share the project
+        # store, so a controller transaction can legitimately delay a save.
+        # Waiting here used to stop draining the provider pipe, hide Jiuwen's
+        # live events, and eventually produce a false startup timeout even
+        # though the gateway was actively streaming. Keep one ordered writer
+        # per subprocess so persistence remains serialized without sitting on
+        # the provider's read/progress path.
+        stream_persistence_queue: asyncio.Queue[
+            tuple[str, dict[str, Any]] | None
+        ] = asyncio.Queue()
+
+        async def _persist_stream_events() -> None:
+            while True:
+                queued = await stream_persistence_queue.get()
+                try:
+                    if queued is None:
+                        return
+                    kind, payload = queued
+                    if kind == "provider_session":
+                        await self._persist_discovered_provider_session(**payload)
+                    elif kind == "runtime_session":
+                        await self._save_runtime_session(**payload)
+                    elif kind == "transcript":
+                        await self._save_runtime_transcript_entry(**payload)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.opt(exception=True).debug(
+                        "ExternalAgentBroker: deferred stream persistence failed"
+                    )
+                finally:
+                    stream_persistence_queue.task_done()
+
+        stream_persistence_task = asyncio.create_task(_persist_stream_events())
+
         async def _consume(stream: asyncio.StreamReader | None, sink: list[str], stream_name: str) -> None:
             if stream is None:
                 return
@@ -1114,27 +1285,34 @@ class ExternalAgentBroker:
                     if discovered_provider_session_id:
                         async with provider_session_lock:
                             if not state["provider_session_id"]:
-                                persisted = await self._persist_discovered_provider_session(
-                                    adapter=adapter,
-                                    task=task,
-                                    workspace_path=workspace_path,
-                                    runtime_session_id=session_id,
-                                    metadata=metadata,
-                                    provider_session_id=discovered_provider_session_id,
-                                    status="working",
-                                    extra={
-                                        "pid": proc.pid,
-                                        "started_at": started_at.isoformat(),
-                                        "last_activity_at": datetime.now().isoformat(),
-                                        "activity_count": state["activity_count"] + 1,
-                                        "last_output": text.strip(),
-                                        "stream": stream_name,
-                                    },
-                                )
-                                if persisted:
-                                    state["provider_session_id"] = (
-                                        discovered_provider_session_id
+                                # Claim the token in memory before deferring
+                                # its durable write; otherwise adjacent stream
+                                # frames enqueue the same discovery repeatedly.
+                                state["provider_session_id"] = discovered_provider_session_id
+                                metadata["resume_session_id"] = discovered_provider_session_id
+                                metadata["provider_session_id"] = discovered_provider_session_id
+                                stream_persistence_queue.put_nowait(
+                                    (
+                                        "provider_session",
+                                        {
+                                            "adapter": adapter,
+                                            "task": task,
+                                            "workspace_path": workspace_path,
+                                            "runtime_session_id": session_id,
+                                            "metadata": metadata,
+                                            "provider_session_id": discovered_provider_session_id,
+                                            "status": "working",
+                                            "extra": {
+                                                "pid": proc.pid,
+                                                "started_at": started_at.isoformat(),
+                                                "last_activity_at": datetime.now().isoformat(),
+                                                "activity_count": state["activity_count"] + 1,
+                                                "last_output": text.strip(),
+                                                "stream": stream_name,
+                                            },
+                                        },
                                     )
+                                )
                 try:
                     fatal_reason = adapter.detect_runtime_failure(text, stream_name, metadata)
                 except TypeError:
@@ -1177,21 +1355,26 @@ class ExternalAgentBroker:
                         or now_monotonic - float(state["last_session_update_monotonic"]) >= self._STREAM_SESSION_UPDATE_MIN_SECONDS
                     ):
                         state["last_session_update_monotonic"] = now_monotonic
-                        await self._save_runtime_session(
-                            adapter=adapter,
-                            task=task,
-                            workspace_path=workspace_path,
-                            session_id=session_id,
-                            status="working",
-                            metadata=metadata,
-                            extra={
-                                "pid": proc.pid,
-                                "started_at": started_at.isoformat(),
-                                "last_activity_at": state["last_activity_at"].isoformat(),
-                                "activity_count": state["activity_count"],
-                                "last_output": state["last_output"],
-                                "stream": stream_name,
-                            },
+                        stream_persistence_queue.put_nowait(
+                            (
+                                "runtime_session",
+                                {
+                                    "adapter": adapter,
+                                    "task": task,
+                                    "workspace_path": workspace_path,
+                                    "session_id": session_id,
+                                    "status": "working",
+                                    "metadata": metadata,
+                                    "extra": {
+                                        "pid": proc.pid,
+                                        "started_at": started_at.isoformat(),
+                                        "last_activity_at": state["last_activity_at"].isoformat(),
+                                        "activity_count": state["activity_count"],
+                                        "last_output": state["last_output"],
+                                        "stream": stream_name,
+                                    },
+                                },
+                            )
                         )
                     stream_line_counts[stream_name] = stream_line_counts.get(stream_name, 0) + 1
                     transcript_entry = self._stream_transcript_entry(
@@ -1201,14 +1384,19 @@ class ExternalAgentBroker:
                     )
                     if transcript_entry:
                         transcript_content, transcript_meta = transcript_entry
-                        await self._save_runtime_transcript_entry(
-                            adapter=adapter,
-                            task=task,
-                            metadata=metadata,
-                            role="assistant",
-                            entry_type="stream",
-                            content=transcript_content,
-                            extra=transcript_meta,
+                        stream_persistence_queue.put_nowait(
+                            (
+                                "transcript",
+                                {
+                                    "adapter": adapter,
+                                    "task": task,
+                                    "metadata": metadata,
+                                    "role": "assistant",
+                                    "entry_type": "stream",
+                                    "content": transcript_content,
+                                    "extra": transcript_meta,
+                                },
+                            )
                         )
                 if on_progress and text.strip():
                     progress_update = adapter.format_progress_update(text, stream_name)
@@ -1502,6 +1690,19 @@ class ExternalAgentBroker:
                     await _cancel_and_await(task_obj)
                 for task_obj in (stdout_task, stderr_task):
                     await _drain_reader_task(task_obj)
+                stream_persistence_queue.put_nowait(None)
+                try:
+                    await asyncio.wait_for(
+                        asyncio.shield(stream_persistence_task),
+                        timeout=30,
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "External stream persistence drain timed out: "
+                        f"agent={adapter.agent_type} task_id={task.id} "
+                        f"queued={stream_persistence_queue.qsize()}"
+                    )
+                    await _cancel_and_await(stream_persistence_task)
                 try:
                     await adapter.cleanup_process(proc)
                 finally:
@@ -1554,6 +1755,29 @@ class ExternalAgentBroker:
         output = "".join(stdout_chunks)
         errors = "".join(stderr_chunks)
         normalized_output = adapter.normalize_result_output(output)
+        if company_workspace_snapshot is not None:
+            try:
+                workspace_attestation = await asyncio.to_thread(
+                    validate_company_workspace,
+                    company_workspace_snapshot,
+                    workspace_path,
+                )
+                metadata["company_workspace_attestation"] = workspace_attestation
+            except CompanyWorkspaceFenceError as exc:
+                metadata["company_workspace_attestation"] = {
+                    "validated": False,
+                    "error": str(exc),
+                }
+                if not state["fatal_reason"]:
+                    state["fatal_reason"] = (
+                        f"Company external workspace validation failed: {exc}"
+                    )
+        output_validation_error = adapter.validate_result_output(
+            normalized_output,
+            task,
+        )
+        if output_validation_error and not state["fatal_reason"]:
+            state["fatal_reason"] = output_validation_error
         raw_log_path = self._write_external_raw_log(
             task=task,
             workspace_path=workspace_path,
@@ -1696,7 +1920,7 @@ class ExternalAgentBroker:
             return False
         # Tool cards are discrete UI events. Do not let the generic stream
         # throttle swallow fast tool calls that arrive immediately after init.
-        if ":tool]" in progress_update:
+        if ":tool]" in progress_update or ":thinking_snapshot]" in progress_update:
             return True
         return (
             now_monotonic - last_progress_monotonic >= cls._STREAM_PROGRESS_MIN_SECONDS
@@ -1866,6 +2090,13 @@ class ExternalAgentBroker:
         )
         if verification_evidence.get("status") == "provided":
             enriched["verification_evidence"] = verification_evidence
+
+        opaque_team_result = structured.get("opaque_external_team_result")
+        if isinstance(opaque_team_result, dict) and opaque_team_result:
+            enriched["opaque_external_team_result"] = dict(opaque_team_result)
+            enriched["handoff"] = opaque_team_result.get("handoff")
+            enriched["risks"] = list(opaque_team_result.get("risks", []) or [])
+            enriched["open_questions"] = list(opaque_team_result.get("open_questions", []) or [])
 
         collaboration_failure = self._infer_collaboration_infrastructure_failure(raw_output)
         if collaboration_failure:
@@ -2528,14 +2759,18 @@ class ExternalAgentBroker:
         # Role-instance model: opc_session_id is the stable role_session_id
         # when available, so later turns for the same role can look the
         # session up regardless of which task.id they run under.
-        role_session_id = str(
+        delegation_role_session_id = str(
             (task.metadata or {}).get("delegation_role_session_id", "") or ""
         ).strip()
+        role_session_id = self._external_role_resume_session_id(task)
+        resume_lookup_session_id = (
+            self._external_work_item_resume_session_id(task) or role_session_id
+        )
         session = ExternalSession(
             agent_type=adapter.agent_type,
             project_id=task.project_id,
             session_id=persisted_session_id,
-            opc_session_id=role_session_id or task.session_id,
+            opc_session_id=resume_lookup_session_id or task.session_id,
             task_id=task.id,
             workspace_path=workspace_path,
             run_mode=adapter.config.run_mode,
@@ -2546,7 +2781,8 @@ class ExternalAgentBroker:
                 "session_mode": metadata.get("session_mode", "auto"),
                 "agent_type": adapter.agent_type,
                 "runtime_session_id": session_id,
-                "delegation_role_session_id": role_session_id,
+                "delegation_role_session_id": delegation_role_session_id,
+                "external_resume_scope_id": resume_lookup_session_id,
                 "company_run_id": str(
                     (task.metadata or {}).get("delegation_run_id", "") or ""
                 ).strip(),
@@ -2603,9 +2839,13 @@ class ExternalAgentBroker:
         )
 
         # Role-instance model: opc_session_id keyed by role_session_id.
-        role_session_id = str(
+        delegation_role_session_id = str(
             (task.metadata or {}).get("delegation_role_session_id", "") or ""
         ).strip()
+        role_session_id = self._external_role_resume_session_id(task)
+        resume_lookup_session_id = (
+            self._external_work_item_resume_session_id(task) or role_session_id
+        )
         resume_session_id = str(
             (result.artifacts or {}).get("resume_session_id")
             or metadata.get("resume_session_id")
@@ -2618,7 +2858,7 @@ class ExternalAgentBroker:
             agent_type=adapter.agent_type,
             project_id=task.project_id,
             session_id=session_id,
-            opc_session_id=role_session_id or task.session_id,
+            opc_session_id=resume_lookup_session_id or task.session_id,
             task_id=task.id,
             workspace_path=workspace_path,
             run_mode=adapter.config.run_mode,
@@ -2628,7 +2868,8 @@ class ExternalAgentBroker:
                 "model": metadata.get("model", "(cli default)"),
                 "session_mode": metadata.get("session_mode", "auto"),
                 "agent_type": adapter.agent_type,
-                "delegation_role_session_id": role_session_id,
+                "delegation_role_session_id": delegation_role_session_id,
+                "external_resume_scope_id": resume_lookup_session_id,
                 "company_run_id": str(
                     (task.metadata or {}).get("delegation_run_id", "") or ""
                 ).strip(),

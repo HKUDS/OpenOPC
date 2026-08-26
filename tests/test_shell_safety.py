@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
 
 from opc.layer2_organization.shell_safety import (
     has_blocked_substitution,
     is_read_only_shell_command,
+    is_workspace_scoped_read_only_shell_command,
     shell_structure_requires_review,
     sanitize_expansions,
     split_shell_segments,
@@ -233,6 +236,58 @@ class ReadOnlyClassifierTests(unittest.TestCase):
         sanitized, safe = sanitize_expansions("cd $(pwd) && ls")
         self.assertTrue(safe)
         self.assertNotIn("$(", sanitized)
+
+    def test_company_workspace_read_only_boundary(self) -> None:
+        with TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            workspace = base / "workspace"
+            outside = base / "outside"
+            workspace.mkdir()
+            outside.mkdir()
+            report = workspace / "report.md"
+            report.write_text("result\n", encoding="utf-8")
+            outside_report = outside / "secret.md"
+            outside_report.write_text("secret\n", encoding="utf-8")
+            (workspace / "outside-link").symlink_to(outside_report)
+
+            for command in (
+                "pwd",
+                f"ls -la {workspace}",
+                f"wc -w {report}",
+                "git status --short",
+            ):
+                with self.subTest(command=command):
+                    safe, reason = is_workspace_scoped_read_only_shell_command(
+                        command,
+                        working_directory=str(workspace),
+                        workspace_root=str(workspace),
+                    )
+                    self.assertTrue(safe, reason)
+
+            for command in (
+                f"ls -la {outside}",
+                f"cat {outside_report}",
+                "cat outside-link",
+                "cat $HOME/.ssh/config",
+                "grep -f/etc/passwd needle report.md",
+                f"git -C {outside} status --short",
+                "ls *.md",
+                "touch report.md",
+            ):
+                with self.subTest(command=command):
+                    safe, _ = is_workspace_scoped_read_only_shell_command(
+                        command,
+                        working_directory=str(workspace),
+                        workspace_root=str(workspace),
+                    )
+                    self.assertFalse(safe)
+
+            safe, _ = is_workspace_scoped_read_only_shell_command(
+                "ls -la",
+                working_directory=str(workspace),
+                workspace_root="",
+            )
+            self.assertFalse(safe)
 
 
 class SegmentSplitterTests(unittest.TestCase):
