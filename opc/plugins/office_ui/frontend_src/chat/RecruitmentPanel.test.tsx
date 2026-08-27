@@ -65,7 +65,7 @@ const markup = renderToStaticMarkup(
         senior_engineer: { kind: 'template', id: 'engineering-backend-architect' },
       },
     },
-    onReply: () => undefined,
+    onReply: async () => true,
     responded: false,
   }),
 )
@@ -84,5 +84,6 @@ assert.match(source, /buildReplyMetadata\('feedback'\)/)
 assert.match(source, /recruitment_agent: recruitmentAgent/)
 assert.match(source, /hasSubmittedCheckpointMetadata/, 'responded recruitment cards must detect persisted reply metadata')
 assert.match(source, /setRoleAgents\(buildRoleAgentsFromMeta\(meta, roles\)\)/, 'responded recruitment cards must sync displayed agent choices from reply metadata')
+assert.match(source, /if \(accepted\) setFeedback\(''\)/, 'feedback must only clear after the durable ACK')
 
 console.log('RecruitmentPanel.test.tsx: OK (recruitment review uses staffing-style UI)')

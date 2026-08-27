@@ -7,6 +7,8 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+from opc.layer2_organization.company_runtime_identity import is_runtime_auxiliary_task
+
 from .context import OfficeServiceContext
 from .models import ServiceError, ServiceEvent, ServiceResult
 
@@ -161,6 +163,7 @@ class AgentService:
                 }
                 for task in tasks
                 if getattr(task, "assigned_to", "") == role_id
+                and not is_runtime_auxiliary_task(task)
             ]
         tracker = self.context.event_adapter.get_tracker(agent_id) if self.context.event_adapter else None
         detail: dict[str, Any] = {

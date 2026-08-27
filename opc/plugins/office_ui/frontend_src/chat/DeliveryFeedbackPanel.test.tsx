@@ -22,7 +22,7 @@ const markup = renderToStaticMarkup(
       ],
       permission_requests: [{ id: 'perm-1' }],
     },
-    onReply: () => undefined,
+    onReply: async () => true,
     responded: false,
   }),
 )
@@ -41,7 +41,8 @@ const src = readFileSync(join(here, 'DeliveryFeedbackPanel.tsx'), 'utf8')
 assert.match(src, /metadata\.self_evolution_trigger = true/, 'delivery card replies must explicitly trigger self-evolution')
 assert.match(src, /kind === 'approve' \|\| kind === 'feedback'/, 'ignore must not trigger self-evolution metadata')
 assert.match(src, /buildReplyMetadata\('ignore'\)/, 'delivery card must send an explicit ignore checkpoint reply')
-assert.match(src, /submittingAction/, 'delivery card actions must be locally locked while awaiting server metadata')
+assert.match(src, /submitting = false/, 'delivery card actions must follow the shared ACK-correlated submit state')
+assert.doesNotMatch(src, /submittingAction/, 'delivery card must not maintain a second submit state')
 assert.match(src, /disabled=\{actionsDisabled\}/, 'delivery card must disable controls immediately after a card action')
 assert.doesNotMatch(src, /ckpt-btn-deny/, 'delivery self-evolution card must not render a deny action')
 assert.doesNotMatch(src, /localResponded|setLocalResponded/, 'panel must wait for server checkpoint metadata before showing responded state')

@@ -88,6 +88,11 @@ class RuntimeDurableMemoryExtractionTests(unittest.IsolatedAsyncioTestCase):
                 project_id="proj1",
                 assigned_to="executor",
             )
+            # NativeRuntimeV2 refreshes the Store-owned ToolCall ledger before
+            # each model boundary.  Production tasks are always persisted by
+            # the Engine before runtime admission; keep this focused fixture on
+            # the same durable contract.
+            await store.save_task(task)
 
             result = await runtime.run(
                 system_prompt="You are a test runtime.",

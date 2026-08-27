@@ -196,6 +196,11 @@ export function normalizeOrgInfoPayload(raw: OrgInfoPayload | RecordLike | null 
     runtime_topology_version: typeof source.runtime_topology_version === 'number' ? source.runtime_topology_version : 0,
     installed_packages: Array.isArray(source.installed_packages) ? source.installed_packages as NonNullable<OrgInfoPayload['installed_packages']> : [],
     runtime_policy: isRecord(source.runtime_policy) ? source.runtime_policy as NonNullable<OrgInfoPayload['runtime_policy']> : undefined,
+    runtime_topology_preview: isRecord(source.runtime_topology_preview) ? source.runtime_topology_preview : undefined,
+    work_item_runtime_preview: isRecord(source.work_item_runtime_preview) ? source.work_item_runtime_preview : undefined,
+    external_team_bindings: asRecordArray(source.external_team_bindings),
+    external_execution_units: asRecordArray(source.external_execution_units) as unknown as NonNullable<OrgInfoPayload['external_execution_units']>,
+    external_agent_profiles: asRecordArray(source.external_agent_profiles),
   }
 }
 

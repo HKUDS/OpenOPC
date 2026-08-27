@@ -121,6 +121,7 @@ _WORK_ITEM_FIELDS: tuple[MetadataFieldSpec, ...] = (
     _spec("deliverable_summary", MetadataOwner.WORK_ITEM, allowed_locations=("work_item",), legacy_fallback=True, migration_policy="backfill_if_missing"),
     _spec("work_item_summary", MetadataOwner.WORK_ITEM, allowed_locations=("work_item",), legacy_fallback=True, migration_policy="backfill_if_missing"),
     _spec("work_item_summary_for_downstream", MetadataOwner.WORK_ITEM, allowed_locations=("work_item", "task_execution_copy"), legacy_fallback=True, migration_policy="backfill_if_missing"),
+    _spec("opaque_external_team_result", MetadataOwner.WORK_ITEM, allowed_locations=("work_item",), legacy_fallback=True, migration_policy="backfill_if_missing"),
     _spec("work_item_artifact_index", MetadataOwner.WORK_ITEM, allowed_locations=("work_item",), legacy_fallback=True, migration_policy="backfill_if_missing"),
     _spec("verification_status", MetadataOwner.WORK_ITEM, allowed_locations=("work_item",), legacy_fallback=True, migration_policy="backfill_if_missing"),
     _spec("verification_evidence", MetadataOwner.WORK_ITEM, allowed_locations=("work_item",), legacy_fallback=True, migration_policy="backfill_if_missing"),
@@ -293,6 +294,44 @@ EXECUTION_COPY_KEYS: frozenset[str] = frozenset(
     if spec.owner == MetadataOwner.EXECUTION_COPY or spec.allows_task_execution_copy
 )
 LEGACY_READONLY_KEYS: frozenset[str] = frozenset()
+
+
+# A final-delivery revision owns these cached products as one unit.  Both the
+# owner-follow-up path and dependency-graph invalidation use this helper so a
+# stale package cannot survive into a later delivery attempt through a
+# different metadata/context location.
+FINAL_DELIVERY_CURRENT_OUTPUT_KEYS: frozenset[str] = frozenset(
+    {
+        "delivery_package",
+        "final_delivery_package",
+        "feedback_followup_message",
+        "ceo_pre_delivery_assessment",
+        "pre_delivery_assessment_status",
+        "pre_delivery_assessment_failure_kind",
+        "pre_delivery_rework_cap_reached",
+        "pre_delivery_rework_cap",
+        "feedback_close_user_message",
+    }
+)
+
+
+def clear_current_final_delivery_outputs(task: Task) -> None:
+    """Drop every cached output owned by the current delivery revision."""
+
+    task.metadata = dict(getattr(task, "metadata", {}) or {})
+    task.context_snapshot = dict(getattr(task, "context_snapshot", {}) or {})
+    for key in FINAL_DELIVERY_CURRENT_OUTPUT_KEYS:
+        task.metadata.pop(key, None)
+        task.context_snapshot.pop(key, None)
+    owned_outputs = dict(
+        task.context_snapshot.get("work_item_owned_outputs", {}) or {}
+    )
+    for key in FINAL_DELIVERY_CURRENT_OUTPUT_KEYS:
+        owned_outputs.pop(key, None)
+    if owned_outputs:
+        task.context_snapshot["work_item_owned_outputs"] = owned_outputs
+    else:
+        task.context_snapshot.pop("work_item_owned_outputs", None)
 
 
 def metadata_owner_for_key(key: str) -> MetadataOwner | None:

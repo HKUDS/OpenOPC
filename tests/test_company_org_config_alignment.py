@@ -60,7 +60,7 @@ def test_corporate_org_config_materializes_builtin_runtime() -> None:
     from opc.core.config import OPCConfig
     from opc.layer2_organization.org_engine import OrgEngine
 
-    cfg = OPCConfig.load(REPO_ROOT / ".opc" / "config")
+    cfg = OPCConfig.load(REPO_ROOT / ".opc" / "config", trusted_source=True)
     org = OrgEngine(cfg, REPO_ROOT / ".opc")
     agents = org.list_agents()
 
@@ -99,7 +99,7 @@ def test_company_mode_catalogs_remain_external_to_org_yaml() -> None:
     from opc.core.config import OPCConfig
     from opc.layer2_organization.talent_market import TalentMarket
 
-    cfg = OPCConfig.load(REPO_ROOT / ".opc" / "config")
+    cfg = OPCConfig.load(REPO_ROOT / ".opc" / "config", trusted_source=True)
     assert cfg.org.talent_templates == []
     market = TalentMarket(REPO_ROOT / ".opc", cfg)
     assert market.get_template("finance-finance-investment-researcher") is not None

@@ -29,7 +29,9 @@ from rich.table import Table
 from rich.theme import Theme
 
 from opc import __version__
-from opc.core.config import OPCConfig, get_opc_home
+from opc.core.config import OPCConfig, get_opc_home, get_project_config_workspace
+from opc.core.execution_agents import EXECUTION_AGENTS
+from opc.core.interaction_protocol import owner_interaction_actor_identity
 from opc.core.windows_ssl import (
     format_windows_sslkeylog_warning,
     pop_windows_sslkeylogfile,
@@ -94,12 +96,52 @@ def _current_command_label(argv: list[str] | None = None) -> str:
 def _get_config() -> OPCConfig:
     config_dir = get_opc_home() / "config"
     if config_dir.exists():
-        return OPCConfig.load(config_dir)
+        return _load_config_with_workspace_trust(config_dir)
     return OPCConfig()
 
 
+def _load_config_with_workspace_trust(config_dir: Path) -> OPCConfig:
+    """Load config, obtaining an explicit CLI trust decision when possible."""
+
+    from opc.core.workspace_trust import WorkspaceTrustRequired, WorkspaceTrustStore
+
+    try:
+        return OPCConfig.load(config_dir)
+    except WorkspaceTrustRequired as exc:
+        if not sys.stdin.isatty():
+            console.print(f"[error]{escape(str(exc))}[/error]")
+            console.print(
+                "[info]Non-interactive commands fail closed. Review the project config, then run "
+                f"[bold]opc trust add {escape(str(exc.workspace))}[/bold].[/info]"
+            )
+            raise typer.Exit(code=2) from exc
+
+        console.print(Panel(
+            "This project contains OpenOPC configuration that can start local "
+            "MCP or external-agent processes, connect to remote MCP/LLM endpoints, "
+            "and use configured credentials.\n\n"
+            f"Workspace: {exc.workspace}\n"
+            f"Config: {exc.config_dir}\n"
+            f"Reason: {exc.reason}\n"
+            f"Authority source: {exc.current_fingerprint}",
+            title="Workspace Trust Required",
+            border_style="yellow",
+        ))
+        if not typer.confirm("Trust this workspace and load its OpenOPC configuration?", default=False):
+            console.print("[warning]Workspace was not trusted; configuration was not loaded.[/warning]")
+            raise typer.Exit(code=2) from exc
+        # Parsing is allowed only after the explicit decision.  Trust is bound
+        # to both the post-migration source bytes and normalized authority.
+        config = OPCConfig.load(config_dir, trusted_source=True)
+        WorkspaceTrustStore().trust(exc.workspace, config_dir, config)
+        config.bind_workspace_trust(exc.workspace, config_dir)
+        config.require_workspace_trust(include_effective=True)
+        console.print(f"[success]Trusted workspace:[/success] {exc.workspace}")
+        return config
+
+
 def _channel_runtime_pid_path() -> Path:
-    from opc.core.config import get_opc_home, get_project_workplace
+    from opc.core.config import get_opc_home
 
     return get_opc_home() / "run" / "channels.pid"
 
@@ -550,7 +592,7 @@ def chat(
     project: Optional[str] = typer.Option(None, "--project", "-p", help="Project ID to work in"),
     model: Optional[str] = typer.Option(None, "--model", "-m", help="Override default LLM model"),
     mode: str = typer.Option("task", "--mode", help="Execution mode: task or company"),
-    agent: Optional[str] = typer.Option(None, "--agent", help="Preferred agent: native, claude_code, codex, cursor, opencode"),
+    agent: Optional[str] = typer.Option(None, "--agent", help="Preferred agent: native, claude_code, codex, cursor, opencode, jiuwen, jiuwenswarm"),
     company_profile: str = typer.Option("corporate", "--company-profile", help="Company profile for company mode"),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Show detailed logs"),
     no_markdown: bool = typer.Option(False, "--no-markdown", help="Plain text output"),
@@ -592,7 +634,7 @@ def exec_command(
     project: Optional[str] = typer.Option(None, "--project", "-p", help="Project ID to work in"),
     mode: str = typer.Option("task", "--mode", help="Execution mode: task, company, or org"),
     company_profile: str = typer.Option("corporate", "--company-profile", help="Company profile for company mode"),
-    agent: Optional[str] = typer.Option(None, "--agent", help="Preferred agent: native, claude_code, codex, cursor, opencode"),
+    agent: Optional[str] = typer.Option(None, "--agent", help="Preferred agent: native, claude_code, codex, cursor, opencode, jiuwen, jiuwenswarm"),
     org_id: Optional[str] = typer.Option(None, "--org", "--org-id", help="Saved org id for org/custom mode"),
     session_id: Optional[str] = typer.Option(None, "--session-id", help="Existing task-backed session id to reuse"),
     resume: bool = typer.Option(False, "--resume", help="Resume the latest task-backed session in the project"),
@@ -918,7 +960,9 @@ def init(
 
     opc_home = get_opc_home()
     template_dir = _project_config_template_dir()
+    config_dir_preexisting = (opc_home / "config").exists()
     already_initialized = _opc_config_initialized(opc_home)
+    created_project_config = not config_dir_preexisting
     config: OPCConfig
 
     if already_initialized:
@@ -929,7 +973,7 @@ def init(
             console.print("[warning]Init cancelled. Existing config was left unchanged.[/warning]")
             raise typer.Exit(1)
         console.print(f"[info]Existing config preserved: {opc_home / 'config'}[/info]")
-        config = OPCConfig.load(opc_home / "config")
+        config = _load_config_with_workspace_trust(opc_home / "config")
     elif template_dir is not None:
         # Use repo config template (same setup as maintainers, keys left for user to set)
         config = _load_config_template(template_dir)
@@ -992,6 +1036,11 @@ def init(
                     responsibility="Strategic intake, high-level routing, final aggregation and delivery to the owner",
                     reports_to="owner",
                     can_spawn=["cto", "cmo", "coo"],
+                    capabilities=[
+                        "strategic_planning", "work_delegation",
+                        "cross_team_coordination", "final_synthesis",
+                        "delivery_review",
+                    ],
                     tools=planning_tools,
                 ),
                 RoleConfig(
@@ -1001,6 +1050,11 @@ def init(
                     responsibility="Technical planning, architecture decisions, code review, and engineering oversight",
                     reports_to="ceo",
                     can_spawn=["senior_engineer", "devops_engineer"],
+                    capabilities=[
+                        "technical_planning", "architecture_design",
+                        "technical_research", "engineering_oversight",
+                        "code_review", "research_synthesis",
+                    ],
                     tools=[*planning_tools, "shell_exec", "web_search", "web_fetch"],
                 ),
                 RoleConfig(
@@ -1010,6 +1064,12 @@ def init(
                     responsibility="Marketing strategy, content planning, UX review, and brand oversight",
                     reports_to="ceo",
                     can_spawn=["content_specialist", "designer"],
+                    capabilities=[
+                        "market_research", "industry_analysis",
+                        "marketing_strategy", "content_strategy",
+                        "user_research", "brand_strategy",
+                        "research_synthesis",
+                    ],
                     tools=[
                         *planning_tools,
                         "web_search",
@@ -1029,6 +1089,11 @@ def init(
                     responsibility="Operations coordination, process management, cross-team alignment, and quality assurance",
                     reports_to="ceo",
                     can_spawn=["qa_analyst"],
+                    capabilities=[
+                        "operational_planning", "cross_team_coordination",
+                        "quality_assurance", "source_acquisition",
+                        "compliance_review", "research_synthesis",
+                    ],
                     tools=[
                         *planning_tools,
                         "shell_exec",
@@ -1047,6 +1112,10 @@ def init(
                     responsibility="Code implementation, system development, and technical execution",
                     reports_to="cto",
                     preferred_external_agent="codex",
+                    capabilities=[
+                        "software_implementation", "system_development",
+                        "technical_execution", "testing",
+                    ],
                     tools=engineering_tools,
                 ),
                 RoleConfig(
@@ -1056,6 +1125,10 @@ def init(
                     responsibility="Infrastructure, deployment, CI/CD, monitoring, and operational hardening",
                     reports_to="cto",
                     preferred_external_agent="cursor",
+                    capabilities=[
+                        "infrastructure_engineering", "ci_cd", "deployment",
+                        "monitoring", "operational_hardening",
+                    ],
                     tools=engineering_tools,
                 ),
                 RoleConfig(
@@ -1064,6 +1137,10 @@ def init(
                     icon="writing",
                     responsibility="Documentation, copywriting, presentations, and user-facing writing",
                     reports_to="cmo",
+                    capabilities=[
+                        "documentation", "copywriting", "presentation_design",
+                        "user_facing_writing",
+                    ],
                     tools=[
                         "file_read",
                         "file_write",
@@ -1083,6 +1160,10 @@ def init(
                     icon="design",
                     responsibility="Visual design, UX artifacts, wireframes, and design system work",
                     reports_to="cmo",
+                    capabilities=[
+                        "visual_design", "ux_design", "wireframing",
+                        "design_systems",
+                    ],
                     tools=[
                         "file_read",
                         "file_write",
@@ -1102,6 +1183,10 @@ def init(
                     icon="bug",
                     responsibility="Testing, security review, compliance checks, and acceptance validation",
                     reports_to="coo",
+                    capabilities=[
+                        "testing", "security_review", "compliance_review",
+                        "acceptance_validation", "quality_assurance",
+                    ],
                     tools=review_tools,
                 ),
             ]
@@ -1112,6 +1197,16 @@ def init(
                 EscalationRule(condition="Budget exceeds 80% of limit", action="Alert owner and await instructions"),
             ]
         config.save(opc_home / "config")
+
+    if created_project_config:
+        workspace = get_project_config_workspace(opc_home / "config")
+        if workspace is not None:
+            from opc.core.workspace_trust import WorkspaceTrustStore
+
+            # Bind the normalized on-disk form, not the pre-serialization
+            # template object, so the next load reproduces the same authority.
+            config = OPCConfig.load(opc_home / "config", trusted_source=True)
+            WorkspaceTrustStore().trust(workspace, opc_home / "config", config)
 
     # Create default directories. ``agent_homes/`` and ``bin/`` get
     # provisioned lazily by the skill installer the first time an
@@ -1677,6 +1772,71 @@ async def _exec_message(
         raise typer.Exit(code=2) from exc
 
 
+trust_app = typer.Typer(help="Manage trust for project-local OpenOPC configuration")
+app.add_typer(trust_app, name="trust")
+
+
+@trust_app.command("add")
+def trust_add(
+    path: Path = typer.Argument(Path("."), help="Workspace, .opc, or .opc/config path"),
+) -> None:
+    """Trust a workspace after reviewing its project-local OpenOPC config."""
+
+    from opc.core.workspace_trust import WorkspaceTrustStore, workspace_from_user_path
+
+    try:
+        workspace = workspace_from_user_path(path)
+    except ValueError as exc:
+        console.print(f"[error]{escape(str(exc))}[/error]")
+        raise typer.Exit(code=2) from exc
+    config_dir = workspace / ".opc" / "config"
+    try:
+        config = OPCConfig.load(config_dir, trusted_source=True)
+    except Exception as exc:
+        console.print(f"[error]Unable to load reviewed configuration: {escape(str(exc))}[/error]")
+        raise typer.Exit(code=2) from exc
+    WorkspaceTrustStore().trust(workspace, config_dir, config)
+    console.print(f"[success]Trusted workspace:[/success] {workspace}")
+
+
+@trust_app.command("remove")
+def trust_remove(
+    path: Path = typer.Argument(Path("."), help="Trusted workspace path"),
+) -> None:
+    """Remove a workspace trust decision."""
+
+    from opc.core.workspace_trust import (
+        WorkspaceTrustStore,
+        canonical_workspace,
+        workspace_from_user_path,
+    )
+
+    try:
+        workspace = workspace_from_user_path(path)
+    except ValueError:
+        workspace = canonical_workspace(path)
+    if WorkspaceTrustStore().untrust(workspace):
+        console.print(f"[success]Removed workspace trust:[/success] {workspace}")
+    else:
+        console.print(f"[warning]Workspace was not trusted:[/warning] {workspace}")
+
+
+@trust_app.command("list")
+def trust_list() -> None:
+    """List trusted workspaces and the user-owned trust store location."""
+
+    from opc.core.workspace_trust import WorkspaceTrustStore
+
+    store = WorkspaceTrustStore()
+    trusted = store.list_trusted()
+    console.print(f"[info]Trust store:[/info] {store.path}")
+    if not trusted:
+        console.print("[info]No trusted workspaces.[/info]")
+        return
+    for workspace in trusted:
+        console.print(f"  - {workspace}")
+
+
 project_app = typer.Typer(help="Manage OPC projects")
 app.add_typer(project_app, name="project")
 
@@ -1963,6 +2123,75 @@ def agent_move(agent_id: str = typer.Argument(...), office_id: str = typer.Argum
     asyncio.run(_run_service_command(project, lambda svc: svc.agent.move(agent_id=agent_id, office_id=office_id, seat_zone=seat_zone, desk_id=desk_id), json_output=json_output))
 
 
+agents_app = typer.Typer(help="Inspect external execution agents")
+app.add_typer(agents_app, name="agents")
+
+
+@agents_app.command("list")
+def external_agents_list(json_output: bool = typer.Option(False, "--json")):
+    from opc.layer3_agent.adapters.registry import ADAPTER_CLASSES
+
+    config = _get_config()
+
+    async def collect_profiles() -> list[dict[str, Any]]:
+        profiles: list[dict[str, Any]] = []
+        for name, adapter_cls in ADAPTER_CLASSES.items():
+            adapter = adapter_cls(config=config.agents.agents.get(name))
+            profile = adapter.describe()
+            profile["available"] = await adapter.is_available()
+            profiles.append(profile)
+        return profiles
+
+    profiles = asyncio.run(collect_profiles())
+    if json_output:
+        console.print_json(data={"agents": profiles})
+        return
+    table = Table(title="External Agents")
+    table.add_column("Agent")
+    table.add_column("Available")
+    table.add_column("Execution unit")
+    table.add_column("Task")
+    table.add_column("Company")
+    table.add_column("Transport / mode")
+    for profile in profiles:
+        capabilities = dict(profile.get("capabilities", {}) or {})
+        table.add_row(
+            str(profile.get("agent") or ""),
+            "yes" if profile.get("available") else "no",
+            str(profile.get("execution_unit_kind") or "external_agent"),
+            "yes" if capabilities.get("task_mode") else "no",
+            "yes" if capabilities.get("company_mode") else "no",
+            f"{profile.get('transport', 'cli')} / {profile.get('provider_mode') or profile.get('run_mode', '')}",
+        )
+    console.print(table)
+
+
+@agents_app.command("preflight")
+def external_agents_preflight(
+    agent: Optional[str] = typer.Argument(None),
+    project: str = typer.Option("default", "--project", "-p"),
+    probe_commands: bool = typer.Option(True, "--probe-commands/--no-probe-commands"),
+    json_output: bool = typer.Option(False, "--json"),
+):
+    from opc.layer3_agent.preflight import run_external_agent_preflight
+
+    results = run_external_agent_preflight(
+        _get_config(),
+        project_id=project,
+        probe_commands=probe_commands,
+        prepare_surfaces=True,
+    )
+    if agent:
+        results = [item for item in results if item.agent == agent]
+        if not results:
+            console.print(f"[error]Unknown external agent: {agent}[/error]")
+            raise typer.Exit(code=2)
+    if json_output:
+        console.print_json(data={"agents": [item.as_dict() for item in results]})
+        return
+    _render_external_agent_preflight_table(results)
+
+
 org_app = typer.Typer(help="Manage organization configuration")
 app.add_typer(org_app, name="org")
 
@@ -1986,6 +2215,79 @@ def org_import(
 ):
     raw = Path(path).read_text(encoding="utf-8")
     asyncio.run(_run_service_command(project, lambda svc: svc.org.import_config(raw, dry_run=dry_run), json_output=json_output))
+
+
+@org_app.command("team-bind")
+def org_team_bind(
+    role_id: str = typer.Option(..., "--role", help="Boundary role id, for example cto or cmo"),
+    organization_id: Optional[str] = typer.Option(None, "--org", help="Expected active organization id"),
+    binding_id: str = typer.Option("", "--binding-id", help="Stable binding id (auto-generated when omitted)"),
+    agent: str = typer.Option("jiuwenswarm", "--agent"),
+    scope: str = typer.Option("subtree", "--scope", help="role or subtree"),
+    collapse_subtree: bool = typer.Option(True, "--collapse-subtree/--no-collapse-subtree"),
+    provider_mode: str = typer.Option("team", "--provider-mode"),
+    session_scope: str = typer.Option("company_run", "--session-scope"),
+    max_inflight: int = typer.Option(1, "--max-inflight", min=1),
+    failure_policy: str = typer.Option("fail_closed", "--failure-policy", help="fail_closed or fallback_native"),
+    review_owner_role_id: str = typer.Option("", "--review-owner", help="Reviewer role; defaults to the boundary manager"),
+    artifact_isolation: str = typer.Option("validated_workspace", "--artifact-isolation"),
+    project: Optional[str] = typer.Option(None, "--project", "-p"),
+    json_output: bool = typer.Option(False, "--json"),
+):
+    payload = {
+        "organization_id": organization_id,
+        "binding_id": binding_id,
+        "boundary_role_id": role_id,
+        "external_agent": agent,
+        "scope": scope,
+        "collapse_subtree": collapse_subtree,
+        "provider_mode": provider_mode,
+        "session_scope": session_scope,
+        "max_inflight": max_inflight,
+        "failure_policy": failure_policy,
+        "review_owner_role_id": review_owner_role_id,
+        "artifact_isolation": artifact_isolation,
+    }
+    asyncio.run(
+        _run_service_command(
+            project,
+            lambda svc: svc.org.bind_external_team(payload),
+            json_output=json_output,
+        )
+    )
+
+
+@org_app.command("team-bindings")
+def org_team_bindings(
+    project: Optional[str] = typer.Option(None, "--project", "-p"),
+    json_output: bool = typer.Option(False, "--json"),
+):
+    asyncio.run(
+        _run_service_command(
+            project,
+            lambda svc: svc.org.list_external_team_bindings(),
+            json_output=json_output,
+        )
+    )
+
+
+@org_app.command("team-unbind")
+def org_team_unbind(
+    role_or_binding: str = typer.Option(..., "--role", "--binding"),
+    organization_id: Optional[str] = typer.Option(None, "--org", help="Expected active organization id"),
+    project: Optional[str] = typer.Option(None, "--project", "-p"),
+    json_output: bool = typer.Option(False, "--json"),
+):
+    asyncio.run(
+        _run_service_command(
+            project,
+            lambda svc: svc.org.unbind_external_team(
+                role_or_binding,
+                organization_id=organization_id,
+            ),
+            json_output=json_output,
+        )
+    )
 
 
 org_saved_app = typer.Typer(help="Manage saved org architectures")
@@ -2614,7 +2916,6 @@ async def _propose_reorg(config, payload: str, project: str | None) -> None:
         console.print(f"Risk: {proposal.risk_level.value}")
         console.print(f"Summary: {proposal.summary}")
         if proposal.user_confirmation_required:
-            await engine._save_reorg_checkpoint(proposal)  # noqa: SLF001
             console.print("[warning]User confirmation is required before applying this reorg.[/warning]")
     finally:
         await engine.shutdown()
@@ -2624,6 +2925,19 @@ async def _approve_reorg(config, proposal_id: str, project: str | None, *, appro
     engine, _runtime_display = _create_cli_engine(config, project)
     try:
         await engine.initialize()
+        checkpoint = await _reorg_interaction(engine, proposal_id)
+        if checkpoint is not None:
+            receipt = await _submit_reorg_interaction(
+                engine,
+                checkpoint,
+                approved=approved,
+                notes=f"{'Approved' if approved else 'Denied'} via CLI.",
+            )
+            console.print(
+                f"[success]Submitted reorg decision:[/success] {proposal_id}"
+            )
+            console.print(f"Checkpoint status: {receipt.get('status', 'answered')}")
+            return
         proposal = await engine.approve_company_reorg(
             proposal_id,
             approved=approved,
@@ -2644,6 +2958,85 @@ async def _apply_reorg(config, proposal_id: str, project: str | None) -> None:
         console.print(json.dumps(result, ensure_ascii=False, indent=2))
     finally:
         await engine.shutdown()
+
+
+async def _reorg_interaction(engine: Any, proposal_id: str) -> Any | None:
+    """Return the proposal's durable owner card, including terminal history."""
+
+    store = getattr(engine, "store", None)
+    if store is None:
+        return None
+    project_id = _current_project_id(engine)
+    checkpoints = await store.get_execution_checkpoints(
+        project_id=project_id,
+        checkpoint_types=["company_reorg_pending"],
+    )
+    matches = [
+        checkpoint
+        for checkpoint in checkpoints
+        if str(getattr(checkpoint, "checkpoint_type", "") or "").strip()
+        == "company_reorg_pending"
+        and str(dict(getattr(checkpoint, "payload", {}) or {}).get("proposal_id", "") or "").strip()
+        == str(proposal_id or "").strip()
+        and str(getattr(checkpoint, "project_id", project_id) or project_id).strip()
+        == project_id
+    ]
+    if len(matches) > 1:
+        raise RuntimeError(
+            f"Multiple durable reorg checkpoints reference proposal {proposal_id}."
+        )
+    return matches[0] if matches else None
+
+
+async def _submit_reorg_interaction(
+    engine: Any,
+    checkpoint: Any,
+    *,
+    approved: bool,
+    notes: str,
+) -> dict[str, Any]:
+    """Submit one reorg decision through the canonical durable ingress."""
+
+    submit = getattr(engine, "submit_checkpoint_decision", None)
+    if not callable(submit):
+        raise RuntimeError("The engine does not support durable checkpoint replies.")
+    action = "approve" if approved else "deny"
+    checkpoint_status = str(
+        getattr(checkpoint, "status", "") or ""
+    ).strip().lower()
+    if checkpoint_status != "pending":
+        raise RuntimeError(
+            "The reorg decision is already durable "
+            f"({checkpoint_status or 'unknown'}); it cannot be revised."
+        )
+    requester_task_id, requester_session_id = owner_interaction_actor_identity(
+        checkpoint
+    )
+    requester_actor: dict[str, Any] | None = None
+    if not requester_task_id and not requester_session_id:
+        issue_actor = getattr(engine, "issue_project_owner_actor", None)
+        if not callable(issue_actor):
+            raise RuntimeError("The engine cannot authorize a taskless owner reply.")
+        requester_actor = issue_actor(interface="cli")
+    receipt = await submit(
+        checkpoint_id=str(getattr(checkpoint, "checkpoint_id", "") or ""),
+        checkpoint_type="company_reorg_pending",
+        decision={
+            "option_id": action,
+            "checkpoint_reply_kind": action,
+            "text": str(notes or action).strip() or action,
+        },
+        client_request_id=(
+            f"cli-reorg:{getattr(checkpoint, 'checkpoint_id', '')}:{uuid.uuid4().hex}"
+        ),
+        requester_task_id=requester_task_id,
+        requester_session_id=requester_session_id or None,
+        requester_actor=requester_actor,
+    )
+    if not bool(receipt.get("accepted")):
+        reason = str(receipt.get("reason", "") or "invalid_decision").strip()
+        raise RuntimeError(f"Reorg decision was not accepted ({reason}).")
+    return dict(receipt)
 
 
 async def _show_reorg(config, proposal_id: str, project: str | None) -> None:
@@ -2673,7 +3066,7 @@ _SLASH_DEFAULT_LIMIT = 20
 _SLASH_MAX_LIMIT = 100
 _VALID_CHAT_MODES = {"task", "company"}
 _VALID_COMPANY_PROFILES = {"corporate", "custom"}
-_VALID_PREFERRED_AGENTS = {"native", "codex", "claude_code", "cursor", "opencode"}
+_VALID_PREFERRED_AGENTS = EXECUTION_AGENTS
 
 
 @dataclass(frozen=True)
@@ -2949,7 +3342,7 @@ _SLASH_COMMANDS: tuple[_SlashCommandSpec, ...] = (
     _SlashCommandSpec("Chat", "/queue list|drop|clear", "Inspect or edit queued prompts while a turn is running.", ("list", "drop", "clear")),
     _SlashCommandSpec("Context", "/status", "Show project, session, mode, agent, domains, model, and cost."),
     _SlashCommandSpec("Context", "/mode [task|company] [corporate|custom]", "Set execution mode for future messages.", ("task", "company", "corporate", "custom")),
-    _SlashCommandSpec("Context", "/agent [native|codex|claude_code|cursor|opencode|none]", "Set preferred external agent.", ("native", "codex", "claude_code", "cursor", "opencode", "none")),
+    _SlashCommandSpec("Context", "/agent [native|codex|jiuwen|jiuwenswarm|claude_code|cursor|opencode|none]", "Set preferred external agent.", ("native", "codex", "jiuwen", "jiuwenswarm", "claude_code", "cursor", "opencode", "none")),
     _SlashCommandSpec("Context", "/domains [domain ...|clear]", "Set domain hints for future messages.", ("clear",)),
     _SlashCommandSpec("Project", "/project", "Show current project, known projects, and switch/create/delete usage.", ("list", "switch", "create", "rename", "delete")),
     _SlashCommandSpec("Project", "/project list", "List known projects."),
@@ -4280,7 +4673,12 @@ async def _handle_session_slash(state: _InteractiveChatState, args: list[str], c
         if not rest:
             console.print("[warning]Usage: /session complete <task_id>[/warning]")
             return
-        operation = lambda svc: svc.session.complete(project_id=_current_project_id(state.engine), task_id=rest[0])
+        def operation(svc):
+            return svc.session.complete(
+                project_id=_current_project_id(state.engine),
+                task_id=rest[0],
+            )
+
         payload = await _run_chat_office_service(state, operation)
         if payload:
             console.print(f"[success]Completed session:[/success] {rest[0]}")
@@ -5343,12 +5741,31 @@ async def _handle_reorg_slash(state: _InteractiveChatState, args: list[str]) -> 
                 console.print(f"[warning]Usage: /reorg {command} <proposal_id> [--notes ...][/warning]")
                 return
             approved = command == "approve"
+            decision_notes = notes or (
+                "Approved via CLI." if approved else "Denied via CLI."
+            )
+            checkpoint = await _reorg_interaction(state.engine, rest[0])
+            if checkpoint is not None:
+                receipt = await _submit_reorg_interaction(
+                    state.engine,
+                    checkpoint,
+                    approved=approved,
+                    notes=decision_notes,
+                )
+                console.print(
+                    f"[success]Submitted reorg decision for {rest[0]} "
+                    f"({receipt.get('status', 'answered')}).[/success]"
+                )
+                return
             proposal = await state.engine.approve_company_reorg(
                 rest[0],
                 approved=approved,
-                notes=notes or ("Approved via CLI." if approved else "Denied via CLI."),
+                notes=decision_notes,
             )
-            console.print(f"[success]Reorg {proposal.proposal_id} {'approved' if approved else 'denied'}.[/success]")
+            console.print(
+                f"[success]Reorg {proposal.proposal_id} "
+                f"{'approved' if approved else 'denied'}.[/success]"
+            )
             return
         if command == "apply":
             if not rest:
@@ -5857,8 +6274,6 @@ _IMPORTANT_WORK_ITEM_EVENTS = {
     "approval_resolved",
     "checkpoint_created",
     "checkpoint_resolved",
-    "escalation_created",
-    "escalation_resolved",
     "work_item_failed",
     "work_item_blocked",
     "work_item_completed",
@@ -6070,7 +6485,7 @@ def _event_is_high_signal(event_type: str) -> bool:
         return False
     if normalized in _IMPORTANT_WORK_ITEM_EVENTS:
         return True
-    return any(token in normalized for token in ("approval", "checkpoint", "escalation", "fail", "error", "blocked"))
+    return any(token in normalized for token in ("approval", "checkpoint", "fail", "error", "blocked"))
 
 
 def _render_codex_block(content: Any, *, prefix: str = "  ", style: str = "", full: bool = False) -> None:
@@ -6583,7 +6998,7 @@ async def _handle_agent_slash(state: _InteractiveChatState, args: list[str]) -> 
         table.add_column("Agent", style="cyan")
         table.add_column("Current", justify="center")
         table.add_column("Command")
-        for agent in ["native", "codex", "claude_code", "cursor", "opencode"]:
+        for agent in ["native", "codex", "jiuwen", "jiuwenswarm", "claude_code", "cursor", "opencode"]:
             table.add_row(agent, "*" if state.preferred_agent == agent else "", f"/agent {agent}")
         table.add_row("system default", "*" if state.preferred_agent is None else "", "/agent none")
         console.print(table)
@@ -6802,7 +7217,7 @@ def _company_staffing_agent_choices(state: _InteractiveChatState) -> list[dict[s
             available.update(str(item).strip().lower().replace("-", "_") for item in registry.list_available())
         except Exception:
             pass
-    ordered = ["native", "codex", "claude_code", "cursor", "opencode"]
+    ordered = ["native", "codex", "jiuwen", "jiuwenswarm", "claude_code", "cursor", "opencode"]
     return [
         {
             "agent": agent,
@@ -8189,7 +8604,7 @@ async def _show_cost_summary(config) -> None:
     try:
         costs = await store.get_total_cost()
         if costs["total_calls"] > 0:
-            console.print(f"\n[bold]Cost Summary:[/bold]")
+            console.print("\n[bold]Cost Summary:[/bold]")
             console.print(f"  Total calls: {costs['total_calls']}")
             console.print(f"  Total tokens: {costs['total_tokens_in'] + costs['total_tokens_out']}")
             console.print(f"  Total cost: ${costs['total_cost']:.4f}")
@@ -8209,7 +8624,7 @@ async def _show_autonomy_summary(config, project: str | None = None) -> None:
     await store.initialize()
     try:
         stats = await store.get_autonomy_stats(project_id=project)
-        console.print(f"\n[bold]Autonomy Summary:[/bold]")
+        console.print("\n[bold]Autonomy Summary:[/bold]")
         console.print(f"  Decisions: {stats['total']}")
         console.print(f"  Auto-approved: {stats['auto_approved']}")
         console.print(f"  Escalated: {stats['escalated']}")

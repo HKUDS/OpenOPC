@@ -8,19 +8,10 @@ import type {
   StaffingTemplateOption,
 } from '../types/chat'
 import type { TaskPreferredAgent } from '../types/kanban'
-
-const TASK_AGENT_LABELS: Record<TaskPreferredAgent, string> = {
-  native: 'OpenOPC Native',
-  codex: 'Codex',
-  claude_code: 'Claude Code',
-  cursor: 'Cursor',
-  opencode: 'OpenCode',
-}
+import { RECRUITMENT_AGENT_OPTIONS, TASK_AGENT_LABELS, TASK_AGENT_OPTIONS } from '../lib/externalAgents'
 
 const DEFAULT_ROLE_AGENT: TaskPreferredAgent = 'codex'
 const DEFAULT_RECRUITMENT_AGENT: TaskPreferredAgent = 'native'
-const TASK_AGENT_OPTIONS: TaskPreferredAgent[] = ['codex', 'native', 'claude_code', 'cursor', 'opencode']
-const RECRUITMENT_AGENT_OPTIONS: TaskPreferredAgent[] = ['native', 'codex', 'claude_code', 'cursor', 'opencode']
 
 type StaffingOption =
   | { kind: 'employee'; id: string; name: string; subtitle: string; category: string; searchText: string }
@@ -141,6 +132,58 @@ function buildRoleAgentsFromMeta(meta: ChatMessageMeta, roles: StaffingRoleEntry
   return initial
 }
 
+export function buildDynamicTeamCoverage(
+  roles: StaffingRoleEntry[],
+  roleAgents: Record<string, TaskPreferredAgent>,
+): {
+  boundaryByRole: Map<string, string>
+  coveredRoleIdsByBoundary: Map<string, string[]>
+} {
+  const parentByRole = new Map(
+    roles.map(role => [String(role.role_id ?? '').trim(), String(role.reports_to ?? '').trim()]),
+  )
+  const candidates = new Set(
+    roles
+      .map(role => String(role.role_id ?? '').trim())
+      .filter(roleId => roleId && roleAgents[roleId] === 'jiuwenswarm'),
+  )
+  const hasSelectedAncestor = (roleId: string): boolean => {
+    const seen = new Set<string>()
+    let cursor = parentByRole.get(roleId) ?? ''
+    while (cursor && cursor !== 'owner' && !seen.has(cursor)) {
+      if (candidates.has(cursor)) return true
+      seen.add(cursor)
+      cursor = parentByRole.get(cursor) ?? ''
+    }
+    return false
+  }
+  const boundaries = new Set([...candidates].filter(roleId => !hasSelectedAncestor(roleId)))
+  const boundaryByRole = new Map<string, string>()
+  const coveredRoleIdsByBoundary = new Map<string, string[]>()
+  for (const role of roles) {
+    const roleId = String(role.role_id ?? '').trim()
+    if (!roleId) continue
+    let cursor = roleId
+    const seen = new Set<string>()
+    let boundary = ''
+    while (cursor && cursor !== 'owner' && !seen.has(cursor)) {
+      if (boundaries.has(cursor)) {
+        boundary = cursor
+        break
+      }
+      seen.add(cursor)
+      cursor = parentByRole.get(cursor) ?? ''
+    }
+    if (!boundary) continue
+    boundaryByRole.set(roleId, boundary)
+    coveredRoleIdsByBoundary.set(
+      boundary,
+      [...(coveredRoleIdsByBoundary.get(boundary) ?? []), roleId],
+    )
+  }
+  return { boundaryByRole, coveredRoleIdsByBoundary }
+}
+
 function hasSubmittedCheckpointMetadata(meta: ChatMessageMeta): boolean {
   return Boolean(
     String(meta.checkpoint_response_message_id ?? '').trim()
@@ -169,6 +212,10 @@ export const StaffingSelectionPanel = React.memo(function StaffingSelectionPanel
   const [recruitmentAgent, setRecruitmentAgent] = useState<TaskPreferredAgent>(meta.recruitment_agent ?? DEFAULT_RECRUITMENT_AGENT)
   const isResponded = responded
   const recommendAutoRecruit = meta.recommended_action === 'auto_recruit' && templates.length > 0
+  const dynamicTeamCoverage = useMemo(
+    () => buildDynamicTeamCoverage(roles, roleAgents),
+    [roleAgents, roles],
+  )
 
   useEffect(() => {
     if (!isResponded || !hasSubmittedCheckpointMetadata(meta)) return
@@ -249,6 +296,14 @@ export const StaffingSelectionPanel = React.memo(function StaffingSelectionPanel
       <div className="ckpt-staffing-grid">
         {roles.map(role => {
           const roleId = String(role.role_id ?? '').trim()
+          const persistedExternalTeam = role.staffing_locked && role.staffing_mode === 'opaque_external_team'
+          const dynamicBoundaryRoleId = dynamicTeamCoverage.boundaryByRole.get(roleId) ?? ''
+          const dynamicTeamBoundary = dynamicBoundaryRoleId === roleId
+          const dynamicTeamCovered = Boolean(dynamicBoundaryRoleId)
+          const externallyStaffed = persistedExternalTeam || dynamicTeamCovered
+          const coveredRoleIds = persistedExternalTeam
+            ? (role.covered_role_ids ?? [roleId])
+            : (dynamicTeamCoverage.coveredRoleIdsByBoundary.get(dynamicBoundaryRoleId) ?? [roleId])
           const options = optionsByRole[roleId] ?? [{ kind: 'fallback', id: '', name: 'Fallback role-only', subtitle: 'No employee override', category: 'fallback', searchText: 'fallback role only no employee override' }]
           const selected = optionForSelection(options, selections[roleId])
           const query = queries[roleId] ?? ''
@@ -257,28 +312,36 @@ export const StaffingSelectionPanel = React.memo(function StaffingSelectionPanel
             <div key={roleId} className="ckpt-staffing-card">
               <div className="ckpt-proposal-header">
                 <span className="ckpt-role-name">{roleId}</span>
-                <span className={`ckpt-badge ckpt-badge-${selected.kind}`}>{selected.kind}</span>
+                <span className={`ckpt-badge ckpt-badge-${externallyStaffed ? 'external-team' : selected.kind}`}>
+                  {externallyStaffed ? 'JiuwenSwarm Team' : selected.kind}
+                </span>
               </div>
               {role.role_label && role.role_label !== roleId && (
                 <div className="ckpt-role-labels">
                   <span className="ckpt-field-tag">{role.role_label}</span>
                 </div>
               )}
-              <div className="ckpt-staffing-selected">
+              {externallyStaffed ? (
+                <div className="ckpt-external-team-staffing">
+                  <b>{dynamicTeamCovered && !dynamicTeamBoundary ? `Covered by Team at ${dynamicBoundaryRoleId}` : 'Internally staffed external team'}</b>
+                  <span>One opaque Team covers: {coveredRoleIds.join(', ')}</span>
+                  <span>No OPC employees are recruited for these covered roles.</span>
+                </div>
+              ) : <div className="ckpt-staffing-selected">
                 <div className="ckpt-cand-name">{selected.name}</div>
                 <div className="ckpt-cand-meta">
                   <span className="ckpt-cand-category">{selected.category}</span>
                   <span className="ckpt-domain-tag">{selected.subtitle}</span>
                 </div>
-              </div>
-              <input
+              </div>}
+              {!externallyStaffed && <input
                 className="ckpt-staffing-search"
                 value={query}
                 onChange={event => setQueries(current => ({ ...current, [roleId]: event.target.value }))}
                 placeholder="Search employees or templates..."
                 disabled={isResponded}
-              />
-              <div className="ckpt-staffing-options">
+              />}
+              {!externallyStaffed && <div className="ckpt-staffing-options">
                 {visibleOptions.map(option => {
                   const active = `${option.kind}:${option.id}` === selectionKey(selections[roleId])
                   return (
@@ -294,7 +357,7 @@ export const StaffingSelectionPanel = React.memo(function StaffingSelectionPanel
                     </button>
                   )
                 })}
-              </div>
+              </div>}
               <div className="ckpt-agent-picker">
                 <label className="ckpt-agent-label" htmlFor={`staffing-agent-${meta.checkpoint_id}-${roleId}`}>
                   Execution Agent
@@ -302,9 +365,11 @@ export const StaffingSelectionPanel = React.memo(function StaffingSelectionPanel
                 <select
                   id={`staffing-agent-${meta.checkpoint_id}-${roleId}`}
                   className="ckpt-agent-select"
-                  value={roleAgents[roleId] ?? role.selected_agent ?? role.default_agent ?? DEFAULT_ROLE_AGENT}
+                  value={dynamicTeamCovered && !dynamicTeamBoundary
+                    ? 'jiuwenswarm'
+                    : (roleAgents[roleId] ?? role.selected_agent ?? role.default_agent ?? DEFAULT_ROLE_AGENT)}
                   onChange={event => setRoleAgents(current => ({ ...current, [roleId]: event.target.value as TaskPreferredAgent }))}
-                  disabled={isResponded}
+                  disabled={isResponded || Boolean(persistedExternalTeam) || (dynamicTeamCovered && !dynamicTeamBoundary)}
                 >
                   {TASK_AGENT_OPTIONS.map(agent => (
                     <option key={agent} value={agent}>{TASK_AGENT_LABELS[agent]}</option>

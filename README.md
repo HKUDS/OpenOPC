@@ -23,6 +23,7 @@
 
 ## News
 
+- **Aug 26, 2026 — Jiuwen and JiuwenSwarm integration:** Use Jiuwen as a single agent or JiuwenSwarm as one opaque Team in both Task and Company modes. [Setup and role behavior](#jiuwen-integration).
 - **Jul 14, 2026 — More resilient company runs:** Company-mode sessions now recover and resume more seamlessly while preserving agent identity, shared role context, delegation, and review progress.
 - **Jul 13, 2026 — Smoother Office UI:** Faster live updates and chat scrolling improve long-running projects.
 - **Jul 8, 2026 — Smarter approvals:** Session grants persist, low-risk actions flow automatically, and deferred decisions stay available.
@@ -36,6 +37,7 @@
 - [Office UI Guide](#office-ui-guide)
 - [CLI Guide](#cli-guide)
 - [Configuration](#configuration)
+- [Jiuwen / JiuwenSwarm](#jiuwen-integration)
 - [Ecosystem And Sharing](#ecosystem-and-sharing)
 - [Roadmap](#roadmap)
 - [Acknowledgements](#acknowledgements)
@@ -546,6 +548,56 @@ opc session create "Research sprint" -p demo --mode org --org hku_research_lab
 
 Run `opc init` once from the repo root. It creates `.opc/`, copies the template config from `config/`, creates memory/skills/log folders, and optionally creates the first project.
 
+Project-local `.opc/config` files can select local executables, remote endpoints, and credential sources. OpenOPC therefore asks for workspace trust before loading an existing project's config; non-interactive commands fail closed. Review the files, then use `opc trust add /path/to/workspace`. Trust is bound to fingerprints of the security-relevant source files and their normalized effective authority, so changes to system, LLM, agent, or channel configuration require renewal. Legacy path-only records also require one renewal. Use `opc trust list` and `opc trust remove /path/to/workspace` to inspect or revoke the user-owned decision. A workspace initialized by `opc init` is trusted automatically at creation time.
+
+<a id="jiuwen-integration"></a>
+<details>
+<summary><strong>Jiuwen / JiuwenSwarm — setup and role behavior</strong></summary>
+
+OpenOPC exposes two choices in both Task and Company modes:
+
+- **Jiuwen** is a single external agent, like Codex or Claude Code. It handles only the selected task or role.
+- **JiuwenSwarm Team** is one opaque external Team. OpenOPC works with the Team as a whole and does not manage its internal agents.
+
+### Setup
+
+Jiuwen reads `~/.jiuwenswarm/config/.env`; it does not automatically read OpenOPC's `.opc/config/llm_config.yaml`. You may reuse the same provider credentials, but the model name must support Jiuwen agent requests. For example, Volcengine Ark Agent Plan uses:
+
+```dotenv
+API_BASE="https://ark.cn-beijing.volces.com/api/plan/v3"
+API_KEY="<your API key>"
+MODEL_NAME="ark-code-latest"
+MODEL_PROVIDER="OpenAI"
+```
+
+Install the adapter, start the Gateway, and verify both choices:
+
+```bash
+pip install -e '.[jiuwen]'
+chmod 600 ~/.jiuwenswarm/config/.env
+jiuwenswarm-start --restart default
+opc agents preflight jiuwen
+opc agents preflight jiuwenswarm
+opc exec --mode task --agent jiuwen "Handle this task"
+opc exec --mode task --agent jiuwenswarm "Have one Team handle this task"
+```
+
+The default Gateway URL is `ws://127.0.0.1:19001/tui`. Change `gateway_url` in `.opc/config/agent_config.yaml` only when Jiuwen runs elsewhere.
+
+### Role selection in Company Mode
+
+Choose the execution agent in Staffing / Recruitment Review, or under **Company → Org → role → Runtime**.
+
+- Select **Jiuwen** on CTO: only CTO uses Jiuwen. CTO's subordinates remain separate OpenOPC roles and keep their own staffing and agent choices.
+- Select **JiuwenSwarm Team** on CTO: CTO and every role below CTO become one Team. The roles remain visible in the org chart, but descendant controls are locked and OpenOPC does not recruit or assign employees inside that subtree. CEO delegates to the CTO Team boundary and receives one Team result.
+- Select **JiuwenSwarm Team** on CEO: CEO and the entire company subtree become one Team. Descendants cannot select separate agents or create nested Teams.
+- Select Teams on several peer managers, such as COO, CTO, and CMO: they become separate Teams coordinated and reviewed by their parent manager.
+- Select no Team: normal Company staffing and per-role execution continue unchanged.
+
+The parent manager receives a capability summary compiled from the covered roles, skills, tools, and deliverables. Jiuwen decides how work is divided internally.
+
+</details>
+
 <details>
 <summary><b>Expand configuration — config files, LLM keys, external agents, channels, browser/MCP, troubleshooting</b></summary>
 
@@ -608,9 +660,7 @@ Task Mode can explicitly select an execution agent:
 opc chat -p demo --mode task --agent codex "Implement the change"
 ```
 
-Available values are `native`, `codex`, `claude_code`, `cursor`, and `opencode`. Configure command names, flags, timeouts, session reuse, and approval behavior in `.opc/config/agent_config.yaml`.
-
-In Company Mode, roles can prefer external agents through their role config or the Org role inspector. A role can use `auto`, `native`, or `external` execution strategy, with an optional preferred external agent.
+Available values are `native`, `codex`, `claude_code`, `cursor`, `opencode`, `jiuwen`, and `jiuwenswarm`. See [Jiuwen / JiuwenSwarm setup and role behavior](#jiuwen-integration).
 
 ### Feishu Connection
 
@@ -731,7 +781,7 @@ Run:
 opc status
 ```
 
-Check `.opc/config/agent_config.yaml` for command names such as `codex`, `claude`, `cursor-agent`, and `opencode`. Disable or reprioritize agents you do not have installed.
+Check `.opc/config/agent_config.yaml` for command names such as `codex`, `claude`, `cursor-agent`, `opencode`, and `jiuwenswarm`. Gateway mode also requires a running `jiuwenswarm-start` service; use `opc agents preflight jiuwen` to verify it.
 </details>
 
 <details>

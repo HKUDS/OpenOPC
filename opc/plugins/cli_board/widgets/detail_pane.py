@@ -148,8 +148,6 @@ class DetailPaneWidget(Static):
             return self._render_recruitment_checkpoint(checkpoint)
         if cp_type == "company_reorg_pending":
             return self._render_reorg_checkpoint(checkpoint)
-        if cp_type == "human_escalation":
-            return self._render_escalation_checkpoint(checkpoint)
         return self._render_generic_checkpoint(checkpoint)
 
     # ----- Recruitment -----
@@ -330,50 +328,6 @@ class DetailPaneWidget(Static):
 
         return Panel(Group(*parts), title=f"Checkpoint: {title}", border_style="#fbbf24")
 
-    # ----- Escalation -----
-
-    def _render_escalation_checkpoint(self, checkpoint: PendingCheckpointView) -> RenderableType:
-        payload = checkpoint.payload
-        prompt = payload.get("prompt", "") or payload.get("summary", "") or checkpoint.prompt
-        escalation_type = payload.get("escalation_type", "decision_needed")
-        options = payload.get("options", [])
-        default_action = payload.get("default_action", "")
-
-        lines = [line.strip() for line in prompt.split("\n") if line.strip()]
-        title = (lines[0].lstrip("[").split("]", 1)[-1].strip() if lines else "Action Required") or "Action Required"
-        detail_lines = lines[1:] if len(lines) > 1 else []
-
-        header = Text()
-        header.append("ESCALATION", style="bold #fbbf24")
-        header.append("  ")
-        type_label = escalation_type.replace("_", " ")
-        header += badge(type_label, "bold black on #64748b")
-
-        parts: list[RenderableType] = [header]
-
-        if detail_lines:
-            body = Text()
-            for line in detail_lines[:10]:
-                body.append(f"\n{truncate_text(line, 200)}", style="white")
-            parts.append(body)
-        elif not detail_lines and title != "Action Required":
-            parts.append(Text(f"\n{truncate_text(title, 200)}", style="white"))
-
-        if options:
-            opts_text = Text("\nOptions:", style="bold #cbd5e1")
-            for opt in options:
-                opt_id = opt.get("id", "") if isinstance(opt, dict) else str(opt)
-                opt_label = opt.get("label", opt_id) if isinstance(opt, dict) else str(opt)
-                opts_text.append(f"\n  \u25c6 {opt_label}", style="white")
-            parts.append(opts_text)
-
-        if default_action:
-            parts.append(Text(f"\nDefault on timeout: {default_action}", style="dim italic"))
-
-        parts.append(Text("\n[a] Approve  [d] Deny  [e] Feedback", style="dim italic"))
-
-        return Panel(Group(*parts), title=f"Checkpoint: {title[:40]}", border_style="#fbbf24")
-
     # ----- Generic fallback -----
 
     def _render_generic_checkpoint(self, checkpoint: PendingCheckpointView) -> RenderableType:
@@ -384,7 +338,13 @@ class DetailPaneWidget(Static):
         if checkpoint.summary:
             section.append(f"\n{truncate_text(checkpoint.summary, 120)}", style="white")
         section.append(f"\n{truncate_text(checkpoint.prompt, 420)}", style="dim")
-        section.append("\n[a] Approve  [d] Deny  [e] Feedback", style="dim italic")
+        if checkpoint.checkpoint_type in {"tool_permission", "action_permission"}:
+            section.append(
+                "\n[a/e] Disabled here (use Office UI for exact review)  [d] Deny",
+                style="dim italic",
+            )
+        else:
+            section.append("\n[a] Approve  [d] Deny  [e] Feedback", style="dim italic")
         return Panel(section, title="Checkpoint", border_style="#fbbf24")
 
     # ----- Shared renderers -----

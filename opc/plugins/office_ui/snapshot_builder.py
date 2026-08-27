@@ -43,6 +43,7 @@ from opc.layer2_organization.company_runtime_identity import (
     ACTIVE_COMPANY_RUNTIME_CHECKPOINT_STATUSES,
     COMPANY_RUNTIME_CHECKPOINT_TYPES,
     build_company_runtime_identity_index,
+    is_runtime_auxiliary_task,
 )
 from opc.layer2_organization.work_item_context_view import WorkItemContextView
 from opc.layer2_organization.work_item_identity import (
@@ -913,6 +914,14 @@ def _build_role_work_items_for_session(
             "executor_role_id": executor_role_id or None,
             "executor_role_name": row_role_name or None,
             "reviewer_role_id": reviewer_role_id or None,
+            "selected_execution_agent": (
+                _resolve_task_selected_execution_agent(linked_task)
+                if linked_task is not None
+                else meta.get("selected_execution_agent")
+            ),
+            "execution_unit_kind": view.get("execution_unit_kind"),
+            "external_team_binding_id": view.get_dict("external_team_binding").get("binding_id"),
+            "covered_role_ids": view.get_list("covered_role_ids"),
             "created_at": _coerce_event_timestamp(getattr(item, "created_at", None)),
             "updated_at": _coerce_event_timestamp(getattr(item, "updated_at", None)),
             "execution_turn_id": execution_turn_id or None,
@@ -1292,6 +1301,11 @@ def task_to_kanban(
             "work_item_gate": meta.get("work_item_gate"),
             "employee_assignment": meta.get("employee_assignment"),
             "selected_execution_agent": _resolve_task_selected_execution_agent(task),
+            "execution_unit_kind": meta.get("execution_unit_kind"),
+            "external_team_binding_id": dict(meta.get("external_team_binding", {}) or {}).get("binding_id"),
+            "external_team_boundary_role_id": dict(meta.get("external_team_binding", {}) or {}).get("boundary_role_id"),
+            "covered_role_ids": list(meta.get("covered_role_ids", []) or []),
+            "external_company_execution_fence": meta.get("external_company_execution_fence"),
             "origin_channel": meta.get("origin_channel"),
             "progress_log": list(meta.get("progress_log", []))[-10:],
             "handoff_context": _extract_work_item_summary_for_downstream(meta),
@@ -1372,6 +1386,10 @@ def work_item_to_kanban(
     employee_name = employee_name_by_id.get(employee_id, "")
     linked_task = task_by_work_item_id.get(str(getattr(item, "work_item_id", "") or "").strip())
     linked_meta = _task_metadata(linked_task) if linked_task is not None else {}
+    external_team_binding = {
+        **dict(metadata.get("external_team_binding", {}) or {}),
+        **dict(linked_meta.get("external_team_binding", {}) or {}),
+    }
     # Work-item context sync: WorkItemContextView prefers work_item.metadata, falls
     # back to linked_task.metadata. The four UI-critical fields
     # (work_item_role_name / employee_prompt_context / employee_delta_context
@@ -1437,6 +1455,16 @@ def work_item_to_kanban(
         ],
         **work_item_identity_payload(projection_id=work_item_projection_id, turn_type=work_item_turn_type),
         "company_profile": str(linked_meta.get("company_profile", "") or "").strip() if linked_task is not None else None,
+        "selected_execution_agent": (
+            _resolve_task_selected_execution_agent(linked_task)
+            if linked_task is not None
+            else metadata.get("selected_execution_agent")
+        ),
+        "execution_unit_kind": linked_meta.get("execution_unit_kind") or metadata.get("execution_unit_kind"),
+        "external_team_binding_id": external_team_binding.get("binding_id"),
+        "external_team_boundary_role_id": external_team_binding.get("boundary_role_id"),
+        "covered_role_ids": list(linked_meta.get("covered_role_ids", []) or metadata.get("covered_role_ids", []) or []),
+        "external_company_execution_fence": linked_meta.get("external_company_execution_fence") or metadata.get("external_company_execution_fence"),
         # work_item_role_id keeps the executor identity for audit/UI labels;
         # assignee_ids above already reflects the effective owner for lane
         # placement.
@@ -1530,6 +1558,8 @@ def _primary_session_tasks_by_session_id(
     primary_tasks_by_session_id: dict[str, Any] = {}
     ordered_session_ids: list[str] = []
     for task in tasks:
+        if is_runtime_auxiliary_task(task):
+            continue
         task_id = str(getattr(task, "id", "") or "").strip()
         task_meta = (
             task_meta_map.get(task_id, {}) if task_meta_map is not None and task_id else _task_metadata(task)
@@ -2131,7 +2161,21 @@ async def _build_snapshot_checkpoint_meta(engine: "OPCEngine", task: Any) -> dic
     getter = getattr(engine, "get_latest_pending_checkpoint_for_session", None)
     if not callable(getter):
         return None
-    maybe_checkpoint = getter(session_id)
+    # Rendering a UI snapshot is read-only.  Legacy runtime-v2 enrichment may
+    # be calculated for display, but must not persist through an unfenced live
+    # Company Task: that write is controller-owned and its lease-loss signal is
+    # intentionally a CancelledError subclass (which would tear down the WS).
+    try:
+        getter_parameters = inspect.signature(getter).parameters
+    except (TypeError, ValueError):
+        getter_parameters = {}
+    if "persist_runtime_v2_migration" in getter_parameters:
+        maybe_checkpoint = getter(
+            session_id,
+            persist_runtime_v2_migration=False,
+        )
+    else:
+        maybe_checkpoint = getter(session_id)
     checkpoint = await maybe_checkpoint if inspect.isawaitable(maybe_checkpoint) else maybe_checkpoint
     if not checkpoint:
         return None
@@ -2241,6 +2285,13 @@ async def _build_snapshot_checkpoint_meta(engine: "OPCEngine", task: Any) -> dic
         employee_payloads: list[dict[str, Any]] = []
         template_payloads: list[dict[str, Any]] = []
         org_engine = getattr(engine, "org_engine", None)
+        reports_to_by_role = {
+            str(getattr(agent, "role_id", "") or "").strip(): str(
+                getattr(agent, "reports_to", "") or ""
+            ).strip()
+            for agent in (org_engine.list_agents() if org_engine else [])
+            if str(getattr(agent, "role_id", "") or "").strip()
+        }
         talent_market = getattr(engine, "talent_market", None)
         is_placeholder = getattr(engine, "_is_placeholder_staffing_employee", lambda _employee: False)
         employee_payload = getattr(engine, "_staffing_employee_payload", None)
@@ -2397,6 +2448,7 @@ async def _build_snapshot_checkpoint_meta(engine: "OPCEngine", task: Any) -> dic
                         "role_id": role_id,
                         "role_label": role_label,
                         "role_responsibility": "",
+                        "reports_to": reports_to_by_role.get(role_id, ""),
                         "default_selection": default_selection,
                         "same_role_employee_ids": sorted(same_role_ids),
                         "fallback_available": True,
@@ -2437,6 +2489,14 @@ async def _build_snapshot_checkpoint_meta(engine: "OPCEngine", task: Any) -> dic
         }
 
     if checkpoint_type == "company_staffing_selection":
+        org_engine = getattr(engine, "org_engine", None)
+        reports_to_by_role = {
+            str(getattr(agent, "role_id", "") or "").strip(): str(
+                getattr(agent, "reports_to", "") or ""
+            ).strip()
+            for agent in (org_engine.list_agents() if org_engine else [])
+            if str(getattr(agent, "role_id", "") or "").strip()
+        }
         raw_role_agents = payload.get("recruitment_role_agents")
         payload_role_agents = raw_role_agents if isinstance(raw_role_agents, dict) else {}
         recruitment_agent = _normalize_session_preferred_agent(
@@ -2456,6 +2516,9 @@ async def _build_snapshot_checkpoint_meta(engine: "OPCEngine", task: Any) -> dic
             )
             if role_id:
                 role["selected_agent"] = selected_agent
+                role["reports_to"] = str(
+                    role.get("reports_to") or reports_to_by_role.get(role_id, "")
+                ).strip()
                 recruitment_role_agents[role_id] = selected_agent
             staffing_roles.append(role)
         return {
@@ -2746,6 +2809,8 @@ async def reconcile_sessions(
     if not engine.store:
         return 0
 
+    tasks = [task for task in tasks if not is_runtime_auxiliary_task(task)]
+
     total_backfilled = 0
     hydrated = 0
     task_ids = {
@@ -2831,9 +2896,24 @@ async def build_snapshot(
     """Build VisualSnapshot matching frontend types/visual.ts."""
     project_id = engine.project_id or "default"
     agents = await agent_store.get_all()
+    hidden_role_ids: set[str] = set()
+    try:
+        from opc.layer2_organization.external_team_compiler import (
+            opaque_external_team_hidden_role_ids,
+        )
+
+        hidden_role_ids = opaque_external_team_hidden_role_ids(
+            getattr(engine, "org_engine", None)
+        )
+    except Exception:
+        logger.opt(exception=True).warning(
+            "Failed to project opaque external Team visibility for snapshot"
+        )
     snapshot_agents = {
         str(agent.get("agent_id", "") or ""): _agent_with_runtime(agent, event_adapter)
         for agent in agents
+        if str(agent.get("opc_role_id") or agent.get("agent_id") or "").strip()
+        not in hidden_role_ids
     }
 
     # Skills
@@ -2858,6 +2938,12 @@ async def build_snapshot(
 
     # Agent templates
     templates = await agent_store.get_templates(engine.org_engine)
+    if hidden_role_ids:
+        templates = [
+            template
+            for template in templates
+            if str(template.get("id", "") or "").strip() not in hidden_role_ids
+        ]
 
     return {
         "project_id": project_id,
@@ -2907,6 +2993,14 @@ async def build_project_index_sync(
         except Exception:
             logger.opt(exception=True).warning("Failed to load tasks for project index")
 
+    auxiliary_task_ids = {
+        str(getattr(task, "id", "") or "").strip()
+        for task in tasks
+        if is_runtime_auxiliary_task(task)
+        and str(getattr(task, "id", "") or "").strip()
+    }
+    tasks = [task for task in tasks if not is_runtime_auxiliary_task(task)]
+
     existing_task_ids = {
         str(getattr(task, "id", "") or "").strip()
         for task in tasks
@@ -2931,6 +3025,34 @@ async def build_project_index_sync(
         session_channels = list(resolved_session_channels) if isinstance(resolved_session_channels, list) else []
     else:
         session_channels = []
+    hidden_auxiliary_channel_ids = {
+        f"session:{task_id}" for task_id in auxiliary_task_ids
+    }
+    if hidden_auxiliary_channel_ids:
+        channels = [
+            channel
+            for channel in channels
+            if str(channel.get("channel_id", "") or "").strip()
+            not in hidden_auxiliary_channel_ids
+        ]
+        session_channels = [
+            channel
+            for channel in session_channels
+            if str(channel.get("channel_id", "") or "").strip()
+            not in hidden_auxiliary_channel_ids
+        ]
+        delete_channel = getattr(chat_store, "delete_channel", None)
+        if callable(delete_channel):
+            for channel_id in hidden_auxiliary_channel_ids:
+                try:
+                    deleted = delete_channel(channel_id, project_id=project_id)
+                    if inspect.isawaitable(deleted):
+                        await deleted
+                except Exception:
+                    logger.opt(exception=True).debug(
+                        "Failed to prune auxiliary runtime channel {}",
+                        channel_id,
+                    )
     session_channel_map = {ch["channel_id"]: ch for ch in session_channels}
     known_channel_ids = {
         str(ch.get("channel_id", "") or "").strip()
@@ -3003,7 +3125,8 @@ async def build_project_index_sync(
     all_task_meta_map = {str(getattr(t, "id", "") or ""): _task_metadata(t) for t in tasks}
     session_tasks = [
         t for t in tasks
-        if not bool(all_task_meta_map.get(str(getattr(t, "id", "") or ""), {}).get("review_task", False))
+        if not is_runtime_auxiliary_task(t)
+        and not bool(all_task_meta_map.get(str(getattr(t, "id", "") or ""), {}).get("review_task", False))
         and not (
             (canonical_id := _task_mode_origin_ui_task_id(
                 t,
@@ -3204,6 +3327,11 @@ async def build_project_index_sync(
             "org_id": org_id,
             "preferred_agent": preferred_agent_val,
             "selected_execution_agent": selected_execution_agent_val,
+            "execution_unit_kind": identity_meta.get("execution_unit_kind") or t_meta.get("execution_unit_kind"),
+            "external_team_binding_id": dict(identity_meta.get("external_team_binding", {}) or t_meta.get("external_team_binding", {}) or {}).get("binding_id"),
+            "external_team_boundary_role_id": dict(identity_meta.get("external_team_binding", {}) or t_meta.get("external_team_binding", {}) or {}).get("boundary_role_id"),
+            "covered_role_ids": list(identity_meta.get("covered_role_ids", []) or t_meta.get("covered_role_ids", []) or []),
+            "external_company_execution_fence": identity_meta.get("external_company_execution_fence") or t_meta.get("external_company_execution_fence"),
             "channel_id": channel_id,
             "title": getattr(t, "title", "") or "Session",
             "status": status_val,
@@ -3286,6 +3414,7 @@ async def build_collab_sync(
             tasks = await engine.store.get_tasks(project_id=project_id)
         except Exception:
             logger.warning("Failed to load tasks for collab_sync")
+    tasks = [task for task in tasks if not is_runtime_auxiliary_task(task)]
     company_board_tasks: list[dict[str, Any]] = []
     company_board_columns: list[dict[str, Any]] = []
     company_boards: list[dict[str, Any]] = []
@@ -3558,7 +3687,8 @@ async def build_collab_sync(
     }
     session_tasks = [
         t for t in tasks
-        if not bool(all_task_meta_map.get(str(getattr(t, "id", "") or ""), {}).get("review_task", False))
+        if not is_runtime_auxiliary_task(t)
+        and not bool(all_task_meta_map.get(str(getattr(t, "id", "") or ""), {}).get("review_task", False))
         and not (
             (canonical_id := _task_mode_origin_ui_task_id(
                 t,
@@ -3802,6 +3932,11 @@ async def build_collab_sync(
             "org_id": org_id,
             "preferred_agent": preferred_agent_val,
             "selected_execution_agent": selected_execution_agent_val,
+            "execution_unit_kind": identity_meta.get("execution_unit_kind") or t_meta.get("execution_unit_kind"),
+            "external_team_binding_id": dict(identity_meta.get("external_team_binding", {}) or t_meta.get("external_team_binding", {}) or {}).get("binding_id"),
+            "external_team_boundary_role_id": dict(identity_meta.get("external_team_binding", {}) or t_meta.get("external_team_binding", {}) or {}).get("boundary_role_id"),
+            "covered_role_ids": list(identity_meta.get("covered_role_ids", []) or t_meta.get("covered_role_ids", []) or []),
+            "external_company_execution_fence": identity_meta.get("external_company_execution_fence") or t_meta.get("external_company_execution_fence"),
             "channel_id": channel_id,
             "title": t.title,
             "status": status_val,

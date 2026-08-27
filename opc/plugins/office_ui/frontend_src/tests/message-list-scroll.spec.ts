@@ -567,8 +567,9 @@ async function runHiddenPendingCase(page: Page, baseUrl: string): Promise<void> 
   assert.equal(initiallyHidden, true, 'the oldest pending checkpoint must begin outside the 200-row DOM window')
 
   await page.getByRole('button', { name: /Pending actions/i }).click()
-  await page.waitForFunction(() => Array.from(document.querySelectorAll<HTMLElement>('.ckpt-title'))
-    .some((element) => element.textContent?.trim() === 'Approval checkpoint 0'))
+  await page.waitForFunction(() => document
+    .querySelector<HTMLElement>('[data-timeline-key="checkpoint:fixture-checkpoint-0"]')
+    ?.textContent?.includes('Approval checkpoint 0'))
   await settle(page, 120)
   const focused = await page.evaluate(() => {
     const list = document.querySelector<HTMLElement>('.msg-list')
@@ -593,9 +594,9 @@ async function runCheckpointCase(page: Page, baseUrl: string): Promise<void> {
   await page.waitForSelector('text=fixture-marker-0111')
 
   const chronological = await page.evaluate(() => {
-    const checkpointTitle = Array.from(document.querySelectorAll<HTMLElement>('.ckpt-title'))
-      .find((element) => element.textContent?.includes('Approval checkpoint 110'))
-    const checkpointRow = checkpointTitle?.closest('.msg-row')
+    const checkpointRow = document
+      .querySelector<HTMLElement>('[data-timeline-key="checkpoint:fixture-checkpoint-110"]')
+      ?.querySelector<HTMLElement>('.msg-row')
     const nextRow = Array.from(document.querySelectorAll<HTMLElement>('.msg-row'))
       .find((element) => element.textContent?.includes('fixture-marker-0111'))
     if (!checkpointRow || !nextRow) throw new Error('checkpoint chronology nodes are missing')
@@ -608,9 +609,9 @@ async function runCheckpointCase(page: Page, baseUrl: string): Promise<void> {
   await page.waitForSelector('text=Approved fixture checkpoint')
   await settle(page)
   const retainedNode = await page.evaluate(() => {
-    const checkpointTitle = Array.from(document.querySelectorAll<HTMLElement>('.ckpt-title'))
-      .find((element) => element.textContent?.includes('Approval checkpoint 110'))
-    const currentRow = checkpointTitle?.closest('.msg-row')
+    const currentRow = document
+      .querySelector<HTMLElement>('[data-timeline-key="checkpoint:fixture-checkpoint-110"]')
+      ?.querySelector<HTMLElement>('.msg-row')
     return !!currentRow
       && currentRow === window.__rememberedCheckpointRow
       && document.contains(window.__rememberedCheckpointRow ?? null)

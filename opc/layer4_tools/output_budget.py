@@ -12,6 +12,7 @@ from typing import Any
 
 from opc.core.config import get_opc_home
 from opc.layer4_tools.execution_context import resolve_task_execution_context
+from opc.layer4_tools.workspace_fs import SecureWorkspace, workspace_roots_for_task
 
 
 DEFAULT_TRUNCATION_MARKER = "truncated"
@@ -86,7 +87,10 @@ def _tool_results_root(task: Any | None) -> Path:
     context = resolve_task_execution_context(task)
     comms_root = str(context.get("comms_root", "") or "").strip()
     if comms_root:
-        return Path(comms_root).expanduser().resolve() / "tool-results"
+        # Do not resolve here: following a pre-existing ``.opc-comms`` symlink
+        # would escape the task workspace before the secure writer can reject
+        # it.
+        return Path(comms_root).expanduser() / "tool-results"
     return get_opc_home() / "artifacts" / "tool-results"
 
 
@@ -108,14 +112,25 @@ def persist_tool_result(
     task_id = str(getattr(task, "id", "") or "").strip()
     session_id = str(getattr(task, "session_id", "") or getattr(task, "parent_session_id", "") or "").strip()
     bucket = _safe_segment(task_id or session_id or "global", "global")
-    root = _tool_results_root(task) / bucket
-    root.mkdir(parents=True, exist_ok=True)
-
     stamp = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
     digest = sha256(text.encode("utf-8", errors="replace")).hexdigest()[:12]
     suffix = extension.lstrip(".") or "txt"
-    path = root / f"{_safe_segment(tool_name, 'tool')}-{stamp}-{digest}.{suffix}"
-    path.write_text(text, encoding="utf-8")
+    path = _tool_results_root(task) / bucket / (
+        f"{_safe_segment(tool_name, 'tool')}-{stamp}-{digest}.{suffix}"
+    )
+    workspace_root, output_root = workspace_roots_for_task(task)
+    if task is not None and workspace_root:
+        with SecureWorkspace(workspace_root, output_root or workspace_root) as workspace:
+            target = workspace.resolve(
+                str(path),
+                use_output_root=False,
+                allow_runtime_internal_read=True,
+            )
+            workspace.write_runtime_text(target, text, create_dirs=True)
+            path = target.display_path
+    else:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
     return {
         "full_output_path": str(path),
         "original_size_chars": len(text),

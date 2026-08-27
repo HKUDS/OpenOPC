@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import inspect
-import json
 import traceback
 from typing import Any, Callable, Coroutine
 
@@ -18,6 +17,23 @@ _OUTPUT_LIMIT = 20_000
 
 
 ToolFunc = Callable[..., Coroutine[Any, Any, Any]]
+
+COMPANY_EFFECT_UNKNOWN = "unknown"
+COMPANY_EFFECT_NO_LOCAL_FS = "no_local_fs"
+COMPANY_EFFECT_STRUCTURED_PATHS = "structured_file_paths"
+COMPANY_EFFECT_OPAQUE_EXACT = "opaque_exact"
+COMPANY_EFFECT_RUNTIME_INTERNAL = "runtime_internal"
+COMPANY_EFFECT_FORBIDDEN = "forbidden"
+_COMPANY_EFFECT_KINDS = frozenset(
+    {
+        COMPANY_EFFECT_UNKNOWN,
+        COMPANY_EFFECT_NO_LOCAL_FS,
+        COMPANY_EFFECT_STRUCTURED_PATHS,
+        COMPANY_EFFECT_OPAQUE_EXACT,
+        COMPANY_EFFECT_RUNTIME_INTERNAL,
+        COMPANY_EFFECT_FORBIDDEN,
+    }
+)
 
 _PARAM_ALIASES: dict[str, str] = {
     "cmd": "command",
@@ -34,6 +50,34 @@ _PARAM_ALIASES: dict[str, str] = {
     "text": "content",
     "body": "content",
 }
+
+# These values are supplied by the runtime execution envelope, never by a
+# model-authored ToolCall.  Treating them as ordinary function parameters lets
+# an argument such as ``{"task": null}`` replace the durable Task and erase
+# its workspace/controller identity before a tool executes.
+_TRUSTED_RUNTIME_ARGUMENTS = ("task", "on_progress")
+
+
+class ToolInvocationValidationError(ValueError):
+    """Expected, model-correctable tool input validation failure.
+
+    These failures are part of the tool protocol rather than implementation
+    crashes.  Returning a stable correction payload lets the agent repair its
+    call without exposing an internal Python traceback in the conversation.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: str = "tool_input_validation",
+        correction: str = "Correct the tool arguments and retry.",
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.code = str(code or "tool_input_validation").strip()
+        self.correction = str(correction or "").strip()
+        self.details = dict(details or {})
 
 
 class ToolDefinition:
@@ -54,6 +98,7 @@ class ToolDefinition:
         persist_large_results: bool = True,
         self_bounded_output: bool = False,
         preview_chars: int | None = None,
+        company_effect_kind: str = COMPANY_EFFECT_UNKNOWN,
     ) -> None:
         self.name = name
         self.description = description
@@ -68,6 +113,12 @@ class ToolDefinition:
         self.persist_large_results = persist_large_results
         self.self_bounded_output = self_bounded_output
         self.preview_chars = preview_chars
+        normalized_effect_kind = str(company_effect_kind or "").strip().lower()
+        if normalized_effect_kind not in _COMPANY_EFFECT_KINDS:
+            raise ValueError(
+                f"Unknown company tool-effect capability: {company_effect_kind}"
+            )
+        self.company_effect_kind = normalized_effect_kind
 
     def to_schema(self) -> dict[str, Any]:
         return {
@@ -156,6 +207,22 @@ class ToolRegistry:
             call_args = self._prepare_call_args(tool, arguments, task=task, on_progress=on_progress)
             result = await tool.func(**call_args)
             output = {"result": result, "success": True}
+        except ToolInvocationValidationError as e:
+            logger.warning(
+                "Tool {} rejected model-authored input ({}): {}",
+                name,
+                e.code,
+                e,
+            )
+            output = {
+                "error": str(e),
+                "error_type": "validation_error",
+                "error_code": e.code,
+                "retryable": True,
+                "correction": e.correction,
+                "details": dict(e.details),
+                "success": False,
+            }
         except Exception as e:
             # Loguru has no stdlib-style ``exc_info`` kwarg: extra kwargs are
             # format() arguments, which forces str.format() on the message — an
@@ -188,10 +255,30 @@ class ToolRegistry:
         for alias, canonical in _PARAM_ALIASES.items():
             if alias in call_args and alias not in signature.parameters and canonical in signature.parameters:
                 call_args[canonical] = call_args.pop(alias)
-        if "task" in signature.parameters and "task" not in call_args:
-            call_args["task"] = task
-        if "on_progress" in signature.parameters and "on_progress" not in call_args:
-            call_args["on_progress"] = on_progress
+
+        trusted_values = {
+            "task": task,
+            "on_progress": on_progress,
+        }
+        for name in _TRUSTED_RUNTIME_ARGUMENTS:
+            supplied_by_model = name in call_args
+            accepts_runtime_value = name in signature.parameters
+            if supplied_by_model and trusted_values[name] is None:
+                raise ValueError(
+                    f"Tool `{tool.name}` received reserved runtime argument "
+                    f"`{name}` without a trusted runtime value. Remove `{name}` "
+                    "from the tool arguments and retry."
+                )
+            if supplied_by_model and not accepts_runtime_value:
+                raise ValueError(
+                    f"Tool `{tool.name}` received reserved runtime argument "
+                    f"`{name}`. Models cannot supply runtime context arguments; "
+                    f"remove `{name}` and retry."
+                )
+            if accepts_runtime_value:
+                # Always overwrite model input, including null/fake values.
+                # The outer executor owns this capability-bearing context.
+                call_args[name] = trusted_values[name]
         # Reject unknown arguments with a helpful error instead of silently
         # dropping them. The error is caught by `invoke()` and packaged as
         # `{"success": False, "error": ...}`, which the agent's tool-call

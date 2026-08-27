@@ -6,7 +6,7 @@ import shlex
 from typing import Any
 
 from opc.layer4_tools.shell import shell_exec
-from opc.layer4_tools.registry import ToolDefinition
+from opc.layer4_tools.registry import COMPANY_EFFECT_FORBIDDEN, ToolDefinition
 
 
 async def git_status(working_directory: str = ".") -> dict[str, Any]:
@@ -50,6 +50,7 @@ def create_git_tools() -> list[ToolDefinition]:
             },
             func=git_status,
             category="code",
+            company_effect_kind=COMPANY_EFFECT_FORBIDDEN,
         ),
         ToolDefinition(
             name="git_commit",
@@ -66,6 +67,7 @@ def create_git_tools() -> list[ToolDefinition]:
             func=git_commit,
             category="code",
             requires_confirmation=True,
+            company_effect_kind=COMPANY_EFFECT_FORBIDDEN,
         ),
         ToolDefinition(
             name="git_diff",
@@ -80,5 +82,6 @@ def create_git_tools() -> list[ToolDefinition]:
             },
             func=git_diff,
             category="code",
+            company_effect_kind=COMPANY_EFFECT_FORBIDDEN,
         ),
     ]

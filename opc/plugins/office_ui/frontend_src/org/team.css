@@ -99,6 +99,13 @@
   background: color-mix(in srgb, var(--bg-elevated) 48%, var(--bg) 52%);
   border-color: color-mix(in srgb, var(--border-hover) 78%, var(--accent) 22%);
 }
+.team-roster-card--external {
+  border-color: color-mix(in srgb, var(--accent) 38%, var(--border));
+  background: color-mix(in srgb, var(--accent) 5%, var(--bg));
+}
+.team-roster-external { display: flex; flex-direction: column; gap: 4px; padding: 5px 0; }
+.team-roster-external b { color: var(--accent); font-size: 11px; }
+.team-roster-external span { color: var(--text-secondary); font-size: 10.5px; line-height: 1.4; }
 .team-roster-card-header {
   display: flex;
   align-items: center;

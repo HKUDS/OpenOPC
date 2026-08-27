@@ -38,7 +38,6 @@ from opc.database.store import OPCStore
 from opc.layer2_organization.collaboration_service import (
     CollaborationContext,
     CollaborationService,
-    CommunicationDeliveryError,
 )
 from opc.layer2_organization.collaboration_policy import (
     effective_contact_roles,
@@ -970,7 +969,7 @@ class CommunicationManager:
             "action_items": action_items,
             "reasoning": reasoning,
             "decision_method": decision_method,
-            "requires_human_input": bool(parsed.get("requires_human_input", False)),
+            "resolution_status": "resolved" if decision else "unresolved",
             "follow_up_questions": follow_up_questions,
         }
         if consensus:
@@ -978,8 +977,6 @@ class CommunicationManager:
             outcome["aligned_points"] = list(consensus.get("aligned_points", []))
             outcome["unresolved_items"] = list(consensus.get("blocking_conflicts", []))
             outcome["vote_summary"] = dict(consensus.get("vote_summary", {}))
-        if not outcome["decision"] and consensus:
-            outcome["decision"] = str(consensus.get("dominant_proposal", "") or "").strip()
         return outcome
 
     @staticmethod
@@ -1071,7 +1068,7 @@ class CommunicationManager:
             '"open_questions": ["..."], "blocking_conflicts": ["..."], '
             '"suggested_next_speakers": ["role_id"], "dominant_proposal": "...", '
             '"vote_summary": {"support": 0, "oppose": 0, "abstain": 0}, '
-            '"recommended_decision_method": "semantic_consensus|owner_override|majority_vote|human_escalation"}\n\n'
+            '"recommended_decision_method": "semantic_consensus|owner_override|majority_vote"}\n\n'
             f"Topic: {meeting.topic}\n"
             f"Agenda: {json.dumps(meeting.agenda, ensure_ascii=False)}\n"
             f"Current round: {meeting.current_round}\n"
@@ -1138,7 +1135,6 @@ class CommunicationManager:
                 '{"decision":"...",'
                 '"action_items":["..."],'
                 '"reasoning":"...",'
-                '"requires_human_input":false,'
                 '"follow_up_questions":["..."]}'
             )
             prompt = (
@@ -1149,7 +1145,12 @@ class CommunicationManager:
                 + "\n".join(f"- {item}" for item in meeting.agenda)
                 + f"\n\nRecent transcript:\n{transcript}"
                 + f"\n\nConsensus analysis:\n{json.dumps(consensus or {}, ensure_ascii=False)}"
-                + "\n\nIf evidence is insufficient or risk is too high, set `requires_human_input` to true."
+                + (
+                    "\n\nResolve this decision within the company roles. Make a concrete decision when the evidence "
+                    "supports one. If the evidence is genuinely insufficient, leave `decision` empty and explain "
+                    "the unresolved evidence in `reasoning`; the workflow will return the issue to the owning agent "
+                    "for an internal retry."
+                )
             )
         else:
             task_brief = (
@@ -1315,10 +1316,16 @@ class CommunicationManager:
         outcome: dict[str, Any],
         transcript_note: str = "",
     ) -> MeetingRoom:
-        meeting.outcome = dict(outcome)
+        normalized_outcome = dict(outcome)
+        decision = str(normalized_outcome.get("decision", "") or "").strip()
+        resolution_status = str(normalized_outcome.get("resolution_status", "") or "").strip()
+        if resolution_status not in {"resolved", "unresolved"}:
+            resolution_status = "resolved" if decision else "unresolved"
+        normalized_outcome["resolution_status"] = resolution_status
+        meeting.outcome = normalized_outcome
         meeting.decision_method = str(outcome.get("decision_method", "") or meeting.decision_method or "").strip()
         meeting.pending_participants = []
-        meeting.status = MeetingStatus.DECIDED
+        meeting.status = MeetingStatus.DECIDED if resolution_status == "resolved" else MeetingStatus.CLOSED
         meeting.updated_at = datetime.now()
         meeting.last_activity_at = datetime.now()
         if transcript_note:
@@ -1347,9 +1354,9 @@ class CommunicationManager:
                         details={
                             "meeting_room_id": meeting.room_id,
                             "decision_method": meeting.decision_method,
+                            "resolution_status": resolution_status,
                             "consensus": dict(meeting.consensus or {}),
                             "action_items": list(outcome.get("action_items", []) or []),
-                            "requires_human_input": bool(outcome.get("requires_human_input", False)),
                         },
                     )
                 )
@@ -1381,7 +1388,7 @@ class CommunicationManager:
             ],
             "reasoning": "Consensus was not unanimous, so the meeting used a majority vote fallback.",
             "decision_method": "majority_vote",
-            "requires_human_input": False,
+            "resolution_status": "resolved",
             "follow_up_questions": [],
             "consensus_summary": dict(consensus),
             "aligned_points": list(consensus.get("aligned_points", [])),
@@ -1389,19 +1396,25 @@ class CommunicationManager:
             "vote_summary": vote_summary,
         }
 
-    def _human_escalation_outcome(self, meeting: MeetingRoom, consensus: dict[str, Any]) -> dict[str, Any]:
+    def _unresolved_meeting_outcome(
+        self,
+        consensus: dict[str, Any],
+        *,
+        owner_reasoning: str = "",
+    ) -> dict[str, Any]:
+        reasoning = "The decision owner did not produce a concrete decision after the meeting failed to converge."
+        if owner_reasoning:
+            reasoning = f"{reasoning} Owner assessment: {owner_reasoning}"
         return {
             "decision": "",
             "action_items": [
-                "Escalate this decision to a human reviewer.",
-                "Resolve the listed blocking conflicts before resuming execution.",
+                "Return the unresolved conflicts to the owning agent.",
+                "Gather the missing evidence and retry the decision internally.",
             ],
-            "reasoning": (
-                "The meeting exhausted its semantic consensus path and no safe automatic owner/majority decision "
-                "was available."
-            ),
-            "decision_method": "human_escalation",
-            "requires_human_input": True,
+            "reasoning": reasoning,
+            "decision_method": "owner_unresolved",
+            "resolution_status": "unresolved",
+            "retry_recommended": True,
             "follow_up_questions": list(consensus.get("open_questions", [])),
             "consensus_summary": dict(consensus),
             "aligned_points": list(consensus.get("aligned_points", [])),
@@ -1416,11 +1429,31 @@ class CommunicationManager:
         consensus: dict[str, Any],
     ) -> MeetingRoom:
         decision_policy = str(meeting.metadata.get("decision_policy", "") or "semantic_consensus_then_owner").strip()
+        # Upgrade compatibility for meetings persisted before owner decisions
+        # became fully internal. Never surface the legacy policy to prompts or
+        # create a user-facing wait from it.
+        if decision_policy == "owner_then_human":
+            decision_policy = "owner_override"
+        majority_first = decision_policy in {
+            "semantic_consensus_then_vote",
+            "majority_vote",
+        }
+        if majority_first:
+            majority = self._majority_vote_outcome(meeting, consensus)
+            if majority is not None:
+                return await self._finalize_meeting(
+                    meeting,
+                    outcome=majority,
+                    transcript_note=str(majority.get("decision", "") or majority.get("reasoning", "")).strip(),
+                )
+
+        owner_reasoning = ""
         if meeting.decision_owner and decision_policy in {
             "semantic_consensus_then_owner",
             "owner_override",
-            "owner_then_human",
             "semantic_consensus_then_owner_then_vote",
+            "semantic_consensus_then_vote",
+            "majority_vote",
         }:
             owner_response = await self._run_meeting_turn(
                 meeting,
@@ -1439,12 +1472,9 @@ class CommunicationManager:
                     outcome=owner_outcome,
                     transcript_note=str(owner_outcome.get("decision", "") or owner_outcome.get("reasoning", "")).strip(),
                 )
+            owner_reasoning = str(owner_outcome.get("reasoning", "") or "").strip()
 
-        if decision_policy in {
-            "semantic_consensus_then_owner_then_vote",
-            "semantic_consensus_then_vote",
-            "majority_vote",
-        }:
+        if not majority_first and decision_policy == "semantic_consensus_then_owner_then_vote":
             majority = self._majority_vote_outcome(meeting, consensus)
             if majority is not None:
                 return await self._finalize_meeting(
@@ -1453,11 +1483,14 @@ class CommunicationManager:
                     transcript_note=str(majority.get("decision", "") or majority.get("reasoning", "")).strip(),
                 )
 
-        escalation = self._human_escalation_outcome(meeting, consensus)
+        unresolved = self._unresolved_meeting_outcome(
+            consensus,
+            owner_reasoning=owner_reasoning,
+        )
         return await self._finalize_meeting(
             meeting,
-            outcome=escalation,
-            transcript_note=str(escalation.get("reasoning", "")).strip(),
+            outcome=unresolved,
+            transcript_note=str(unresolved.get("reasoning", "")).strip(),
         )
 
     async def _advance_meeting(
@@ -1541,18 +1574,19 @@ class CommunicationManager:
                         "Semantic consensus was reached across the participant positions and blocking conflicts were resolved."
                     ),
                     "decision_method": "semantic_consensus",
-                    "requires_human_input": False,
+                    "resolution_status": "resolved",
                     "follow_up_questions": list(consensus.get("open_questions", [])),
                     "consensus_summary": dict(consensus),
                     "aligned_points": list(consensus.get("aligned_points", [])),
                     "unresolved_items": list(consensus.get("blocking_conflicts", [])),
                     "vote_summary": dict(consensus.get("vote_summary", {})),
                 }
-                return await self._finalize_meeting(
-                    meeting,
-                    outcome=semantic_outcome,
-                    transcript_note=str(semantic_outcome.get("decision", "")).strip(),
-                ), True
+                if semantic_outcome["decision"]:
+                    return await self._finalize_meeting(
+                        meeting,
+                        outcome=semantic_outcome,
+                        transcript_note=str(semantic_outcome.get("decision", "")).strip(),
+                    ), True
 
             deadline_reached = bool(meeting.deadline_at and datetime.now() >= meeting.deadline_at)
             if meeting.current_round >= max(1, int(meeting.max_rounds or 1)) or deadline_reached:
@@ -1578,7 +1612,6 @@ class CommunicationManager:
                 return meeting, True
         await self.store.save_meeting(meeting)
         return meeting, changed
-        await self.store.save_task(task)
 
     def _mark_peer_wait(self, task: Task, message: AgentMessage, timeout_seconds: int = 300) -> dict[str, Any]:
         task.status = TaskStatus.AWAITING_PEER
@@ -2270,20 +2303,24 @@ class CommunicationManager:
         meeting = await self.store.get_meeting(room_id)
         if not meeting or meeting.status not in {MeetingStatus.DECIDED, MeetingStatus.CLOSED}:
             return False
-        requires_human = bool((meeting.outcome or {}).get("requires_human_input", False)) or meeting.decision_method == "human_escalation"
-        task.status = TaskStatus.AWAITING_HUMAN if requires_human else TaskStatus.PENDING
+        outcome = dict(meeting.outcome or {})
+        resolution_status = str(outcome.get("resolution_status", "") or "").strip()
+        if not resolution_status:
+            resolution_status = "resolved" if str(outcome.get("decision", "") or "").strip() else "unresolved"
+        task.status = TaskStatus.PENDING
         task.metadata = dict(task.metadata)
         task.metadata.pop("peer_wait", None)
         task.context_snapshot = dict(task.context_snapshot)
-        task.context_snapshot["meeting_outcome"] = meeting.outcome or {}
+        task.context_snapshot["meeting_outcome"] = outcome
         task.context_snapshot["meeting_decision_method"] = meeting.decision_method
+        task.context_snapshot["meeting_resolution_status"] = resolution_status
         task.context_snapshot["meeting_consensus"] = dict(meeting.consensus or {})
         outcome_origin = str((meeting.metadata or {}).get("outcome_origin", "") or "live_meeting").strip()
         task.context_snapshot["meeting_outcome_origin"] = outcome_origin
-        if requires_human:
-            task.context_snapshot["meeting_requires_human_review"] = {
+        if resolution_status == "unresolved":
+            task.context_snapshot["meeting_internal_retry"] = {
                 "room_id": meeting.room_id,
-                "reason": str((meeting.outcome or {}).get("reasoning", "") or "Human review is required before this work item can resume.").strip(),
+                "reason": str(outcome.get("reasoning", "") or "The meeting ended without an internal decision.").strip(),
             }
         await self.store.save_task(task)
         if outcome_origin != "live_meeting":

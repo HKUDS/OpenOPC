@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { RoleWorkItemSummary, Session, TaskPreferredAgent } from '../types/kanban'
-import type { ChatMessage, CheckpointReplyMetadata, OutgoingAttachmentPayload } from '../types/chat'
+import type { ChatMessage, CheckpointReplyMetadata, InteractionReplyReceipt, OutgoingAttachmentPayload, SessionSendMetadata } from '../types/chat'
 import type { AgentInfo, OrgInfoPayload, SavedOrgSummary } from '../types/visual'
 import type { CommsStatePayload, CommsMessagePayload } from '../lib/wsClient'
 import { CommsPanel } from './CommsPanel'
@@ -9,7 +9,6 @@ import { PRIORITY_META, type TaskPriority } from '../types/kanban'
 import { TaskHeaderBar } from '../chat/TaskHeaderBar'
 import { MarkdownBody, MessageList } from '../chat/MessageList'
 import { MessageComposer } from '../chat/MessageComposer'
-import { analyzeCheckpointMessages, checkpointReplyMetadataForComposer } from '../chat/checkpointUtils'
 import { AgentWorkPanel } from '../chat/AgentWorkPanel'
 import { WorkItemProgressCard } from '../chat/WorkItemProgressCard'
 import { IconTimeline, IconHandoff, IconTool } from '../chat/SvgIcons'
@@ -108,12 +107,12 @@ interface ContextPanelProps {
   onMaximize: () => void
 
   onComposerSend: (content: string, attachments?: OutgoingAttachmentPayload[]) => void
-  onMessageSend: (content: string, taskId?: string, metadata?: CheckpointReplyMetadata) => void
+  onInteractionReply: (content: string, taskId?: string, metadata?: CheckpointReplyMetadata) => Promise<InteractionReplyReceipt>
   onSessionSend?: (
     taskId: string,
     content: string,
     attachments?: OutgoingAttachmentPayload[],
-    metadata?: CheckpointReplyMetadata,
+    metadata?: SessionSendMetadata,
   ) => void
   onWorkItemClick: (executionTurnId: string) => void
   onWorkItemOpenSession?: (executionTurnId: string) => void
@@ -520,7 +519,7 @@ export function ContextPanel({
   onExpand,
   onMaximize,
   onComposerSend,
-  onMessageSend,
+  onInteractionReply,
   onSessionSend,
   onWorkItemClick,
   onWorkItemOpenSession,
@@ -1020,7 +1019,7 @@ export function ContextPanel({
                             workItemLog={sessionConversationSession?.workItemLog ?? session.workItemLog}
                             childSessions={sessionWorkItemRoleSessions}
                             showWorkItemRuntimeCard={!sessionIsCompanyRuntime}
-                            onSend={(content, _taskId, metadata) => onSessionSend?.(session.taskId, content, undefined, metadata)}
+                            onInteractionReply={(content, _taskId, metadata) => onInteractionReply(content, session.taskId, metadata)}
                             onWorkItemClick={onWorkItemClick}
                             onWorkItemOpenSession={onWorkItemOpenSession}
                             onMarkRead={() => onSessionMarkRead?.(session.taskId)}
@@ -1060,6 +1059,7 @@ export function ContextPanel({
                           />
                         </div>
                         <MessageComposer
+                          key={sessionConversationSession?.channelId ?? session.channelId}
                           disabled={false}
                           channelId={sessionConversationSession?.channelId ?? session.channelId}
                           execMode={composerExecModeForSession(session, execMode)}
@@ -1083,9 +1083,6 @@ export function ContextPanel({
                             session.taskId,
                             content,
                             attachments,
-                            checkpointReplyMetadataForComposer(
-                              analyzeCheckpointMessages(sessionMessages).latestPendingReplyMetadata,
-                            ),
                           )}
                           onModeChange={(mode, profile, orgId) => onSessionConfigChange?.(session.taskId, mode, profile, orgId)}
                           onTaskAgentChange={(preferredAgent) => onSessionTaskAgentChange?.(session.taskId, preferredAgent)}
@@ -1112,7 +1109,7 @@ export function ContextPanel({
                     channelName="Activity"
                     viewKind="activity"
                     detailMode="summary"
-                    onSend={onMessageSend}
+                    onInteractionReply={onInteractionReply}
                     onMarkRead={onMarkRead}
                     scrollScope={channelId}
                   />
@@ -1128,11 +1125,12 @@ export function ContextPanel({
                     channelName="Secretary"
                     viewKind="secretary"
                     detailMode="summary"
-                    onSend={onMessageSend}
+                    onInteractionReply={onInteractionReply}
                     onMarkRead={onMarkRead}
                     scrollScope={secretaryChannelId}
                   />
                   <MessageComposer
+                    key={secretaryChannelId}
                     disabled={false}
                     channelId={secretaryChannelId}
                     placeholder="Talk to Secretary about policies, rules, preferences..."
@@ -1185,7 +1183,7 @@ export function ContextPanel({
                     roleWorkItems={activeRoleWorkItems}
                     executorRoleWorkItems={activeExecutorRoleWorkItems}
                     childSessions={activeWorkItemRoleSessions}
-                    onSend={onMessageSend}
+                    onInteractionReply={onInteractionReply}
                     onWorkItemClick={onWorkItemClick}
                     onWorkItemOpenSession={onWorkItemOpenSession}
                     onMarkRead={onMarkRead}
@@ -1215,6 +1213,7 @@ export function ContextPanel({
                     showRuntimeProgress={activeDetailMode === 'full'}
                   />
                   <MessageComposer
+                    key={activeConversationSession?.channelId ?? channelId}
                     disabled={!canSend}
                     channelId={activeConversationSession?.channelId ?? channelId}
                     execMode={composerExecModeForSession(activeSession, execMode)}

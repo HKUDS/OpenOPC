@@ -266,15 +266,14 @@ class ClearSessionFocusOnTerminalHookTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(refreshed.status, "blocked")
 
     async def test_awaiting_human_does_not_clear(self) -> None:
-        """AWAITING_HUMAN is an escalation, not a terminal. The session
-        is legitimately still focused on the item until the human acts.
-        Hook must NOT clear focus on that transition."""
+        """A real explicit-input/final-delivery wait is not terminal.
+
+        Manager review is deliberately not allowed to escalate into this
+        state; the legal RUNNING → AWAITING_HUMAN edge remains for explicit
+        request_user_input and final owner feedback.
+        """
         wi, sess = await self._seed_work_and_session(
             session_focus_matches=True, session_status="blocked",
-        )
-        await self.store.update_delegation_work_item(wi.work_item_id, phase=Phase.RUNNING)
-        await self.store.update_delegation_work_item(
-            wi.work_item_id, phase=Phase.AWAITING_MANAGER_REVIEW
         )
         await self.store.update_delegation_work_item(
             wi.work_item_id, phase=Phase.AWAITING_HUMAN

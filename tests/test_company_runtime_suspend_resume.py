@@ -22,6 +22,10 @@ from opc.core.models import (
 )
 from opc.database.store import OPCStore
 from opc.engine import OPCEngine
+from opc.layer0_interaction.coordinator import (
+    InteractionCoordinator,
+    InteractionDecisionLease,
+)
 from opc.layer2_organization.company_runtime import CompanyRuntime
 from opc.layer2_organization.company_mode import CompanyWorkItemExecutor, serialize_company_work_item_runtime_plan
 from opc.layer2_organization.work_item_links import set_linked_work_item_id
@@ -168,7 +172,99 @@ class CompanyRuntimeSuspendResumeTests(unittest.IsolatedAsyncioTestCase):
         engine = OPCEngine()
         engine.project_id = "proj1"
         engine.store = store
+        engine.interaction_coordinator = InteractionCoordinator(
+            store=store,
+            project_id="proj1",
+            checkpoint_changed_callback=engine._interaction_checkpoint_changed,
+        )
+        engine._initialized = True
+        # Tests drive the durable consumer explicitly so assertions observe a
+        # deterministic terminal row instead of racing a background task.
+        engine._schedule_interaction_consumption = lambda *_args: None
         return engine
+
+    async def _publish_owner_checkpoint(
+        self,
+        store: OPCStore,
+        checkpoint: ExecutionCheckpoint,
+    ) -> ExecutionCheckpoint:
+        payload = dict(checkpoint.payload or {})
+        task_id = str(
+            checkpoint.task_id
+            or payload.get("waiting_task_id")
+            or payload.get("task_id")
+            or ""
+        ).strip()
+        task = await store.get_task(task_id) if task_id else None
+        waiting_session_id = str(
+            checkpoint.session_id or getattr(task, "session_id", "") or ""
+        ).strip()
+        root_session_id = str(
+            getattr(task, "parent_session_id", "")
+            or waiting_session_id
+        ).strip()
+        interaction = dict(payload.get("interaction", {}) or {})
+        domain_key = str(
+            interaction.get("domain_key")
+            or f"test:{checkpoint.checkpoint_type}:{checkpoint.checkpoint_id}"
+        ).strip()
+        ownership = dict(interaction.get("ownership", {}) or {})
+        if task_id:
+            ownership.setdefault("waiting_task_id", task_id)
+        if waiting_session_id:
+            ownership.setdefault("waiting_session_id", waiting_session_id)
+        if root_session_id:
+            ownership.setdefault("root_session_id", root_session_id)
+            ownership.setdefault("ui_anchor_session_id", root_session_id)
+        interaction.update(
+            {
+                "kind": checkpoint.checkpoint_type,
+                "domain_key": domain_key,
+                "ownership": ownership,
+            }
+        )
+        payload["interaction"] = interaction
+        checkpoint.payload = payload
+        persisted, _ = await store.publish_owner_interaction_checkpoint(
+            checkpoint,
+            interaction_key=domain_key,
+            supersede_pending_scope=False,
+        )
+        return persisted
+
+    async def _submit_and_consume_owner_checkpoint(
+        self,
+        engine: OPCEngine,
+        checkpoint: ExecutionCheckpoint,
+        decision: dict[str, Any],
+        *,
+        requester_session_id: str = "sess-parent",
+    ) -> tuple[ExecutionCheckpoint, str]:
+        receipt = await engine.submit_checkpoint_decision(
+            checkpoint_id=checkpoint.checkpoint_id,
+            checkpoint_type=checkpoint.checkpoint_type,
+            decision=decision,
+            client_request_id=(
+                f"test:{checkpoint.checkpoint_id}:"
+                f"{decision.get('option_id') or decision.get('text') or 'reply'}"
+            ),
+            requester_session_id=requester_session_id,
+        )
+        self.assertTrue(receipt["accepted"], receipt)
+        await engine._consume_answered_interaction(
+            checkpoint.checkpoint_id,
+            checkpoint.checkpoint_type,
+        )
+        assert engine.store is not None
+        persisted = await engine.store.get_execution_checkpoint(
+            checkpoint.checkpoint_id,
+            project_id=checkpoint.project_id,
+            checkpoint_type=checkpoint.checkpoint_type,
+        )
+        self.assertIsNotNone(persisted)
+        assert persisted is not None
+        result = dict(persisted.payload.get("interaction_result", {}) or {})
+        return persisted, str(result.get("message", "") or "")
 
     class _CapturingCompanyExecutor:
         def __init__(self) -> None:
@@ -499,7 +595,7 @@ class CompanyRuntimeSuspendResumeTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertFalse(engine._active_task_run_registry.is_active("proj1", task.id))
 
-    async def test_resume_attempt_pins_unlocked_auto_external_agent_without_permanent_lock(self) -> None:
+    async def test_resume_retires_external_pin_at_company_native_boundary(self) -> None:
         store = await self._store()
         _, task = await self._seed_runtime(store)
         task.assigned_external_agent = "opencode"
@@ -565,32 +661,40 @@ class CompanyRuntimeSuspendResumeTests(unittest.IsolatedAsyncioTestCase):
         )
 
         resumed_task = captured["task"]
-        self.assertEqual(captured["selected"], "opencode")
-        self.assertEqual(resumed_task.assigned_external_agent, "opencode")
+        self.assertIsNone(captured["selected"])
+        self.assertIsNone(resumed_task.assigned_external_agent)
         self.assertEqual(resumed_task.assigned_to, "executor")
         self.assertEqual(resumed_task.metadata["delegation_seat_id"], "seat-1")
         self.assertEqual(
             resumed_task.metadata["employee_assignment"]["employee_id"],
             "employee-executor",
         )
-        self.assertFalse(resumed_task.metadata["execution_agent_locked"])
+        self.assertTrue(resumed_task.metadata["execution_agent_locked"])
         self.assertNotIn(
             "_company_runtime_resume_execution_agent_pin",
             resumed_task.metadata,
         )
         self.assertEqual(
             resumed_task.metadata["agent_selection"]["selection_source"],
-            "company_runtime_resume_checkpoint",
+            "company_isolation_boundary",
+        )
+        self.assertEqual(
+            resumed_task.metadata["selected_execution_agent"],
+            "native",
+        )
+        self.assertIsNone(
+            resumed_task.metadata["preferred_external_agent"],
         )
         adaptive_selector.assert_not_awaited()
 
-        # A later ordinary dispatch has no checkpoint pin and may adapt again.
+        # A later company dispatch remains native and cannot resurrect the
+        # checkpoint's stale external provider selection.
         selected_after_resume = await engine._assign_task_execution_agent(
             resumed_task,
             role=SimpleNamespace(),
         )
-        self.assertEqual(selected_after_resume, "codex")
-        adaptive_selector.assert_awaited_once()
+        self.assertIsNone(selected_after_resume)
+        adaptive_selector.assert_not_awaited()
 
     async def test_resume_attempt_pins_native_without_running_adaptive_selector(self) -> None:
         store = await self._store()
@@ -972,7 +1076,11 @@ class CompanyRuntimeSuspendResumeTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(
             resumed.metadata["agent_selection"]["selection_source"],
-            "company_runtime_resume_checkpoint",
+            "company_isolation_boundary",
+        )
+        self.assertEqual(
+            resumed.metadata["selected_execution_agent"],
+            "native",
         )
         self.assertIsNone(resumed.assigned_external_agent)
 
@@ -1499,6 +1607,140 @@ class CompanyRuntimeSuspendResumeTests(unittest.IsolatedAsyncioTestCase):
         assert target is not None
         self.assertEqual(target.id, "task-delivery")
 
+    async def test_followup_target_prefers_live_board_owner_over_open_delivery(self) -> None:
+        engine = self._engine(await self._store())
+        plan = CompanyWorkItemRuntimePlan(
+            profile="corporate",
+            metadata={
+                "execution_model": "multi_team_org",
+                "runtime_model": "multi_team_org",
+                "final_decider_role_id": "ceo",
+                "top_level_role_ids": ["ceo"],
+            },
+        )
+        intake = Task(
+            id="task-intake",
+            title="CEO Intake",
+            status=TaskStatus.BLOCKED,
+            project_id="proj1",
+            assigned_to="ceo",
+            metadata=mark_work_item_projection(
+                {
+                    "work_item_runtime": True,
+                    "delegated_children_pending": True,
+                    "delegation_pending_work_item_ids": ["wi-cto", "wi-cmo"],
+                    "delegation_wait_for_work_item_ids": ["wi-cto", "wi-cmo"],
+                },
+                projection_id="ceo-intake",
+                turn_type="intake",
+            ),
+        )
+        delivery = Task(
+            id="task-delivery",
+            title="CEO Delivery",
+            status=TaskStatus.AWAITING_HUMAN,
+            project_id="proj1",
+            assigned_to="ceo",
+            metadata=mark_work_item_projection(
+                {
+                    "work_item_runtime": True,
+                    "execution_mode": "company_mode",
+                    "authoritative_output": True,
+                    "user_visible": True,
+                    "requires_user_feedback": True,
+                    "feedback_scope": "final",
+                },
+                projection_id="ceo-delivery",
+                turn_type="deliver",
+            ),
+        )
+        cto = Task(
+            id="task-cto",
+            title="CTO Team",
+            status=TaskStatus.AWAITING_MANAGER_REVIEW,
+            project_id="proj1",
+            assigned_to="cto",
+            metadata=mark_work_item_projection(
+                {"work_item_runtime": True},
+                projection_id="cto-execute",
+                turn_type="execute",
+            ),
+        )
+
+        target = engine._company_followup_target_task(
+            plan,
+            [delivery, cto, intake],
+        )
+
+        assert target is not None
+        self.assertEqual(target.id, "task-intake")
+
+    async def test_followup_target_never_selects_review_helper_when_delivery_flags_are_closed(self) -> None:
+        engine = self._engine(await self._store())
+        plan = CompanyWorkItemRuntimePlan(
+            profile="corporate",
+            metadata={
+                "execution_model": "multi_team_org",
+                "runtime_model": "multi_team_org",
+                "final_decider_role_id": "ceo",
+                "top_level_role_ids": ["ceo"],
+            },
+        )
+        intake = Task(
+            id="task-intake",
+            title="CEO Intake",
+            status=TaskStatus.BLOCKED,
+            project_id="proj1",
+            assigned_to="ceo",
+            metadata=mark_work_item_projection(
+                {
+                    "work_item_runtime": True,
+                    "dependency_work_item_ids": ["wi-cto", "wi-cmo"],
+                },
+                projection_id="ceo-intake",
+                turn_type="intake",
+            ),
+        )
+        premature_delivery = Task(
+            id="task-delivery",
+            title="CEO Delivery",
+            status=TaskStatus.RUNNING,
+            project_id="proj1",
+            assigned_to="ceo",
+            metadata=mark_work_item_projection(
+                {
+                    "work_item_runtime": True,
+                    "execution_mode": "company_mode",
+                    "authoritative_output": True,
+                    "user_visible": True,
+                    "requires_user_feedback": False,
+                    "feedback_scope": "final",
+                },
+                projection_id="ceo-delivery",
+                turn_type="deliver",
+            ),
+        )
+        review = Task(
+            id="task-review-cmo",
+            title="Review CMO",
+            status=TaskStatus.PENDING,
+            project_id="proj1",
+            assigned_to="ceo",
+            metadata=mark_work_item_projection(
+                {"work_item_runtime": True},
+                projection_id="review-cmo",
+                turn_type="review",
+            ),
+        )
+
+        target = engine._company_followup_target_task(
+            plan,
+            [review, premature_delivery, intake],
+        )
+
+        assert target is not None
+        self.assertEqual(target.id, "task-intake")
+
     async def test_final_delivery_followup_preserves_delivery_identity(self) -> None:
         store = await self._store()
         engine = self._engine(store)
@@ -1706,17 +1948,46 @@ class CompanyRuntimeSuspendResumeTests(unittest.IsolatedAsyncioTestCase):
         await store.save_task(delivery_task)
         await store.link_work_item_runtime_task("wi-intake", intake_task.id)
         await store.link_work_item_runtime_task("wi-delivery", delivery_task.id)
-        await store.save_execution_checkpoint(
+        old_feedback = await self._publish_owner_checkpoint(
+            store,
             ExecutionCheckpoint(
                 checkpoint_id="old-feedback",
                 project_id="proj1",
                 session_id=delivery_task.session_id,
                 checkpoint_type="company_delivery_feedback",
-                status="resolved",
                 task_id=delivery_task.id,
                 payload={"waiting_task_id": delivery_task.id},
-            )
+            ),
         )
+        receipt = await engine.submit_checkpoint_decision(
+            checkpoint_id=old_feedback.checkpoint_id,
+            checkpoint_type=old_feedback.checkpoint_type,
+            decision={
+                "option_id": "approve",
+                "checkpoint_reply_kind": "approve",
+                "text": "approve",
+            },
+            client_request_id="test:old-feedback:approve",
+            requester_session_id="sess-parent",
+        )
+        self.assertTrue(receipt["accepted"], receipt)
+        assert engine.interaction_coordinator is not None
+        claim = await engine.interaction_coordinator.claim_answered(
+            checkpoint_id=old_feedback.checkpoint_id,
+            checkpoint_type=old_feedback.checkpoint_type,
+            consumer_id="test-historical-delivery-consumer",
+        )
+        self.assertTrue(claim.acquired, claim)
+        assert claim.checkpoint is not None
+        finished = await engine.interaction_coordinator.finish(
+            InteractionDecisionLease(
+                checkpoint=claim.checkpoint,
+                decision={"checkpoint_reply_kind": "approve"},
+                consumer_id="test-historical-delivery-consumer",
+                claim_id=claim.claim_id,
+            ),
+        )
+        self.assertTrue(finished.applied, finished)
 
         class DummyExecutor:
             async def execute(self, runtime_plan: CompanyWorkItemRuntimePlan, tasks: list[Task]) -> str:
@@ -2116,7 +2387,7 @@ class CompanyRuntimeSuspendResumeTests(unittest.IsolatedAsyncioTestCase):
         )
         runtime._claimed_task_ids.add(task.id)
         runtime._claimed_work_item_ids.add("work-item-1")
-        runtime.role_queues["executor"].append(f"work-item::work-item-1")
+        runtime.role_queues["executor"].append("work-item::work-item-1")
         captured: dict[str, Any] = {}
 
         class DummyCompanyExecutor:
@@ -2532,7 +2803,10 @@ class CompanyRuntimeSuspendResumeTests(unittest.IsolatedAsyncioTestCase):
             checkpoint_type="task_user_input",
             payload={"prompt": "Need human input.", "task_id": task.id},
         )
-        await store.save_execution_checkpoint(child_checkpoint)
+        child_checkpoint = await self._publish_owner_checkpoint(
+            store,
+            child_checkpoint,
+        )
 
         selected = await engine.get_latest_pending_checkpoint_for_session("sess-parent")
 
@@ -2589,22 +2863,26 @@ class CompanyRuntimeSuspendResumeTests(unittest.IsolatedAsyncioTestCase):
                 "pause_request": {"reason": "Need second input"},
             },
         )
-        await store.save_execution_checkpoint(first_checkpoint)
-        await store.save_execution_checkpoint(second_checkpoint)
+        first_checkpoint = await self._publish_owner_checkpoint(
+            store,
+            first_checkpoint,
+        )
+        second_checkpoint = await self._publish_owner_checkpoint(
+            store,
+            second_checkpoint,
+        )
         engine = self._engine(store)
         executor = self._CapturingCompanyExecutor()
         engine.company_executor = executor  # type: ignore[assignment]
 
-        result = await engine._maybe_resume_checkpoint(
-            "Use the first answer",
-            "sess-parent",
-            reply_metadata={
-                "response_to_checkpoint_id": "cp-first",
-                "response_to_checkpoint_type": "task_user_input",
-            },
+        terminal, result = await self._submit_and_consume_owner_checkpoint(
+            engine,
+            first_checkpoint,
+            {"text": "Use the first answer"},
         )
 
         self.assertEqual(result, "runtime resumed")
+        self.assertEqual(terminal.status, "resolved")
         refreshed_first = await store.get_task(task.id)
         refreshed_second = await store.get_task(sibling.id)
         assert refreshed_first is not None
@@ -2635,25 +2913,23 @@ class CompanyRuntimeSuspendResumeTests(unittest.IsolatedAsyncioTestCase):
                 "pause_request": {"reason": "Need child input"},
             },
         )
-        await store.save_execution_checkpoint(checkpoint)
+        checkpoint = await self._publish_owner_checkpoint(store, checkpoint)
         engine = self._engine(store)
         engine.company_executor = self._CapturingCompanyExecutor()  # type: ignore[assignment]
 
-        result = await engine._maybe_resume_checkpoint(
-            "Parent replied to child",
-            "sess-parent",
-            reply_metadata={
-                "response_to_checkpoint_id": "cp-child-input",
-                "response_to_checkpoint_type": "task_user_input",
-            },
+        terminal, result = await self._submit_and_consume_owner_checkpoint(
+            engine,
+            checkpoint,
+            {"text": "Parent replied to child"},
         )
 
         self.assertEqual(result, "runtime resumed")
+        self.assertEqual(terminal.status, "resolved")
         refreshed = await store.get_task(task.id)
         assert refreshed is not None
         self.assertEqual(refreshed.context_snapshot.get("user_supplied_input"), "Parent replied to child")
 
-    async def test_explicit_resolved_checkpoint_reply_returns_inactive(self) -> None:
+    async def test_resolved_checkpoint_rejects_late_interaction_reply(self) -> None:
         store = await self._store()
         _, task = await self._seed_runtime(store)
         checkpoint = ExecutionCheckpoint(
@@ -2662,25 +2938,30 @@ class CompanyRuntimeSuspendResumeTests(unittest.IsolatedAsyncioTestCase):
             session_id=task.session_id,
             task_id=task.id,
             checkpoint_type="task_user_input",
-            status="resolved",
             payload={"task_id": task.id, "session_id": task.session_id},
         )
-        await store.save_execution_checkpoint(checkpoint)
+        checkpoint = await self._publish_owner_checkpoint(store, checkpoint)
         engine = self._engine(store)
         engine.company_executor = self._CapturingCompanyExecutor()  # type: ignore[assignment]
+        terminal, _ = await self._submit_and_consume_owner_checkpoint(
+            engine,
+            checkpoint,
+            {"text": "initial answer"},
+        )
+        self.assertEqual(terminal.status, "resolved")
 
-        result = await engine._maybe_resume_checkpoint(
-            "late reply",
-            "sess-parent",
-            reply_metadata={
-                "response_to_checkpoint_id": "cp-old",
-                "response_to_checkpoint_type": "task_user_input",
-            },
+        late = await engine.submit_checkpoint_decision(
+            checkpoint_id=checkpoint.checkpoint_id,
+            checkpoint_type=checkpoint.checkpoint_type,
+            decision={"text": "late reply"},
+            client_request_id="test:cp-old:late",
+            requester_session_id="sess-parent",
         )
 
-        self.assertEqual(result, "This request is no longer active.")
+        self.assertFalse(late["accepted"], late)
+        self.assertEqual(late["status"], "resolved")
 
-    async def test_explicit_resolved_delivery_feedback_reply_allows_runtime_followup(self) -> None:
+    async def test_resolved_delivery_feedback_does_not_swallow_runtime_followup(self) -> None:
         store = await self._store()
         _, task = await self._seed_runtime(store)
         checkpoint = ExecutionCheckpoint(
@@ -2689,20 +2970,29 @@ class CompanyRuntimeSuspendResumeTests(unittest.IsolatedAsyncioTestCase):
             session_id=task.session_id,
             task_id=task.id,
             checkpoint_type="company_delivery_feedback",
-            status="resolved",
-            payload={"task_id": task.id, "session_id": task.session_id},
+            payload={
+                "task_id": task.id,
+                "waiting_task_id": task.id,
+                "session_id": task.session_id,
+            },
         )
-        await store.save_execution_checkpoint(checkpoint)
+        checkpoint = await self._publish_owner_checkpoint(store, checkpoint)
         engine = self._engine(store)
         engine.company_executor = self._CapturingCompanyExecutor()  # type: ignore[assignment]
+        terminal, _ = await self._submit_and_consume_owner_checkpoint(
+            engine,
+            checkpoint,
+            {
+                "option_id": "ignore",
+                "checkpoint_reply_kind": "ignore",
+                "text": "ignore",
+            },
+        )
+        self.assertEqual(terminal.status, "ignored")
 
         result = await engine._maybe_resume_checkpoint(
             "late delivery follow-up",
             "sess-parent",
-            reply_metadata={
-                "response_to_checkpoint_id": "cp-old-delivery",
-                "response_to_checkpoint_type": "company_delivery_feedback",
-            },
         )
 
         self.assertIsNone(result)
@@ -2724,21 +3014,24 @@ class CompanyRuntimeSuspendResumeTests(unittest.IsolatedAsyncioTestCase):
                 "prompt": "Send your next review instruction.",
             },
         )
-        await store.save_execution_checkpoint(checkpoint)
+        checkpoint = await self._publish_owner_checkpoint(store, checkpoint)
         engine = self._engine(store)
         engine.company_executor = self._CapturingCompanyExecutor()  # type: ignore[assignment]
         engine.memory = object()  # type: ignore[assignment]
 
-        result = await engine._maybe_resume_checkpoint(
-            "   ",
-            task.session_id,
-            reply_metadata={
-                "response_to_checkpoint_id": "cp-delivery",
-                "response_to_checkpoint_type": "company_delivery_feedback",
+        receipt = await engine.submit_checkpoint_decision(
+            checkpoint_id=checkpoint.checkpoint_id,
+            checkpoint_type=checkpoint.checkpoint_type,
+            decision={
+                "checkpoint_reply_kind": "feedback",
+                "human_feedback_text": "   ",
+                "text": "   ",
             },
+            client_request_id="test:cp-delivery:blank-feedback",
+            requester_session_id="sess-parent",
         )
 
-        self.assertIn("pending delivery self-evolution review", result or "")
+        self.assertFalse(receipt["accepted"], receipt)
         checkpoints = await store.get_execution_checkpoints("proj1")
         statuses = {item.checkpoint_id: item.status for item in checkpoints}
         self.assertEqual(statuses["cp-delivery"], "pending")

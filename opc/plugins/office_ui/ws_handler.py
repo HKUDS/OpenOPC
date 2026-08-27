@@ -21,17 +21,16 @@ from opc.core.active_task_runs import (
     ActiveTaskRunAdmissionClosed,
     ActiveTaskRunRegistry,
 )
+from opc.core.company_controller import CompanyRunControllerLeaseLost
 from opc.core.config import (
     OPCConfig,
     get_project_workplace,
     slugify_organization_name,
-    validate_organization_id,
 )
 from opc.core.org_config import (
     allocate_org_config_id,
     apply_org_config_payload_to_config,
     build_org_config_payload_from_config,
-    list_org_config_paths,
     load_org_config_payload,
     org_config_filename,
     org_config_path,
@@ -45,11 +44,12 @@ from opc.core.org_config import (
 )
 from opc.core.models import normalize_role_runtime_status
 from opc.core.transcript_visibility import rendered_transcript_metadata_visible
-from opc.presentation.kanban import build_company_board_columns
-from opc.layer2_organization.phase import (
-    kanban_column,
-    should_hide_work_item_from_company_kanban,
+from opc.core.interaction_protocol import (
+    OWNER_INTERACTION_ACTIVE_STATUSES,
+    OWNER_INTERACTION_CHECKPOINT_TYPES,
+    owner_interaction_actor_identity,
 )
+from opc.presentation.kanban import build_company_board_columns
 from opc.layer2_organization.company_runtime_identity import (
     ACTIVE_COMPANY_RUNTIME_CHECKPOINT_STATUSES,
     COMPANY_RUNTIME_CHECKPOINT_TYPES,
@@ -58,16 +58,12 @@ from opc.layer2_organization.company_runtime_identity import (
 )
 from opc.layer2_organization.work_item_identity import (
     work_item_identity_payload,
-    work_item_identity_payload_for_task,
     work_item_projection_id_from_metadata,
     work_item_turn_type_from_metadata,
 )
-from opc.layer2_organization.work_item_links import linked_work_item_id_for_task
 from opc.layer2_organization.work_item_transition import (
     apply_task_status_transition,
 )
-from opc.layer2_organization.org_work_item_planner import build_custom_org_work_item_blueprint
-from opc.layer4_tools.output_budget import clip_text
 
 if TYPE_CHECKING:
     import aiohttp.web
@@ -101,8 +97,6 @@ from opc.plugins.office_ui.snapshot_builder import (
 )
 from opc.plugins.office_ui.org_architecture_snapshot import (
     apply_org_architecture_snapshot,
-    build_org_architecture_snapshot,
-    dump_org_architecture_snapshot,
     parse_org_architecture_snapshot,
 )
 
@@ -237,47 +231,6 @@ _TASK_MODE_VISIBLE_RUNTIME_PROGRESS_TYPES: frozenset[str] = frozenset({
 })
 
 
-def _normalize_escalation_key(value: str) -> str:
-    return re.sub(r"[\s\-]+", "_", value.strip()).strip("_").casefold()
-
-
-def _normalize_escalation_reply(reply: str, options: list[dict[str, Any]]) -> str | None:
-    raw_reply = str(reply or "").strip()
-    if not raw_reply:
-        return None
-
-    normalized_map: dict[str, str] = {}
-    for idx, option in enumerate(options, start=1):
-        option_id = str(option.get("id", "")).strip()
-        label = str(option.get("label", option_id)).strip()
-        if not option_id:
-            continue
-        normalized_map[option_id.casefold()] = option_id
-        normalized_map[_normalize_escalation_key(option_id)] = option_id
-        if label:
-            normalized_map[label.casefold()] = option_id
-            normalized_map[_normalize_escalation_key(label)] = option_id
-        normalized_map[str(idx)] = option_id
-
-    alias_map = {
-        "y": "approve_once",
-        "yes": "approve_once",
-        "approve": "approve_once",
-        "allow": "approve_once",
-        "session": "approve_session",
-        "n": "deny",
-        "no": "deny",
-        "deny": "deny",
-        "reject": "deny",
-        "project": "always_project",
-        "global": "always_global",
-    }
-    alias = alias_map.get(_normalize_escalation_key(raw_reply))
-    if alias and alias in normalized_map.values():
-        return alias
-    return normalized_map.get(raw_reply.casefold()) or normalized_map.get(_normalize_escalation_key(raw_reply))
-
-
 def _ui_message_identity_metadata(
     *,
     kind: str | None = None,
@@ -307,29 +260,6 @@ def _ui_conversation_turn_id(message_id: str | None) -> str:
         return ""
     return f"ui-turn:{normalized_id}"
 
-
-_GENERIC_ESCALATION_OPTIONS: list[dict[str, str]] = [
-    {"id": "approve_once", "label": "Approve once"},
-    {"id": "approve_session", "label": "Allow for this session"},
-    {"id": "deny", "label": "Deny"},
-    {"id": "always_project", "label": "Always allow for this project"},
-    {"id": "always_global", "label": "Always allow globally"},
-    {"id": "proceed", "label": "Proceed"},
-    {"id": "abort", "label": "Abort"},
-]
-
-
-def _looks_like_escalation_reply(content: str) -> bool:
-    return _normalize_escalation_reply(content, _GENERIC_ESCALATION_OPTIONS) is not None
-
-
-_TASK_MODE_PREFERRED_AGENTS = frozenset({
-    "native",
-    "codex",
-    "claude_code",
-    "cursor",
-    "opencode",
-})
 
 _PERSISTED_WORKER_NOTIFICATION_KINDS = frozenset({
     "idle",
@@ -379,6 +309,7 @@ _PROJECT_SCOPED_ENVELOPE_TYPES = frozenset({
     "work_item_batch_updated",
     "project_recovery_updated",
     "project_revision_created",
+    "reorg_list",
     "comms_state",
     "comms_message",
     "comms_state_dirty",
@@ -460,8 +391,6 @@ class WSHandler:
         self._secretary_session_ids: dict[str, str] = {}
         self._session_to_task: dict[str, str] = {}
         self._ui_task_aliases: dict[str, str] = {}
-        self._pending_escalations: dict[str, dict[str, Any]] = {}
-        self._pending_escalation_order: list[str] = []
         self._progress_buffer: dict[str, list[dict[str, Any]]] = {}
         self._progress_project_ids: dict[str, str] = {}
         self._runtime_status_sync_task: asyncio.Task[Any] | None = None
@@ -474,7 +403,6 @@ class WSHandler:
         self._company_stop_intents: dict[str, dict[str, Any]] = {}
         self._company_stop_finalize_tasks: dict[str, asyncio.Task[Any]] = {}
         self._company_suspend_reply_locks: dict[str, asyncio.Lock] = {}
-        self._company_delivery_feedback_reply_locks: dict[str, asyncio.Lock] = {}
         # Buffer progress entries before UPSERTing to SQLite. Raised from 1
         # so bursts (codex streaming thinking chunks, multi-line tool output)
         # don't hammer the DB once per entry, but kept small enough that a
@@ -673,18 +601,6 @@ class WSHandler:
         setattr(_runtime_event, "_opc_ui_project_id", self._normalize_project_id(getattr(engine, "project_id", None)))
         return _runtime_event
 
-    def _escalation_callback_for_engine(self, engine: Any) -> Any:
-        async def _escalation(message: str, options: list[dict]) -> str | None:
-            return await self._handle_ui_escalation(
-                message,
-                options,
-                project_id=self._normalize_project_id(getattr(engine, "project_id", None)),
-            )
-
-        setattr(_escalation, "_opc_ui_handler_id", id(self))
-        setattr(_escalation, "_opc_ui_project_id", self._normalize_project_id(getattr(engine, "project_id", None)))
-        return _escalation
-
     def _kanban_callback_for_engine(self, engine: Any) -> Any:
         async def _kanban_changed() -> None:
             try:
@@ -702,14 +618,18 @@ class WSHandler:
         try:
             progress_callback = self._progress_callback_for_engine(engine)
             runtime_event_callback = self._runtime_event_callback_for_engine(engine)
-            escalation_callback = self._escalation_callback_for_engine(engine)
             engine.on_company_runtime_children = self._register_company_runtime_children
             engine.on_company_kanban_callback_factory = self._kanban_callback_for_engine
-            engine.on_escalation = escalation_callback
+            # Human interactions are durable ExecutionCheckpoints.  Office UI
+            # must never install the legacy synchronous escalation callback:
+            # custom runtimes have their own EventBus and a missed callback
+            # would otherwise turn a tool permission into generic user input.
+            engine.on_escalation = None
             engine.on_progress = progress_callback
             engine.on_runtime_event = runtime_event_callback
-            if getattr(engine, "escalation", None):
-                engine.escalation.user_reply_callback = escalation_callback
+            interaction_coordinator = getattr(engine, "interaction_coordinator", None)
+            if interaction_coordinator is not None:
+                interaction_coordinator.presentation_callback = None
             company_executor = getattr(engine, "company_executor", None)
             if company_executor is not None:
                 company_executor.progress_callback = progress_callback
@@ -1121,6 +1041,10 @@ class WSHandler:
                     pass
                 elif msg.type == 8:  # ERROR
                     logger.warning(f"WS error: {ws.exception()}")
+        except asyncio.CancelledError:
+            if not self._shutting_down:
+                logger.warning("WS connection task cancelled unexpectedly")
+            raise
         except Exception as e:
             if self._is_expected_shutdown_error(e) or self._is_ws_disconnect_error(e):
                 logger.debug(f"WS handler closed during disconnect/shutdown: {type(e).__name__}: {e!r}")
@@ -1603,12 +1527,6 @@ class WSHandler:
             except Exception:
                 pass
 
-        # Mirror escalations to chat
-        if event.event_type == "escalation_created":
-            await self._mirror_escalation(event, engine=engine, project_id=pid)
-        if event.event_type in {"escalation_resolved", "escalation_timeout"}:
-            await self._mark_escalation_event_checkpoint_terminal(event, project_id=pid)
-
         if event.event_type == "task_status_changed":
             payload = event.payload or {}
             task_id = str(payload.get("task_id", "") or "").strip()
@@ -1640,13 +1558,65 @@ class WSHandler:
         runtime_engine = engine or self.engine
         pid = self._normalize_project_id(project_id or getattr(runtime_engine, "project_id", None))
         payload = self._enrich_runtime_progress_payload(payload, engine=runtime_engine)
+        runtime_type = str(payload.get("type", "") or "").strip()
         raw_task_id = str(payload.get("task_id", "") or "").strip()
+        if runtime_type == "external_team_bindings_changed":
+            # Staffing changes the executable roster, not the source org
+            # architecture. Rebuild the visual projection immediately so
+            # covered provider-internal roles do not linger until reconnect.
+            snapshot = await build_snapshot(
+                runtime_engine,
+                self.agent_store,
+                self.chat_store,
+                self.event_adapter,
+            )
+            snapshot["project_id"] = pid
+            snapshot["exec_mode"] = "company"
+            snapshot["company_profile"] = str(
+                getattr(getattr(runtime_engine, "config", None), "org", None).company_profile
+                if getattr(getattr(runtime_engine, "config", None), "org", None) is not None
+                else self._company_profile
+            )
+            snapshot["task_preferred_agent"] = self._task_preferred_agent
+            await self.broadcast({"type": "snapshot", "payload": snapshot})
+            return
+        if runtime_type == "interaction_checkpoint_changed":
+            cards: list[dict[str, Any]] = []
+            changed_checkpoint_id = str(payload.get("checkpoint_id", "") or "").strip()
+            changed_checkpoint_type = str(payload.get("checkpoint_type", "") or "").strip()
+            if changed_checkpoint_id:
+                checkpoint = await self._load_execution_checkpoint_for_reply(
+                    engine=runtime_engine,
+                    project_id=pid,
+                    checkpoint_id=changed_checkpoint_id,
+                    checkpoint_type=changed_checkpoint_type,
+                )
+                if checkpoint is not None:
+                    actor_task_id, actor_session_id = (
+                        owner_interaction_actor_identity(checkpoint)
+                    )
+                    cards = await self._visible_owner_interaction_cards(
+                        engine=runtime_engine,
+                        project_id=pid,
+                        requester_task_id=actor_task_id,
+                        requester_session_id=actor_session_id,
+                        checkpoints=[checkpoint],
+                    )
+            else:
+                # A refresh without an exact row is only a hint.  Never turn its
+                # runtime/waiting Task into an owner actor; rebuild from durable
+                # ownership instead.
+                cards = await self._owner_interaction_baseline_cards(
+                    engine=runtime_engine,
+                    project_id=pid,
+                )
+            for card in cards:
+                await self.broadcast({"type": "session_message", "payload": card})
         if not raw_task_id:
             return
         task_id = await self._ui_task_id_for_runtime_task_id(raw_task_id, engine=runtime_engine)
         if not task_id:
             return
-        runtime_type = str(payload.get("type", "") or "").strip()
         entry = self._runtime_event_to_progress_entry(payload)
         if not entry:
             if runtime_type in {"turn_completed", "turn_failed", "checkpoint_saved"}:
@@ -1778,323 +1748,6 @@ class WSHandler:
             "payload": message,
         })
 
-    def _remember_pending_escalation(self, payload: dict[str, Any]) -> dict[str, Any]:
-        escalation_id = str(payload.get("escalation_id") or f"esc_{uuid.uuid4()}")
-        raw_project_id = str(payload.get("project_id") or "").strip()
-        project_id = self._normalize_project_id(raw_project_id) if raw_project_id else ""
-        approval_group_key = str(payload.get("approval_group_key") or "").strip() or self._approval_group_key(
-            str(payload.get("message") or "")
-        )
-        existing = self._pending_escalations.get(escalation_id)
-        if existing is not None:
-            future = existing.get("future")
-            if future is None or future.done():
-                future = asyncio.get_running_loop().create_future()
-            record = {
-                **existing,
-                **payload,
-                "future": future,
-                "escalation_id": escalation_id,
-                "approval_group_key": approval_group_key,
-            }
-            if project_id:
-                record["project_id"] = project_id
-            self._pending_escalations[escalation_id] = record
-            if escalation_id in self._pending_escalation_order:
-                self._pending_escalation_order = [
-                    item for item in self._pending_escalation_order
-                    if item != escalation_id
-                ]
-            self._pending_escalation_order.append(escalation_id)
-            return record
-
-        future: asyncio.Future[str | None] = asyncio.get_running_loop().create_future()
-        record = {
-            **payload,
-            "future": future,
-            "escalation_id": escalation_id,
-            "approval_group_key": approval_group_key,
-        }
-        if project_id:
-            record["project_id"] = project_id
-        self._pending_escalations[escalation_id] = record
-        self._pending_escalation_order.append(escalation_id)
-        return record
-
-    @staticmethod
-    def _approval_group_key(message: str) -> str:
-        raw = str(message or "").strip()
-        if not raw:
-            return ""
-        normalized = WSHandler._semantic_permission_group_key(raw)
-        if normalized:
-            return normalized
-        for line in raw.splitlines():
-            stripped = line.strip()
-            if stripped.lower().startswith("allowlist target:"):
-                return stripped.split(":", 1)[1].strip()
-        match = re.search(r"Approve\s+([a-z_]+)\s+'([^']+)'\?", raw, re.IGNORECASE)
-        if match:
-            return f"{match.group(1).lower()}:{match.group(2).strip()}"
-        return ""
-
-    @staticmethod
-    def _semantic_permission_group_key(message: str) -> str:
-        raw = str(message or "")
-        tool_match = re.search(r"Approve\s+tool\s+'([^']+)'\?", raw, re.IGNORECASE)
-        tool_name = tool_match.group(1).strip().casefold() if tool_match else ""
-        if tool_name != "shell_exec":
-            return ""
-
-        command_match = re.search(
-            r"command=(.*?)(?:\nAllowlist target:|\Z)",
-            raw,
-            re.IGNORECASE | re.DOTALL,
-        )
-        command = (command_match.group(1) if command_match else raw).strip()
-        command_family = ""
-        if re.match(r"^(?:python|python3)\b", command, re.IGNORECASE):
-            command_family = "python"
-        elif re.match(r"^node\b", command, re.IGNORECASE):
-            command_family = "node"
-        if not command_family:
-            return ""
-
-        domains = sorted({
-            match.group(1).casefold()
-            for match in re.finditer(r"https?://([^/\s'\"<>]+)", command)
-        })
-        domain_key = ",".join(domains) if domains else "no-domain"
-        return f"tool:shell_exec/{command_family}:domain:{domain_key}"
-
-    def _resolve_related_pending_escalations(
-        self,
-        record: dict[str, Any],
-        reply: str,
-    ) -> list[str]:
-        normalized_reply = str(reply or "").strip().lower()
-        if normalized_reply not in {"approve_session", "always_project", "always_global"}:
-            return []
-        group_key = str(record.get("approval_group_key") or "").strip()
-        if not group_key:
-            return []
-        current_escalation_id = str(record.get("escalation_id") or "").strip()
-        task_id = str(record.get("task_id") or "").strip()
-        project_id = str(record.get("project_id") or "").strip()
-        resolved_ids: list[str] = []
-        for escalation_id in list(self._pending_escalation_order):
-            if escalation_id == current_escalation_id:
-                continue
-            candidate = self._pending_escalations.get(escalation_id)
-            if not candidate:
-                continue
-            future = candidate.get("future")
-            if future is None or future.done():
-                continue
-            candidate_project_id = str(candidate.get("project_id") or "").strip()
-            if project_id and candidate_project_id and candidate_project_id != project_id:
-                continue
-            if str(candidate.get("approval_group_key") or "").strip() != group_key:
-                continue
-            if normalized_reply == "approve_session" and str(candidate.get("task_id") or "").strip() != task_id:
-                continue
-            future.set_result(normalized_reply)
-            resolved_ids.append(escalation_id)
-        return resolved_ids
-
-    @staticmethod
-    def _task_mode_permission_prompt(message: str, current_turn_title: str = "") -> str:
-        raw = str(message or "").strip()
-        lines = [line.strip() for line in raw.splitlines() if line.strip()]
-        cleaned: list[str] = []
-        for line in lines:
-            if line.startswith("[") and "]" in line:
-                line = line.split("]", 1)[1].strip()
-            if line.lower().startswith("task:"):
-                continue
-            cleaned.append(line)
-        title = "Permission required"
-        if current_turn_title:
-            title = f"Permission required: {current_turn_title[:80]}"
-        return "\n".join([title, *cleaned]).strip()
-
-    async def _resolve_escalation_session_task_id(
-        self,
-        task_id: str | None,
-        *,
-        engine: Any | None = None,
-    ) -> str | None:
-        source_task_id = str(task_id or "").strip()
-        if not source_task_id:
-            return None
-
-        runtime_engine = engine or self.engine
-        store = getattr(runtime_engine, "store", None)
-        get_task = getattr(store, "get_task", None)
-        if callable(get_task):
-            try:
-                task = await get_task(source_task_id)
-            except Exception as e:
-                logger.warning(f"Failed to resolve escalation task mapping for {source_task_id}: {e}")
-                task = None
-            if task is not None:
-                try:
-                    identity_index = await load_company_runtime_identity_index(
-                        store,
-                        self._normalize_project_id(
-                            getattr(task, "project_id", None)
-                            or getattr(runtime_engine, "project_id", None)
-                        ),
-                    )
-                    runtime_identity = identity_index.resolve(task_id=source_task_id)
-                except Exception:
-                    logger.opt(exception=True).debug(
-                        "failed to resolve durable company identity for escalation"
-                    )
-                    runtime_identity = None
-                if runtime_identity is not None:
-                    # Escalations are a control decision.  Route only through
-                    # the durable runtime identity; process-local progress maps
-                    # are not evidence that a work-item Task is the UI parent.
-                    return runtime_identity.ui_anchor_task_id or None
-                if is_company_runtime_task(task):
-                    return None
-                internal_turn_target = self._company_internal_turn_escalation_target(task)
-                if internal_turn_target is not None:
-                    return internal_turn_target or None
-                ui_task_id = self._ui_task_id_for_task(task)
-                if ui_task_id:
-                    return ui_task_id
-                metadata = dict(getattr(task, "metadata", {}) or {})
-                origin_task_id = str(metadata.get("origin_task_id") or "").strip()
-                if origin_task_id:
-                    return origin_task_id
-
-        return source_task_id
-
-    def _company_internal_turn_escalation_target(self, task: Any | None) -> str | None:
-        """Visible routing target for escalations raised by internal
-        company-mode scheduling turns.
-
-        Review/report turn work items get composite ids (``review::<wid>::vN``),
-        so their runtime tasks carry session ids shaped like
-        ``<root_session>:review::<wid>::vN``. The UI deliberately hides those
-        session channels, so an approval card posted to the turn's own channel
-        can never be seen or answered — it silently times out and the work item
-        parks on AWAITING_HUMAN.
-
-        Returns None when ``task`` is not such an internal turn (caller keeps
-        its normal resolution), the durable origin task when present, or ""
-        when no visible channel is known.  Company runtime control routing is
-        resolved before this helper; process-local session maps are deliberately
-        not consulted here.
-        """
-        if task is None:
-            return None
-        session_id = str(getattr(task, "session_id", "") or "").strip()
-        root_session_id, sep, suffix = session_id.partition(":")
-        if not sep or "::" not in suffix:
-            return None
-        metadata = dict(getattr(task, "metadata", {}) or {})
-        origin_task_id = str(metadata.get("origin_task_id") or "").strip()
-        task_id = str(getattr(task, "id", "") or "").strip()
-        if origin_task_id and origin_task_id != task_id:
-            return origin_task_id
-        return ""
-
-    @staticmethod
-    def _pending_escalation_matches_task(record: dict[str, Any], task_id: str | None) -> bool:
-        task_key = str(task_id or "").strip()
-        if not task_key:
-            return True
-        record_task_id = str(record.get("task_id") or "").strip()
-        source_task_id = str(record.get("source_task_id") or "").strip()
-        return task_key in {record_task_id, source_task_id}
-
-    @staticmethod
-    def _pending_escalation_matches_project(record: dict[str, Any], project_id: str | None) -> bool:
-        project_key = str(project_id or "").strip()
-        if not project_key:
-            return True
-        record_project_id = str(record.get("project_id") or "").strip()
-        if not record_project_id:
-            return True
-        return record_project_id == project_key
-
-    def _find_pending_escalation(
-        self,
-        *,
-        task_id: str | None = None,
-        escalation_id: str | None = None,
-        project_id: str | None = None,
-    ) -> dict[str, Any] | None:
-        explicit_escalation_id = str(escalation_id or "").strip()
-        if explicit_escalation_id:
-            record = self._pending_escalations.get(explicit_escalation_id)
-            if not record:
-                return None
-            future = record.get("future")
-            if future is None or future.done():
-                return None
-            if not self._pending_escalation_matches_project(record, project_id):
-                return None
-            if not self._pending_escalation_matches_task(record, task_id):
-                return None
-            return record
-
-        for escalation_id in reversed(self._pending_escalation_order):
-            record = self._pending_escalations.get(escalation_id)
-            if not record:
-                continue
-            future = record.get("future")
-            if future is None or future.done():
-                continue
-            if not self._pending_escalation_matches_project(record, project_id):
-                continue
-            if not self._pending_escalation_matches_task(record, task_id):
-                continue
-            return record
-        return None
-
-    async def _handle_ui_escalation(
-        self,
-        message: str,
-        options: list[dict],
-        *,
-        project_id: str | None = None,
-    ) -> str | None:
-        project_key = self._normalize_project_id(project_id)
-        option_ids = tuple(str(opt.get("id", "")).strip() for opt in options)
-        record = None
-        for escalation_id in reversed(self._pending_escalation_order):
-            candidate = self._pending_escalations.get(escalation_id)
-            if not candidate:
-                continue
-            future = candidate.get("future")
-            if future is None or future.done():
-                continue
-            if not self._pending_escalation_matches_project(candidate, project_key):
-                continue
-            candidate_ids = tuple(str(opt.get("id", "")).strip() for opt in candidate.get("options", []))
-            if candidate_ids == option_ids and str(candidate.get("message", "")) == message:
-                record = candidate
-                break
-        if record is None:
-            record = self._find_pending_escalation(project_id=project_key)
-        if record is None:
-            return None
-
-        future = record["future"]
-        try:
-            return await future
-        finally:
-            escalation_id = str(record.get("escalation_id", ""))
-            self._pending_escalations.pop(escalation_id, None)
-            self._pending_escalation_order = [
-                item for item in self._pending_escalation_order
-                if item != escalation_id
-            ]
-
     async def on_kanban_changed(self, *, engine: Any | None = None) -> None:
         """Callback fired by the company-mode lifecycle loop after each work item
         batch completes.  Broadcasts a full collab_sync so the frontend kanban
@@ -2113,6 +1766,10 @@ class WSHandler:
                 exec_mode=self._exec_mode,
             )
             await self.broadcast({"type": "collab_sync_push", "payload": collab})
+            await self._broadcast_owner_interaction_baseline(
+                engine=runtime_engine,
+                project_id=self._normalize_project_id(getattr(runtime_engine, "project_id", None)),
+            )
         except Exception as exc:
             if self._is_expected_shutdown_error(exc) or self._is_closed_database_error(exc):
                 logger.debug(
@@ -2473,7 +2130,7 @@ class WSHandler:
                 parts = header.split(":")
                 agent = parts[1] if len(parts) > 1 else "external"
                 stream = parts[2] if len(parts) > 2 else ""
-                if stream == "thinking":
+                if stream in {"thinking", "thinking_snapshot"}:
                     thinking_summary = detail[:120] if detail else f"{agent} thinking"
                     if len(detail) > 120:
                         thinking_summary = thinking_summary.rstrip() + "..."
@@ -3439,6 +3096,23 @@ class WSHandler:
                         await handler(self, ws, data)
                 else:
                     await handler(self, ws, data)
+            except CompanyRunControllerLeaseLost as e:
+                # Lease loss is implemented as a CancelledError subclass so it
+                # can stop stale Company execution coroutines immediately.  At
+                # the WebSocket request boundary it is a domain rejection, not
+                # cancellation of the connection itself.
+                logger.warning(f"WS request lost Company controller lease for {msg_type}: {e}")
+                try:
+                    await self._send_ack(
+                        ws,
+                        ok=False,
+                        error=str(e) or "company_controller_lease_lost",
+                        action=msg_type,
+                    )
+                except Exception:
+                    pass
+            except asyncio.CancelledError:
+                raise
             except Exception as e:
                 if self._is_ws_disconnect_error(e) or self._is_expected_shutdown_error(e):
                     logger.debug(
@@ -3539,6 +3213,11 @@ class WSHandler:
                 if switch_seq and self._client_switch_seq.get(ws, "") != switch_seq:
                     return
                 await self._send_envelope_to_client(ws, {"type": "snapshot", "payload": snapshot})
+                await self._send_owner_interaction_baseline_for_client(
+                    ws,
+                    engine=engine,
+                    project_id=project_id,
+                )
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -3599,6 +3278,19 @@ class WSHandler:
             raise
         except Exception:
             logger.opt(exception=True).warning("Initial websocket org_info push failed")
+        try:
+            if self._client_active_project_id(ws) == project_id:
+                await self._send_owner_interaction_baseline_for_client(
+                    ws,
+                    engine=engine,
+                    project_id=project_id,
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.opt(exception=True).warning(
+                "Initial owner interaction checkpoint replay failed"
+            )
 
     async def _handle_collab_sync(self, ws: Any, data: dict) -> None:
         engine, project_id = await self._engine_for_request(data)
@@ -4005,6 +3697,10 @@ class WSHandler:
         snapshot["company_profile"] = self._company_profile
         snapshot["task_preferred_agent"] = self._task_preferred_agent
         await self.broadcast({"type": "snapshot", "payload": snapshot})
+        await self._broadcast_owner_interaction_baseline(
+            engine=self.engine,
+            project_id=self._normalize_project_id(getattr(self.engine, "project_id", None)),
+        )
 
     async def _ensure_custom_role_agents(self) -> list[dict[str, Any]]:
         if self._exec_mode not in {"org", "custom"} or not self.engine.org_engine:
@@ -4184,6 +3880,10 @@ class WSHandler:
             exec_mode=self._exec_mode,
         )
         await self.broadcast({"type": "collab_sync_push", "payload": collab})
+        await self._broadcast_owner_interaction_baseline(
+            engine=self.engine,
+            project_id=self._normalize_project_id(getattr(self.engine, "project_id", None)),
+        )
         await self._broadcast_org_info()
         return True
 
@@ -4940,6 +4640,11 @@ class WSHandler:
             )
             collab["project_id"] = self._normalize_project_id(project_id)
             await self._safe_send_json(ws, {"type": "collab_sync_push", "payload": collab})
+            await self._send_owner_interaction_baseline_for_client(
+                ws,
+                engine=engine,
+                project_id=self._normalize_project_id(project_id),
+            )
         except Exception:
             logger.opt(exception=True).debug("failed to refresh runtime control after rejected Continue")
 
@@ -5116,9 +4821,14 @@ class WSHandler:
                     )
             content = f"{title}\n{description}".strip()
             engine_mode, company_profile = self._resolve_engine_mode(mode, profile)
-            engine_preferred_agent = preferred_agent if engine_mode == "project" else None
-            response = None
-
+            # The Company router uses this preference to seed staffing.  A
+            # JiuwenSwarm Team choice must therefore cross the same ingress
+            # boundary as a Task-mode external-agent choice.
+            engine_preferred_agent = (
+                preferred_agent
+                if engine_mode == "project" or preferred_agent != "native"
+                else None
+            )
             if task_id:
                 # Per-task lock: same session serialized, different sessions concurrent
                 async with self._get_task_lock(task_id):
@@ -5148,7 +4858,7 @@ class WSHandler:
                             await self._set_company_runtime_control(company_runtime_target, state="running")
                         except Exception:
                             logger.opt(exception=True).debug("failed to mark run_task company runtime running")
-                    response = await engine.process_message(
+                    await engine.process_message(
                         content,
                         project_id=pid,
                         session_id=session_id,
@@ -5160,7 +4870,7 @@ class WSHandler:
                     )
                 await self._sync_task_transcript_messages(task_id, engine=engine)
             else:
-                response = await engine.process_message(
+                await engine.process_message(
                     content,
                     project_id=pid,
                     mode=engine_mode,
@@ -5221,6 +4931,10 @@ class WSHandler:
                     exec_mode=mode,
                 )
                 await self.broadcast({"type": "collab_sync_push", "payload": collab})
+                await self._broadcast_owner_interaction_baseline(
+                    engine=engine,
+                    project_id=pid,
+                )
             except Exception:
                 logger.opt(exception=True).warning("Post-run collab_sync broadcast failed (non-fatal)")
 
@@ -5270,395 +4984,6 @@ class WSHandler:
         )
         await self.broadcast({"type": "session_message", "payload": msg})
 
-    async def _mirror_escalation(
-        self,
-        event: Any,
-        *,
-        engine: Any | None = None,
-        project_id: str | None = None,
-    ) -> None:
-        """Mirror escalation_created events into session channel or activity."""
-        runtime_engine = engine or self.engine
-        pid = self._normalize_project_id(project_id or getattr(runtime_engine, "project_id", None))
-        p = event.payload or {}
-        message = p.get("message", "Escalation required")
-        source_task_id = str(p.get("task_id") or "").strip() or None
-        source_task = None
-        if source_task_id and getattr(runtime_engine, "store", None):
-            getter = getattr(runtime_engine.store, "get_task", None)
-            if callable(getter):
-                try:
-                    source_task = await getter(source_task_id)
-                except Exception:
-                    source_task = None
-        source_metadata = dict(getattr(source_task, "metadata", {}) or {}) if source_task is not None else {}
-        is_task_mode = self._runtime_payload_is_task_mode(source_metadata)
-        current_turn_title = str(
-            source_metadata.get("original_message")
-            or getattr(source_task, "description", "")
-            or ""
-        ).strip()
-        display_message = self._task_mode_permission_prompt(message, current_turn_title) if is_task_mode else message
-        session_task_id = await self._resolve_escalation_session_task_id(source_task_id, engine=runtime_engine)
-        target_channel = f"session:{session_task_id}" if session_task_id else f"activity:{pid}"
-        options = p.get("options", []) or []
-        esc_record = self._remember_pending_escalation({
-            "escalation_id": str(p.get("escalation_id") or ""),
-            "project_id": pid,
-            "task_id": session_task_id,
-            "source_task_id": source_task_id,
-            "message": message,
-            "display_message": display_message,
-            "options": options,
-            "default_action": p.get("default_action"),
-            "escalation_type": p.get("type", "decision_needed"),
-            "approval_group_key": p.get("approval_group_key") or self._approval_group_key(message),
-        })
-        esc_meta: dict[str, Any] = {
-            "checkpoint_type": "human_escalation",
-            "checkpoint_id": esc_record.get("escalation_id"),
-            "escalation_id": esc_record.get("escalation_id"),
-            "escalation_type": esc_record.get("escalation_type"),
-            "prompt": display_message,
-            "summary": display_message,
-            "options": options,
-            "default_action": esc_record.get("default_action"),
-            "source": "engine",
-            "ui_message_id": f"escalation::{esc_record.get('escalation_id')}",
-            "project_id": pid,
-            "approval_group_key": esc_record.get("approval_group_key"),
-        }
-        approval_context = dict(p.get("approval_context") or {})
-        if approval_context:
-            # Persisted with the card so a click AFTER the inline wait expired
-            # (or after a restart) can still apply the same allowlist grant and
-            # resume the parked task.
-            esc_meta["approval_context"] = approval_context
-        if is_task_mode:
-            esc_meta["execution_mode"] = "task_mode"
-            esc_meta["permission_group_key"] = esc_record.get("approval_group_key")
-            esc_meta["current_turn_title"] = current_turn_title
-        if session_task_id:
-            esc_meta["task_id"] = session_task_id
-        if source_task_id and source_task_id != session_task_id:
-            esc_meta["source_task_id"] = source_task_id
-        msg = await self.chat_store.insert_message(
-            channel_id=target_channel,
-            sender="assistant",
-            sender_name="OPC",
-            content=display_message,
-            metadata=esc_meta or None,
-            message_id=f"escalation::{esc_record.get('escalation_id')}",
-            project_id=pid,
-        )
-        await self.broadcast({"type": "session_message", "payload": msg})
-
-    async def _recent_identical_helper_exists(
-        self,
-        channel_id: str,
-        content: str,
-        *,
-        project_id: str,
-        window_seconds: float = 120.0,
-        scan_limit: int = 10,
-    ) -> bool:
-        """True when an identical assistant helper was posted very recently.
-
-        Used to collapse rapid duplicate user clicks into a single helper
-        reply instead of one warning per click.
-        """
-        try:
-            recent = await self.chat_store.get_channel_messages(
-                channel_id, limit=scan_limit, project_id=project_id,
-            )
-        except Exception:
-            return False
-        now = time.time()
-        for item in reversed(recent):
-            if str(item.get("sender", "")) != "assistant":
-                continue
-            if str(item.get("content", "")) != content:
-                continue
-            try:
-                created_at = float(item.get("created_at", 0) or 0)
-            except (TypeError, ValueError):
-                continue
-            if now - created_at <= window_seconds:
-                return True
-        return False
-
-    async def _find_pending_approval_park_checkpoint(
-        self,
-        engine: Any,
-        task_id: str,
-        project_id: str,
-    ) -> Any | None:
-        """Locate the pending checkpoint a tool-approval timeout parked on.
-
-        When an approval card's inline wait expires, the blocked runtime task
-        returns AWAITING_HUMAN and the engine saves a durable pause checkpoint
-        (task mode: ``task_user_input``; company mode: ``company_work_item_gate``).
-        A later click on the card resumes execution through that checkpoint.
-        """
-        source_task_id = str(task_id or "").strip()
-        if not source_task_id:
-            return None
-        store = getattr(engine, "store", None)
-        getter = getattr(store, "get_pending_checkpoints", None)
-        if not callable(getter):
-            return None
-        try:
-            pending = await getter(project_id=project_id)
-        except Exception:
-            logger.opt(exception=True).debug(
-                "Failed to load pending checkpoints for deferred escalation resume"
-            )
-            return None
-        candidates = []
-        for checkpoint in pending or []:
-            if str(getattr(checkpoint, "checkpoint_type", "") or "") not in {
-                "task_user_input",
-                "company_work_item_gate",
-            }:
-                continue
-            payload = dict(getattr(checkpoint, "payload", {}) or {})
-            linked_ids = {
-                str(payload.get("task_id") or "").strip(),
-                str(payload.get("waiting_task_id") or "").strip(),
-                str(getattr(checkpoint, "task_id", "") or "").strip(),
-            }
-            linked_ids.update(str(item or "").strip() for item in list(payload.get("task_ids", []) or []))
-            if source_task_id in linked_ids:
-                candidates.append(checkpoint)
-        if not candidates:
-            return None
-
-        def _checkpoint_timestamp(checkpoint: Any) -> float:
-            created = getattr(checkpoint, "created_at", None)
-            try:
-                return float(created.timestamp())
-            except (AttributeError, TypeError, ValueError, OSError):
-                return 0.0
-
-        return max(candidates, key=_checkpoint_timestamp)
-
-    async def _resolve_deferred_escalation_click(
-        self,
-        *,
-        engine: Any,
-        project_id: str,
-        channel_id: str,
-        checkpoint_id: str,
-        card_meta: dict[str, Any],
-        option_id: str,
-    ) -> dict[str, Any]:
-        """Apply a decision clicked on an approval card whose inline wait has
-        expired: persist the allowlist grant, resolve the card, and hand back
-        either a flow-through rewrite (resume the parked task through the
-        normal message pipeline) or a helper reply when nothing is parked."""
-        approval_context = dict(card_meta.get("approval_context") or {})
-        summary: dict[str, Any] = {
-            "approved": option_id in {"approve_once", "approve_session", "always_project", "always_global"},
-            "scope": None,
-        }
-        approval_engine = getattr(engine, "approval_engine", None)
-        apply_decision = getattr(approval_engine, "apply_deferred_escalation_decision", None)
-        if callable(apply_decision):
-            try:
-                summary = apply_decision(option_id, approval_context)
-            except Exception:
-                logger.opt(exception=True).warning(
-                    "Deferred approval grant failed; resuming the parked task without a new allowlist entry"
-                )
-        await self._mark_human_escalation_checkpoint_status(
-            checkpoint_id,
-            status="resolved",
-            project_id=project_id,
-            channel_id=channel_id,
-            reply=option_id,
-            reason="deferred_decision",
-        )
-
-        source_task_id = str(
-            card_meta.get("source_task_id") or card_meta.get("task_id") or ""
-        ).strip()
-        park_checkpoint = await self._find_pending_approval_park_checkpoint(
-            engine, source_task_id, project_id
-        )
-        action_name = str(approval_context.get("action_name", "") or "").strip() or "action"
-        approved = bool(summary.get("approved"))
-        scope = str(summary.get("scope") or "").strip()
-        if park_checkpoint is None:
-            return {
-                "action": "reply",
-                "text": (
-                    f"Decision `{option_id}` recorded"
-                    + (f"; allowlist updated ({scope})" if approved and scope else "")
-                    + ". No parked task is currently waiting on this approval — if the runtime "
-                    "is still transitioning, the grant applies on its next attempt."
-                ),
-            }
-        if approved:
-            scope_note = f" (allowlisted: {scope})" if scope else ""
-            crafted = (
-                f"Approval decision: {option_id}. The previously blocked `{action_name}` action "
-                f"is now permitted{scope_note}. Re-run it and continue the task."
-            )
-        else:
-            crafted = (
-                f"Approval decision: deny. Do not run the blocked `{action_name}` action; "
-                "choose an alternative approach or report the limitation to your manager."
-            )
-        return {
-            "action": "flow_through",
-            "content": crafted,
-            "reply_metadata": {
-                "response_to_checkpoint_id": str(getattr(park_checkpoint, "checkpoint_id", "") or ""),
-                "response_to_checkpoint_type": str(getattr(park_checkpoint, "checkpoint_type", "") or ""),
-            },
-        }
-
-    async def _mark_human_escalation_checkpoint_status(
-        self,
-        escalation_id: str,
-        *,
-        status: str,
-        project_id: str,
-        channel_id: str | None = None,
-        reply: str | None = None,
-        default_action: str | None = None,
-        reason: str | None = None,
-    ) -> dict[str, Any] | None:
-        normalized_escalation_id = str(escalation_id or "").strip()
-        if not normalized_escalation_id:
-            return None
-        update_status = getattr(self.chat_store, "update_checkpoint_status", None)
-        if not callable(update_status):
-            return None
-        status_metadata: dict[str, Any] = {
-            "checkpoint_resolution_source": "escalation_lifecycle",
-        }
-        if reply is not None:
-            status_metadata["checkpoint_resolution_reply"] = reply
-        if default_action is not None:
-            status_metadata["checkpoint_timeout_default_action"] = default_action
-        if reason:
-            status_metadata["checkpoint_resolution_reason"] = reason
-        try:
-            updated = await update_status(
-                normalized_escalation_id,
-                channel_id=channel_id,
-                checkpoint_type="human_escalation",
-                status=status,
-                status_metadata=status_metadata,
-                project_id=project_id,
-            )
-        except Exception:
-            logger.opt(exception=True).debug(
-                f"Failed to update human escalation checkpoint status for {normalized_escalation_id}",
-            )
-            return None
-        if updated is not None:
-            await self.broadcast({"type": "session_message", "payload": updated})
-        return updated
-
-    async def _mark_escalation_event_checkpoint_terminal(
-        self,
-        event: Any,
-        *,
-        project_id: str,
-    ) -> None:
-        payload = dict(getattr(event, "payload", {}) or {})
-        escalation_id = str(payload.get("escalation_id", "") or "").strip()
-        if not escalation_id:
-            return
-        if event.event_type == "escalation_timeout":
-            default_action = str(payload.get("default_action", "") or "").strip() or None
-            if default_action is None:
-                # No default was applied on timeout — the decision is still the
-                # user's to make. The task parks on AWAITING_HUMAN and the card
-                # stays pending; clicking it later applies the decision and
-                # resumes the parked task (deferred approval path).
-                return
-            await self._mark_human_escalation_checkpoint_status(
-                escalation_id,
-                status="timeout",
-                project_id=project_id,
-                default_action=default_action,
-                reason="timeout",
-            )
-            return
-        if event.event_type == "escalation_resolved":
-            await self._mark_human_escalation_checkpoint_status(
-                escalation_id,
-                status="resolved",
-                project_id=project_id,
-                reply=str(payload.get("reply", "") or "").strip() or None,
-                reason="resolved",
-            )
-
-    async def _reconcile_inactive_human_escalation_cards(
-        self,
-        channel_id: str,
-        *,
-        task_id: str,
-        project_id: str,
-    ) -> list[dict[str, Any]]:
-        """Mark legacy human escalation cards stale when no live approval exists.
-
-        Older Office UI builds persisted approval cards without a terminal
-        ``checkpoint_status`` when the runtime timed out or auto-approved. On a
-        later reload there is no in-memory escalation future for those cards, so
-        session detail is the authoritative place to reconcile persisted UI
-        state with runtime state.
-        """
-        getter = getattr(self.chat_store, "get_unresolved_checkpoint_messages", None)
-        if not callable(getter):
-            return []
-        try:
-            cards = await getter(
-                channel_id,
-                checkpoint_type="human_escalation",
-                project_id=project_id,
-            )
-        except Exception:
-            logger.opt(exception=True).debug(
-                f"Failed to load unresolved human escalation cards for {channel_id}",
-            )
-            return []
-
-        updated_cards: list[dict[str, Any]] = []
-        for card in cards:
-            metadata = dict(card.get("metadata", {}) or {})
-            escalation_id = str(
-                metadata.get("escalation_id")
-                or metadata.get("checkpoint_id")
-                or ""
-            ).strip()
-            if not escalation_id:
-                continue
-            if self._find_pending_escalation(
-                task_id=task_id,
-                escalation_id=escalation_id,
-                project_id=project_id,
-            ):
-                continue
-            if isinstance(metadata.get("approval_context"), dict) and metadata.get("approval_context"):
-                # Deferred-capable approval card: it stays answerable after the
-                # inline wait expired or across restarts, so a missing pending
-                # future does NOT make it stale.
-                continue
-            updated = await self._mark_human_escalation_checkpoint_status(
-                escalation_id,
-                status="stale",
-                project_id=project_id,
-                channel_id=channel_id,
-                reason="session_detail_reconcile_inactive_escalation",
-            )
-            if updated is not None:
-                updated_cards.append(updated)
-        return updated_cards
-
     async def _reconcile_execution_checkpoint_cards(
         self,
         channel_id: str,
@@ -5666,7 +4991,7 @@ class WSHandler:
         project_id: str,
         engine: Any,
     ) -> list[dict[str, Any]]:
-        """Mark non-human checkpoint cards terminal once the engine checkpoint is terminal."""
+        """Mark checkpoint cards terminal once the engine checkpoint is terminal."""
         getter = getattr(self.chat_store, "get_unresolved_checkpoint_messages", None)
         if not callable(getter):
             return []
@@ -5682,7 +5007,7 @@ class WSHandler:
         for card in cards:
             metadata = dict(card.get("metadata", {}) or {})
             checkpoint_type = str(metadata.get("checkpoint_type", "") or "").strip()
-            if checkpoint_type in {"", "human_escalation"}:
+            if not checkpoint_type:
                 continue
             checkpoint_id = str(metadata.get("checkpoint_id", "") or "").strip()
             if not checkpoint_id:
@@ -5822,11 +5147,6 @@ class WSHandler:
             transcript_total_count = 0
             transcript_has_more = False
 
-        await self._reconcile_inactive_human_escalation_cards(
-            channel_id,
-            task_id=task_id,
-            project_id=project_id,
-        )
         await self._reconcile_execution_checkpoint_cards(
             channel_id,
             project_id=project_id,
@@ -5854,6 +5174,35 @@ class WSHandler:
             messages = []
             visible_cache_count = len(messages)
             cache_has_more = False
+
+        # ExecutionCheckpoint is the source of truth for actionable cards.
+        # Rebuild active cards for every snapshot so an EventBus loss, server
+        # restart, or stale ChatStore projection cannot hide/change a decision.
+        interaction_cards = await self._visible_owner_interaction_cards(
+            engine=run_engine,
+            project_id=project_id,
+            requester_task_id=task_id,
+            requester_session_id=session_id,
+        )
+        interaction_cards = [
+            card for card in interaction_cards
+            if str(card.get("channel_id", "") or "").strip() == channel_id
+        ]
+        if interaction_cards:
+            authoritative_ids = {
+                str(card.get("metadata", {}).get("checkpoint_id", "") or "").strip()
+                for card in interaction_cards
+            }
+            messages = [
+                message for message in messages
+                if str(dict(message.get("metadata", {}) or {}).get("checkpoint_id", "") or "").strip()
+                not in authoritative_ids
+            ]
+            messages.extend(_sanitize_ui_message_dict(card) for card in interaction_cards)
+            messages.sort(key=lambda item: (
+                float(item.get("created_at", 0) or 0),
+                str(item.get("message_id", "") or ""),
+            ))
         total_message_count = max(transcript_total_count, visible_cache_count, len(messages))
         has_more = transcript_has_more or cache_has_more
 
@@ -5993,6 +5342,283 @@ class WSHandler:
             handoff_to=handoff_to,
         )
 
+    async def _handle_interaction_reply(self, ws: Any, data: dict) -> None:
+        """Durably answer one explicit owner-facing ExecutionCheckpoint.
+
+        This control message deliberately bypasses ``session_send`` and the
+        per-task conversation lock.  The engine commits the decision with a
+        checkpoint CAS before Office acknowledges it; chat rows emitted below
+        are only a transcript projection of that durable receipt.
+        """
+        run_engine, project_id = await self._engine_for_request(data)
+        checkpoint_id = str(data.get("checkpoint_id", "") or "").strip()
+        checkpoint_type = str(data.get("checkpoint_type", "") or "").strip()
+        client_request_id = str(data.get("client_request_id", "") or "").strip()
+        requester_task_id = str(data.get("requester_task_id", "") or "").strip()
+        declared_session_id = str(data.get("requester_session_id", "") or "").strip()
+        decision = data.get("decision")
+
+        missing = [
+            name
+            for name, value in (
+                ("checkpoint_id", checkpoint_id),
+                ("checkpoint_type", checkpoint_type),
+                ("client_request_id", client_request_id),
+            )
+            if not value
+        ]
+        requester_actor: dict[str, Any] | None = None
+        missing_identity = not (requester_task_id or declared_session_id)
+        if missing or not isinstance(decision, dict):
+            await self._send_ack(
+                ws,
+                ok=False,
+                action="interaction_reply",
+                error="invalid_request",
+                reason=(
+                    f"missing:{','.join(missing)}"
+                    if missing
+                    else (
+                        "decision_must_be_object"
+                    )
+                ),
+                checkpoint_id=checkpoint_id,
+                checkpoint_type=checkpoint_type,
+                client_request_id=client_request_id,
+                project_id=project_id,
+            )
+            return
+
+        if missing_identity:
+            # The organization page can render a required-confirmation reorg
+            # that has no task/session anchor. It still uses interaction_reply:
+            # Office issues a process-local owner capability for this exact
+            # checkpoint type and never accepts an actor token from the wire.
+            issue_actor = getattr(run_engine, "issue_project_owner_actor", None)
+            if checkpoint_type != "company_reorg_pending" or not callable(issue_actor):
+                await self._send_ack(
+                    ws,
+                    ok=False,
+                    action="interaction_reply",
+                    error="invalid_request",
+                    reason="requester_identity_required",
+                    checkpoint_id=checkpoint_id,
+                    checkpoint_type=checkpoint_type,
+                    client_request_id=client_request_id,
+                    project_id=project_id,
+                )
+                return
+            try:
+                requester_actor = issue_actor(interface="office_org")
+            except Exception:
+                await self._send_ack(
+                    ws,
+                    ok=False,
+                    action="interaction_reply",
+                    error="owner_actor_unavailable",
+                    reason="requester_identity_required",
+                    checkpoint_id=checkpoint_id,
+                    checkpoint_type=checkpoint_type,
+                    client_request_id=client_request_id,
+                    project_id=project_id,
+                )
+                return
+
+        store = getattr(run_engine, "store", None)
+        if not self._store_is_ready(store):
+            await self._send_ack(
+                ws,
+                ok=False,
+                action="interaction_reply",
+                error="store_not_ready",
+                checkpoint_id=checkpoint_id,
+                checkpoint_type=checkpoint_type,
+                client_request_id=client_request_id,
+                project_id=project_id,
+            )
+            return
+        # Actor visibility and company-runtime identity resolution belong to
+        # the engine.  Office forwards exactly the task/session identity the
+        # client declared and does not maintain a second authorization model.
+        requester_session_id = declared_session_id
+
+        submit = getattr(run_engine, "submit_checkpoint_decision", None)
+        if not callable(submit):
+            # Fail closed.  Falling back to session_send would reintroduce the
+            # task-lock cycle this protocol exists to remove.
+            await self._send_ack(
+                ws,
+                ok=False,
+                action="interaction_reply",
+                error="interaction_reply_unsupported",
+                checkpoint_id=checkpoint_id,
+                checkpoint_type=checkpoint_type,
+                client_request_id=client_request_id,
+                project_id=project_id,
+            )
+            return
+
+        submit_kwargs: dict[str, Any] = {
+            "checkpoint_id": checkpoint_id,
+            "checkpoint_type": checkpoint_type,
+            "decision": dict(decision),
+            "client_request_id": client_request_id,
+            "requester_task_id": requester_task_id,
+            "requester_session_id": requester_session_id or None,
+        }
+        if requester_actor is not None:
+            submit_kwargs["requester_actor"] = requester_actor
+        raw_receipt = await submit(
+            **submit_kwargs,
+        )
+        receipt = (
+            dict(raw_receipt)
+            if isinstance(raw_receipt, dict)
+            else {
+                key: getattr(raw_receipt, key)
+                for key in (
+                    "accepted", "deduplicated", "duplicate", "status",
+                    "outcome", "reason", "checkpoint_id", "checkpoint_type",
+                )
+                if hasattr(raw_receipt, key)
+            }
+        )
+        outcome = str(receipt.get("outcome", "") or "").strip().lower()
+        accepted = bool(receipt.get("accepted")) or outcome in {"accepted", "duplicate"}
+        deduplicated = bool(
+            receipt.get("deduplicated") or receipt.get("duplicate") or outcome == "duplicate"
+        )
+        reason = str(receipt.get("reason") or (outcome if not accepted else "") or "").strip()
+        status = str(receipt.get("status") or ("answered" if accepted else "pending") or "").strip()
+
+        # ACK is sent immediately after the durable store receipt.  Only then
+        # may the frontend switch the card to its accepted/responded state.
+        await self._send_ack(
+            ws,
+            ok=accepted,
+            action="interaction_reply",
+            accepted=accepted,
+            deduplicated=deduplicated,
+            error=(reason or "interaction_reply_rejected") if not accepted else None,
+            reason=reason or None,
+            status=status,
+            checkpoint_id=checkpoint_id,
+            checkpoint_type=checkpoint_type,
+            client_request_id=client_request_id,
+            project_id=project_id,
+            requester_task_id=requester_task_id,
+            requester_session_id=requester_session_id,
+        )
+        if not accepted:
+            return
+
+        try:
+            await self._project_accepted_interaction_reply(
+                engine=run_engine,
+                project_id=project_id,
+                requester_task_id=requester_task_id,
+                requester_session_id=requester_session_id,
+                checkpoint_id=checkpoint_id,
+                checkpoint_type=checkpoint_type,
+                client_request_id=client_request_id,
+                decision=dict(decision),
+            )
+        except Exception:
+            # The durable decision is already accepted.  Projection failures
+            # are repaired from ExecutionCheckpoint on the next snapshot.
+            logger.opt(exception=True).warning(
+                "Failed to project accepted interaction reply {}",
+                checkpoint_id,
+            )
+
+    async def _project_accepted_interaction_reply(
+        self,
+        *,
+        engine: Any,
+        project_id: str,
+        requester_task_id: str,
+        requester_session_id: str,
+        checkpoint_id: str,
+        checkpoint_type: str,
+        client_request_id: str,
+        decision: dict[str, Any],
+    ) -> None:
+        """Write the non-authoritative chat transcript after durable ACK."""
+        checkpoint = await self._load_execution_checkpoint_for_reply(
+            engine=engine,
+            project_id=project_id,
+            checkpoint_id=checkpoint_id,
+            checkpoint_type=checkpoint_type,
+        )
+        presentation_task_id = await self._interaction_checkpoint_presentation_task_id(
+            checkpoint,
+            engine=engine,
+        )
+        channel_id = (
+            f"session:{presentation_task_id}"
+            if presentation_task_id
+            else f"activity:{project_id}"
+        )
+        text = str(
+            decision.get("text")
+            or decision.get("option_label")
+            or decision.get("option_id")
+            or "Decision submitted."
+        ).strip() or "Decision submitted."
+        response_metadata: dict[str, Any] = {
+            "response_to_checkpoint_id": checkpoint_id,
+            "response_to_checkpoint_type": checkpoint_type,
+            "ui_message_id": client_request_id,
+        }
+        # Preserve only the domain reply fields consumed by transcript/UI
+        # renderers.  Tool arguments and approval policy data remain solely in
+        # the ExecutionCheckpoint.
+        for key in (
+            "checkpoint_reply_kind",
+            "option_id",
+            "option_label",
+            "self_evolution_trigger",
+            "human_feedback_text",
+            "recruitment_role_agents",
+            "recruitment_agent",
+            "staffing_action",
+            "staffing_selections",
+            "user_input_answers",
+        ):
+            if key in decision:
+                response_metadata[key] = decision[key]
+
+        message_id = f"interaction::{client_request_id}"
+        existing_scope = await self.chat_store.message_scope(message_id)
+        response_message: dict[str, Any] | None = None
+        if existing_scope is None:
+            response_message = await self.chat_store.insert_message(
+                channel_id=channel_id,
+                sender="user",
+                sender_name="You",
+                content=text,
+                project_id=project_id,
+                metadata=response_metadata,
+                message_id=message_id,
+            )
+            await self.broadcast({"type": "session_message", "payload": response_message})
+        elif existing_scope != (channel_id, project_id):
+            logger.warning(
+                "Interaction reply projection id collision: {} belongs to {}",
+                message_id,
+                existing_scope,
+            )
+
+        if checkpoint is not None:
+            card = await self._interaction_checkpoint_ui_message(
+                checkpoint,
+                presentation_task_id=presentation_task_id,
+                engine=engine,
+                project_id=project_id,
+            )
+            if card is not None:
+                await self.broadcast({"type": "session_message", "payload": card})
+
     async def _handle_session_send(self, ws: Any, data: dict) -> None:
         """Handle user message in a session. Auto-titles from first message."""
         task_id = data.get("task_id", "")
@@ -6000,6 +5626,24 @@ class WSHandler:
         if not content or not task_id:
             return
         run_engine, run_project_id = await self._engine_for_request(data)
+        raw_metadata = data.get("metadata")
+        if isinstance(raw_metadata, dict) and any(
+            str(raw_metadata.get(key, "") or "").strip()
+            for key in (
+                "response_to_checkpoint_id",
+                "response_to_checkpoint_type",
+                "response_to_escalation_id",
+            )
+        ):
+            await self._send_ack(
+                ws,
+                ok=False,
+                action="session_send",
+                error="checkpoint_reply_requires_interaction_reply",
+                project_id=run_project_id,
+                task_id=task_id,
+            )
+            return
 
         # Process file attachments via AttachmentStore (disk storage, lightweight refs)
         raw_attachments = data.get("attachments", [])
@@ -6098,104 +5742,13 @@ class WSHandler:
             if raw_attachments and not attachment_refs and content.strip() == "Sent with attachments":
                 return
 
-        pending_escalation: dict[str, Any] | None = None
-        background_pending_escalation: dict[str, Any] | None = None
-        normalized_pending_reply: str | None = None
-
-        # Insert user message to chat_store (UI rendering layer)
+        # Ordinary conversation metadata contains only its idempotency key.
+        # Every structured checkpoint field belongs to interaction_reply.
         reply_metadata: dict[str, Any] = {}
-        raw_metadata = data.get("metadata")
         if isinstance(raw_metadata, dict):
-            for key in (
-                "response_to_checkpoint_id",
-                "response_to_checkpoint_type",
-                "response_to_escalation_id",
-            ):
-                value = raw_metadata.get(key)
-                if value is None:
-                    continue
-                normalized_value = str(value).strip()
-                if normalized_value:
-                    reply_metadata[key] = normalized_value
-            raw_checkpoint_reply_kind = str(raw_metadata.get("checkpoint_reply_kind", "") or "").strip().lower()
-            if raw_checkpoint_reply_kind in {"approve", "deny", "feedback", "ignore"}:
-                reply_metadata["checkpoint_reply_kind"] = raw_checkpoint_reply_kind
             raw_ui_message_id = str(raw_metadata.get("ui_message_id", "") or "").strip()
             if raw_ui_message_id:
                 reply_metadata["ui_message_id"] = raw_ui_message_id
-            raw_role_agents = raw_metadata.get("recruitment_role_agents")
-            if isinstance(raw_role_agents, dict):
-                normalized_role_agents: dict[str, str] = {}
-                for raw_role_id, raw_agent in raw_role_agents.items():
-                    role_id = str(raw_role_id or "").strip()
-                    agent_name = str(raw_agent or "").strip().lower()
-                    if role_id and agent_name in _TASK_MODE_PREFERRED_AGENTS:
-                        normalized_role_agents[role_id] = agent_name
-                if normalized_role_agents:
-                    reply_metadata["recruitment_role_agents"] = normalized_role_agents
-            raw_recruitment_agent = str(raw_metadata.get("recruitment_agent", "") or "").strip().lower().replace("-", "_")
-            if raw_recruitment_agent in _TASK_MODE_PREFERRED_AGENTS:
-                reply_metadata["recruitment_agent"] = raw_recruitment_agent
-            raw_staffing_action = str(raw_metadata.get("staffing_action", "") or "").strip().lower()
-            if raw_staffing_action in {"manual_approve", "approve", "auto_recruit", "deny"}:
-                reply_metadata["staffing_action"] = (
-                    "manual_approve" if raw_staffing_action == "approve" else raw_staffing_action
-                )
-            raw_staffing_selections = raw_metadata.get("staffing_selections")
-            if isinstance(raw_staffing_selections, dict):
-                normalized_selections: dict[str, dict[str, str]] = {}
-                for raw_role_id, raw_selection in raw_staffing_selections.items():
-                    role_id = str(raw_role_id or "").strip()
-                    if not role_id or not isinstance(raw_selection, dict):
-                        continue
-                    kind = str(raw_selection.get("kind", "") or "").strip().lower()
-                    selected_id = str(
-                        raw_selection.get("id")
-                        or raw_selection.get("employee_id")
-                        or raw_selection.get("template_id")
-                        or ""
-                    ).strip()
-                    if kind in {"employee", "template"} and selected_id:
-                        normalized_selections[role_id] = {"kind": kind, "id": selected_id}
-                    elif kind == "fallback":
-                        normalized_selections[role_id] = {"kind": "fallback", "id": ""}
-                if normalized_selections:
-                    reply_metadata["staffing_selections"] = normalized_selections
-            raw_user_input_answers = raw_metadata.get("user_input_answers")
-            if isinstance(raw_user_input_answers, dict):
-                normalized_answers: dict[str, dict[str, Any]] = {}
-                for raw_question_id, raw_answer in raw_user_input_answers.items():
-                    question_id = str(raw_question_id or "").strip()
-                    if not question_id:
-                        continue
-                    if isinstance(raw_answer, dict):
-                        answer: dict[str, Any] = {}
-                        for field in (
-                            "question_id",
-                            "question",
-                            "selected_option_id",
-                            "selected_label",
-                            "freeform_text",
-                            "answer_text",
-                        ):
-                            value = raw_answer.get(field)
-                            if value is None:
-                                continue
-                            normalized_value = str(value).strip()
-                            if normalized_value:
-                                answer[field] = normalized_value
-                        if answer:
-                            answer.setdefault("question_id", question_id)
-                            normalized_answers[question_id] = answer
-                    else:
-                        normalized_value = str(raw_answer or "").strip()
-                        if normalized_value:
-                            normalized_answers[question_id] = {
-                                "question_id": question_id,
-                                "answer_text": normalized_value,
-                            }
-                if normalized_answers:
-                    reply_metadata["user_input_answers"] = normalized_answers
 
         # Idempotency on the client-generated message id: the WS client queues
         # sends while disconnected and flushes the queue after a reconnect, so
@@ -6225,154 +5778,6 @@ class WSHandler:
                 # as a row id there (insert_message REPLACEs by primary key).
                 client_message_id = ""
 
-        explicit_checkpoint_id = str(reply_metadata.get("response_to_checkpoint_id", "")).strip()
-        explicit_checkpoint_type = str(reply_metadata.get("response_to_checkpoint_type", "")).strip()
-        explicit_escalation_id = str(reply_metadata.get("response_to_escalation_id", "")).strip()
-        explicit_human_escalation = (
-            explicit_checkpoint_type == "human_escalation"
-            or bool(explicit_escalation_id)
-        )
-        if explicit_human_escalation:
-            pending_escalation_id = explicit_escalation_id
-            if (
-                not pending_escalation_id
-                and reply_metadata.get("response_to_checkpoint_type") == "human_escalation"
-            ):
-                pending_escalation_id = reply_metadata.get("response_to_checkpoint_id")
-
-            pending_escalation = self._find_pending_escalation(
-                task_id=task_id,
-                escalation_id=pending_escalation_id,
-                project_id=pid,
-            )
-        elif not explicit_checkpoint_id and not explicit_checkpoint_type:
-            background_pending_escalation = self._find_pending_escalation(
-                task_id=task_id,
-                project_id=pid,
-            )
-
-        stale_human_escalation = (
-            explicit_human_escalation
-            and not pending_escalation
-            and bool(explicit_checkpoint_id or explicit_escalation_id)
-        )
-        if stale_human_escalation:
-            handled_as_deferred = False
-            if _looks_like_escalation_reply(content):
-                stale_checkpoint_id = explicit_escalation_id or explicit_checkpoint_id
-                # Duplicate clicks on an approval card that was JUST resolved
-                # (e.g. the user's own first click) are a normal occurrence
-                # when the server is slow: answer idempotently instead of
-                # flipping the card to "stale" and spamming inactive warnings.
-                card = None
-                try:
-                    card = await self.chat_store.get_checkpoint_message(
-                        stale_checkpoint_id,
-                        channel_id=channel_id,
-                        checkpoint_type="human_escalation",
-                        project_id=pid,
-                    )
-                except Exception:
-                    logger.opt(exception=True).debug(
-                        "Failed to load checkpoint card for stale escalation reply"
-                    )
-                card_meta = dict((card or {}).get("metadata", {}) or {})
-                card_status = str(card_meta.get("checkpoint_status", "") or "").strip().lower()
-                helper_text: str | None = None
-                if card_status in {"resolved", "responded"}:
-                    resolution_reply = str(
-                        card_meta.get("checkpoint_resolution_reply", "") or ""
-                    ).strip()
-                    helper_text = (
-                        "This approval was already handled"
-                        + (f" (decision: {resolution_reply})" if resolution_reply else "")
-                        + ". No further action is needed."
-                    )
-                else:
-                    approval_context = card_meta.get("approval_context")
-                    deferred_option = (
-                        _normalize_escalation_reply(content, list(card_meta.get("options") or []))
-                        if isinstance(approval_context, dict) and approval_context
-                        else None
-                    )
-                    if deferred_option:
-                        # The inline wait expired (or the server restarted), but
-                        # the decision is still the user's to make: apply the
-                        # grant, resolve the card, and resume the parked task.
-                        outcome = await self._resolve_deferred_escalation_click(
-                            engine=run_engine,
-                            project_id=pid,
-                            channel_id=channel_id,
-                            checkpoint_id=stale_checkpoint_id,
-                            card_meta=card_meta,
-                            option_id=deferred_option,
-                        )
-                        if outcome.get("action") == "flow_through":
-                            content = str(outcome.get("content") or content)
-                            for key in (
-                                "response_to_checkpoint_id",
-                                "response_to_checkpoint_type",
-                                "response_to_escalation_id",
-                            ):
-                                reply_metadata.pop(key, None)
-                            reply_metadata.update(dict(outcome.get("reply_metadata") or {}))
-                            handled_as_deferred = True
-                        else:
-                            helper_text = str(outcome.get("text") or "Decision recorded.")
-                    else:
-                        await self._mark_human_escalation_checkpoint_status(
-                            stale_checkpoint_id,
-                            status="stale",
-                            project_id=pid,
-                            channel_id=channel_id,
-                            reason="reply_to_inactive_escalation",
-                        )
-                        helper_text = (
-                            "That approval request is no longer active. "
-                            "The approval card has been marked inactive in the session history."
-                        )
-                if helper_text is not None:
-                    if await self._recent_identical_helper_exists(
-                        channel_id, helper_text, project_id=pid
-                    ):
-                        return
-                    helper = await self.chat_store.insert_message(
-                        channel_id=channel_id,
-                        sender="assistant",
-                        sender_name="OPC",
-                        content=helper_text,
-                        project_id=pid,
-                        metadata={"type": "system"},
-                    )
-                    await self.broadcast({"type": "session_message", "payload": helper})
-                    return
-            if not handled_as_deferred:
-                for key in (
-                    "response_to_checkpoint_id",
-                    "response_to_checkpoint_type",
-                    "response_to_escalation_id",
-                ):
-                    reply_metadata.pop(key, None)
-
-        if (
-            explicit_checkpoint_type == "company_delivery_feedback"
-            and str(reply_metadata.get("checkpoint_reply_kind", "") or "").strip().lower() == "ignore"
-        ):
-            if await self._route_company_delivery_feedback_reply_if_pending(
-                task_id=task_id,
-                content=content,
-                session_id=session_id,
-                task=task,
-                attachment_refs=attachment_refs or None,
-                message_metadata=reply_metadata if reply_metadata else None,
-                user_message_id=None,
-                user_message_created_at=None,
-                run_engine=run_engine,
-                run_project_id=run_project_id,
-                reply_channel_id=channel_id,
-            ):
-                return
-
         msg_metadata: dict = dict(reply_metadata)
         if attachment_refs:
             msg_metadata["attachment_refs"] = attachment_refs
@@ -6388,22 +5793,6 @@ class WSHandler:
             message_id=client_message_id or None,
         )
         await self.broadcast({"type": "session_message", "payload": msg})
-
-        if (
-            explicit_checkpoint_id
-            and explicit_checkpoint_type
-            and explicit_checkpoint_type not in {"human_escalation", "company_delivery_feedback"}
-        ):
-            updated_checkpoint_msg = await self.chat_store.mark_checkpoint_responded(
-                channel_id,
-                explicit_checkpoint_id,
-                checkpoint_type=explicit_checkpoint_type,
-                response_message_id=str(msg.get("message_id") or "").strip() or None,
-                response_metadata=reply_metadata if reply_metadata else None,
-                project_id=pid,
-            )
-            if updated_checkpoint_msg is not None:
-                await self.broadcast({"type": "session_message", "payload": updated_checkpoint_msg})
 
         # Auto-generate title from first message if task title is still default
         store = run_engine.store
@@ -6421,116 +5810,6 @@ class WSHandler:
                     "task_id": task_id,
                     "title": auto_title,
                 }})
-
-        if background_pending_escalation:
-            escalation_key = str(background_pending_escalation.get("escalation_id") or "").strip()
-            helper_text = (
-                "This approval is waiting for a card action. "
-                "Please use the approval card buttons to approve or deny."
-            )
-            if not _looks_like_escalation_reply(content):
-                allowed = [
-                    str(opt.get("label") or opt.get("id") or "").strip()
-                    for opt in background_pending_escalation.get("options", [])
-                    if str(opt.get("id", "")).strip()
-                ]
-                if allowed:
-                    helper_text = (
-                        "This task is waiting for an approval decision. "
-                        f"Use the approval card buttons: {', '.join(allowed)}."
-                    )
-            helper = await self.chat_store.insert_message(
-                channel_id=channel_id,
-                sender="assistant",
-                sender_name="OPC",
-                content=helper_text,
-                project_id=pid,
-                metadata={
-                    "type": "system",
-                    "pending_checkpoint_type": "human_escalation",
-                    "pending_escalation_id": escalation_key,
-                },
-            )
-            await self.broadcast({"type": "session_message", "payload": helper})
-            return
-
-        if pending_escalation:
-            normalized = normalized_pending_reply
-            if normalized is None:
-                normalized = _normalize_escalation_reply(content, pending_escalation.get("options", []))
-            if normalized is None:
-                allowed = [
-                    str(opt.get("label") or opt.get("id") or "").strip()
-                    for opt in pending_escalation.get("options", [])
-                    if str(opt.get("id", "")).strip()
-                ]
-                helper = await self.chat_store.insert_message(
-                    channel_id=channel_id,
-                    sender="assistant",
-                    sender_name="OPC",
-                    content=(
-                        "This task is waiting for your escalation decision. "
-                        f"Choose one of: {', '.join(allowed)}."
-                    ),
-                    metadata={
-                        "checkpoint_type": "human_escalation",
-                        "checkpoint_id": pending_escalation.get("escalation_id"),
-                        "escalation_id": pending_escalation.get("escalation_id"),
-                        "escalation_type": pending_escalation.get("escalation_type"),
-                        "prompt": pending_escalation.get("message", ""),
-                        "summary": pending_escalation.get("message", ""),
-                        "options": pending_escalation.get("options", []),
-                        "default_action": pending_escalation.get("default_action"),
-                    },
-                    project_id=pid,
-                )
-                await self.broadcast({"type": "session_message", "payload": helper})
-                return
-            future = pending_escalation.get("future")
-            if future and not future.done():
-                future.set_result(normalized)
-            auto_resolved_ids = self._resolve_related_pending_escalations(pending_escalation, normalized)
-            for escalation_id in auto_resolved_ids:
-                updated = await self.chat_store.mark_checkpoint_responded(
-                    channel_id,
-                    escalation_id,
-                    checkpoint_type="human_escalation",
-                    response_message_id=msg.get("message_id"),
-                    response_metadata=reply_metadata if reply_metadata else None,
-                    project_id=pid,
-                )
-                if updated is not None:
-                    await self.broadcast({"type": "session_message", "payload": updated})
-            return
-
-        if await self._route_company_delivery_feedback_reply_if_pending(
-            task_id=task_id,
-            content=content,
-            session_id=session_id,
-            task=task,
-            attachment_refs=attachment_refs or None,
-            message_metadata=reply_metadata if reply_metadata else None,
-            user_message_id=str(msg.get("message_id") or "").strip() or None,
-            user_message_created_at=float(msg.get("created_at")) if msg.get("created_at") is not None else None,
-            run_engine=run_engine,
-            run_project_id=run_project_id,
-            reply_channel_id=channel_id,
-        ):
-            return
-
-        if (
-            task
-            and self._is_company_session_exec_mode(task_session_exec_mode)
-            and not explicit_checkpoint_id
-            and not explicit_checkpoint_type
-            and not explicit_escalation_id
-        ):
-            await self._supersede_pending_delivery_feedback_for_new_company_turn(
-                task_id=task_id,
-                session_id=session_id,
-                run_engine=run_engine,
-                run_project_id=run_project_id,
-            )
 
         if await self._route_company_suspend_reply_if_pending(
             task_id=task_id,
@@ -7189,113 +6468,6 @@ class WSHandler:
                 return checkpoint
         return None
 
-    async def _company_delivery_feedback_parent_target(
-        self,
-        *,
-        task_id: str,
-        waiting_task_id: str,
-        waiting_task: Any | None,
-        checkpoint: Any,
-        payload: dict[str, Any],
-        engine: Any,
-    ) -> dict[str, str]:
-        expected_runtime_session_id = str(
-            payload.get("parent_session_id")
-            or getattr(waiting_task, "parent_session_id", "")
-            or getattr(checkpoint, "session_id", "")
-            or ""
-        ).strip()
-
-        for candidate_task_id in (waiting_task_id, task_id):
-            if not candidate_task_id:
-                continue
-            try:
-                target = await self._resolve_company_runtime_target(candidate_task_id, engine=engine)
-            except Exception:
-                logger.opt(exception=True).debug("failed to resolve company runtime target for delivery feedback")
-                target = None
-            if not target:
-                continue
-            runtime_session_id = str(target.get("runtime_session_id", "") or "").strip()
-            if expected_runtime_session_id and runtime_session_id != expected_runtime_session_id:
-                continue
-            ui_anchor_task_id = str(target.get("ui_anchor_task_id", "") or "").strip()
-            if runtime_session_id and ui_anchor_task_id:
-                return {
-                    "parent_task_id": ui_anchor_task_id,
-                    "parent_session_id": runtime_session_id,
-                }
-
-        # Delivery feedback is a company checkpoint action, not a generic
-        # chat operation.  Ambiguous/missing durable identity must be rejected
-        # instead of selecting the first Task sharing the root session.
-        return {"parent_task_id": "", "parent_session_id": ""}
-
-    async def _delivery_feedback_checkpoint_visible_to_session(
-        self,
-        checkpoint: Any,
-        *,
-        task_id: str,
-        session_id: str | None,
-        engine: Any,
-    ) -> bool:
-        requested_session_id = str(session_id or "").strip()
-        if not requested_session_id:
-            return False
-
-        payload = dict(getattr(checkpoint, "payload", {}) or {})
-        review_level = str(payload.get("review_level", "") or "").strip().lower()
-        if review_level == "manager":
-            return False
-
-        checker = getattr(engine, "_checkpoint_visible_to_reply_session", None)
-        if callable(checker):
-            try:
-                maybe_visible = checker(checkpoint, requested_session_id)
-                visible = await maybe_visible if inspect.isawaitable(maybe_visible) else maybe_visible
-                if visible is True:
-                    return True
-            except Exception:
-                logger.opt(exception=True).debug("failed to evaluate delivery feedback checkpoint visibility")
-
-        checkpoint_session_id = str(getattr(checkpoint, "session_id", "") or "").strip()
-        if checkpoint_session_id == requested_session_id:
-            return True
-
-        for key in ("parent_session_id", "runtime_session_id", "origin_session_id"):
-            if str(payload.get(key, "") or "").strip() == requested_session_id:
-                return True
-
-        normalized_task_id = str(task_id or "").strip()
-        raw_task_ids = payload.get("task_ids", [])
-        task_ids = {
-            str(item or "").strip()
-            for item in (raw_task_ids if isinstance(raw_task_ids, list) else [])
-            if str(item or "").strip()
-        }
-        payload_task_id = str(payload.get("task_id", "") or "").strip()
-        waiting_task_id = str(payload.get("waiting_task_id", "") or payload_task_id or "").strip()
-        if normalized_task_id and normalized_task_id in ({payload_task_id, waiting_task_id} | task_ids):
-            return True
-
-        store = getattr(engine, "store", None)
-        get_task = getattr(store, "get_task", None) if self._store_is_ready(store) else None
-        if callable(get_task) and waiting_task_id:
-            try:
-                waiting_task = await get_task(waiting_task_id)
-            except Exception:
-                logger.opt(exception=True).debug("failed to load waiting task for delivery feedback visibility")
-                waiting_task = None
-            if waiting_task is not None:
-                waiting_session_id = str(getattr(waiting_task, "session_id", "") or "").strip()
-                parent_session_id = str(getattr(waiting_task, "parent_session_id", "") or "").strip()
-                if requested_session_id in {waiting_session_id, parent_session_id}:
-                    return True
-                if normalized_task_id and normalized_task_id == str(getattr(waiting_task, "id", "") or "").strip():
-                    return True
-
-        return False
-
     @staticmethod
     def _checkpoint_created_timestamp(checkpoint: Any | None) -> float | None:
         raw_value = getattr(checkpoint, "created_at", None) if checkpoint is not None else None
@@ -7311,645 +6483,6 @@ class WSHandler:
             except ValueError:
                 return None
         return None
-
-    def _delivery_feedback_checkpoint_channel_id(
-        self,
-        checkpoint: Any | None,
-        *,
-        fallback_channel_id: str | None = None,
-    ) -> str:
-        normalized_fallback = str(fallback_channel_id or "").strip()
-        if normalized_fallback:
-            return normalized_fallback
-        payload = dict(getattr(checkpoint, "payload", {}) or {}) if checkpoint is not None else {}
-        for key in ("parent_task_id", "ui_task_id", "origin_task_id", "task_id", "waiting_task_id"):
-            task_id = str(payload.get(key, "") or "").strip()
-            if task_id:
-                return f"session:{task_id}"
-        checkpoint_task_id = str(getattr(checkpoint, "task_id", "") or "").strip() if checkpoint is not None else ""
-        return f"session:{checkpoint_task_id}" if checkpoint_task_id else ""
-
-    async def _update_or_emit_checkpoint_card_status(
-        self,
-        checkpoint_id: str,
-        *,
-        checkpoint_type: str,
-        status: str,
-        project_id: str,
-        channel_id: str | None = None,
-        checkpoint: Any | None = None,
-        response_message_id: str | None = None,
-        response_metadata: dict[str, Any] | None = None,
-        status_metadata: dict[str, Any] | None = None,
-        broadcast_update: bool = True,
-    ) -> dict[str, Any] | None:
-        """Update a persisted checkpoint card, or persist a terminal synthetic card.
-
-        Snapshot-built delivery review cards can be synthetic-only. In that case
-        there is no chat_store row for update_checkpoint_status() to mutate, so
-        the client keeps the old pending card in the floating Pending Actions
-        section. Persisting the terminal synthetic card with the same checkpoint
-        identity lets the frontend merge it and move it back into the timeline.
-        """
-        normalized_checkpoint_id = str(checkpoint_id or "").strip()
-        normalized_checkpoint_type = str(checkpoint_type or "").strip()
-        normalized_status = str(status or "resolved").strip().lower() or "resolved"
-        normalized_project_id = self._normalize_project_id(project_id)
-        if not normalized_checkpoint_id or not normalized_checkpoint_type:
-            return None
-
-        updated = await self.chat_store.update_checkpoint_status(
-            normalized_checkpoint_id,
-            channel_id=channel_id,
-            checkpoint_type=normalized_checkpoint_type,
-            status=normalized_status,
-            response_message_id=response_message_id,
-            response_metadata=response_metadata,
-            status_metadata=status_metadata,
-            project_id=normalized_project_id,
-        )
-        if updated is not None:
-            if broadcast_update:
-                await self.broadcast({"type": "session_message", "payload": updated})
-            return updated
-
-        if normalized_checkpoint_type != "company_delivery_feedback":
-            return None
-
-        fallback_channel_id = self._delivery_feedback_checkpoint_channel_id(
-            checkpoint,
-            fallback_channel_id=channel_id,
-        )
-        if not fallback_channel_id:
-            return None
-
-        if checkpoint is not None:
-            base_meta = self._build_delivery_feedback_meta(checkpoint)
-        else:
-            base_meta = {
-                "checkpoint_type": normalized_checkpoint_type,
-                "checkpoint_id": normalized_checkpoint_id,
-                "summary": "Human review requested.",
-                "prompt": "Human review requested.",
-            }
-
-        now = time.time()
-        metadata = dict(base_meta)
-        metadata["checkpoint_type"] = normalized_checkpoint_type
-        metadata["checkpoint_id"] = normalized_checkpoint_id
-        metadata["checkpoint_status"] = normalized_status
-        if normalized_status == "responded":
-            metadata["checkpoint_responded_at"] = now
-        else:
-            metadata["checkpoint_resolved_at"] = now
-        if response_message_id:
-            metadata["checkpoint_response_message_id"] = response_message_id
-        if isinstance(status_metadata, dict):
-            for key, value in status_metadata.items():
-                metadata[str(key)] = value
-        if isinstance(response_metadata, dict):
-            raw_reply_kind = str(response_metadata.get("checkpoint_reply_kind", "") or "").strip().lower()
-            if raw_reply_kind in {"approve", "deny", "feedback", "ignore"}:
-                metadata["checkpoint_reply_kind"] = raw_reply_kind
-
-        content = str(
-            metadata.get("prompt")
-            or metadata.get("summary")
-            or "Human review requested."
-        ).strip() or "Human review requested."
-        sender_name = str(
-            metadata.get("work_item_projection_title")
-            or metadata.get("requesting_role_id")
-            or "Company Member"
-        ).strip() or "Company Member"
-        message_id = f"checkpoint::{normalized_checkpoint_id}"
-        try:
-            created = await self.chat_store.insert_message(
-                channel_id=fallback_channel_id,
-                sender="assistant",
-                sender_name=sender_name,
-                content=content,
-                metadata=metadata,
-                message_id=message_id,
-                project_id=normalized_project_id,
-                created_at=self._checkpoint_created_timestamp(checkpoint),
-            )
-        except Exception:
-            logger.opt(exception=True).debug(
-                "failed to insert terminal synthetic checkpoint card; retrying status update: checkpoint_id={}",
-                normalized_checkpoint_id,
-            )
-            updated = await self.chat_store.update_checkpoint_status(
-                normalized_checkpoint_id,
-                channel_id=None,
-                checkpoint_type=normalized_checkpoint_type,
-                status=normalized_status,
-                response_message_id=response_message_id,
-                response_metadata=response_metadata,
-                status_metadata=status_metadata,
-                project_id=normalized_project_id,
-            )
-            if updated is not None:
-                if broadcast_update:
-                    await self.broadcast({"type": "session_message", "payload": updated})
-                return updated
-            return None
-        if broadcast_update:
-            await self.broadcast({"type": "session_message", "payload": created})
-        return created
-
-    async def _supersede_pending_delivery_feedback_for_new_company_turn(
-        self,
-        *,
-        task_id: str,
-        session_id: str | None,
-        run_engine: Any,
-        run_project_id: str,
-    ) -> list[str]:
-        project_id = self._normalize_project_id(run_project_id or getattr(run_engine, "project_id", None))
-        store = getattr(run_engine, "store", None)
-        if not session_id or not self._store_is_ready(store):
-            return []
-        getter = getattr(store, "get_pending_checkpoints", None)
-        resolver = getattr(store, "resolve_execution_checkpoint", None)
-        if not callable(getter) or not callable(resolver):
-            return []
-        try:
-            checkpoints = await getter(
-                project_id=project_id,
-                checkpoint_types=["company_delivery_feedback"],
-            )
-        except Exception:
-            logger.opt(exception=True).debug("failed to list pending delivery feedback checkpoints")
-            return []
-
-        superseded_ids: list[str] = []
-        for checkpoint in list(checkpoints or []):
-            checkpoint_id = str(getattr(checkpoint, "checkpoint_id", "") or "").strip()
-            if (
-                not checkpoint_id
-                or str(getattr(checkpoint, "checkpoint_type", "") or "").strip() != "company_delivery_feedback"
-                or str(getattr(checkpoint, "status", "") or "").strip().lower() != "pending"
-            ):
-                continue
-            visible = await self._delivery_feedback_checkpoint_visible_to_session(
-                checkpoint,
-                task_id=task_id,
-                session_id=session_id,
-                engine=run_engine,
-            )
-            if not visible:
-                continue
-
-            try:
-                terminalizer = getattr(run_engine, "_terminalize_company_delivery_feedback_checkpoint", None)
-                if inspect.iscoroutinefunction(terminalizer):
-                    superseded_at = datetime.now().isoformat()
-                    await terminalizer(
-                        checkpoint,
-                        status="superseded",
-                        resolution="superseded_by_new_company_turn",
-                        payload_updates={
-                            "feedback_superseded": True,
-                            "feedback_superseded_at": superseded_at,
-                            "feedback_resolution": "superseded_by_new_company_turn",
-                        },
-                        task_metadata_updates={
-                            "feedback_superseded": True,
-                            "feedback_superseded_at": superseded_at,
-                        },
-                    )
-                else:
-                    await resolver(checkpoint_id, status="superseded")
-                    waiting_task_id = str(
-                        dict(getattr(checkpoint, "payload", {}) or {}).get("waiting_task_id")
-                        or getattr(checkpoint, "task_id", "")
-                        or ""
-                    ).strip()
-                    if waiting_task_id and hasattr(store, "get_task") and hasattr(store, "save_task"):
-                        from opc.core.models import TaskStatus
-                        waiting_task = await store.get_task(waiting_task_id)
-                        if waiting_task is not None:
-                            superseded_at = datetime.now().isoformat()
-                            waiting_task.metadata = dict(getattr(waiting_task, "metadata", {}) or {})
-                            waiting_task.metadata.update({
-                                "requires_user_feedback": False,
-                                "human_review_closed": True,
-                                "human_review_closed_at": superseded_at,
-                                "human_review_resolution": "superseded_by_new_company_turn",
-                                "feedback_closed": True,
-                                "feedback_resolved": True,
-                                "feedback_superseded": True,
-                                "feedback_superseded_at": superseded_at,
-                                "feedback_resolution": "superseded_by_new_company_turn",
-                            })
-                            await apply_task_status_transition(
-                                store,
-                                waiting_task,
-                                target_status_or_phase=TaskStatus.DONE,
-                                reason="superseded_by_new_company_turn",
-                            )
-            except Exception:
-                logger.opt(exception=True).debug("failed to mark delivery feedback checkpoint superseded")
-                continue
-
-            superseded_ids.append(checkpoint_id)
-            await self._update_or_emit_checkpoint_card_status(
-                checkpoint_id,
-                checkpoint_type="company_delivery_feedback",
-                status="superseded",
-                checkpoint=checkpoint,
-                channel_id=f"session:{task_id}",
-                status_metadata={"checkpoint_resolution_reason": "new_company_turn_started"},
-                project_id=project_id,
-            )
-        return superseded_ids
-
-    async def _route_company_delivery_feedback_reply_if_pending(
-        self,
-        *,
-        task_id: str,
-        content: str,
-        session_id: str | None,
-        task: Any | None,
-        attachment_refs: list[dict] | None,
-        message_metadata: dict[str, Any] | None,
-        user_message_id: str | None,
-        user_message_created_at: float | None,
-        run_engine: Any,
-        run_project_id: str,
-        reply_channel_id: str,
-    ) -> bool:
-        metadata = dict(message_metadata or {})
-        checkpoint_id = str(metadata.get("response_to_checkpoint_id", "") or "").strip()
-        checkpoint_type = str(metadata.get("response_to_checkpoint_type", "") or "").strip()
-        reply_kind = str(metadata.get("checkpoint_reply_kind", "") or "").strip().lower()
-        if checkpoint_type != "company_delivery_feedback" or not checkpoint_id:
-            return False
-
-        checkpoint = await self._load_execution_checkpoint_for_reply(
-            engine=run_engine,
-            project_id=run_project_id,
-            checkpoint_id=checkpoint_id,
-            checkpoint_type=checkpoint_type,
-        )
-        if checkpoint is None:
-            await self._update_or_emit_checkpoint_card_status(
-                checkpoint_id,
-                channel_id=reply_channel_id,
-                checkpoint_type=checkpoint_type,
-                status="stale",
-                response_message_id=user_message_id,
-                response_metadata=metadata,
-                project_id=run_project_id,
-            )
-            if reply_kind == "ignore":
-                return True
-            helper = await self.chat_store.insert_message(
-                channel_id=reply_channel_id,
-                sender="assistant",
-                sender_name="OPC",
-                content=(
-                    "This delivery self-evolution review is no longer active. "
-                    "The review card has been marked inactive in the session history."
-                ),
-                project_id=run_project_id,
-                metadata={"type": "system"},
-            )
-            await self.broadcast({"type": "session_message", "payload": helper})
-            return True
-
-        status = str(getattr(checkpoint, "status", "") or "").strip().lower()
-        if status and status != "pending":
-            await self._update_or_emit_checkpoint_card_status(
-                checkpoint_id,
-                channel_id=reply_channel_id,
-                checkpoint_type=checkpoint_type,
-                status=status,
-                checkpoint=checkpoint,
-                response_message_id=user_message_id,
-                response_metadata=metadata,
-                project_id=run_project_id,
-            )
-            if reply_kind == "ignore":
-                return True
-            if status == "superseded":
-                helper_text = (
-                    "This delivery self-evolution review was superseded by a newer company turn. "
-                    "The review card has been marked inactive in the session history."
-                )
-            else:
-                helper_text = (
-                    "This delivery self-evolution review is no longer active. "
-                    "The review card has been updated in the session history."
-                )
-            helper = await self.chat_store.insert_message(
-                channel_id=reply_channel_id,
-                sender="assistant",
-                sender_name="OPC",
-                content=helper_text,
-                project_id=run_project_id,
-                metadata={"type": "system"},
-            )
-            await self.broadcast({"type": "session_message", "payload": helper})
-            return True
-
-        payload = dict(getattr(checkpoint, "payload", {}) or {})
-        waiting_task_id = str(payload.get("waiting_task_id", "") or payload.get("task_id", "") or "").strip()
-        if reply_kind == "ignore":
-            lock_key = checkpoint_id
-            lock = self._company_delivery_feedback_reply_locks.get(lock_key)
-            if lock is None:
-                lock = asyncio.Lock()
-                self._company_delivery_feedback_reply_locks[lock_key] = lock
-
-            async with lock:
-                checkpoint = await self._load_execution_checkpoint_for_reply(
-                    engine=run_engine,
-                    project_id=run_project_id,
-                    checkpoint_id=checkpoint_id,
-                    checkpoint_type=checkpoint_type,
-                )
-                if checkpoint is None:
-                    await self._update_or_emit_checkpoint_card_status(
-                        checkpoint_id,
-                        channel_id=reply_channel_id,
-                        checkpoint_type=checkpoint_type,
-                        status="stale",
-                        response_message_id=user_message_id,
-                        response_metadata=metadata,
-                        project_id=run_project_id,
-                    )
-                    return True
-
-                status = str(getattr(checkpoint, "status", "") or "").strip().lower()
-                if status and status != "pending":
-                    await self._update_or_emit_checkpoint_card_status(
-                        checkpoint_id,
-                        channel_id=reply_channel_id,
-                        checkpoint_type=checkpoint_type,
-                        status=status,
-                        checkpoint=checkpoint,
-                        response_message_id=user_message_id,
-                        response_metadata=metadata,
-                        project_id=run_project_id,
-                    )
-                    return True
-
-                started = time.monotonic()
-                await self._update_or_emit_checkpoint_card_status(
-                    checkpoint_id,
-                    channel_id=reply_channel_id,
-                    checkpoint_type="company_delivery_feedback",
-                    status="ignored",
-                    checkpoint=checkpoint,
-                    response_message_id=user_message_id,
-                    response_metadata=metadata,
-                    status_metadata={"checkpoint_resolution_reason": "ignored_by_user"},
-                    project_id=run_project_id,
-                )
-
-                payload = dict(getattr(checkpoint, "payload", {}) or {})
-                ignored_at = datetime.now().isoformat()
-                try:
-                    runner = getattr(run_engine, "ignore_company_delivery_feedback_checkpoint", None)
-                    if callable(runner):
-                        result = runner(checkpoint, reply_metadata=metadata or None)
-                        if inspect.isawaitable(result):
-                            await result
-                    else:
-                        terminalizer = getattr(run_engine, "_terminalize_company_delivery_feedback_checkpoint", None)
-                        if callable(terminalizer):
-                            result = terminalizer(
-                                checkpoint,
-                                status="ignored",
-                                resolution="self_evolution_review_ignored",
-                                payload_updates={
-                                    **payload,
-                                    "feedback_ignored": True,
-                                    "feedback_ignored_at": ignored_at,
-                                    "feedback_resolution": "self_evolution_review_ignored",
-                                },
-                                task_metadata_updates={
-                                    "self_evolution_review_ignored": True,
-                                    "self_evolution_review_ignored_at": ignored_at,
-                                    "feedback_ignored": True,
-                                    "feedback_ignored_at": ignored_at,
-                                },
-                            )
-                            if inspect.isawaitable(result):
-                                await result
-                        else:
-                            resolver = getattr(getattr(run_engine, "store", None), "resolve_execution_checkpoint", None)
-                            if callable(resolver):
-                                result = resolver(checkpoint_id, status="ignored")
-                                if inspect.isawaitable(result):
-                                    await result
-                except Exception:
-                    logger.exception(
-                        "failed to terminalize ignored delivery feedback checkpoint: checkpoint_id={}",
-                        checkpoint_id,
-                    )
-                logger.info(
-                    "delivery feedback ignore handled: checkpoint_id={} elapsed_ms={:.1f}",
-                    checkpoint_id,
-                    (time.monotonic() - started) * 1000,
-                )
-            return True
-        waiting_task = None
-        store = getattr(run_engine, "store", None)
-        if waiting_task_id and self._store_is_ready(store):
-            try:
-                waiting_task = await store.get_task(waiting_task_id)
-            except Exception:
-                logger.opt(exception=True).debug("failed to load delivery feedback waiting task")
-        target = await self._company_delivery_feedback_parent_target(
-            task_id=task_id,
-            waiting_task_id=waiting_task_id,
-            waiting_task=waiting_task,
-            checkpoint=checkpoint,
-            payload=payload,
-            engine=run_engine,
-        )
-        parent_task_id = str(target.get("parent_task_id", "") or "").strip()
-        parent_session_id = str(target.get("parent_session_id", "") or "").strip()
-        if not parent_task_id or not parent_session_id:
-            # This is already known to be an explicit delivery-feedback reply.
-            # Consuming it here prevents a missing/ambiguous durable identity
-            # from falling through as an ordinary turn on the work-item Task.
-            if self._chat_store_is_ready(self.chat_store):
-                try:
-                    helper = await self.chat_store.insert_message(
-                        channel_id=reply_channel_id,
-                        sender="assistant",
-                        sender_name="OPC",
-                        content=(
-                            "This review no longer matches an active company runtime. "
-                            "Refresh the session before replying again."
-                        ),
-                        project_id=run_project_id,
-                        metadata={
-                            "type": "system",
-                            "reason": "company_runtime_identity_mismatch",
-                        },
-                    )
-                    await self.broadcast({"type": "session_message", "payload": helper})
-                except Exception:
-                    logger.opt(exception=True).debug(
-                        "failed to emit delivery feedback identity rejection"
-                    )
-            return True
-
-        lock_key = checkpoint_id or parent_session_id
-        lock = self._company_delivery_feedback_reply_locks.get(lock_key)
-        if lock is None:
-            lock = asyncio.Lock()
-            self._company_delivery_feedback_reply_locks[lock_key] = lock
-
-        self._track_session(
-            parent_task_id,
-            self._process_company_delivery_feedback_reply(
-                parent_task_id=parent_task_id,
-                parent_session_id=parent_session_id,
-                reply_channel_id=reply_channel_id,
-                content=content,
-                attachment_refs=attachment_refs,
-                message_metadata=metadata,
-                user_message_id=user_message_id,
-                user_message_created_at=user_message_created_at,
-                run_engine=run_engine,
-                run_project_id=run_project_id,
-                checkpoint=checkpoint,
-                waiting_task_id=waiting_task_id,
-                lock=lock,
-            ),
-            project_id=run_project_id,
-            engine=run_engine,
-        )
-        return True
-
-    async def _process_company_delivery_feedback_reply(
-        self,
-        *,
-        parent_task_id: str,
-        parent_session_id: str,
-        reply_channel_id: str,
-        content: str,
-        attachment_refs: list[dict] | None,
-        message_metadata: dict[str, Any] | None,
-        user_message_id: str | None,
-        user_message_created_at: float | None,
-        run_engine: Any,
-        run_project_id: str,
-        checkpoint: Any,
-        waiting_task_id: str,
-        lock: asyncio.Lock,
-    ) -> None:
-        pid = self._normalize_project_id(run_project_id or getattr(run_engine, "project_id", None))
-        async with lock:
-            try:
-                parent_task = None
-                if self._store_is_ready(run_engine.store):
-                    try:
-                        parent_task = await run_engine.store.get_task(parent_task_id)
-                    except Exception:
-                        logger.opt(exception=True).debug("failed to load parent task for delivery feedback reply")
-                if parent_task is None:
-                    raise ServiceError(
-                        "org_id_required",
-                        "org_id_required",
-                        {
-                            "project_id": pid,
-                            "task_id": parent_task_id,
-                            "reason": "delivery_feedback_requires_durable_parent_task",
-                        },
-                    )
-                session_exec_mode = self._normalize_session_exec_mode(self._exec_mode)
-                session_company_profile = self._normalize_session_company_profile(self._company_profile)
-                session_org_id = ""
-                if parent_task is not None:
-                    session_exec_mode, session_company_profile = self._resolve_task_session_config(parent_task)
-                    session_org_id = self._resolve_task_org_id(parent_task)
-                engine_mode, company_profile = self._resolve_engine_mode(
-                    session_exec_mode,
-                    session_company_profile,
-                )
-                engine_message_metadata = dict(message_metadata or {})
-                engine_message_metadata.update(_ui_message_identity_metadata(
-                    message_id=user_message_id,
-                    conversation_turn_id=_ui_conversation_turn_id(user_message_id),
-                    created_at=user_message_created_at,
-                ))
-                self._active_runtime_children[parent_task_id] = parent_task_id
-                self._session_to_task[parent_session_id] = parent_task_id
-                payload = dict(getattr(checkpoint, "payload", {}) or {})
-                for child_task_id in list(payload.get("task_ids", []) or []):
-                    child_id = str(child_task_id or "").strip()
-                    if child_id:
-                        self._active_runtime_children[child_id] = parent_task_id
-                if waiting_task_id:
-                    self._active_runtime_children[waiting_task_id] = parent_task_id
-
-                reply_kind = str(engine_message_metadata.get("checkpoint_reply_kind", "") or "").strip().lower()
-                if reply_kind not in {"approve", "feedback"}:
-                    normalized_content = str(content or "").strip().lower()
-                    reply_kind = "approve" if normalized_content in {"approve", "approved", "i approve this delivery."} else "feedback"
-                feedback_text = str(content or "").strip() if reply_kind == "feedback" else ""
-                runner = getattr(run_engine, "run_company_delivery_self_evolution_checkpoint", None)
-                if not callable(runner):
-                    raise RuntimeError("Company delivery self-evolution is not available in this runtime.")
-                result_text = await runner(
-                    checkpoint,
-                    action=reply_kind,
-                    feedback=feedback_text,
-                    reply_metadata=engine_message_metadata or None,
-                )
-                assistant_msg = await self.chat_store.insert_message(
-                    channel_id=reply_channel_id or f"session:{parent_task_id}",
-                    sender="assistant",
-                    sender_name="OPC",
-                    content=str(result_text or "Self-evolution completed.").strip(),
-                    project_id=pid,
-                    metadata={
-                        "type": "system",
-                        "kind": "company_self_evolution_result",
-                        "response_to_checkpoint_type": "company_delivery_feedback",
-                        "response_to_checkpoint_id": str(getattr(checkpoint, "checkpoint_id", "") or "").strip(),
-                        "checkpoint_reply_kind": reply_kind,
-                        "self_evolution_completed": True,
-                    },
-                )
-                await self.broadcast({"type": "session_message", "payload": assistant_msg})
-                updated_checkpoint_msg = await self._mark_checkpoint_card_after_engine_response(
-                    channel_id=reply_channel_id,
-                    project_id=pid,
-                    engine=run_engine,
-                    message_metadata=engine_message_metadata,
-                    response_message_id=user_message_id,
-                )
-                if updated_checkpoint_msg is not None:
-                    await self.broadcast({"type": "session_message", "payload": updated_checkpoint_msg})
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                logger.exception("Company delivery feedback reply processing error: {}", exc)
-                if self._chat_store_is_ready(self.chat_store):
-                    try:
-                        msg = await self.chat_store.insert_message(
-                            channel_id=reply_channel_id or f"session:{parent_task_id}",
-                            sender="system",
-                            sender_name="OPC",
-                            content=f"Error: {exc}",
-                            project_id=pid,
-                        )
-                        await self.broadcast({"type": "session_message", "payload": msg})
-                    except Exception:
-                        logger.opt(exception=True).debug("failed to write delivery feedback reply error")
-            finally:
-                if self._chat_store_is_ready(self.chat_store):
-                    await self._flush_progress(parent_task_id, project_id=pid)
-                if waiting_task_id:
-                    await self._flush_progress(waiting_task_id, project_id=pid)
 
     async def _route_company_suspend_reply_if_pending(
         self,
@@ -8100,6 +6633,15 @@ class WSHandler:
                     "This company runtime checkpoint is no longer active. Refresh before retrying.",
                 )
             return False
+        checkpoint_type = str(
+            getattr(checkpoint, "checkpoint_type", "") or ""
+        ).strip()
+        if checkpoint_type not in COMPANY_RUNTIME_CHECKPOINT_TYPES:
+            # This router owns only Stop/Continue runtime handoffs.  A completed
+            # delivery-feedback (or any other ordinary interaction) may remain
+            # the latest durable checkpoint after the company run ends; it must
+            # not capture and reject the next normal conversation turn.
+            return False
         checkpoint_status = str(
             getattr(checkpoint, "status", "") or ""
         ).strip().lower()
@@ -8219,6 +6761,11 @@ class WSHandler:
                 self._session_to_task[runtime_session_id] = (
                     execution_anchor_task_id or ui_task_id
                 )
+                resolved_preferred_agent = (
+                    self._resolve_task_preferred_agent(config_task)
+                    if config_task is not None
+                    else self._task_preferred_agent
+                )
                 await run_engine.process_message(
                     content,
                     project_id=pid,
@@ -8226,21 +6773,26 @@ class WSHandler:
                     mode=engine_mode,
                     org_id=session_org_id or None,
                     company_profile=company_profile,
-                    preferred_agent=None,
+                    preferred_agent=(
+                        resolved_preferred_agent
+                        if resolved_preferred_agent != "native"
+                        else None
+                    ),
                     origin_task_id=execution_anchor_task_id or None,
                     attachment_refs=attachment_refs,
                     message_metadata=engine_message_metadata or None,
                 )
-                checkpoint_meta = await self._extract_checkpoint_metadata(
-                    ui_task_id,
-                    session_id=runtime_session_id,
-                    engine=run_engine,
-                )
                 await self._sync_task_transcript_messages(
                     ui_task_id,
                     engine=run_engine,
-                    latest_assistant_metadata=checkpoint_meta if checkpoint_meta else None,
                 )
+                for card in await self._visible_owner_interaction_cards(
+                    engine=run_engine,
+                    project_id=pid,
+                    requester_task_id=ui_task_id,
+                    requester_session_id=runtime_session_id,
+                ):
+                    await self.broadcast({"type": "session_message", "payload": card})
                 # Replace the optimistic ``resuming`` projection with the
                 # checkpoint state committed by the engine.  Successful and
                 # already-consumed handoffs need the same durable refresh as
@@ -8497,278 +7049,6 @@ class WSHandler:
             return ""
         return str(getattr(checkpoint, "status", "") or "").strip().lower()
 
-    async def _mark_checkpoint_card_after_engine_response(
-        self,
-        *,
-        channel_id: str,
-        project_id: str,
-        engine: Any,
-        message_metadata: dict[str, Any] | None,
-        response_message_id: str | None,
-    ) -> dict[str, Any] | None:
-        metadata = dict(message_metadata or {})
-        checkpoint_id = str(metadata.get("response_to_checkpoint_id", "") or "").strip()
-        checkpoint_type = str(metadata.get("response_to_checkpoint_type", "") or "").strip()
-        if not checkpoint_id or checkpoint_type == "human_escalation":
-            return None
-        status = await self._execution_checkpoint_status(
-            engine=engine,
-            project_id=project_id,
-            checkpoint_id=checkpoint_id,
-            checkpoint_type=checkpoint_type,
-        )
-        if not status or status == "pending":
-            return None
-        try:
-            if status == "resolved":
-                updated = await self.chat_store.mark_checkpoint_responded(
-                    channel_id,
-                    checkpoint_id,
-                    checkpoint_type=checkpoint_type,
-                    response_message_id=response_message_id,
-                    response_metadata=metadata,
-                    project_id=project_id,
-                )
-                if updated is not None:
-                    return updated
-                updated = await self.chat_store.update_checkpoint_status(
-                    checkpoint_id,
-                    channel_id=None,
-                    checkpoint_type=checkpoint_type,
-                    status="responded",
-                    response_message_id=response_message_id,
-                    response_metadata=metadata,
-                    project_id=project_id,
-                )
-                if updated is not None:
-                    return updated
-                checkpoint = await self._load_execution_checkpoint_for_reply(
-                    engine=engine,
-                    project_id=project_id,
-                    checkpoint_id=checkpoint_id,
-                    checkpoint_type=checkpoint_type,
-                )
-                return await self._update_or_emit_checkpoint_card_status(
-                    checkpoint_id,
-                    channel_id=channel_id,
-                    checkpoint_type=checkpoint_type,
-                    status="responded",
-                    checkpoint=checkpoint,
-                    response_message_id=response_message_id,
-                    response_metadata=metadata,
-                    project_id=project_id,
-                    broadcast_update=False,
-                )
-            updated = await self.chat_store.update_checkpoint_status(
-                checkpoint_id,
-                channel_id=channel_id,
-                checkpoint_type=checkpoint_type,
-                status=status,
-                response_message_id=response_message_id,
-                response_metadata=metadata,
-                project_id=project_id,
-            )
-            if updated is not None:
-                return updated
-            updated = await self.chat_store.update_checkpoint_status(
-                checkpoint_id,
-                channel_id=None,
-                checkpoint_type=checkpoint_type,
-                status=status,
-                response_message_id=response_message_id,
-                response_metadata=metadata,
-                project_id=project_id,
-            )
-            if updated is not None:
-                return updated
-            checkpoint = await self._load_execution_checkpoint_for_reply(
-                engine=engine,
-                project_id=project_id,
-                checkpoint_id=checkpoint_id,
-                checkpoint_type=checkpoint_type,
-            )
-            return await self._update_or_emit_checkpoint_card_status(
-                checkpoint_id,
-                channel_id=channel_id,
-                checkpoint_type=checkpoint_type,
-                status=status,
-                checkpoint=checkpoint,
-                response_message_id=response_message_id,
-                response_metadata=metadata,
-                project_id=project_id,
-                broadcast_update=False,
-            )
-        except Exception:
-            logger.opt(exception=True).debug("failed to persist checkpoint card terminal state")
-            return None
-
-    _LOCK_FREE_CHECKPOINT_ANSWER_TYPES = frozenset({
-        "task_user_input",
-        "company_work_item_gate",
-    })
-
-    async def _try_lock_free_parked_checkpoint_answer(
-        self,
-        *,
-        task_id: str,
-        content: str,
-        session_id: str | None,
-        message_metadata: dict[str, Any] | None,
-        user_message_id: str | None,
-        user_message_created_at: float | None,
-        engine: Any,
-        pid: str,
-        channel_id: str,
-        session_exec_mode: str,
-        session_company_profile: str | None,
-        session_org_id: str,
-        attachment_refs: list[dict] | None,
-    ) -> bool:
-        """Answer a pending park checkpoint without taking the per-task turn lock.
-
-        A company goal turn can hold the per-task lock for hours while its live
-        dispatcher waits on AWAITING_HUMAN approval cards. The card answers are
-        themselves session messages, so they queue behind that same lock — a
-        circular wait: dispatcher waits for the answer, the answer waits for the
-        lock, the lock waits for the dispatcher (project-0012 late-approval
-        wedge). When the reply explicitly targets a pending park checkpoint and
-        the lock is currently held, deliver it straight through the engine's
-        checkpoint-resume channel instead: with a live dispatcher the engine
-        only persists the input, applies the approval decision, releases the
-        human wait, and wakes the loop — no second dispatcher, no re-entry.
-
-        Returns True when the reply was fully handled here.
-        """
-        metadata = dict(message_metadata or {})
-        checkpoint_id = str(metadata.get("response_to_checkpoint_id", "") or "").strip()
-        checkpoint_type = str(metadata.get("response_to_checkpoint_type", "") or "").strip()
-        if not checkpoint_id or checkpoint_type not in self._LOCK_FREE_CHECKPOINT_ANSWER_TYPES:
-            return False
-        lock = self._get_task_lock(task_id)
-        if not lock.locked():
-            # No turn in flight: the serialized path works and preserves
-            # ordering, so keep the existing behavior.
-            return False
-        store = getattr(engine, "store", None)
-        if not self._store_is_ready(store):
-            return False
-        getter = getattr(store, "get_pending_checkpoints", None)
-        if not callable(getter):
-            return False
-        try:
-            pending = await getter(project_id=pid)
-        except Exception:
-            logger.opt(exception=True).debug(
-                "Lock-free checkpoint answer: failed to load pending checkpoints"
-            )
-            return False
-        checkpoint = next(
-            (
-                item
-                for item in pending or []
-                if str(getattr(item, "checkpoint_id", "") or "").strip() == checkpoint_id
-                and str(getattr(item, "checkpoint_type", "") or "").strip() == checkpoint_type
-            ),
-            None,
-        )
-        if checkpoint is None:
-            return False
-        # Ownership scoping must accept every channel the card legitimately
-        # reaches, not just the task that raised the checkpoint: company gate
-        # cards raised by role work items are answered from the run's anchor
-        # chat, whose task id only appears in payload["task_ids"] (the same
-        # linkage set _find_parked_checkpoint_for_deferred_resume uses). An
-        # exact task/session equality check would silently disable this fast
-        # path for those answers and re-open the late-approval lock wedge.
-        checkpoint_payload = dict(getattr(checkpoint, "payload", {}) or {})
-        requester_task_id = str(task_id or "").strip()
-        requester_session_id = str(session_id or "").strip()
-        linked_task_ids = {
-            str(checkpoint_payload.get("task_id") or "").strip(),
-            str(checkpoint_payload.get("waiting_task_id") or "").strip(),
-            str(getattr(checkpoint, "task_id", "") or "").strip(),
-        }
-        linked_task_ids.update(
-            str(item or "").strip()
-            for item in list(checkpoint_payload.get("task_ids", []) or [])
-        )
-        linked_task_ids.discard("")
-        linked_session_ids = {
-            str(getattr(checkpoint, "session_id", "") or "").strip(),
-            str(checkpoint_payload.get("session_id") or "").strip(),
-        }
-        linked_session_ids.discard("")
-        has_linkage = bool(linked_task_ids or linked_session_ids)
-        if has_linkage and (
-            requester_task_id not in linked_task_ids
-            and (not requester_session_id or requester_session_id not in linked_session_ids)
-        ):
-            return False
-        logger.info(
-            f"Lock-free checkpoint answer: task lock for {task_id} is held by a "
-            f"live turn; delivering reply to pending checkpoint {checkpoint_id} "
-            "through the engine resume channel"
-        )
-        try:
-            engine_mode, company_profile = self._resolve_engine_mode(
-                session_exec_mode,
-                session_company_profile,
-            )
-            engine_message_metadata = dict(metadata)
-            engine_message_metadata.update(_ui_message_identity_metadata(
-                message_id=user_message_id,
-                conversation_turn_id=_ui_conversation_turn_id(user_message_id),
-                created_at=user_message_created_at,
-            ))
-            response = await engine.process_message(
-                content,
-                project_id=pid,
-                session_id=session_id,
-                mode=engine_mode,
-                org_id=session_org_id or None,
-                company_profile=company_profile,
-                origin_task_id=task_id,
-                attachment_refs=attachment_refs,
-                message_metadata=engine_message_metadata or None,
-            )
-            updated_checkpoint_msg = await self._mark_checkpoint_card_after_engine_response(
-                channel_id=channel_id,
-                project_id=pid,
-                engine=engine,
-                message_metadata=engine_message_metadata,
-                response_message_id=user_message_id,
-            )
-            if updated_checkpoint_msg is not None:
-                await self.broadcast({"type": "session_message", "payload": updated_checkpoint_msg})
-            reply_text = str(response or "").strip() or "Input received."
-            reply_msg = await self.chat_store.insert_message(
-                channel_id=channel_id,
-                sender="assistant",
-                sender_name="OPC",
-                content=reply_text,
-                project_id=pid,
-                metadata={"type": "system", "checkpoint_answer_lock_free": True},
-            )
-            await self.broadcast({"type": "session_message", "payload": reply_msg})
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            # Do NOT fall back to the locked path: it would silently queue
-            # behind the in-flight turn — exactly the wedge this path exists
-            # to break. Surface the failure so the user can retry.
-            logger.opt(exception=True).warning(
-                f"Lock-free checkpoint answer failed for {checkpoint_id}"
-            )
-            helper = await self.chat_store.insert_message(
-                channel_id=channel_id,
-                sender="system",
-                sender_name="OPC",
-                content=f"Failed to deliver the approval reply: {exc}. Please click the card again.",
-                project_id=pid,
-            )
-            await self.broadcast({"type": "session_message", "payload": helper})
-        return True
-
     async def _process_session_message(
         self, task_id: str, content: str, *,
         session_id: str | None = None,
@@ -8851,23 +7131,6 @@ class WSHandler:
                             "failed to surface session identity error"
                         )
                     return
-
-        if await self._try_lock_free_parked_checkpoint_answer(
-            task_id=task_id,
-            content=content,
-            session_id=session_id,
-            message_metadata=message_metadata,
-            user_message_id=user_message_id,
-            user_message_created_at=user_message_created_at,
-            engine=engine,
-            pid=pid,
-            channel_id=channel_id,
-            session_exec_mode=session_exec_mode,
-            session_company_profile=session_company_profile,
-            session_org_id=session_org_id,
-            attachment_refs=attachment_refs,
-        ):
-            return
 
         # Per-task lock: same session serialized, different sessions concurrent
         async with self._get_task_lock(task_id):
@@ -8957,14 +7220,18 @@ class WSHandler:
                     session_exec_mode,
                     session_company_profile,
                 )
-                engine_preferred_agent = session_preferred_agent if session_exec_mode == "task" else None
+                engine_preferred_agent = (
+                    session_preferred_agent
+                    if session_exec_mode == "task" or session_preferred_agent != "native"
+                    else None
+                )
                 engine_message_metadata = dict(message_metadata or {})
                 engine_message_metadata.update(_ui_message_identity_metadata(
                     message_id=user_message_id,
                     conversation_turn_id=_ui_conversation_turn_id(user_message_id),
                     created_at=user_message_created_at,
                 ))
-                response = await engine.process_message(
+                await engine.process_message(
                     content,
                     project_id=pid,
                     session_id=session_id,
@@ -8976,24 +7243,17 @@ class WSHandler:
                     attachment_refs=attachment_refs,
                     message_metadata=engine_message_metadata or None,
                 )
-                updated_checkpoint_msg = await self._mark_checkpoint_card_after_engine_response(
-                    channel_id=channel_id,
-                    project_id=pid,
-                    engine=engine,
-                    message_metadata=engine_message_metadata,
-                    response_message_id=user_message_id,
-                )
-                if updated_checkpoint_msg is not None:
-                    await self.broadcast({"type": "session_message", "payload": updated_checkpoint_msg})
-                # ── Check for pending checkpoint → attach structured metadata ──
-                checkpoint_meta = await self._extract_checkpoint_metadata(
-                    task_id, session_id=session_id, engine=engine,
-                )
                 await self._sync_task_transcript_messages(
                     task_id,
                     engine=engine,
-                    latest_assistant_metadata=checkpoint_meta if checkpoint_meta else None,
                 )
+                for card in await self._visible_owner_interaction_cards(
+                    engine=engine,
+                    project_id=pid,
+                    requester_task_id=task_id,
+                    requester_session_id=session_id,
+                ):
+                    await self.broadcast({"type": "session_message", "payload": card})
                 await self._ensure_reply_projected(
                     channel_id=channel_id,
                     project_id=pid,
@@ -9109,40 +7369,404 @@ class WSHandler:
 
     # ── Checkpoint metadata extraction ──────────────────────────────────
 
-    async def _extract_checkpoint_metadata(
+    async def _interaction_checkpoint_presentation_task_id(
         self,
-        task_id: str,
+        checkpoint: Any | None,
         *,
-        session_id: str | None = None,
-        engine: Any | None = None,
+        engine: Any,
+    ) -> str:
+        """Choose a UI host without changing the checkpoint's owner actor."""
+
+        actor_task_id, actor_session_id = (
+            owner_interaction_actor_identity(checkpoint)
+        )
+        if actor_task_id:
+            return actor_task_id
+        if not actor_session_id:
+            return ""
+        store = getattr(engine, "store", None)
+        if not self._store_is_ready(store):
+            return ""
+        try:
+            identity_index = await load_company_runtime_identity_index(
+                store,
+                str(getattr(checkpoint, "project_id", "") or "default").strip()
+                or "default",
+            )
+            identity = identity_index.resolve(runtime_session_id=actor_session_id)
+        except Exception:
+            logger.opt(exception=True).debug(
+                "failed to resolve owner interaction presentation task"
+            )
+            return ""
+        if identity is None:
+            return ""
+        # Rootless company runtimes have no ui_anchor_task_id.  Their canonical
+        # config Task is a presentation host only; the actor metadata below
+        # deliberately remains taskless/root-session-owned.
+        return str(
+            identity.ui_anchor_task_id or identity.config_source_task_id or ""
+        ).strip()
+
+    async def _build_owner_interaction_meta(
+        self,
+        checkpoint: Any,
+        *,
+        engine: Any,
     ) -> dict[str, Any] | None:
-        """Query pending checkpoint from engine store and build structured metadata.
-
-        Called after engine.process_message() returns.  The engine saves the
-        checkpoint *before* returning its summary string, so a pending
-        checkpoint is guaranteed to exist here if the response represents an
-        interactive confirmation prompt.
-
-        Returns a dict suitable for ChatStore message ``metadata``, or None.
-        """
-        runtime_engine = engine or self.engine
-        checkpoint = await runtime_engine.get_latest_pending_checkpoint_for_session(session_id)
-        if not checkpoint:
+        checkpoint_type = str(getattr(checkpoint, "checkpoint_type", "") or "").strip()
+        if checkpoint_type not in OWNER_INTERACTION_CHECKPOINT_TYPES:
             return None
-
-        if checkpoint.checkpoint_type == "task_user_input":
-            return await self._build_task_user_input_meta(checkpoint, engine=runtime_engine)
-        if checkpoint.checkpoint_type == "company_work_item_gate":
+        payload = dict(getattr(checkpoint, "payload", {}) or {})
+        if not self._owner_interaction_checkpoint_is_projectable(checkpoint):
+            return None
+        if checkpoint_type in {"tool_permission", "action_permission"}:
+            interaction = dict(payload.get("interaction", {}) or {})
+            approval = dict(payload.get("approval", {}) or {})
+            tool_call = dict(payload.get("tool_call", {}) or {})
+            options = [
+                {
+                    "id": str(option.get("id", "") or "").strip(),
+                    "label": str(option.get("label") or option.get("id") or "").strip(),
+                    "description": str(option.get("description", "") or "").strip(),
+                }
+                for option in list(interaction.get("options", []) or [])
+                if isinstance(option, dict) and str(option.get("id", "") or "").strip()
+            ]
+            prompt = str(
+                interaction.get("prompt")
+                or approval.get("rationale")
+                or (
+                    f"Authorize tool {tool_call.get('name') or 'action'}?"
+                    if checkpoint_type == "tool_permission"
+                    else f"Authorize action {approval.get('action_name') or tool_call.get('name') or 'request'}?"
+                )
+            ).strip()
+            return {
+                "checkpoint_type": checkpoint_type,
+                "checkpoint_id": str(getattr(checkpoint, "checkpoint_id", "") or "").strip(),
+                "checkpoint_status": str(getattr(checkpoint, "status", "pending") or "pending").strip(),
+                "escalation_type": checkpoint_type,
+                "prompt": prompt,
+                "summary": str(approval.get("rationale") or prompt).strip(),
+                "options": options,
+                "default_action": interaction.get("default_action"),
+                "tool_call_id": str(tool_call.get("id", "") or "").strip(),
+                "tool_name": str(tool_call.get("name", "") or "").strip(),
+                "tool_risk_level": str(approval.get("risk_level", "") or "").strip(),
+                "action_kind": str(approval.get("action_kind", "") or "").strip(),
+                "action_name": str(approval.get("action_name", "") or "").strip(),
+            }
+        if checkpoint_type == "task_user_input":
+            return await self._build_task_user_input_meta(checkpoint, engine=engine)
+        if checkpoint_type == "company_work_item_gate":
             return self._build_company_work_item_gate_meta(checkpoint)
-        if checkpoint.checkpoint_type == "company_staffing_selection":
-            return self._build_staffing_selection_meta(checkpoint)
-        if checkpoint.checkpoint_type == "company_recruitment_confirmation":
-            return self._build_recruitment_meta(checkpoint, engine=runtime_engine)
-        if checkpoint.checkpoint_type == "company_reorg_pending":
-            return await self._build_reorg_meta(checkpoint, engine=runtime_engine)
-        if checkpoint.checkpoint_type == "company_delivery_feedback":
+        if checkpoint_type == "company_staffing_selection":
+            return self._build_staffing_selection_meta(checkpoint, engine=engine)
+        if checkpoint_type == "company_recruitment_confirmation":
+            return self._build_recruitment_meta(checkpoint, engine=engine)
+        if checkpoint_type == "company_reorg_pending":
+            return await self._build_reorg_meta(checkpoint, engine=engine)
+        if checkpoint_type == "company_delivery_feedback":
             return self._build_delivery_feedback_meta(checkpoint)
-        return None
+
+        # Routing/failure interactions share the structured-input renderer but
+        # retain their real checkpoint_type for engine dispatch.
+        interaction = dict(payload.get("interaction", {}) or {})
+        prompt = str(
+            interaction.get("prompt")
+            or payload.get("prompt")
+            or payload.get("reason")
+            or "Additional input is required to continue."
+        ).strip()
+        options = [
+            {
+                "id": str(option.get("id", "") or "").strip(),
+                "label": str(option.get("label") or option.get("id") or "").strip(),
+                "description": str(option.get("description", "") or "").strip(),
+            }
+            for option in list(interaction.get("options", payload.get("options", [])) or [])
+            if isinstance(option, dict) and str(option.get("id", "") or "").strip()
+        ]
+        return {
+            "checkpoint_type": checkpoint_type,
+            "checkpoint_id": str(getattr(checkpoint, "checkpoint_id", "") or "").strip(),
+            "checkpoint_status": str(getattr(checkpoint, "status", "pending") or "pending").strip(),
+            "work_item_projection_title": {
+                "route_clarification": "Clarification Needed",
+                "company_runtime_selection": "Runtime Selection",
+                "company_run_failure_review": "Run Failure Review",
+            }.get(checkpoint_type, "Input Needed"),
+            "summary": str(payload.get("summary") or payload.get("reason") or prompt).strip(),
+            "prompt": prompt,
+            "questions": [],
+            "input_questions": ([{
+                "id": "decision",
+                "header": "Choose an action",
+                "question": prompt,
+                "options": options,
+                "allow_freeform": True,
+                "required": True,
+            }] if options else []),
+            "required_fields": [],
+        }
+
+    @staticmethod
+    def _owner_interaction_checkpoint_is_projectable(checkpoint: Any) -> bool:
+        """Keep internal manager reviews outside the owner interaction surface."""
+
+        payload = dict(getattr(checkpoint, "payload", {}) or {})
+        review_levels = {
+            str(container.get("review_level", "") or "").strip().lower()
+            for container in (
+                payload,
+                dict(payload.get("interaction", {}) or {}),
+                dict(payload.get("gate", {}) or {}),
+                dict(payload.get("approval", {}) or {}),
+                dict(payload.get("pause_request", {}) or {}),
+            )
+        }
+        return "manager" not in review_levels
+
+    async def _interaction_checkpoint_ui_message(
+        self,
+        checkpoint: Any,
+        *,
+        presentation_task_id: str = "",
+        engine: Any,
+        project_id: str,
+    ) -> dict[str, Any] | None:
+        metadata = await self._build_owner_interaction_meta(checkpoint, engine=engine)
+        if metadata is None:
+            return None
+        checkpoint_id = str(getattr(checkpoint, "checkpoint_id", "") or "").strip()
+        if not checkpoint_id:
+            return None
+        status = str(getattr(checkpoint, "status", "pending") or "pending").strip().lower()
+        metadata = {
+            **metadata,
+            "checkpoint_id": checkpoint_id,
+            "checkpoint_status": status,
+            "source": "execution_checkpoint",
+        }
+        actor_task_id, actor_session_id = owner_interaction_actor_identity(checkpoint)
+        host_task_id = str(presentation_task_id or "").strip()
+        if not host_task_id:
+            host_task_id = await self._interaction_checkpoint_presentation_task_id(
+                checkpoint,
+                engine=engine,
+            )
+        metadata["interaction_requester_task_id"] = actor_task_id
+        metadata["interaction_requester_session_id"] = actor_session_id
+        channel_id = f"session:{host_task_id}" if host_task_id else f"activity:{project_id}"
+        created_at = self._checkpoint_created_timestamp(checkpoint) or time.time()
+        content = str(
+            metadata.get("prompt")
+            or metadata.get("summary")
+            or "Action required."
+        ).strip() or "Action required."
+        return {
+            "message_id": f"checkpoint::{checkpoint_id}",
+            "channel_id": channel_id,
+            "sender": "assistant",
+            "sender_name": str(
+                metadata.get("work_item_projection_title")
+                or metadata.get("requesting_role_id")
+                or "OPC"
+            ).strip() or "OPC",
+            "content": content,
+            "created_at": created_at,
+            "reply_to_id": None,
+            "mentions": [],
+            "metadata": metadata,
+            "project_id": project_id,
+        }
+
+    async def _visible_owner_interaction_cards(
+        self,
+        *,
+        engine: Any,
+        project_id: str,
+        requester_task_id: str,
+        requester_session_id: str | None,
+        checkpoints: list[Any] | None = None,
+    ) -> list[dict[str, Any]]:
+        if checkpoints is None:
+            checkpoints = await self._active_owner_interaction_checkpoints(
+                engine=engine,
+                project_id=project_id,
+            )
+
+        requested_session_id = str(requester_session_id or "").strip()
+        requested_task_id = str(requester_task_id or "").strip()
+        visible: list[dict[str, Any]] = []
+        visibility_check = getattr(engine, "can_answer_checkpoint", None)
+        if not callable(visibility_check):
+            return []
+        for checkpoint in checkpoints:
+            actor_task_id, actor_session_id = (
+                owner_interaction_actor_identity(checkpoint)
+            )
+            if not actor_task_id and not actor_session_id:
+                continue
+            # The caller's Task can be a UI-only host for a root-session-owned
+            # checkpoint.  It selects presentation scope but is never forwarded
+            # to the engine as the actor.
+            if actor_task_id:
+                in_scope = bool(
+                    requested_task_id == actor_task_id
+                    or (
+                        requested_session_id
+                        and actor_session_id
+                        and requested_session_id == actor_session_id
+                    )
+                )
+            else:
+                in_scope = bool(
+                    requested_session_id
+                    and requested_session_id == actor_session_id
+                )
+            if not in_scope:
+                continue
+            try:
+                candidate = visibility_check(
+                    checkpoint,
+                    requester_task_id=actor_task_id,
+                    requester_session_id=actor_session_id or None,
+                )
+                allowed = bool(await candidate) if inspect.isawaitable(candidate) else bool(candidate)
+            except Exception:
+                logger.opt(exception=True).debug(
+                    "failed owner interaction checkpoint visibility check"
+                )
+                allowed = False
+            if not allowed:
+                continue
+            presentation_task_id = (
+                await self._interaction_checkpoint_presentation_task_id(
+                    checkpoint,
+                    engine=engine,
+                )
+            )
+            card = await self._interaction_checkpoint_ui_message(
+                checkpoint,
+                presentation_task_id=presentation_task_id,
+                engine=engine,
+                project_id=project_id,
+            )
+            if card is not None:
+                visible.append(card)
+        return sorted(
+            visible,
+            key=lambda card: (
+                float(card.get("created_at", 0) or 0),
+                str(card.get("message_id", "") or ""),
+            ),
+        )
+
+    async def _active_owner_interaction_checkpoints(
+        self,
+        *,
+        engine: Any,
+        project_id: str,
+    ) -> list[Any]:
+        store = getattr(engine, "store", None)
+        getter = getattr(store, "get_execution_checkpoints", None)
+        if not callable(getter):
+            return []
+        try:
+            checkpoints = await getter(
+                project_id=project_id,
+                statuses=sorted(OWNER_INTERACTION_ACTIVE_STATUSES),
+            )
+        except TypeError:
+            checkpoints = await getter(project_id=project_id)
+        except Exception:
+            logger.opt(exception=True).debug("failed to load owner interaction checkpoints")
+            return []
+
+        active: list[Any] = []
+        for checkpoint in list(checkpoints or []):
+            checkpoint_type = str(getattr(checkpoint, "checkpoint_type", "") or "").strip()
+            status = str(getattr(checkpoint, "status", "") or "").strip().lower()
+            if checkpoint_type not in OWNER_INTERACTION_CHECKPOINT_TYPES:
+                continue
+            if status not in OWNER_INTERACTION_ACTIVE_STATUSES:
+                continue
+            if not self._owner_interaction_checkpoint_is_projectable(checkpoint):
+                continue
+            active.append(checkpoint)
+        return active
+
+    async def _owner_interaction_baseline_cards(
+        self,
+        *,
+        engine: Any,
+        project_id: str,
+    ) -> list[dict[str, Any]]:
+        """Rebuild every reconnect card from durable checkpoints, not events."""
+
+        checkpoints = await self._active_owner_interaction_checkpoints(
+            engine=engine,
+            project_id=project_id,
+        )
+        if not checkpoints:
+            return []
+
+        cards_by_id: dict[str, dict[str, Any]] = {}
+        for checkpoint in checkpoints:
+            actor_task_id, actor_session_id = (
+                owner_interaction_actor_identity(checkpoint)
+            )
+            if not actor_task_id and not actor_session_id:
+                continue
+            for card in await self._visible_owner_interaction_cards(
+                engine=engine,
+                project_id=project_id,
+                requester_task_id=actor_task_id,
+                requester_session_id=actor_session_id,
+                checkpoints=[checkpoint],
+            ):
+                card_id = str(card.get("message_id", "") or "").strip()
+                if card_id:
+                    cards_by_id[card_id] = card
+        return sorted(
+            cards_by_id.values(),
+            key=lambda card: (
+                float(card.get("created_at", 0) or 0),
+                str(card.get("message_id", "") or ""),
+            ),
+        )
+
+    async def _send_owner_interaction_baseline_for_client(
+        self,
+        ws: Any,
+        *,
+        engine: Any,
+        project_id: str,
+    ) -> None:
+        for card in await self._owner_interaction_baseline_cards(
+            engine=engine,
+            project_id=project_id,
+        ):
+            if self._client_active_project_id(ws) != project_id:
+                return
+            await self._send_envelope_to_client(
+                ws,
+                {"type": "session_message", "payload": card},
+            )
+
+    async def _broadcast_owner_interaction_baseline(
+        self,
+        *,
+        engine: Any,
+        project_id: str,
+    ) -> None:
+        for card in await self._owner_interaction_baseline_cards(
+            engine=engine,
+            project_id=project_id,
+        ):
+            await self.broadcast({"type": "session_message", "payload": card})
 
     async def _build_task_user_input_meta(
         self,
@@ -9192,15 +7816,6 @@ class WSHandler:
             if str(item).strip()
         ]
         resume_hint = str(pause_request.get("resume_hint", "") or "").strip()
-        if not resume_hint and "blocked by autonomy policy" in f"{prompt} {summary}".lower():
-            # This park came from a tool-approval timeout. The approval card
-            # posted earlier stays pending and clickable indefinitely, so point
-            # the user at it instead of leaving typed input as the only path.
-            resume_hint = (
-                "Tip: the tool-approval card above is still active — choose an option "
-                "there (e.g. Approve) to grant the permission and resume this task "
-                "automatically. Reply here only to give different instructions."
-            )
 
         return {
             "checkpoint_type": "task_user_input",
@@ -9292,6 +7907,13 @@ class WSHandler:
         employee_payloads: list[dict[str, Any]] = []
         template_payloads: list[dict[str, Any]] = []
         org_engine = getattr(runtime_engine, "org_engine", None)
+        reports_to_by_role = {
+            str(getattr(agent, "role_id", "") or "").strip(): str(
+                getattr(agent, "reports_to", "") or ""
+            ).strip()
+            for agent in (org_engine.list_agents() if org_engine else [])
+            if str(getattr(agent, "role_id", "") or "").strip()
+        }
         talent_market = getattr(runtime_engine, "talent_market", None)
         is_placeholder = getattr(runtime_engine, "_is_placeholder_staffing_employee", lambda _employee: False)
         employee_payload = getattr(runtime_engine, "_staffing_employee_payload", None)
@@ -9430,6 +8052,7 @@ class WSHandler:
                         "role_id": role_id,
                         "role_label": role_label,
                         "role_responsibility": "",
+                        "reports_to": reports_to_by_role.get(role_id, ""),
                         "default_selection": default_selection,
                         "same_role_employee_ids": sorted(same_role_ids),
                         "fallback_available": True,
@@ -9475,9 +8098,23 @@ class WSHandler:
             "staffing_selections": staffing_selections,
         }
 
-    def _build_staffing_selection_meta(self, cp: Any) -> dict[str, Any]:
+    def _build_staffing_selection_meta(
+        self,
+        cp: Any,
+        *,
+        engine: Any | None = None,
+    ) -> dict[str, Any]:
         """Extract manual staffing data into frontend-friendly metadata."""
         payload = dict(cp.payload or {})
+        runtime_engine = engine or self.engine
+        org_engine = getattr(runtime_engine, "org_engine", None)
+        reports_to_by_role = {
+            str(getattr(agent, "role_id", "") or "").strip(): str(
+                getattr(agent, "reports_to", "") or ""
+            ).strip()
+            for agent in (org_engine.list_agents() if org_engine else [])
+            if str(getattr(agent, "role_id", "") or "").strip()
+        }
         raw_role_agents = payload.get("recruitment_role_agents")
         payload_role_agents = raw_role_agents if isinstance(raw_role_agents, dict) else {}
         recruitment_agent = self._normalize_session_preferred_agent(
@@ -9497,6 +8134,9 @@ class WSHandler:
             )
             if role_id:
                 role["selected_agent"] = selected_agent
+                role["reports_to"] = str(
+                    role.get("reports_to") or reports_to_by_role.get(role_id, "")
+                ).strip()
                 recruitment_role_agents[role_id] = selected_agent
             staffing_roles.append(role)
         return {
@@ -9878,18 +8518,36 @@ class WSHandler:
     # ── Phase 4: Reorg Management ───────────────────────────────────────
 
     async def _handle_reorg_list(self, ws: Any, data: dict) -> None:
-        """List recent reorg proposals for the current project."""
-        store = self.engine.store
+        """List recent proposals with their canonical owner checkpoint."""
+        run_engine, project_id = await self._engine_for_request(data)
+        store = run_engine.store
         if not store:
-            await ws.send_json({"type": "reorg_list", "payload": {"proposals": []}})
+            await ws.send_json({
+                "type": "reorg_list",
+                "payload": {"project_id": project_id, "proposals": []},
+            })
             return
-        project_id = self.engine.project_id or "default"
         try:
             proposals = await store.list_reorg_proposals(project_id, limit=20)
+            checkpoints = await store.get_execution_checkpoints(
+                project_id=project_id,
+                checkpoint_types=["company_reorg_pending"],
+                statuses=["pending", "answered", "consuming"],
+            )
+            checkpoints_by_proposal: dict[str, list[Any]] = {}
+            for checkpoint in checkpoints:
+                linked_proposal_id = str(
+                    dict(checkpoint.payload or {}).get("proposal_id", "") or ""
+                ).strip()
+                if linked_proposal_id:
+                    checkpoints_by_proposal.setdefault(linked_proposal_id, []).append(
+                        checkpoint
+                    )
             result = []
             for p in proposals:
                 changeset_summary: dict[str, Any] = {
                     "role_changes": [],
+                    "work_item_projection_changes": [],
                     "task_adjustments_count": 0,
                 }
                 if p.changeset:
@@ -9898,9 +8556,28 @@ class WSHandler:
                             {"action": rc.action, "role_id": rc.role_id, "reason": rc.reason}
                             for rc in (p.changeset.role_changes or [])
                         ],
+                        "work_item_projection_changes": [],
                         "task_adjustments_count": len(p.changeset.task_adjustments or []),
                     }
+                linked = checkpoints_by_proposal.get(p.proposal_id, [])
+                pending = [
+                    checkpoint
+                    for checkpoint in linked
+                    if str(checkpoint.status or "").strip() == "pending"
+                ]
+                # A proposal must resolve to exactly one active row.  Even one
+                # pending row alongside an answered/consuming duplicate is an
+                # ambiguous owner decision and therefore remains fail-closed.
+                checkpoint = pending[0] if len(linked) == 1 and len(pending) == 1 else None
+                interaction = dict(
+                    dict(getattr(checkpoint, "payload", {}) or {}).get(
+                        "interaction", {}
+                    )
+                    or {}
+                )
+                ownership = dict(interaction.get("ownership", {}) or {})
                 result.append({
+                    "project_id": project_id,
                     "proposal_id": p.proposal_id,
                     "title": p.title,
                     "summary": p.summary,
@@ -9911,35 +8588,49 @@ class WSHandler:
                     "initiated_by": p.initiated_by,
                     "changeset": changeset_summary,
                     "impact_summary": p.impact_summary or {},
+                    "user_confirmation_required": bool(
+                        p.user_confirmation_required
+                    ),
+                    "checkpoint_id": (
+                        str(checkpoint.checkpoint_id or "") if checkpoint else ""
+                    ),
+                    "checkpoint_type": (
+                        str(checkpoint.checkpoint_type or "") if checkpoint else ""
+                    ),
+                    "checkpoint_status": (
+                        str(checkpoint.status or "")
+                        if checkpoint
+                        else (
+                            "ambiguous"
+                            if len(linked) > 1
+                            else (
+                                str(linked[0].status or "")
+                                if len(linked) == 1
+                                else "missing"
+                            )
+                        )
+                    ),
+                    "requester_task_id": str(
+                        ownership.get("ui_anchor_task_id", "") or ""
+                    ),
+                    "requester_session_id": str(
+                        ownership.get("ui_anchor_session_id")
+                        or ownership.get("root_session_id")
+                        or ""
+                    ),
                     "created_at": p.created_at.timestamp() if hasattr(p.created_at, "timestamp") else 0,
                     "updated_at": p.updated_at.timestamp() if hasattr(p.updated_at, "timestamp") else 0,
                 })
-            await ws.send_json({"type": "reorg_list", "payload": {"proposals": result}})
+            await ws.send_json({
+                "type": "reorg_list",
+                "payload": {"project_id": project_id, "proposals": result},
+            })
         except Exception:
-            logger.debug("Failed to list reorg proposals")
-            await ws.send_json({"type": "reorg_list", "payload": {"proposals": []}})
-
-    async def _handle_reorg_decide(self, ws: Any, data: dict) -> None:
-        """Approve or deny a reorg proposal from the UI."""
-        proposal_id = data.get("proposal_id", "")
-        approved = data.get("approved", False)
-        notes = data.get("notes", "")
-        rm = getattr(self.engine, "reorg_manager", None)
-        if not rm or not proposal_id:
-            await ws.send_json({"type": "ack", "payload": {"ok": False, "error": "reorg_manager not available or missing proposal_id"}})
-            return
-        try:
-            await rm.set_reorg_approval(proposal_id, approved=approved, notes=notes)
-            if approved:
-                result = await rm.apply_reorg(proposal_id)
-                await ws.send_json({"type": "ack", "payload": {"ok": True, "action": "reorg_applied", "result": result}})
-                # Refresh org info for all clients
-                await self._handle_org_info(ws, {})
-            else:
-                await ws.send_json({"type": "ack", "payload": {"ok": True, "action": "reorg_denied"}})
-        except Exception as exc:
-            logger.warning(f"Failed to decide reorg {proposal_id}: {exc}")
-            await ws.send_json({"type": "ack", "payload": {"ok": False, "error": str(exc)}})
+            logger.opt(exception=True).debug("Failed to list reorg proposals")
+            await ws.send_json({
+                "type": "reorg_list",
+                "payload": {"project_id": project_id, "proposals": []},
+            })
 
     # ------------------------------------------------------------------
     # Org config import / export
@@ -10419,6 +9110,50 @@ class WSHandler:
             logger.warning(f"Failed to update role: {exc}")
             await self._send_ack(ws, ok=False, error=str(exc))
 
+    async def _handle_bind_external_team(self, ws: Any, data: dict) -> None:
+        """Bind a role boundary (and optionally its subtree) to JiuwenSwarm."""
+        try:
+            result = await self._ensure_office_services().org.bind_external_team(data)
+            await self._publish_service_result(result)
+            binding = dict(result.payload.get("binding", {}) or {})
+            await self._send_ack(
+                ws,
+                ok=True,
+                action="external_team_bound",
+                binding_id=binding.get("binding_id"),
+                boundary_role_id=binding.get("boundary_role_id"),
+            )
+            await self._broadcast_org_info()
+        except ServiceError as exc:
+            await self._send_service_error(ws, exc, action="bind_external_team")
+        except Exception as exc:
+            logger.warning(f"Failed to bind external team: {exc}")
+            await self._send_ack(ws, ok=False, action="bind_external_team", error=str(exc))
+
+    async def _handle_unbind_external_team(self, ws: Any, data: dict) -> None:
+        """Remove an opaque external-team binding from an org boundary."""
+        try:
+            token = str(
+                data.get("binding_id") or data.get("boundary_role_id") or ""
+            ).strip()
+            result = await self._ensure_office_services().org.unbind_external_team(
+                token,
+                organization_id=str(data.get("organization_id", "") or "").strip() or None,
+            )
+            await self._publish_service_result(result)
+            await self._send_ack(
+                ws,
+                ok=True,
+                action="external_team_unbound",
+                binding=token,
+            )
+            await self._broadcast_org_info()
+        except ServiceError as exc:
+            await self._send_service_error(ws, exc, action="unbind_external_team")
+        except Exception as exc:
+            logger.warning(f"Failed to unbind external team: {exc}")
+            await self._send_ack(ws, ok=False, action="unbind_external_team", error=str(exc))
+
     async def _handle_update_org_strategy(self, ws: Any, data: dict) -> None:
         try:
             result = await self._ensure_office_services().org.update_org_strategy(
@@ -10503,6 +9238,7 @@ class WSHandler:
         "create_session":      _handle_create_session,
         "session_update_config": _handle_session_update_config,
         "session_detail":      _handle_session_detail,
+        "interaction_reply":   _handle_interaction_reply,
         "session_send":        _handle_session_send,
         "session_stop":        _handle_session_stop,
         "session_resume":      _handle_session_resume,
@@ -10527,7 +9263,6 @@ class WSHandler:
         "import_employee_as_agent": _handle_import_employee_as_agent,
         "employee_detail":     _handle_employee_detail,
         "reorg_list":          _handle_reorg_list,
-        "reorg_decide":        _handle_reorg_decide,
         # OPC Market
         "market_browse":       _handle_market_browse,
         "market_preview":      _handle_market_preview,
@@ -10549,6 +9284,8 @@ class WSHandler:
         "bulk_add_roles":      _handle_bulk_add_roles,
         "add_role":            _handle_add_role,
         "update_role":         _handle_update_role,
+        "bind_external_team":  _handle_bind_external_team,
+        "unbind_external_team": _handle_unbind_external_team,
         "update_org_strategy": _handle_update_org_strategy,
         "delete_role":         _handle_delete_role,
         "update_runtime_policy": _handle_update_runtime_policy,

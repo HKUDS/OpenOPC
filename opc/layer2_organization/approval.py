@@ -2,14 +2,18 @@
 
 from __future__ import annotations
 
+import asyncio
+import hashlib
 import json
 import re
 import shlex
+import uuid
 from pathlib import Path
 from typing import Any, Callable, Coroutine
 
 from loguru import logger
 
+from opc.core.approval_decision import normalize_escalation_reply
 from opc.core.company_tools import COMPANY_APPROVAL_EXEMPT_TOOL_NAMES
 from opc.core.config import AutonomyConfig, get_opc_home
 from opc.core.models import (
@@ -20,17 +24,27 @@ from opc.core.models import (
     RiskLevel,
     RuntimePermissionDecision,
     Task,
+    ExecutionCheckpoint,
 )
 from opc.database.store import OPCStore
-from opc.layer2_organization.data_acquisition_policy import (
-    ACQUISITION_SHELL_PREFIXES,
-    is_projection_scoped_acquisition_shell_command,
-)
-from opc.layer2_organization.escalation import EscalationEngine
+from opc.layer2_organization.data_acquisition_policy import ACQUISITION_SHELL_PREFIXES
+from opc.layer0_interaction.coordinator import InteractionCoordinator, InteractionDecisionLease
 from opc.layer2_organization import shell_safety
 from opc.layer2_organization.work_item_identity import (
     work_item_identity_payload_for_task,
-    work_item_projection_id_from_metadata,
+)
+from opc.layer2_organization.work_item_links import linked_work_item_id_for_task
+from opc.layer2_organization.company_runtime_identity import (
+    is_company_runtime_task,
+    resolve_company_interaction_ownership,
+)
+from opc.layer4_tools.opaque_execution import (
+    OpaqueExecutionEnvelopeError,
+    build_company_opaque_execution_plan,
+    company_opaque_execution_identity,
+    company_workspace_read_only_shell_decision,
+    exact_tool_call_fingerprint,
+    opaque_envelope_display,
 )
 from opc.layer5_memory.approval_allowlist import ApprovalAllowlistManager
 from opc.layer5_memory.memory_manager import MemoryManager
@@ -108,36 +122,6 @@ _SHELL_COMMAND_PREFIX_ARITY = {
 }
 
 
-_ESCALATION_DECISION_TOKENS: frozenset[str] = frozenset({
-    "approve_once",
-    "approve_session",
-    "always_project",
-    "always_global",
-    "deny",
-})
-
-_ESCALATION_APPROVE_SYNONYMS: frozenset[str] = frozenset({
-    "approve", "approved", "yes", "y", "ok", "allow", "同意", "批准", "允许",
-})
-
-_ESCALATION_DENY_SYNONYMS: frozenset[str] = frozenset({
-    "no", "n", "denied", "reject", "rejected", "拒绝", "不允许",
-})
-
-
-def normalize_escalation_reply(reply: str) -> str:
-    """Map a human reply to an approval decision token; ``""`` when the text
-    is not a decision (it is then ordinary task input, never a silent deny)."""
-    text = str(reply or "").strip().lower()
-    if text in _ESCALATION_DECISION_TOKENS:
-        return text
-    if text in _ESCALATION_APPROVE_SYNONYMS:
-        return "approve_once"
-    if text in _ESCALATION_DENY_SYNONYMS:
-        return "deny"
-    return ""
-
-
 class ApprovalEngine:
     """Bounded-autonomy policy engine."""
 
@@ -147,21 +131,23 @@ class ApprovalEngine:
         store: OPCStore,
         preferences: PreferenceManager,
         memory: MemoryManager,
-        escalation: EscalationEngine | None,
         config: AutonomyConfig,
         secretary_policies: SecretaryPolicyManager | None = None,
+        interaction_coordinator: InteractionCoordinator | None = None,
     ) -> None:
         self.llm = llm
         self.store = store
         self.preferences = preferences
         self.memory = memory
-        self.escalation = escalation
         self.config = config
         self.secretary_policies = secretary_policies
+        self.interaction_coordinator = interaction_coordinator
         opc_home = getattr(preferences, "opc_home", None)
         self.allowlist = ApprovalAllowlistManager(opc_home) if opc_home else None
         self._session_allowlist: dict[str, dict[str, dict[str, list[str]]]] = {}
         self._denial_counts: dict[str, int] = {}
+        self._recorded_denial_ids: set[tuple[str, str]] = set()
+        self._permit_persist_locks: dict[str, asyncio.Lock] = {}
         if self.allowlist:
             self.allowlist.ensure_file()
 
@@ -172,12 +158,14 @@ class ApprovalEngine:
         arguments: dict[str, Any],
         metadata: dict[str, Any] | None = None,
         on_progress: Callable[[str], Coroutine[Any, Any, None]] | None = None,
+        call_context: dict[str, Any] | None = None,
     ) -> tuple[bool, ApprovalDecision]:
         action_name = tool_name
         payload = {
             "tool": tool_name,
             "arguments": arguments,
             "metadata": dict(metadata or {}),
+            "tool_call": dict(call_context or {}),
             **work_item_identity_payload_for_task(task),
             "role_id": str((task.assigned_to if task else "") or (task.metadata if task else {}).get("work_item_role_id", "") or ""),
             "target_output_dir": str((task.metadata if task else {}).get("target_output_dir", "") or ""),
@@ -200,6 +188,7 @@ class ApprovalEngine:
         arguments: dict[str, Any],
         metadata: dict[str, Any] | None = None,
         on_progress: Callable[[str], Coroutine[Any, Any, None]] | None = None,
+        call_context: dict[str, Any] | None = None,
     ) -> RuntimePermissionDecision:
         _, decision = await self.authorize_tool_call(
             task=task,
@@ -207,6 +196,7 @@ class ApprovalEngine:
             arguments=arguments,
             metadata=metadata,
             on_progress=on_progress,
+            call_context=call_context,
         )
         return self.to_permission_decision(decision)
 
@@ -369,6 +359,39 @@ class ApprovalEngine:
     # persisted allowlist as authorize, so there is exactly one policy.
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _company_opaque_exact_approval_reason(
+        *,
+        task: Task | None,
+        action_kind: str,
+        action_name: str,
+        metadata: dict[str, Any],
+    ) -> str:
+        """Require a one-shot durable permit for opaque company effects."""
+
+        if (
+            action_kind != "tool"
+            or action_name not in {"shell_exec", "python_exec"}
+            or task is None
+            or not is_company_runtime_task(task)
+        ):
+            return ""
+        if action_name == "python_exec":
+            return (
+                "Company Python execution is opaque and requires exact "
+                "one-shot human approval for this ToolCall."
+            )
+        read_only, _ = company_workspace_read_only_shell_decision(
+            task,
+            dict(metadata.get("arguments", {}) or {}),
+        )
+        if read_only:
+            return ""
+        return (
+            "Company shell execution requires exact one-shot human approval "
+            "for its frozen launch envelope."
+        )
+
     def predict(
         self,
         tool: Any,
@@ -384,21 +407,70 @@ class ApprovalEngine:
                 "Unknown tool requires manual review.",
                 source="runtime_prediction",
             )
-        if not self.config.enabled or not p2.enabled:
-            return self._predict_decision(
-                PermissionResolution.ALLOW, RiskLevel.LOW,
-                "Autonomy policy is disabled.", source="config",
-            )
         tool_name = str(getattr(tool, "name", "") or "")
         args = dict(arguments or {})
-
-        repeated = self._repeated_denial_decision(tool_name, args)
+        repeated = self._repeated_denial_decision(tool_name, args, task=task)
         if repeated is not None:
             return repeated
         if tool_name in {str(item or "").strip() for item in p2.deny_tools if str(item or "").strip()}:
             return self._predict_decision(
                 PermissionResolution.DENY, RiskLevel.HIGH,
                 "Tool is explicitly denied by permission rules.", source="permission_rules",
+            )
+        shell_structure_reason = self._shell_structure_review_reason(
+            action_kind="tool",
+            action_name=tool_name,
+            metadata={"arguments": args},
+        )
+        if shell_structure_reason:
+            return self._predict_decision(
+                PermissionResolution.ASK,
+                RiskLevel.MEDIUM,
+                shell_structure_reason,
+                source="shell_structure_guard",
+            )
+        git_option_reason = self._shell_git_option_review_reason(
+            action_kind="tool",
+            action_name=tool_name,
+            metadata={"arguments": args},
+        )
+        if git_option_reason:
+            return self._predict_decision(
+                PermissionResolution.ASK,
+                RiskLevel.MEDIUM,
+                git_option_reason,
+                source="shell_git_option_guard",
+            )
+        shell_pattern_review = self._configured_shell_pattern_review(
+            action_kind="tool",
+            action_name=tool_name,
+            metadata={"arguments": args},
+        )
+        if shell_pattern_review:
+            risk_level, rationale = shell_pattern_review
+            return self._predict_decision(
+                PermissionResolution.ASK,
+                risk_level,
+                rationale,
+                source="shell_pattern",
+            )
+        exact_reason = self._company_opaque_exact_approval_reason(
+            task=task,
+            action_kind="tool",
+            action_name=tool_name,
+            metadata={"arguments": args},
+        )
+        if exact_reason:
+            return self._predict_decision(
+                PermissionResolution.ASK,
+                RiskLevel.MEDIUM,
+                exact_reason,
+                source="company_exact_tool_permission",
+            )
+        if not self.config.enabled or not p2.enabled:
+            return self._predict_decision(
+                PermissionResolution.ALLOW, RiskLevel.LOW,
+                "Autonomy policy is disabled.", source="config",
             )
         if tool_name in COMPANY_APPROVAL_EXEMPT_TOOL_NAMES:
             return self._predict_decision(
@@ -468,27 +540,113 @@ class ApprovalEngine:
             "No permission warning triggered.", source="runtime_prediction",
         )
 
-    def record_denial(self, tool_name: str, arguments: dict[str, Any] | None = None) -> None:
+    def record_denial(
+        self,
+        tool_name: str,
+        arguments: dict[str, Any] | None = None,
+        *,
+        task: Task | None = None,
+        denial_id: str = "",
+    ) -> None:
         if not self.config.permissions_v2.denial_memory.enabled:
             return
-        key = self._denial_memory_key(tool_name, arguments)
+        key = self._denial_memory_key(tool_name, arguments, task=task)
+        normalized_denial_id = str(denial_id or "").strip()
+        if normalized_denial_id:
+            denial_identity = (key, normalized_denial_id)
+            if denial_identity in self._recorded_denial_ids:
+                return
+            self._recorded_denial_ids.add(denial_identity)
         self._denial_counts[key] = self._denial_counts.get(key, 0) + 1
 
-    def _denial_memory_key(self, tool_name: str, arguments: dict[str, Any] | None) -> str:
+    def _denial_memory_key(
+        self,
+        tool_name: str,
+        arguments: dict[str, Any] | None,
+        *,
+        task: Task | None = None,
+    ) -> str:
+        """Return a stable, scoped fingerprint for one denied action.
+
+        Shell actions are identified by their exact (outer-whitespace-normalized)
+        command before considering directory-like arguments.  This prevents two
+        unrelated commands in the same workspace from sharing denial memory.
+        Runtime/session identifiers are deliberately excluded so a resumed
+        runtime for the same durable Task retains the existing count.
+        """
         args = dict(arguments or {})
-        for key in (*_PREDICT_PATH_KEYS, *_PREDICT_COMMAND_KEYS, "url"):
-            value = str(args.get(key, "") or "").strip()
-            if value:
-                return f"{tool_name}:{value}"
-        return f"{tool_name}:*"
+        normalized_tool_name = str(tool_name or "").strip()
+        action_arguments: dict[str, Any] = args
+        if normalized_tool_name in _SHELL_LIKE_TOOL_NAMES:
+            command = next(
+                (
+                    str(args.get(key, "") or "").strip()
+                    for key in _PREDICT_COMMAND_KEYS
+                    if str(args.get(key, "") or "").strip()
+                ),
+                "",
+            )
+            if command:
+                # Timeout is not part of action identity. The command, working
+                # directory, and explicit shell determine what would execute.
+                action_arguments = {"command": command}
+                working_directory = str(args.get("working_directory", "") or "").strip()
+                shell = str(args.get("shell", "") or "").strip().lower()
+                if working_directory:
+                    action_arguments["working_directory"] = working_directory
+                if shell:
+                    action_arguments["shell"] = shell
+
+        action_fingerprint = hashlib.sha256(
+            json.dumps(
+                {
+                    "tool_name": normalized_tool_name,
+                    "arguments": action_arguments,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            ).encode("utf-8")
+        ).hexdigest()
+
+        metadata = dict(getattr(task, "metadata", {}) or {}) if task is not None else {}
+        employee_assignment = dict(metadata.get("employee_assignment", {}) or {})
+        role_id = str(
+            metadata.get("work_item_role_id", "")
+            or metadata.get("role_id", "")
+            or employee_assignment.get("role_id", "")
+            or getattr(task, "assigned_to", "")
+            or "unscoped"
+        ).strip()
+        scope_fingerprint = hashlib.sha256(
+            json.dumps(
+                {
+                    "project_id": str(getattr(task, "project_id", "") or "unscoped").strip(),
+                    "task_id": str(getattr(task, "id", "") or "unscoped").strip(),
+                    "role_id": role_id,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        return f"{normalized_tool_name}:{scope_fingerprint}:{action_fingerprint}"
 
     def _repeated_denial_decision(
-        self, tool_name: str, arguments: dict[str, Any] | None
+        self,
+        tool_name: str,
+        arguments: dict[str, Any] | None,
+        *,
+        task: Task | None = None,
     ) -> RuntimePermissionDecision | None:
         memory = self.config.permissions_v2.denial_memory
         if not memory.enabled:
             return None
-        repeats = self._denial_counts.get(self._denial_memory_key(tool_name, arguments), 0)
+        repeats = self._denial_counts.get(
+            self._denial_memory_key(tool_name, arguments, task=task),
+            0,
+        )
         if repeats < max(1, memory.repeat_threshold):
             return None
         return self._predict_decision(
@@ -512,24 +670,6 @@ class ApprovalEngine:
                 break
         if not command:
             return None
-        for pattern in self.config.permissions_v2.dangerous_shell_patterns:
-            if pattern and re.search(pattern, command, flags=re.IGNORECASE):
-                return self._predict_decision(
-                    PermissionResolution.ASK, RiskLevel.CRITICAL,
-                    f"Command matched dangerous shell pattern `{pattern}`.",
-                    source="shell_pattern",
-                )
-        if is_projection_scoped_acquisition_shell_command(
-            command=command,
-            task=task,
-            working_directory=str(args.get("working_directory", "") or args.get("workdir", "") or "").strip(),
-            target_output_dir=str((getattr(task, "metadata", {}) or {}).get("target_output_dir", "") or "").strip() if task else "",
-        ):
-            return self._predict_decision(
-                PermissionResolution.ALLOW, RiskLevel.LOW,
-                "Work-item-scoped acquisition command inside the assigned workspace.",
-                source="shell_prefix",
-            )
         safe_prefixes = [
             item for item in self.config.safe_command_prefixes
             if str(item or "").strip() not in _LOW_RISK_SHELL_PREFIXES
@@ -674,6 +814,165 @@ class ApprovalEngine:
         on_progress: Callable[[str], Coroutine[Any, Any, None]] | None = None,
         allow_auto: bool = True,
     ) -> tuple[bool, ApprovalDecision]:
+        # Structural shell syntax is a hard human-review boundary.  Keep this
+        # ahead of memory, secretary rules, reusable grants, learned policy,
+        # and LLM review so none of those broad mechanisms can authorize a
+        # second command merely because the first command has a safe prefix.
+        shell_structure_reason = self._shell_structure_review_reason(
+            action_kind=action_kind,
+            action_name=action_name,
+            metadata=metadata,
+        )
+        if shell_structure_reason:
+            decision = ApprovalDecision(
+                action=ApprovalAction.ESCALATE,
+                risk_level=RiskLevel.MEDIUM,
+                rationale=shell_structure_reason,
+                confidence=0.99,
+                policy_source="shell_structure_guard",
+                metadata=metadata,
+            )
+            if self.interaction_coordinator and task:
+                approved, decision = await self._ask_user(
+                    task,
+                    action_kind,
+                    action_name,
+                    decision,
+                    metadata,
+                )
+                await self._record(task, action_kind, action_name, target_agent, decision)
+                return approved, decision
+            await self._record(task, action_kind, action_name, target_agent, decision)
+            return False, decision
+
+        git_option_reason = self._shell_git_option_review_reason(
+            action_kind=action_kind,
+            action_name=action_name,
+            metadata=metadata,
+        )
+        if git_option_reason:
+            decision = ApprovalDecision(
+                action=ApprovalAction.ESCALATE,
+                risk_level=RiskLevel.MEDIUM,
+                rationale=git_option_reason,
+                confidence=0.99,
+                policy_source="shell_git_option_guard",
+                metadata=metadata,
+            )
+            if self.interaction_coordinator and task:
+                approved, decision = await self._ask_user(
+                    task,
+                    action_kind,
+                    action_name,
+                    decision,
+                    metadata,
+                )
+                await self._record(task, action_kind, action_name, target_agent, decision)
+                return approved, decision
+            await self._record(task, action_kind, action_name, target_agent, decision)
+            return False, decision
+
+        # Configured shell regexes are another hard human-review boundary.
+        # Evaluate the untouched command string before any broad policy or
+        # reusable grant so quoting, secretary rules, and allowlists cannot
+        # turn a configured review requirement into an automatic approval.
+        shell_pattern_review = self._configured_shell_pattern_review(
+            action_kind=action_kind,
+            action_name=action_name,
+            metadata=metadata,
+        )
+        if shell_pattern_review:
+            risk_level, rationale = shell_pattern_review
+            decision = ApprovalDecision(
+                action=ApprovalAction.ESCALATE,
+                risk_level=risk_level,
+                rationale=rationale,
+                confidence=0.99,
+                policy_source="shell_pattern",
+                metadata=metadata,
+            )
+            if self.interaction_coordinator and task:
+                approved, decision = await self._ask_user(
+                    task,
+                    action_kind,
+                    action_name,
+                    decision,
+                    metadata,
+                )
+                await self._record(task, action_kind, action_name, target_agent, decision)
+                return approved, decision
+            await self._record(task, action_kind, action_name, target_agent, decision)
+            return False, decision
+
+        exact_reason = self._company_opaque_exact_approval_reason(
+            task=task,
+            action_kind=action_kind,
+            action_name=action_name,
+            metadata=metadata,
+        )
+        if exact_reason:
+            try:
+                build_company_opaque_execution_plan(
+                    task,
+                    action_name,
+                    dict(metadata.get("arguments", {}) or {}),
+                )
+            except (
+                OpaqueExecutionEnvelopeError,
+                TypeError,
+                ValueError,
+            ) as exc:
+                decision = ApprovalDecision(
+                    action=ApprovalAction.REJECT,
+                    risk_level=RiskLevel.HIGH,
+                    rationale=(
+                        "Exact company launch cannot be presented or frozen "
+                        f"safely: {exc}"
+                    ),
+                    confidence=1.0,
+                    policy_source="company_exact_envelope_invalid",
+                    metadata=metadata,
+                )
+                await self._record(
+                    task,
+                    action_kind,
+                    action_name,
+                    target_agent,
+                    decision,
+                )
+                return False, decision
+            decision = ApprovalDecision(
+                action=ApprovalAction.ESCALATE,
+                risk_level=RiskLevel.MEDIUM,
+                rationale=exact_reason,
+                confidence=0.99,
+                policy_source="company_exact_tool_permission",
+                metadata=metadata,
+            )
+            if self.interaction_coordinator and task:
+                approved, decision = await self._ask_user(
+                    task,
+                    action_kind,
+                    action_name,
+                    decision,
+                    metadata,
+                )
+                await self._record(
+                    task,
+                    action_kind,
+                    action_name,
+                    target_agent,
+                    decision,
+                )
+                return approved, decision
+            await self._record(
+                task,
+                action_kind,
+                action_name,
+                target_agent,
+                decision,
+            )
+            return False, decision
         if not self.config.enabled:
             decision = ApprovalDecision(
                 action=ApprovalAction.AUTO_APPROVE,
@@ -712,7 +1011,7 @@ class ApprovalEngine:
                     policy_source="secretary_policy",
                     metadata={**metadata, "secretary_rule_id": policy_hit.get("rule_id", "")},
                 )
-                if self.escalation and task:
+                if self.interaction_coordinator and task:
                     approved, decision = await self._ask_user(task, action_kind, action_name, decision, metadata)
                     await self._record(task, action_kind, action_name, target_agent, decision)
                     return approved, decision
@@ -881,7 +1180,7 @@ class ApprovalEngine:
                     metadata=metadata,
                 )
 
-        if decision.action == ApprovalAction.ESCALATE and self.escalation and task:
+        if decision.action == ApprovalAction.ESCALATE and self.interaction_coordinator and task:
             hierarchy_target = self._company_hierarchy_target(task)
             if hierarchy_target:
                 decision.metadata = {
@@ -1133,10 +1432,103 @@ class ApprovalEngine:
             return False
         if action_name in COMPANY_APPROVAL_EXEMPT_TOOL_NAMES:
             return False
-        if self._is_low_risk_shell_first_use_exempt(action_name, metadata):
-            return False
         exemptions = {item.strip() for item in self.config.tool_approval_exemptions if item.strip()}
         return action_name not in exemptions
+
+    @staticmethod
+    def _shell_structure_review_reason(
+        *,
+        action_kind: str,
+        action_name: str,
+        metadata: dict[str, Any],
+    ) -> str:
+        if action_kind != "tool" or action_name != "shell_exec":
+            return ""
+        arguments = metadata.get("arguments", {})
+        if not isinstance(arguments, dict):
+            return ""
+        command = str(
+            arguments.get("command", "") or arguments.get("cmd", "") or ""
+        ).strip()
+        if not command:
+            return ""
+        requires_review, reason = shell_safety.shell_structure_requires_review(command)
+        return reason if requires_review else ""
+
+    @staticmethod
+    def _shell_git_option_review_reason(
+        *,
+        action_kind: str,
+        action_name: str,
+        metadata: dict[str, Any],
+    ) -> str:
+        if action_kind != "tool" or action_name != "shell_exec":
+            return ""
+        arguments = metadata.get("arguments", {})
+        if not isinstance(arguments, dict):
+            return ""
+        command = str(
+            arguments.get("command", "") or arguments.get("cmd", "") or ""
+        ).strip()
+        if not command:
+            return ""
+        requires_review, reason = shell_safety.git_read_only_family_requires_review(
+            command
+        )
+        return reason if requires_review else ""
+
+    def _configured_shell_pattern_review(
+        self,
+        *,
+        action_kind: str,
+        action_name: str,
+        metadata: dict[str, Any],
+    ) -> tuple[RiskLevel, str] | None:
+        """Return the configured raw-shell review boundary, if any.
+
+        Patterns are applied directly to the command exactly as supplied by
+        the tool call.  In particular, the command is not tokenized or quote
+        normalized first: shell quoting must not hide text from an operator's
+        configured regular expression.  A malformed configured expression is
+        itself unsafe configuration and therefore fails closed for shell
+        execution instead of raising or silently skipping the rule.
+        """
+        if (
+            action_kind != "tool"
+            or action_name != "shell_exec"
+            or not self.config.permissions_v2.enabled
+        ):
+            return None
+        arguments = metadata.get("arguments", {})
+        if not isinstance(arguments, dict):
+            return None
+        command = ""
+        for key in _PREDICT_COMMAND_KEYS:
+            raw_value = str(arguments.get(key, "") or "")
+            if raw_value.strip():
+                command = raw_value
+                break
+        if not command:
+            return None
+
+        for configured_pattern in self.config.permissions_v2.dangerous_shell_patterns:
+            pattern = str(configured_pattern or "")
+            if not pattern:
+                continue
+            try:
+                matched = re.search(pattern, command, flags=re.IGNORECASE)
+            except re.error as exc:
+                return (
+                    RiskLevel.HIGH,
+                    "Invalid dangerous shell pattern "
+                    f"`{pattern}` ({exc}); shell execution requires manual review.",
+                )
+            if matched:
+                return (
+                    RiskLevel.CRITICAL,
+                    f"Command matched dangerous shell pattern `{pattern}`.",
+                )
+        return None
 
     def _force_first_use_approval(self, heuristic: ApprovalDecision) -> ApprovalDecision:
         rationale_parts = [heuristic.rationale] if heuristic.rationale else []
@@ -1229,6 +1621,16 @@ class ApprovalEngine:
         raw = " ".join(str(command or "").split()).strip()
         if not raw:
             return [], []
+        requires_review, _ = shell_safety.shell_structure_requires_review(command)
+        if requires_review:
+            # Structural commands can only be described as one exact request;
+            # never derive reusable per-segment prefixes from them.
+            return [raw], [raw]
+        git_requires_review, _ = shell_safety.git_read_only_family_requires_review(
+            command
+        )
+        if git_requires_review:
+            return [raw], [raw]
         sanitized, expansions_safe = shell_safety.sanitize_expansions(raw)
         sanitized = shell_safety.strip_safe_redirections(sanitized)
         segments = shell_safety.split_shell_segments(sanitized) if expansions_safe else None
@@ -1277,23 +1679,6 @@ class ApprovalEngine:
     def _command_matches_safe_prefix(self, command: str, prefixes: list[str]) -> bool:
         safe, _ = shell_safety.is_read_only_shell_command(command, prefixes)
         return safe
-
-    def _is_low_risk_shell_first_use_exempt(self, action_name: str, metadata: dict[str, Any]) -> bool:
-        if action_name != "shell_exec":
-            return False
-        arguments = metadata.get("arguments", {})
-        if not isinstance(arguments, dict):
-            return False
-        command = str(arguments.get("command", "") or arguments.get("cmd", "")).strip()
-        if not command:
-            return False
-        return is_projection_scoped_acquisition_shell_command(
-            command=command,
-            projection_id=work_item_projection_id_from_metadata(metadata, fallback=""),
-            role_id=str(metadata.get("role_id", "") or "").strip(),
-            working_directory=str(arguments.get("working_directory", "") or arguments.get("workdir", "") or "").strip(),
-            target_output_dir=str(metadata.get("target_output_dir", "") or "").strip(),
-        )
 
     def _shell_command_prefix(self, tokens: list[str]) -> list[str]:
         # Interpreter inline-code / module runs keep the flag in the prefix so
@@ -1435,20 +1820,9 @@ class ApprovalEngine:
                 reasons.append(f"Matched destructive pattern: {pattern}")
 
         if command:
-            projection_scoped_low_risk = is_projection_scoped_acquisition_shell_command(
-                command=command,
-                projection_id=work_item_projection_id_from_metadata(metadata, fallback=""),
-                role_id=str(metadata.get("role_id", "") or "").strip(),
-                working_directory=str(
-                    dict(metadata.get("arguments", {}) or {}).get("working_directory", "")
-                    or dict(metadata.get("arguments", {}) or {}).get("workdir", "")
-                    or ""
-                ).strip(),
-                target_output_dir=str(metadata.get("target_output_dir", "") or "").strip(),
-            )
             safe_prefixes = [
                 item for item in self.config.safe_command_prefixes
-                if projection_scoped_low_risk or str(item or "").strip() not in _LOW_RISK_SHELL_PREFIXES
+                if str(item or "").strip() not in _LOW_RISK_SHELL_PREFIXES
             ]
             # The read-only audit must see the ORIGINAL command text: the
             # preview used for keyword scans re-joins shlex tokens and drops
@@ -1460,9 +1834,7 @@ class ApprovalEngine:
                 if isinstance(arguments, dict)
                 else ""
             ) or command
-            if projection_scoped_low_risk:
-                reasons.append("Command matches a projection-scoped acquisition prefix inside the assigned workspace.")
-            elif self._command_matches_safe_prefix(raw_command, safe_prefixes):
+            if self._command_matches_safe_prefix(raw_command, safe_prefixes):
                 reasons.append("Command matches known low-risk prefix.")
             elif risk == RiskLevel.LOW:
                 risk = RiskLevel.MEDIUM
@@ -1836,6 +2208,241 @@ class ApprovalEngine:
             return f"{action_kind}:{action_name}"
         return ", ".join(patterns[:4])
 
+    @staticmethod
+    def _tool_call_reference(
+        *,
+        task: Task,
+        action_name: str,
+        metadata: dict[str, Any],
+    ) -> dict[str, Any]:
+        call_context = dict(metadata.get("tool_call", {}) or {})
+        arguments = dict(metadata.get("arguments", {}) or {})
+        call_id = str(
+            call_context.get("id")
+            or call_context.get("tool_call_id")
+            or ""
+        ).strip()
+        runtime_session_id = str(
+            call_context.get("runtime_session_id")
+            or dict(task.metadata.get("runtime_v2", {}) or {}).get("runtime_session_id")
+            or ""
+        ).strip()
+        execution_envelope: dict[str, Any] = {}
+        execution_identity: dict[str, Any] = {}
+        if (
+            action_name in {"shell_exec", "python_exec"}
+            and is_company_runtime_task(task)
+        ):
+            execution_envelope = build_company_opaque_execution_plan(
+                task,
+                action_name,
+                arguments,
+            ).envelope
+            execution_identity = company_opaque_execution_identity(task)
+        fingerprint = exact_tool_call_fingerprint(
+            tool_call_id=call_id,
+            tool_name=action_name,
+            arguments=arguments,
+            runtime_session_id=runtime_session_id,
+            execution_envelope=execution_envelope,
+            execution_identity=execution_identity,
+        )
+        reference = {
+            "id": call_id,
+            "name": action_name,
+            "arguments": arguments,
+            "fingerprint": fingerprint,
+            "runtime_session_id": runtime_session_id,
+            "batch_id": str(call_context.get("batch_id", "") or "").strip(),
+        }
+        if execution_envelope:
+            reference["execution_envelope"] = execution_envelope
+            reference["execution_identity"] = execution_identity
+        return reference
+
+    async def _approval_interaction_checkpoint(
+        self,
+        *,
+        task: Task,
+        action_kind: str,
+        action_name: str,
+        decision: ApprovalDecision,
+        metadata: dict[str, Any],
+        question: str,
+        options: list[dict[str, str]],
+        approval_context: dict[str, Any],
+    ) -> ExecutionCheckpoint:
+        task_metadata = dict(task.metadata or {})
+        tool_call = self._tool_call_reference(
+            task=task,
+            action_name=action_name,
+            metadata=metadata,
+        )
+        non_replayable_action = bool(metadata.get("non_replayable_action", False))
+        checkpoint_type = (
+            "tool_permission"
+            if action_kind == "tool" and not non_replayable_action
+            else "action_permission"
+        )
+        if checkpoint_type == "tool_permission" and (
+            not str(tool_call.get("id", "") or "").strip()
+            or not str(tool_call.get("runtime_session_id", "") or "").strip()
+        ):
+            raise RuntimeError(
+                "tool approval requires a stable ToolCall id and runtime session id"
+            )
+        waiting_session_id = str(task.session_id or "").strip()
+        parent_task_id = str(getattr(task, "parent_id", "") or "").strip()
+        parent_session_id = str(
+            getattr(task, "parent_session_id", "")
+            or task_metadata.get("parent_session_id")
+            or ""
+        ).strip()
+        origin_task_id = str(task_metadata.get("origin_task_id", "") or "").strip()
+        ownership = await resolve_company_interaction_ownership(
+            self.store,
+            str(task.project_id or "default").strip() or "default",
+            waiting_task_id=str(task.id or "").strip(),
+            waiting_session_id=waiting_session_id,
+            execution_parent_task_id=parent_task_id,
+            execution_parent_session_id=parent_session_id,
+            origin_task_id=origin_task_id,
+            root_session_id_hint=str(
+                task_metadata.get("company_runtime_root_session_id", "") or ""
+            ).strip(),
+            require_company_identity=is_company_runtime_task(task),
+        )
+        ownership.update({
+            "tool_runtime_session_id": str(tool_call.get("runtime_session_id", "") or ""),
+            "delegation_run_id": str(task_metadata.get("delegation_run_id", "") or "").strip(),
+            "work_item_id": str(linked_work_item_id_for_task(task) or "").strip(),
+        })
+        company_profile = str(
+            task_metadata.get("company_profile")
+            or (
+                "custom"
+                if str(task_metadata.get("exec_mode", "") or "").lower()
+                in {"org", "custom"}
+                else ""
+            )
+            or ""
+        ).strip().lower()
+        org_id = str(
+            getattr(task, "org_id", None)
+            or task_metadata.get("org_id")
+            or task_metadata.get("organization_id")
+            or ""
+        ).strip()
+        if company_profile == "custom" and not org_id:
+            raise RuntimeError("custom tool approval requires a durable org_id")
+        source_event_id = str(
+            metadata.get("source_event_id")
+            or metadata.get("approval_request_id")
+            or metadata.get("invocation_id")
+            or ""
+        ).strip()
+        if checkpoint_type == "action_permission" and not source_event_id:
+            raise RuntimeError(
+                "action approval requires a stable source_event_id for its "
+                "live invocation"
+            )
+        interaction_key = hashlib.sha256(
+            json.dumps(
+                {
+                    "project_id": str(task.project_id or "default").strip() or "default",
+                    "checkpoint_type": checkpoint_type,
+                    "task_id": str(task.id or "").strip(),
+                    "event_identity": (
+                        str(tool_call.get("fingerprint", "") or "").strip()
+                        if checkpoint_type == "tool_permission"
+                        else source_event_id
+                    ),
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        envelope_summary = opaque_envelope_display(
+            tool_call.get("execution_envelope")
+            if isinstance(tool_call.get("execution_envelope"), dict)
+            else None
+        )
+        if envelope_summary:
+            effective_command = str(
+                envelope_summary.get("effective_command", "") or ""
+            )
+            rendered_command = "\n".join(
+                f"    {line}" for line in effective_command.splitlines()
+            ) or "    (python payload follows)"
+            environment_keys = ", ".join(
+                envelope_summary.get("inherited_environment_keys", []) or []
+            ) or "(none)"
+            sensitive_environment = ", ".join(
+                f"{key}={digest}"
+                for key, digest in sorted(
+                    dict(
+                        envelope_summary.get(
+                            "sensitive_environment_value_digests", {}
+                        )
+                        or {}
+                    ).items()
+                )
+            ) or "(none)"
+            question = (
+                f"{question}\n\nExact launch envelope:\n"
+                "- Effective command (complete):\n\n"
+                f"{rendered_command}\n\n"
+                f"- Working directory: {envelope_summary.get('cwd') or '(unset)'}\n"
+                f"- Shell/executable: {envelope_summary.get('shell_kind') or '(none)'} / "
+                f"{envelope_summary.get('executable') or '(unset)'}\n"
+                f"- Prefix: {envelope_summary.get('active_prefix') or '(none)'}\n"
+                f"- Inherited environment keys: {environment_keys}\n"
+                f"- Effective PATH: {envelope_summary.get('effective_path') or '(empty)'}\n"
+                f"- Sensitive environment key digests: {sensitive_environment}"
+            )
+            if envelope_summary.get("python_code_sha256"):
+                python_code = str(
+                    envelope_summary.get("python_code_preview", "") or ""
+                )
+                rendered_python = "\n".join(
+                    f"    {line}" for line in python_code.splitlines()
+                ) or "    (empty)"
+                question += (
+                    "\n- Python code SHA-256: "
+                    f"{envelope_summary['python_code_sha256']}"
+                    "\n- Python code (complete):\n\n"
+                    f"{rendered_python}"
+                )
+        return ExecutionCheckpoint(
+            project_id=str(task.project_id or "default").strip() or "default",
+            session_id=waiting_session_id or None,
+            checkpoint_type=checkpoint_type,
+            task_id=task.id,
+            payload={
+                "schema_version": 2,
+                "interaction": {
+                    "kind": checkpoint_type,
+                    "prompt": question,
+                    "options": list(options),
+                    "default_action": None,
+                    "ownership": ownership,
+                    "domain_key": interaction_key,
+                    "execution_scope": {
+                        "company_profile": company_profile,
+                        "org_id": org_id,
+                    },
+                },
+                "tool_call": tool_call,
+                "approval": {
+                    **dict(approval_context),
+                    "source_event_id": source_event_id,
+                    "risk_level": decision.risk_level.value,
+                    "rationale": decision.rationale,
+                },
+            },
+        )
+
     async def _ask_user(
         self,
         task: Task,
@@ -1844,9 +2451,30 @@ class ApprovalEngine:
         decision: ApprovalDecision,
         metadata: dict[str, Any],
     ) -> tuple[bool, ApprovalDecision]:
-        if not self.escalation:
+        if not self.interaction_coordinator:
             return False, decision
         allowlist_enabled = self._allowlist_enabled_for_action(action_kind, metadata)
+        if self._shell_structure_review_reason(
+            action_kind=action_kind,
+            action_name=action_name,
+            metadata=metadata,
+        ) or self._shell_git_option_review_reason(
+            action_kind=action_kind,
+            action_name=action_name,
+            metadata=metadata,
+        ) or self._configured_shell_pattern_review(
+            action_kind=action_kind,
+            action_name=action_name,
+            metadata=metadata,
+        ) or self._company_opaque_exact_approval_reason(
+            task=task,
+            action_kind=action_kind,
+            action_name=action_name,
+            metadata=metadata,
+        ):
+            # Hard shell boundaries are approved only as this exact durable
+            # ToolCall. Do not offer reusable grants that cannot bypass them.
+            allowlist_enabled = False
         allowlist_patterns = (
             self._build_allowlist_patterns(
                 action_kind=action_kind,
@@ -1888,83 +2516,187 @@ class ApprovalEngine:
                 metadata=metadata,
             ),
         }
-        reply = await self.escalation.escalate_decision(
-            task,
-            question,
-            options,
-            default_action=None,
-            context=approval_context,
+        decision_lease: InteractionDecisionLease | None = None
+        checkpoint = await self._approval_interaction_checkpoint(
+            task=task,
+            action_kind=action_kind,
+            action_name=action_name,
+            decision=decision,
+            metadata=metadata,
+            question=question,
+            options=options,
+            approval_context=approval_context,
         )
-        if reply is None:
-            return False, ApprovalDecision(
-                action=ApprovalAction.REQUIRE_INPUT,
-                risk_level=decision.risk_level,
-                rationale=f"{decision.rationale} | Awaiting user input.",
-                confidence=1.0,
-                requires_user_input=True,
-                policy_source="human_escalation",
-                metadata={**metadata, "human_reply": None},
-            )
-        if not allowlist_enabled and reply in {"approve_session", "always_project", "always_global"}:
-            reply = "approve_once"
-        approved = reply in {"approve_once", "approve_session", "always_project", "always_global"}
-        explicit = reply in {"approve_session", "always_project", "always_global"}
-        notes = "User approved via escalation." if approved else "User denied via escalation."
-        saved_patterns: list[str] = []
-        allowlist_scope: str | None = None
-        if reply == "approve_session":
-            saved_patterns = self._add_session_patterns(
+        tool_call = dict(checkpoint.payload.get("tool_call", {}) or {})
+        # Publish the checkpoint only after its exact child execution
+        # envelope and runtime-ledger identity are durable for restart.
+        task.context_snapshot = dict(task.context_snapshot or {})
+        runtime_resume = dict(
+            task.context_snapshot.get("runtime_resume", {}) or {}
+        )
+        tool_runtime_session_id = str(
+            tool_call.get("runtime_session_id", "") or ""
+        ).strip()
+        if tool_runtime_session_id:
+            runtime_resume["runtime_session_id"] = tool_runtime_session_id
+            task.context_snapshot["runtime_resume"] = runtime_resume
+        await self.store.save_task(task)
+        consumer_id = "approval:{}:{}:{}".format(
+            str(tool_call.get("runtime_session_id", "") or task.session_id or "runtime"),
+            str(tool_call.get("id", "") or checkpoint.checkpoint_id),
+            uuid.uuid4().hex,
+        )
+        decision_lease = await self.interaction_coordinator.open_and_wait(
+            checkpoint,
+            prompt=str(
+                dict(checkpoint.payload.get("interaction", {}) or {}).get(
+                    "prompt", ""
+                )
+                or question
+            ),
+            options=options,
+            consumer_id=consumer_id,
+        )
+        raw_reply = str(
+            decision_lease.decision.get("option_id")
+            or decision_lease.decision.get("text")
+            or ""
+        ).strip()
+        reply = normalize_escalation_reply(raw_reply) or "deny"
+        try:
+            return await self._apply_human_approval_reply(
                 task=task,
                 action_kind=action_kind,
                 action_name=action_name,
-                patterns=allowlist_patterns,
+                decision=decision,
+                metadata=metadata,
+                allowlist_enabled=allowlist_enabled,
+                allowlist_patterns=allowlist_patterns,
+                reply=reply,
+                decision_lease=decision_lease,
             )
-            session_scope_id = self._approval_session_scope_id(task)
-            if session_scope_id:
-                allowlist_scope = f"session:{session_scope_id}"
-        elif reply == "approve_once" and allowlist_enabled and action_kind == "tool":
-            # "Approve once" still records the exact blocked candidates as a
-            # session grant: repeating the identical action in this session
-            # must not re-prompt, but nothing broader is granted.
-            once_patterns = approval_context.get("candidates") or allowlist_patterns
-            if once_patterns:
-                saved_patterns = self._add_session_patterns(
-                    task=task,
-                    action_kind=action_kind,
-                    action_name=action_name,
-                    patterns=list(once_patterns),
+        except BaseException as exc:
+            if (
+                decision_lease is not None
+                and self.interaction_coordinator is not None
+            ):
+                release = self.interaction_coordinator.release(
+                    decision_lease,
+                    reason=f"approval_apply_failed:{type(exc).__name__}",
                 )
-                session_scope_id = self._approval_session_scope_id(task)
-                if saved_patterns and session_scope_id:
-                    allowlist_scope = f"session:{session_scope_id}"
-        elif reply == "always_project" and self.allowlist:
-            saved_patterns = self.allowlist.add_patterns(
-                action_kind=action_kind,
-                action_name=action_name,
-                patterns=allowlist_patterns,
-                project_id=task.project_id,
-            )
-            allowlist_scope = f"project:{task.project_id}"
-        elif reply == "always_global" and self.allowlist:
-            saved_patterns = self.allowlist.add_patterns(
-                action_kind=action_kind,
-                action_name=action_name,
-                patterns=allowlist_patterns,
-                project_id=None,
-            )
-            allowlist_scope = "global"
-        self.preferences.record_autonomy_feedback(
-            action_name=action_name,
-            approved=approved,
-            project_id=task.project_id if reply == "always_project" else None,
-            explicit=explicit,
-            notes=notes,
+                try:
+                    await asyncio.shield(release)
+                except Exception:
+                    logger.opt(exception=True).warning(
+                        "Could not release approval decision lease {}",
+                        decision_lease.checkpoint.checkpoint_id,
+                    )
+            raise
+
+    async def _apply_human_approval_reply(
+        self,
+        *,
+        task: Task,
+        action_kind: str,
+        action_name: str,
+        decision: ApprovalDecision,
+        metadata: dict[str, Any],
+        allowlist_enabled: bool,
+        allowlist_patterns: list[str],
+        reply: str,
+        decision_lease: InteractionDecisionLease | None,
+    ) -> tuple[bool, ApprovalDecision]:
+        scope_result = self.apply_approval_scope_decision(
+            reply,
+            {
+                "action_kind": action_kind,
+                "action_name": action_name,
+                "project_id": str(task.project_id or ""),
+                "session_scope_id": self._approval_session_scope_id(task),
+                "allowlist_enabled": allowlist_enabled,
+                "allowlist_patterns": list(allowlist_patterns),
+            },
         )
+        reply = str(scope_result.get("reply", "") or "deny")
+        approved = bool(scope_result.get("approved"))
+        saved_patterns = list(scope_result.get("patterns", []) or [])
+        allowlist_scope = str(scope_result.get("scope", "") or "") or None
         result_metadata = {**metadata, "human_reply": reply}
         if saved_patterns:
             result_metadata["allowlist_patterns"] = saved_patterns
         if allowlist_scope:
             result_metadata["allowlist_scope"] = allowlist_scope
+        if decision_lease is not None:
+            assert self.interaction_coordinator is not None
+            tool_call = dict(decision_lease.checkpoint.payload.get("tool_call", {}) or {})
+            result_metadata["approval_checkpoint_id"] = decision_lease.checkpoint.checkpoint_id
+            result_metadata["approved_tool_call_id"] = str(tool_call.get("id", "") or "")
+            result_metadata["approved_tool_call_fingerprint"] = str(
+                tool_call.get("fingerprint", "") or ""
+            )
+            if decision_lease.checkpoint.checkpoint_type == "tool_permission":
+                permit = {
+                    "id": str(tool_call.get("id", "") or ""),
+                    "function": str(tool_call.get("name", "") or ""),
+                    "arguments": dict(tool_call.get("arguments", {}) or {}),
+                    "execution_envelope": dict(
+                        tool_call.get("execution_envelope", {}) or {}
+                    ),
+                    "execution_identity": dict(
+                        tool_call.get("execution_identity", {}) or {}
+                    ),
+                    "fingerprint": str(tool_call.get("fingerprint", "") or ""),
+                    "runtime_session_id": str(tool_call.get("runtime_session_id", "") or ""),
+                    "checkpoint_id": decision_lease.checkpoint.checkpoint_id,
+                    "checkpoint_type": decision_lease.checkpoint.checkpoint_type,
+                    "checkpoint_project_id": decision_lease.checkpoint.project_id,
+                    "task_id": task.id,
+                    "claim_id": decision_lease.claim_id,
+                    "consumer_id": decision_lease.consumer_id,
+                    "decision": reply,
+                    "approved": approved,
+                    "state": "ready",
+                }
+                task_key = str(task.id or "") or "__anonymous__"
+                permit_lock = self._permit_persist_locks.setdefault(
+                    task_key,
+                    asyncio.Lock(),
+                )
+                async with permit_lock:
+                    persisted_task = await self.store.update_task_runtime_tool_permit(
+                        task.id,
+                        runtime_session_id=str(
+                            tool_call.get("runtime_session_id", "") or ""
+                        ).strip(),
+                        fingerprint=permit["fingerprint"],
+                        permit=permit,
+                    )
+                    task.context_snapshot = dict(
+                        persisted_task.context_snapshot or {}
+                    )
+                    task.metadata = dict(persisted_task.metadata or {})
+                result_metadata.update({
+                    "approval_claim_id": decision_lease.claim_id,
+                    "approval_consumer_id": decision_lease.consumer_id,
+                    "approval_checkpoint_type": decision_lease.checkpoint.checkpoint_type,
+                    "approval_checkpoint_project_id": decision_lease.checkpoint.project_id,
+                })
+            else:
+                finish_receipt = await self.interaction_coordinator.finish(
+                    decision_lease,
+                    payload_patch={
+                        "approval_result": {
+                            "reply": reply,
+                            "approved": approved,
+                            "scope": allowlist_scope or "once",
+                        }
+                    },
+                )
+                if not finish_receipt.applied:
+                    raise RuntimeError(
+                        "approval decision consumption failed: "
+                        f"{finish_receipt.outcome}"
+                    )
         return approved, ApprovalDecision(
             action=ApprovalAction.AUTO_APPROVE if approved else ApprovalAction.REJECT,
             risk_level=decision.risk_level,
@@ -1975,63 +2707,12 @@ class ApprovalEngine:
             metadata=result_metadata,
         )
 
-    def escalation_context_for_blocked_tool(
-        self,
-        task: Task | None,
-        *,
-        tool_name: str,
-        arguments: dict[str, Any] | None = None,
-    ) -> dict[str, Any]:
-        """Rebuild the ``approval_context`` an inline escalation would carry
-        for a runtime-blocked tool.
-
-        A block that outlived its inline wait survives only as checkpoint
-        payload (``pause_request.permission_context``), which does not carry
-        the allowlist context an approval card stores. This builder lets any
-        reply surface (chat, CLI, headless API) route its decision through
-        ``apply_deferred_escalation_decision`` — the same channel as the
-        Office UI card click — instead of degrading to plain task input.
-        """
-        action_kind = "tool"
-        action_name = str(tool_name or "").strip()
-        metadata: dict[str, Any] = {"arguments": dict(arguments or {})}
-        allowlist_enabled = self._allowlist_enabled_for_action(action_kind, metadata)
-        patterns = (
-            self._build_allowlist_patterns(
-                action_kind=action_kind,
-                action_name=action_name,
-                metadata=metadata,
-            )
-            if allowlist_enabled
-            else []
-        )
-        return {
-            "action_kind": action_kind,
-            "action_name": action_name,
-            "project_id": str(getattr(task, "project_id", "") or "") if task else "",
-            "session_scope_id": self._approval_session_scope_id(task),
-            "allowlist_enabled": allowlist_enabled,
-            "allowlist_patterns": list(patterns),
-            "candidates": self._build_allowlist_candidates(
-                action_kind=action_kind,
-                action_name=action_name,
-                metadata=metadata,
-            ),
-        }
-
-    def apply_deferred_escalation_decision(
+    def apply_approval_scope_decision(
         self,
         reply: str,
         context: dict[str, Any],
     ) -> dict[str, Any]:
-        """Apply a decision clicked on an approval card after its inline wait
-        expired (the blocked task has parked on AWAITING_HUMAN by then).
-
-        Persists the same allowlist grant the live path would have applied, so
-        the re-run of the blocked action passes automatically. ``context`` is
-        the ``approval_context`` the card was created with. Returns a summary
-        {approved, scope, patterns} for UI messaging.
-        """
+        """Apply one transport-neutral approval scope decision."""
         normalized_reply = str(reply or "").strip()
         context = dict(context or {})
         action_kind = str(context.get("action_kind", "") or "").strip()
@@ -2041,10 +2722,6 @@ class ApprovalEngine:
         allowlist_enabled = bool(context.get("allowlist_enabled", False))
         allowlist_patterns = [
             str(item).strip() for item in list(context.get("allowlist_patterns", []) or [])
-            if str(item).strip()
-        ]
-        exact_candidates = [
-            str(item).strip() for item in list(context.get("candidates", []) or [])
             if str(item).strip()
         ]
         if not allowlist_enabled and normalized_reply in {"approve_session", "always_project", "always_global"}:
@@ -2061,19 +2738,6 @@ class ApprovalEngine:
                 patterns=allowlist_patterns,
             )
             scope = f"session:{session_scope_id}"
-        elif normalized_reply == "approve_once" and session_scope_id and action_kind == "tool":
-            # No one-shot grant store exists; the narrowest durable equivalent
-            # is a session grant for the exact blocked command(s), so the
-            # resumed run passes without widening approval to the whole family.
-            once_patterns = exact_candidates or allowlist_patterns
-            if once_patterns:
-                saved_patterns = self._add_session_patterns_by_scope(
-                    session_scope_id=session_scope_id,
-                    action_kind=action_kind,
-                    action_name=action_name,
-                    patterns=once_patterns,
-                )
-                scope = f"session:{session_scope_id}"
         elif normalized_reply == "always_project" and self.allowlist and project_id and allowlist_patterns:
             saved_patterns = self.allowlist.add_patterns(
                 action_kind=action_kind,
@@ -2099,14 +2763,14 @@ class ApprovalEngine:
                     project_id=project_id if normalized_reply == "always_project" else None,
                     explicit=normalized_reply in {"approve_session", "always_project", "always_global"},
                     notes=(
-                        "User approved via deferred escalation card."
+                        "User approved an owner interaction."
                         if approved
-                        else "User denied via deferred escalation card."
+                        else "User denied an owner interaction."
                     ),
                 )
             except Exception:
                 logger.opt(exception=True).debug(
-                    "Failed to record autonomy feedback for deferred escalation decision"
+                    "Failed to record autonomy feedback for approval decision"
                 )
 
         return {

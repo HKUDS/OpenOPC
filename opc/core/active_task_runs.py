@@ -39,6 +39,14 @@ class ActiveTaskRunRegistry:
 
     def __init__(self) -> None:
         self._attempts: dict[tuple[str, str], set[str]] = {}
+        # Durable task ids are the liveness index used by recovery.  Shutdown
+        # additionally needs the process-local asyncio owner so it can join
+        # the coroutine *before* the shared Store is closed.  Keep that
+        # relationship keyed by the opaque attempt token; callers which use
+        # the registry only as a test/coordination ledger remain untracked.
+        self._attempt_owner_tasks: dict[str, asyncio.Task[object]] = {}
+        self._shutdown_owner_failures: list[BaseException] = []
+        self._recorded_failure_task_ids: set[int] = set()
         self._scope_locks: dict[tuple[str, str], asyncio.Lock] = {}
         self._handoff_refs: dict[str, int] = {}
         self._handoffs_drained = asyncio.Event()
@@ -53,7 +61,13 @@ class ActiveTaskRunRegistry:
             raise ValueError("task_id is required")
         return project, task
 
-    def register(self, project_id: str | None, task_id: str | None) -> str:
+    def register(
+        self,
+        project_id: str | None,
+        task_id: str | None,
+        *,
+        owner_task: asyncio.Task[object] | None = None,
+    ) -> str:
         handoff_token = self._current_pending_handoff_token()
         driver_attempt_token = self._current_driver_attempt_token()
         if (
@@ -67,12 +81,119 @@ class ActiveTaskRunRegistry:
         key = self._key(project_id, task_id)
         attempt_token = uuid.uuid4().hex
         self._attempts.setdefault(key, set()).add(attempt_token)
+        if owner_task is not None:
+            self._attempt_owner_tasks[attempt_token] = owner_task
+            owner_task.add_done_callback(self._attempt_owner_finished)
         # A pre-shutdown WS request is handed off once its first real execution
         # coroutine is registered.  The reservation itself is deliberately not
         # reported by is_active()/active_task_ids(); only this attempt is.
         if handoff_token is not None:
             self._settle_handoff(handoff_token)
         return attempt_token
+
+    def bind_attempt_task(
+        self,
+        attempt_token: str,
+        owner_task: asyncio.Task[object],
+    ) -> None:
+        """Attach the coroutine which owns an already-registered attempt.
+
+        Work-item claims must register before ``asyncio.create_task`` so a
+        shutdown scope lock can never observe a durable claim without a live
+        attempt.  This second, synchronous step records the newly-created task
+        without weakening that ordering invariant.
+        """
+
+        if not self._attempt_token_is_active(attempt_token):
+            raise ValueError("attempt token is not active")
+        self._attempt_owner_tasks[attempt_token] = owner_task
+        owner_task.add_done_callback(self._attempt_owner_finished)
+
+    def _attempt_owner_finished(self, owner_task: asyncio.Task[object]) -> None:
+        """Retain shutdown-race failures after an attempt unregisters itself."""
+
+        if not self._admission_closed or owner_task.cancelled():
+            return
+        task_identity = id(owner_task)
+        if task_identity in self._recorded_failure_task_ids:
+            return
+        try:
+            failure = owner_task.exception()
+        except asyncio.CancelledError:
+            return
+        if failure is not None:
+            self._recorded_failure_task_ids.add(task_identity)
+            self._shutdown_owner_failures.append(failure)
+
+    def active_owner_tasks(
+        self,
+        project_id: str | None = None,
+    ) -> set[asyncio.Task[object]]:
+        """Return live coroutine owners for registered execution attempts."""
+
+        project = (
+            str(project_id or "default").strip() or "default"
+            if project_id is not None
+            else None
+        )
+        live_tokens = {
+            token
+            for (candidate_project, _task_id), tokens in self._attempts.items()
+            if project is None or candidate_project == project
+            for token in tokens
+        }
+        return {
+            task
+            for token, task in self._attempt_owner_tasks.items()
+            if token in live_tokens and not task.done()
+        }
+
+    async def cancel_and_wait_for_owner_tasks(
+        self,
+        project_id: str | None = None,
+    ) -> None:
+        """Cancel and join every process-local owner known to the registry.
+
+        This is a shutdown primitive, not a durable state transition.  The
+        controller must atomically suspend its company scopes first; only then
+        may it call this method to unwind provider/runtime coroutines while the
+        Store and exact controller leases are still available.
+        """
+
+        current = asyncio.current_task()
+        while True:
+            if self._shutdown_owner_failures:
+                failure = self._shutdown_owner_failures.pop(0)
+                self._recorded_failure_task_ids.clear()
+                raise failure
+            owners = {
+                task
+                for task in self.active_owner_tasks(project_id)
+                if task is not current
+            }
+            if not owners:
+                if self._shutdown_owner_failures:
+                    failure = self._shutdown_owner_failures.pop(0)
+                    self._recorded_failure_task_ids.clear()
+                    raise failure
+                return
+            for task in owners:
+                task.cancel()
+            results = await asyncio.gather(*owners, return_exceptions=True)
+            failures = [
+                result
+                for result in results
+                if isinstance(result, BaseException)
+                and not isinstance(result, asyncio.CancelledError)
+            ]
+            if failures:
+                self._shutdown_owner_failures.clear()
+                self._recorded_failure_task_ids.clear()
+                # A cancellation owner may discover a lost controller fence or
+                # fail while persisting its final cleanup.  Shutdown must stay
+                # fail-closed with the Store open; treating that as an ordinary
+                # cancelled coroutine recreates the closed-Store tail race.
+                raise failures[0]
 
     @contextmanager
     def bind_driver_attempt(self, attempt_token: str) -> Iterator[None]:
@@ -250,6 +371,7 @@ class ActiveTaskRunRegistry:
         if not attempts or attempt_token not in attempts:
             return False
         attempts.remove(attempt_token)
+        self._attempt_owner_tasks.pop(attempt_token, None)
         if not attempts:
             self._attempts.pop(key, None)
         return True

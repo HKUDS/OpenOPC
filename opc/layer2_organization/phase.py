@@ -20,6 +20,7 @@ Design:
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any, Awaitable, Callable, Mapping, Optional
 
 from loguru import logger
@@ -55,6 +56,7 @@ __all__ = [
     "is_resumable_after_claim_release",
     "is_orphaned",
     "is_dispatchable",
+    "build_attempt_settlement_updates",
     "PhaseTransitionHook",
     "register_phase_transition_hook",
     "clear_phase_transition_hooks",
@@ -103,6 +105,7 @@ async def on_phase_transition(
     item: Any,
     *,
     store: Any,
+    notifications_only: bool = False,
 ) -> None:
     """Fire all registered phase-transition hooks.
 
@@ -111,6 +114,10 @@ async def on_phase_transition(
     not affect other hooks or the upstream write.
     """
     for hook in list(_PHASE_TRANSITION_HOOKS):
+        if notifications_only and not bool(
+            getattr(hook, "_phase_notification_only", False)
+        ):
+            continue
         try:
             await hook(previous, target, item, store=store)
         except Exception:
@@ -283,10 +290,6 @@ ALLOWED_TRANSITIONS: dict[Phase, frozenset[Phase]] = {
     Phase.AWAITING_MANAGER_REVIEW: frozenset({
         Phase.APPROVED,
         Phase.READY_FOR_REWORK,
-        # Escalation path: when the manager-review/rework loop exceeds its
-        # retry budget, the runtime escalates the card to a human decider
-        # instead of bouncing it back to the worker yet again.
-        Phase.AWAITING_HUMAN,
     }) | _UNIVERSAL_EXITS | _RECOVERY_EXITS,
     Phase.AWAITING_HUMAN: frozenset({
         Phase.APPROVED,
@@ -434,6 +437,46 @@ def has_open_attempt(metadata: Mapping[str, Any] | None) -> bool:
     if _attempt_ledger_int(metadata, "attempt_seq") <= 0:
         return False
     return not bool(metadata.get("attempt_settled", True))
+
+
+def build_attempt_settlement_updates(
+    current_metadata: Mapping[str, Any] | None,
+    *,
+    outcome: str,
+    settled_at: datetime | None = None,
+) -> dict[str, Any]:
+    """Return the canonical settlement delta for the current open attempt.
+
+    This lives beside :func:`has_open_attempt` so both the ordinary
+    transition path and the Store's transactionally fenced controller path
+    use exactly the same ledger semantics.
+    """
+
+    metadata = dict(current_metadata or {})
+    if not has_open_attempt(metadata):
+        return {}
+    outcome_clean = str(outcome or "").strip() or "settled"
+    if outcome_clean == "crashed":
+        crash_streak = _attempt_ledger_int(metadata, "attempt_crash_streak") + 1
+        interrupted_streak = _attempt_ledger_int(
+            metadata,
+            "attempt_interrupted_streak",
+        )
+    elif outcome_clean == "interrupted":
+        crash_streak = _attempt_ledger_int(metadata, "attempt_crash_streak")
+        interrupted_streak = (
+            _attempt_ledger_int(metadata, "attempt_interrupted_streak") + 1
+        )
+    else:
+        crash_streak = 0
+        interrupted_streak = 0
+    return {
+        "attempt_settled": True,
+        "attempt_outcome": outcome_clean,
+        "attempt_settled_at": (settled_at or datetime.now()).isoformat(),
+        "attempt_crash_streak": crash_streak,
+        "attempt_interrupted_streak": interrupted_streak,
+    }
 
 
 def is_dispatchable(item: Any) -> bool:

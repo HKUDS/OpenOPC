@@ -5,7 +5,7 @@ import { fileURLToPath } from 'node:url'
 import React from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
 
-import { StaffingSelectionPanel } from './StaffingSelectionPanel'
+import { buildDynamicTeamCoverage, StaffingSelectionPanel } from './StaffingSelectionPanel'
 
 const markup = renderToStaticMarkup(
   React.createElement(StaffingSelectionPanel, {
@@ -51,6 +51,17 @@ assert.match(markup, /Existing Engineer/)
 assert.match(markup, /Frontend Developer/)
 assert.match(markup, /Approve/)
 assert.match(markup, /Auto Recruit/)
+
+const teamCoverage = buildDynamicTeamCoverage(
+  [
+    { role_id: 'cmo', role_label: 'CMO', reports_to: 'ceo' },
+    { role_id: 'content_specialist', role_label: 'Content', reports_to: 'cmo' },
+    { role_id: 'designer', role_label: 'Designer', reports_to: 'cmo' },
+  ],
+  { cmo: 'jiuwenswarm', content_specialist: 'codex', designer: 'claude_code' },
+)
+assert.equal(teamCoverage.boundaryByRole.get('content_specialist'), 'cmo')
+assert.deepEqual(teamCoverage.coveredRoleIdsByBoundary.get('cmo'), ['cmo', 'content_specialist', 'designer'])
 
 const here = dirname(fileURLToPath(import.meta.url))
 const src = readFileSync(join(here, 'StaffingSelectionPanel.tsx'), 'utf8')

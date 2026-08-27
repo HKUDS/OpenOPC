@@ -35,6 +35,9 @@ from opc.layer2_organization.org_work_item_planner import (
     CompanyWorkItemRuntimePlan,
     build_company_work_item_runtime_plan,
 )
+from opc.layer2_organization.external_team_compiler import (
+    apply_external_team_bindings_to_plan,
+)
 from opc.layer5_memory.employee_evolution import EmployeeEvolutionManager
 
 _DEFAULT_EMPLOYEE_TEMPLATE_ID = "general-default-employee"
@@ -127,6 +130,11 @@ class OrgEngine:
                 memory_policy_ref=role.memory_policy_ref,
                 artifact_contract_ref=role.artifact_contract_ref,
                 runtime_policy=role.runtime_policy.model_dump(),
+                capabilities=", ".join(
+                    str(item).strip()
+                    for item in list(role.capabilities or [])
+                    if str(item).strip()
+                ),
             )
         self._refresh_task_mode_role()
         logger.info(f"OrgEngine initialized with {len(self._agents)} roles")
@@ -250,7 +258,15 @@ class OrgEngine:
         return self.config.org.company_profile
 
     def get_execution_model(self) -> str:
-        return "actor_runtime"
+        # ``execution_model`` is the organization-facing runtime contract.  It
+        # is deliberately distinct from the internal company scheduler model
+        # (currently ``multi_team_org``), so callers must observe the value
+        # loaded from the active organization config instead of an internal
+        # implementation label.
+        return (
+            str(getattr(self.config.org, "execution_model", "") or "").strip()
+            or "actor_runtime"
+        )
 
     def get_top_level_role_ids(self) -> list[str]:
         agent_ids = set(self._agents)
@@ -385,6 +401,7 @@ class OrgEngine:
         *,
         runtime_topology: dict[str, Any] | None = None,
         original_request: str = "",
+        compiled_external_teams: list[Any] | None = None,
     ) -> CompanyWorkItemRuntimePlan:
         """Build the company execution plan from org topology and work items."""
 
@@ -392,12 +409,18 @@ class OrgEngine:
         topology = dict(runtime_topology or self.build_runtime_delegation_topology())
         policy = self.get_runtime_policy(normalized_profile)
         policy_payload = policy.model_dump() if hasattr(policy, "model_dump") else dict(policy or {})
-        return build_company_work_item_runtime_plan(
+        plan = build_company_work_item_runtime_plan(
             self,
             profile=normalized_profile,
             runtime_topology=topology,
             original_request=original_request,
             runtime_policy=policy_payload,
+        )
+        return apply_external_team_bindings_to_plan(
+            self,
+            plan,
+            runtime_topology=topology,
+            compiled_bindings=compiled_external_teams,
         )
 
     def _build_runtime_delegation_topology_from_configured_teams(self) -> dict[str, Any]:
@@ -767,6 +790,22 @@ class OrgEngine:
         from_seat = seat_map.get(from_seat_id)
         if from_seat is None:
             return None
+
+        # Opaque external teams expose one canonical dispatchable seat even
+        # when the org graph renders the boundary role in multiple teams.
+        opaque_target = next(
+            (
+                candidate
+                for candidate in seat_map.values()
+                if str(candidate.get("role_id", "") or "").strip() == target_role_id
+                and str(candidate.get("execution_unit_kind", "") or "").strip()
+                == "opaque_external_team"
+                and bool(candidate.get("dispatchable", False))
+            ),
+            None,
+        )
+        if opaque_target is not None:
+            return opaque_target
 
         def _find_in_team(team_id: str) -> dict[str, Any] | None:
             for candidate in seat_map.values():

@@ -42,6 +42,17 @@ class WSHandlerProgressParsingTests(unittest.TestCase):
         self.assertEqual(entry["summary"], "我先检查 UI 渲染链路。")
         self.assertEqual(entry["detail"], "我先检查 UI 渲染链路。")
 
+    def test_external_jiuwen_snapshot_maps_to_thinking_entry(self) -> None:
+        entry = WSHandler._parse_progress_entry(
+            "[External:jiuwenswarm:thinking_snapshot] 正在搜索并核对论文来源。",
+        )
+
+        self.assertIsNotNone(entry)
+        assert entry is not None
+        self.assertEqual(entry["type"], "thinking")
+        self.assertEqual(entry["summary"], "正在搜索并核对论文来源。")
+        self.assertEqual(entry["detail"], "正在搜索并核对论文来源。")
+
     def test_external_codex_tool_progress_maps_to_tool_call(self) -> None:
         detail = "$ git status --short\n\n M opc/plugins/office_ui/ws_handler.py"
         entry = WSHandler._parse_progress_entry(f"[External:codex:tool] {detail}")

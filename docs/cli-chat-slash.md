@@ -11,7 +11,7 @@ The source of truth for this table is `_SLASH_COMMANDS` in `opc/cli/app.py`.
 - `/queue list|drop|clear` inspects or edits queued prompts while a turn is running.
 - `/status` shows project, session, mode, agent, domains, model, cost, and external agent availability.
 - `/mode [task|company] [corporate|custom]` changes how future natural-language messages run.
-- `/agent [native|codex|claude_code|cursor|opencode|none]` sets or clears the preferred execution agent.
+- `/agent [native|codex|jiuwen|jiuwenswarm|claude_code|cursor|opencode|none]` sets or clears the preferred execution agent.
 - `/domains [domain ...|clear]` sets or clears domain hints.
 - Aliases: `/p` is `/project`, `/s` is `/session`, `/t` is `/task`, and `/checkpoint` is `/checkpoints`.
 

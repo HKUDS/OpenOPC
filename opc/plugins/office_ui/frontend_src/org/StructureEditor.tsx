@@ -21,6 +21,7 @@ interface StructureEditorProps {
   /** role_id -> recruited names for the selected session (canvas display only). */
   sessionRecruitmentByRole?: Record<string, string[]> | null
   isCustomMode?: boolean
+  organizationId?: string
   onAddRole: (
     roleId: string,
     name: string,
@@ -30,6 +31,8 @@ interface StructureEditorProps {
   ) => void
   onUpdateRole: (roleId: string, updates: RoleUpdatePatch) => void
   onDeleteRole: (roleId: string) => void
+  onBindExternalTeam?: (data: { boundary_role_id: string; organization_id?: string; scope: 'subtree' }) => void
+  onUnbindExternalTeam?: (data: { binding_id?: string; boundary_role_id?: string; organization_id?: string }) => void
   // Saved org architectures — render a version-switcher pill in the toolbar
   savedOrgsList?: SavedOrgSummary[] | null
   activeSavedOrg?: string | null
@@ -44,8 +47,8 @@ interface StructureEditorProps {
 type EditorView = 'canvas' | 'table'
 
 export function StructureEditor({
-  roles, employees, sessionRecruitmentByRole, isCustomMode,
-  onAddRole, onUpdateRole, onDeleteRole,
+  roles, employees, sessionRecruitmentByRole, isCustomMode, organizationId,
+  onAddRole, onUpdateRole, onDeleteRole, onBindExternalTeam, onUnbindExternalTeam,
   savedOrgsList, activeSavedOrg, currentOrgVersion, versionAtLoad,
   onSavedOrgsList, onSavedOrgSaveAs, onSavedOrgLoad, onSavedOrgDelete,
 }: StructureEditorProps) {
@@ -212,7 +215,11 @@ export function StructureEditor({
             allRoles={roles}
             employees={employees}
             readOnly={!isCustomMode}
+            teamBindingEditable
+            organizationId={organizationId}
             onUpdateRole={onUpdateRole}
+            onBindExternalTeam={onBindExternalTeam}
+            onUnbindExternalTeam={onUnbindExternalTeam}
             onDeleteRole={(id) => { onDeleteRole(id); setSelectedId(null) }}
             onClose={() => setSelectedId(null)}
           />

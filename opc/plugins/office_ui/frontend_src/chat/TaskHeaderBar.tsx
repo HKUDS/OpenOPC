@@ -4,6 +4,7 @@ import type { AgentInfo } from '../types/visual'
 import { IconStop, IconBoard, IconTool, IconCheck } from './SvgIcons'
 import { getSessionRuntimeStatus, isSessionWorking } from '../lib/sessionRuntime'
 import { getWorkItemRoleLabel } from '../lib/workItemIdentity'
+import { executionAgentLabel } from '../lib/externalAgents'
 
 interface TaskHeaderBarProps {
   session: Session
@@ -43,14 +44,6 @@ const HUMAN_REVIEW_STATUSES = new Set([
   'awaiting_review',
   'awaiting_peer',
 ])
-
-const EXECUTION_AGENT_LABELS: Record<string, string> = {
-  native: 'Native',
-  codex: 'Codex',
-  claude_code: 'Claude Code',
-  cursor: 'Cursor',
-  opencode: 'OpenCode',
-}
 
 export function TaskHeaderBar({ session, agents, onTitleChange, onViewOnBoard, onStop, onComplete, onResume }: TaskHeaderBarProps) {
   const [editing, setEditing] = useState(false)
@@ -194,10 +187,10 @@ export function TaskHeaderBar({ session, agents, onTitleChange, onViewOnBoard, o
         {session.selectedExecutionAgent && (
           <span
             className="task-agent-pill"
-            title={`Execution Agent: ${EXECUTION_AGENT_LABELS[session.selectedExecutionAgent] ?? session.selectedExecutionAgent}`}
+            title={`Execution Agent: ${executionAgentLabel(session.selectedExecutionAgent)}`}
           >
             <span className="task-agent-icon">&#x2699;</span>
-            {EXECUTION_AGENT_LABELS[session.selectedExecutionAgent] ?? session.selectedExecutionAgent}
+            {executionAgentLabel(session.selectedExecutionAgent)}
           </span>
         )}
 

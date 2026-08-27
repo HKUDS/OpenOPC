@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -11,7 +10,6 @@ from typing import Any
 from opc.core.models import (
     AgentMessage,
     CommsSemanticType,
-    HandoffRecord,
     MeetingRoom,
     MeetingStatus,
     MessageStatus,
@@ -1275,8 +1273,9 @@ class CollaborationService:
                 decision_method="manual_owner_finalize",
                 consensus=meeting.consensus,
             )
-            if not manual_outcome.get("decision") and not manual_outcome.get("requires_human_input", False):
+            if not manual_outcome.get("decision") and not host._extract_json_object(content):
                 manual_outcome["decision"] = str(content or "").strip()
+                manual_outcome["resolution_status"] = "resolved"
             meeting.metadata = dict(meeting.metadata)
             meeting.metadata["outcome_origin"] = "live_meeting"
             if layout is not None:
@@ -1417,12 +1416,30 @@ class CollaborationService:
             task_id=task.id,
         )
         proposal = result["proposal"]
+        persisted_task = None
+        if self.store and hasattr(self.store, "get_task"):
+            persisted_task = await self.store.get_task(task.id)
+        if persisted_task is not None:
+            # The proposal/card transaction owns the pending marker, and an
+            # immediate owner answer may already have cleared it.  Refresh the
+            # caller's live Task view instead of saving its pre-publication
+            # snapshot back over the durable decision.
+            task.status = persisted_task.status
+            task.result = persisted_task.result
+            task.assigned_to = persisted_task.assigned_to
+            task.context_snapshot = dict(persisted_task.context_snapshot or {})
+            task.metadata = dict(persisted_task.metadata or {})
         if result.get("auto_applied"):
-            task.metadata = dict(task.metadata)
-            task.metadata["reorg_proposal_id"] = proposal.proposal_id
-            task.metadata.pop("pending_reorg_proposal_id", None)
-            task.metadata.pop("pending_reorg_scope", None)
-            if self.store and hasattr(self.store, "save_task"):
+            if persisted_task is None:
+                task.metadata = dict(task.metadata)
+                task.metadata["reorg_proposal_id"] = proposal.proposal_id
+                task.metadata.pop("pending_reorg_proposal_id", None)
+                task.metadata.pop("pending_reorg_scope", None)
+            if (
+                persisted_task is None
+                and self.store
+                and hasattr(self.store, "save_task")
+            ):
                 await self.store.save_task(task)
             return {
                 "proposal_id": proposal.proposal_id,
@@ -1431,15 +1448,35 @@ class CollaborationService:
                 "auto_applied": True,
                 "result": result.get("result", {}),
             }
-        task.metadata = dict(task.metadata)
-        task.metadata["pending_reorg_proposal_id"] = proposal.proposal_id
-        task.metadata["pending_reorg_scope"] = proposal.scope.value
-        if self.store and hasattr(self.store, "save_task"):
+        if persisted_task is None:
+            task.metadata = dict(task.metadata)
+            task.metadata["pending_reorg_proposal_id"] = proposal.proposal_id
+            task.metadata["pending_reorg_scope"] = proposal.scope.value
+        if (
+            persisted_task is None
+            and self.store
+            and hasattr(self.store, "save_task")
+        ):
             await self.store.save_task(task)
+        proposal_status = str(
+            getattr(proposal.status, "value", proposal.status) or ""
+        ).strip()
+        if proposal_status != "proposed":
+            return {
+                "proposal_id": proposal.proposal_id,
+                "scope": proposal.scope.value,
+                "status": proposal_status,
+                "auto_applied": False,
+                "requires_user_input": False,
+                "reason": (
+                    f"Runtime adjustment `{proposal.proposal_id}` was already "
+                    f"decided with status `{proposal_status}`."
+                ),
+            }
         return {
             "proposal_id": proposal.proposal_id,
             "scope": proposal.scope.value,
-            "status": proposal.status.value,
+            "status": proposal_status,
             "auto_applied": False,
             "requires_user_input": True,
             "reason": (

@@ -46,7 +46,10 @@ def _progress():
 
 async def run_task(desc: str, task_msg: str, timeout: int = 300) -> tuple[bool, str]:
     """Run a single task through the engine. Returns (success, response)."""
-    config = OPCConfig.load(Path(__file__).parent.parent / ".opc" / "config")
+    config = OPCConfig.load(
+        Path(__file__).parent.parent / ".opc" / "config",
+        trusted_source=True,
+    )
     engine = OPCEngine(config=config, project_id="test", on_progress=_progress())
     _logs.clear()
 

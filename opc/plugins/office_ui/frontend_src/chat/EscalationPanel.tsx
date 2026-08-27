@@ -1,15 +1,12 @@
-import React, { useCallback, useEffect, useMemo, useState } from 'react'
-import type { ChatMessageMeta, HumanEscalationOption } from '../types/chat'
+import React, { useCallback, useMemo } from 'react'
+import type { ChatMessageMeta, CheckpointReplyMetadata, InteractionOption } from '../types/chat'
 import { MarkdownBody } from './MarkdownBody'
-
-// If the server never confirms (click lost on a dropped connection), re-enable
-// the buttons after this long so the user can retry.
-const SUBMIT_CONFIRM_TIMEOUT_MS = 30000
 
 interface EscalationPanelProps {
   meta: ChatMessageMeta
-  onReply: (text: string) => void
+  onReply: (text: string, metadata?: Partial<CheckpointReplyMetadata>) => void
   responded: boolean
+  submitting?: boolean
 }
 
 function firstLine(text: string): string {
@@ -28,6 +25,10 @@ function checkpointStatusLabel(status: string): string {
     case 'cancelled':
     case 'canceled':
       return 'Cancelled'
+    case 'failed':
+      return 'Failed'
+    case 'outcome_unknown':
+      return 'Outcome unknown'
     case 'resolved':
       return 'Resolved'
     default:
@@ -36,7 +37,7 @@ function checkpointStatusLabel(status: string): string {
 }
 
 export const EscalationPanel = React.memo(function EscalationPanel({
-  meta, onReply, responded,
+  meta, onReply, responded, submitting = false,
 }: EscalationPanelProps) {
   const isResponded = responded
   const checkpointStatus = String(meta.checkpoint_status ?? '').trim().toLowerCase()
@@ -47,9 +48,23 @@ export const EscalationPanel = React.memo(function EscalationPanel({
     [prompt],
   )
   const title = firstLine(prompt).replace(/^\[[^\]]+\]\s*/, '') || 'Action Required'
-  const details = lines.slice(1).join('\n').trim()
+  const isPermission = ['tool_permission', 'action_permission'].includes(String(meta.checkpoint_type ?? ''))
+  const displayTitle = meta.checkpoint_type === 'tool_permission'
+    ? 'Tool Authorization'
+    : meta.checkpoint_type === 'action_permission'
+      ? 'Action Authorization'
+      : title
+  const permissionBadge = isPermission
+    ? String(meta.checkpoint_type).replace(/_/g, ' ')
+    : String(meta.escalation_type ?? 'decision_needed').replace(/_/g, ' ')
+  // Non-permission cards use the first prompt line as their card title. A
+  // typed permission card has a protocol title instead, so its whole prompt
+  // remains request content; otherwise a one-line command/request vanishes.
+  const request = isPermission
+    ? prompt
+    : lines.slice(1).join('\n').trim()
   const summary = String(meta.summary ?? '').trim()
-  const options = (meta.options ?? []).filter((opt): opt is HumanEscalationOption => !!opt?.id)
+  const options = (meta.options ?? []).filter((opt): opt is InteractionOption => !!opt?.id)
   const activeSubagents = useMemo(
     () => (meta.active_subagents ?? []).filter((item) => !!item && typeof item === 'object'),
     [meta.active_subagents],
@@ -61,20 +76,14 @@ export const EscalationPanel = React.memo(function EscalationPanel({
   const worktreePath = String(meta.worktree_path ?? '').trim()
   const hasRuntimeState = activeSubagents.length > 0 || permissionRequests.length > 0 || !!worktreePath
 
-  const [submittedOptionId, setSubmittedOptionId] = useState('')
-  const isSubmitting = !!submittedOptionId && !isResponded
-
-  useEffect(() => {
-    if (!isSubmitting) return
-    const timer = window.setTimeout(() => setSubmittedOptionId(''), SUBMIT_CONFIRM_TIMEOUT_MS)
-    return () => window.clearTimeout(timer)
-  }, [isSubmitting, submittedOptionId])
-
-  const handleReply = useCallback((option: HumanEscalationOption) => {
-    if (isResponded || isSubmitting) return
-    setSubmittedOptionId(option.id)
-    onReply(option.label || option.id)
-  }, [isResponded, isSubmitting, onReply])
+  const handleReply = useCallback((option: InteractionOption) => {
+    if (isResponded || submitting) return
+    onReply(option.label || option.id, {
+      interaction_option_id: option.id,
+      interaction_option_label: option.label || option.id,
+      checkpoint_reply_kind: option.id.includes('deny') ? 'deny' : 'approve',
+    })
+  }, [isResponded, onReply, submitting])
 
   return (
     <div className="ckpt-panel ckpt-escalation">
@@ -86,9 +95,9 @@ export const EscalationPanel = React.memo(function EscalationPanel({
             <circle cx="8" cy="11.5" r="0.75" fill="currentColor" stroke="none" />
           </svg>
         </div>
-        <div className="ckpt-title">{title}</div>
+        <div className="ckpt-title">{displayTitle}</div>
         <span className="ckpt-badge ckpt-badge-scope">
-          {String(meta.escalation_type ?? 'decision_needed').replace(/_/g, ' ')}
+          {permissionBadge}
         </span>
         {isResponded && <span className="ckpt-badge ckpt-badge-responded">{resolvedLabel}</span>}
       </div>
@@ -96,14 +105,22 @@ export const EscalationPanel = React.memo(function EscalationPanel({
       {summary && summary !== title && (
         <div className="ckpt-section">
           <div className="ckpt-section-title">Summary</div>
-          <MarkdownBody content={summary} className="ckpt-markdown" />
+          <MarkdownBody
+            content={summary}
+            className="ckpt-markdown"
+            collapseMode={isPermission ? 'never' : 'auto'}
+          />
         </div>
       )}
 
-      {details && (
+      {request && (
         <div className="ckpt-section">
           <div className="ckpt-section-title">Request</div>
-          <MarkdownBody content={details} className="ckpt-markdown" />
+          {isPermission ? (
+            <pre className="ckpt-permission-verbatim"><code>{request}</code></pre>
+          ) : (
+            <MarkdownBody content={request} className="ckpt-markdown" />
+          )}
         </div>
       )}
 
@@ -123,19 +140,13 @@ export const EscalationPanel = React.memo(function EscalationPanel({
           {options.map((option) => (
             <button
               key={option.id}
-              className={`ckpt-btn ${option.id.includes('deny') ? 'ckpt-btn-deny' : 'ckpt-btn-approve'}${isSubmitting ? ' ckpt-btn-submitting' : ''}`}
+              className={`ckpt-btn ${option.id.includes('deny') ? 'ckpt-btn-deny' : 'ckpt-btn-approve'}${submitting ? ' ckpt-btn-submitting' : ''}`}
               onClick={() => handleReply(option)}
-              disabled={isSubmitting}
+              disabled={submitting}
             >
-              {isSubmitting && submittedOptionId === option.id ? 'Submitting…' : (option.label || option.id)}
+              {option.label || option.id}
             </button>
           ))}
-        </div>
-      )}
-
-      {isSubmitting && (
-        <div className="ckpt-escalation-hint">
-          Decision sent — waiting for server confirmation…
         </div>
       )}
 

@@ -5,11 +5,14 @@ from __future__ import annotations
 import os
 import shlex
 import shutil
+import socket
+import ssl
 import subprocess
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 from opc.core.config import OPCConfig
 from opc.core.models import Task
@@ -26,6 +29,8 @@ _HELP_COMMANDS: dict[str, tuple[str, ...]] = {
     "claude_code": ("--help",),
     "cursor": ("--help",),
     "opencode": ("run", "--help"),
+    "jiuwen": ("chat", "--help"),
+    "jiuwenswarm": ("chat", "--help"),
 }
 
 
@@ -34,6 +39,8 @@ _VERSION_COMMANDS: dict[str, tuple[str, ...]] = {
     "claude_code": ("--version",),
     "cursor": ("--version",),
     "opencode": ("--version",),
+    "jiuwen": ("--version",),
+    "jiuwenswarm": ("--version",),
 }
 
 
@@ -270,9 +277,25 @@ def run_external_agent_preflight(
         if rpc_issue:
             result.issues.append(rpc_issue)
         if probe_commands:
-            result.version = _probe_version(agent_name, str(binary), result.warnings)
-            if cmd:
-                _probe_help_flags(agent_name, str(binary), cmd, result)
+            if (
+                agent_name in {"jiuwen", "jiuwenswarm"}
+                and str(getattr(adapter.config, "transport", "") or "").strip()
+                == "gateway"
+            ):
+                gateway_url = str(
+                    os.environ.get("JIUWENSWARM_GATEWAY_URL")
+                    or getattr(adapter.config, "gateway_url", "")
+                    or f"ws://{os.environ.get('GATEWAY_HOST', '127.0.0.1')}:{os.environ.get('GATEWAY_PORT', '19001')}/tui"
+                ).strip()
+                gateway_issue = _probe_jiuwen_gateway(gateway_url)
+                if gateway_issue:
+                    result.issues.append(gateway_issue)
+                else:
+                    result.version = f"Jiuwen Gateway protocol ({gateway_url})"
+            else:
+                result.version = _probe_version(agent_name, str(binary), result.warnings)
+                if cmd:
+                    _probe_help_flags(agent_name, str(binary), cmd, result)
         _probe_isolated_home(agent_name, result)
 
         for check in write_checks:
@@ -285,7 +308,6 @@ def run_external_agent_preflight(
 def _describe_collaboration_rpc_transport() -> tuple[str, str]:
     from opc.layer4_tools.collaboration_rpc import (
         OPC_COLLAB_RPC_TRANSPORT,
-        default_collaboration_rpc_transport,
         resolve_collaboration_rpc_transport,
     )
 
@@ -299,6 +321,24 @@ def _describe_collaboration_rpc_transport() -> tuple[str, str]:
     if requested and requested != resolved:
         return (f"{resolved}({requested})", "")
     return (resolved, "")
+
+
+def _probe_jiuwen_gateway(url: str) -> str:
+    """Verify that the configured Gateway endpoint is reachable without starting a chat."""
+
+    parsed = urlparse(str(url or "").strip())
+    if parsed.scheme not in {"ws", "wss"} or not parsed.hostname:
+        return f"invalid Jiuwen Gateway URL: {url!r}"
+    port = int(parsed.port or (443 if parsed.scheme == "wss" else 80))
+    try:
+        connection = socket.create_connection((parsed.hostname, port), timeout=2.0)
+        if parsed.scheme == "wss":
+            context = ssl.create_default_context()
+            connection = context.wrap_socket(connection, server_hostname=parsed.hostname)
+        connection.close()
+    except OSError as exc:
+        return f"Jiuwen Gateway is unreachable at {url}: {exc}"
+    return ""
 
 
 def _describe_stdin_policy(

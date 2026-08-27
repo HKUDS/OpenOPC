@@ -15,6 +15,7 @@
  */
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import type { OrgRole, OrgEmployee } from '../types/visual'
+import { TASK_AGENT_OPTIONS, executionAgentLabel } from '../lib/externalAgents'
 import { ROLE_ICON_KEYS, ROLE_ICONS, resolveRoleIcon, type RoleIconKey } from './roleIcons'
 
 /** Tool union derived from company_runtime_profiles.py _CORPORATE_*_TOOLS. */
@@ -37,7 +38,9 @@ const TOOL_GROUPS: { label: string; prefix: string; tools: readonly string[] }[]
   { label: 'Browser',  prefix: 'browser_', tools: AVAILABLE_TOOLS.filter(t => t.startsWith('browser_')) },
 ]
 
-const EXTERNAL_AGENTS = ['codex', 'cursor', 'claude_code', 'opencode'] as const
+const EXTERNAL_AGENTS = TASK_AGENT_OPTIONS.filter(
+  agent => agent !== 'native' && agent !== 'jiuwenswarm',
+)
 const EXECUTION_STRATEGIES = [
   { value: 'auto',     label: 'Auto',     hint: 'System picks native or external based on role config' },
   { value: 'native',   label: 'Native',   hint: 'Run directly in-process via LLM' },
@@ -51,7 +54,19 @@ interface RoleInspectorProps {
   allRoles: OrgRole[]
   employees: OrgEmployee[]
   readOnly?: boolean
+  teamBindingEditable?: boolean
+  organizationId?: string
   onUpdateRole: (roleId: string, updates: RoleUpdatePatch) => void
+  onBindExternalTeam?: (data: {
+    boundary_role_id: string
+    organization_id?: string
+    scope: 'subtree'
+  }) => void
+  onUnbindExternalTeam?: (data: {
+    binding_id?: string
+    boundary_role_id?: string
+    organization_id?: string
+  }) => void
   onDeleteRole: (roleId: string) => void
   onClose: () => void
 }
@@ -73,8 +88,8 @@ export interface RoleUpdatePatch {
 /* ── RoleInspector ─────────────────────────────────────────────── */
 
 export function RoleInspector({
-  role, allRoles, employees, readOnly,
-  onUpdateRole, onDeleteRole, onClose,
+  role, allRoles, employees, readOnly, teamBindingEditable = true, organizationId,
+  onUpdateRole, onBindExternalTeam, onUnbindExternalTeam, onDeleteRole, onClose,
 }: RoleInspectorProps) {
   const [name, setName] = useState(role.name)
   const [responsibility, setResponsibility] = useState(role.responsibility)
@@ -88,6 +103,7 @@ export function RoleInspector({
   const [extAgent, setExtAgent] = useState<string | null>(role.preferred_external_agent ?? null)
   const [promptRefs, setPromptRefs] = useState<string>((role.prompt_refs ?? []).join('\n'))
   const [confirmDelete, setConfirmDelete] = useState(false)
+  const [teamMutationPending, setTeamMutationPending] = useState(false)
 
   // Reset local state when selected role changes
   const lastRoleIdRef = useRef(role.role_id)
@@ -105,6 +121,17 @@ export function RoleInspector({
     setPromptRefs((role.prompt_refs ?? []).join('\n'))
     setConfirmDelete(false)
   }, [role])
+
+  useEffect(() => {
+    setExtAgent(role.preferred_external_agent ?? null)
+    setTeamMutationPending(false)
+  }, [role.preferred_external_agent, role.external_team_binding_id])
+
+  useEffect(() => {
+    if (!teamMutationPending) return
+    const timeout = setTimeout(() => setTeamMutationPending(false), 12_000)
+    return () => clearTimeout(timeout)
+  }, [teamMutationPending])
 
   /* ── Debounced save: batch fragments, fire once after 500ms quiescence ── */
   const dirtyRef = useRef<RoleUpdatePatch>({})
@@ -177,6 +204,52 @@ export function RoleInspector({
     () => promptRefs.split('\n').filter(s => s.trim()).length,
     [promptRefs],
   )
+  const isExternalTeamBoundary = Boolean(role.external_team_boundary)
+  const isCoveredByExternalTeam = Boolean(role.covered_by_external_team)
+  const isCoveredDescendant = isCoveredByExternalTeam && !isExternalTeamBoundary
+  const coveredRoles = useMemo(() => {
+    const manifestRoles = role.external_team_capability_manifest?.covered_roles ?? []
+    if (manifestRoles.length > 0) {
+      return manifestRoles.map(item => ({
+        role_id: item.role_id,
+        name: item.name || item.role_id,
+        responsibility: item.responsibility || '',
+      }))
+    }
+    const descendants: OrgRole[] = []
+    const seen = new Set<string>()
+    const visit = (roleId: string) => {
+      if (seen.has(roleId)) return
+      seen.add(roleId)
+      const current = allRoles.find(item => item.role_id === roleId)
+      if (current) descendants.push(current)
+      allRoles.filter(item => item.reports_to === roleId).forEach(item => visit(item.role_id))
+    }
+    visit(role.role_id)
+    return descendants
+  }, [allRoles, role.external_team_capability_manifest, role.role_id])
+  const capabilityManifest = role.external_team_capability_manifest
+
+  const handleExecutionScopeChange = (scope: 'role' | 'subtree') => {
+    if (!teamBindingEditable || teamMutationPending) return
+    if (scope === 'subtree' && !onBindExternalTeam) return
+    if (scope === 'role' && !onUnbindExternalTeam) return
+    flush()
+    setTeamMutationPending(true)
+    if (scope === 'subtree') {
+      onBindExternalTeam?.({
+        boundary_role_id: role.role_id,
+        organization_id: organizationId,
+        scope: 'subtree',
+      })
+      return
+    }
+    onUnbindExternalTeam?.({
+      binding_id: role.external_team_binding_id ?? undefined,
+      boundary_role_id: role.external_team_boundary_role_id ?? role.role_id,
+      organization_id: organizationId,
+    })
+  }
 
   /* ── Delete (2-step confirm) ──────────────────────────────── */
   const handleDelete = () => {
@@ -265,8 +338,79 @@ export function RoleInspector({
           </InspectorField>
         </InspectorGroup>
 
-        <InspectorGroup title="Runtime policy">
-          <InspectorField label="Execution strategy">
+        <InspectorGroup title="Runtime policy" defaultExpanded>
+          <InspectorField label="Execution scope">
+            <div className="ri-scope-options">
+              <label className="ri-scope-option">
+                <input
+                  type="radio"
+                  name={`execution-scope-${role.role_id}`}
+                  checked={!isCoveredByExternalTeam}
+                  onChange={() => handleExecutionScopeChange('role')}
+                  disabled={!teamBindingEditable || teamMutationPending || isCoveredDescendant}
+                />
+                <span>
+                  <b>This role only</b>
+                  <small>Choose one executor for this organizational seat.</small>
+                </span>
+              </label>
+              <label className="ri-scope-option">
+                <input
+                  type="radio"
+                  name={`execution-scope-${role.role_id}`}
+                  checked={isExternalTeamBoundary}
+                  onChange={() => handleExecutionScopeChange('subtree')}
+                  disabled={!teamBindingEditable || teamMutationPending || isCoveredDescendant}
+                />
+                <span>
+                  <b>This role and descendants</b>
+                  <small>One opaque JiuwenSwarm Team; no covered roles are recruited separately.</small>
+                </span>
+              </label>
+            </div>
+          </InspectorField>
+
+          {isCoveredDescendant && (
+            <div className="ri-team-notice">
+              This role is covered by the JiuwenSwarm Team at <code>{role.external_team_boundary_role_id}</code>.
+              Its staffing and executor are inherited from that boundary.
+            </div>
+          )}
+
+          {isExternalTeamBoundary && (
+            <div className="ri-team-card">
+              <div className="ri-team-card-title">
+                <span>JiuwenSwarm Team</span>
+                <code>{role.external_team_binding_id}</code>
+              </div>
+              <div className="ri-team-card-copy">
+                OPC dispatches to <code>{role.role_id}</code>; Jiuwen manages its internal leader and members.
+              </div>
+              <div className="ri-team-covered-list">
+                {coveredRoles.map(item => (
+                  <div key={item.role_id} className="ri-team-covered-role" title={item.responsibility}>
+                    <span>{item.name}</span><code>{item.role_id}</code>
+                  </div>
+                ))}
+              </div>
+              {capabilityManifest && (
+                <div className="ri-team-capabilities">
+                  <b>Compiled capability contract</b>
+                  <span>{capabilityManifest.capabilities.length > 0
+                    ? capabilityManifest.capabilities.join(' · ')
+                    : 'Derived from the covered role responsibilities shown above.'}</span>
+                  {capabilityManifest.deliverables.length > 0 && (
+                    <span>Deliverables: {capabilityManifest.deliverables.join(' · ')}</span>
+                  )}
+                  <code title={capabilityManifest.manifest_hash}>
+                    manifest {capabilityManifest.manifest_hash.slice(0, 12)}
+                  </code>
+                </div>
+              )}
+            </div>
+          )}
+
+          {!isCoveredByExternalTeam && <InspectorField label="Execution strategy">
             <div className="ri-radio-group">
               {EXECUTION_STRATEGIES.map(opt => (
                 <label key={opt.value} className="ri-radio" title={opt.hint}>
@@ -282,8 +426,8 @@ export function RoleInspector({
                 </label>
               ))}
             </div>
-          </InspectorField>
-          {execStrategy === 'external' && (
+          </InspectorField>}
+          {!isCoveredByExternalTeam && execStrategy === 'external' && (
             <InspectorField label="Preferred external agent">
               <select
                 className="ri-select"
@@ -292,9 +436,21 @@ export function RoleInspector({
                 disabled={readOnly}
               >
                 <option value="">(any)</option>
-                {EXTERNAL_AGENTS.map(a => <option key={a} value={a}>{a}</option>)}
+                {extAgent === 'jiuwenswarm' && (
+                  <option value="jiuwenswarm">JiuwenSwarm Team (select Team scope above)</option>
+                )}
+                {EXTERNAL_AGENTS.map(a => <option key={a} value={a}>{executionAgentLabel(a)}</option>)}
               </select>
+              {extAgent === 'jiuwenswarm' && (
+                <span className="ri-field-hint">This legacy role-only value is ambiguous. Select “This role and descendants” above to create the Team binding.</span>
+              )}
             </InspectorField>
+          )}
+          {!isExternalTeamBoundary && readOnly && !isCoveredDescendant && (
+            <div className="ri-team-notice">
+              Corporate role structure is fixed. Choose its single-role executor in the Company staffing step,
+              or bind this entire subtree to JiuwenSwarm here.
+            </div>
           )}
         </InspectorGroup>
 

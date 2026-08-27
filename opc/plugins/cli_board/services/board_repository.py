@@ -544,14 +544,16 @@ class BoardRepository:
     @staticmethod
     def _checkpoint_prompt(checkpoint: Any) -> tuple[str, str]:
         payload = getattr(checkpoint, "payload", {}) or {}
+        interaction = dict(payload.get("interaction", {}) or {})
         prompt = (
-            payload.get("prompt")
+            interaction.get("prompt")
+            or payload.get("prompt")
             or payload.get("message")
             or payload.get("summary")
             or payload.get("original_message")
             or ""
         )
-        prompt_text = str(prompt).strip()
+        prompt_text = str(prompt)
         if not prompt_text:
             prompt_text = json.dumps(payload, ensure_ascii=False, indent=2)[:600]
 

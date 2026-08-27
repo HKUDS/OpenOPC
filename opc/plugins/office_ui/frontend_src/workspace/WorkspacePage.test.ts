@@ -9,7 +9,38 @@ const src = readFileSync(join(here, 'WorkspacePage.tsx'), 'utf8')
 assert.match(src, /makeOptimisticUserMessageId/, 'ordinary composer sends must create a stable optimistic ui_message_id')
 assert.match(src, /chatStore\.sendMessage/, 'ordinary composer sends must echo the user message locally before backend response')
 assert.match(src, /ui_message_id: uiMessageId/, 'optimistic local message and websocket metadata must share ui_message_id')
-assert.match(src, /checkpointReplyId/, 'checkpoint replies must be excluded from ordinary optimistic composer echo')
+assert.doesNotMatch(
+  src,
+  /\bcheckpointReplyId\b/,
+  'legacy checkpoint composer state must not be restored',
+)
+const interactionReplyStart = src.indexOf('const handleInteractionReply = useCallback')
+const interactionReplyEnd = src.indexOf('const handleOpenWorkItemSession = useCallback', interactionReplyStart)
+assert.ok(
+  interactionReplyStart >= 0 && interactionReplyEnd > interactionReplyStart,
+  'explicit durable interaction reply handler must be present',
+)
+const interactionReplySrc = src.slice(interactionReplyStart, interactionReplyEnd)
+assert.match(
+  interactionReplySrc,
+  /metadata\?\.response_to_checkpoint_id/,
+  'interaction replies must carry the durable checkpoint id',
+)
+assert.match(
+  interactionReplySrc,
+  /metadata\?\.response_to_checkpoint_type/,
+  'interaction replies must carry the durable checkpoint type',
+)
+assert.match(
+  interactionReplySrc,
+  /return onInteractionReply\(\{[\s\S]*?checkpointId,[\s\S]*?checkpointType,[\s\S]*?clientRequestId,[\s\S]*?requesterTaskId: targetTaskId,[\s\S]*?requesterSessionId,[\s\S]*?decision,/,
+  'checkpoint decisions must use the explicit ACK-correlated interaction transport',
+)
+assert.doesNotMatch(
+  interactionReplySrc,
+  /dispatchSessionSend|chatStore\.sendMessage/,
+  'checkpoint decisions must not fall back through the ordinary composer transport',
+)
 assert.match(src, /const \{ markRead \} = chatStore/, 'workspace must consume the stable markRead action directly')
 assert.doesNotMatch(src, /chatStore\.markRead/, 'workspace mark-read callbacks must not depend on the aggregate chatStore object')
 assert.equal(

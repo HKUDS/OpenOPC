@@ -1,12 +1,19 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import type { AgentInfo, OrgInfoPayload, SavedOrgSummary } from '../types/visual'
-import type { ChatMessage, CheckpointReplyMetadata, OutgoingAttachmentPayload } from '../types/chat'
+import type {
+  ChatMessage,
+  CheckpointReplyMetadata,
+  InteractionDecision,
+  InteractionReplyReceipt,
+  InteractionReplyRequest,
+  OutgoingAttachmentPayload,
+  SessionSendMetadata,
+} from '../types/chat'
 import type { KanbanTask, Session, TaskPreferredAgent } from '../types/kanban'
 import type { BoardStoreState } from '../kanban/BoardStore'
 import type { ChatStoreState } from '../chat/ChatStore'
 import type { SessionStoreState } from '../stores/SessionStore'
 import { SessionSidebar } from '../chat/SessionSidebar'
-import { analyzeCheckpointMessages, checkpointReplyMetadataForComposer } from '../chat/checkpointUtils'
 import { KanbanBoardView } from '../kanban/KanbanBoardView'
 import { AgentStatusBar } from '../kanban/AgentStatusBar'
 import { BoardSelector } from '../kanban/BoardSelector'
@@ -241,8 +248,9 @@ interface WorkspacePageProps {
     taskId: string,
     content: string,
     attachments?: OutgoingAttachmentPayload[],
-    metadata?: CheckpointReplyMetadata,
+    metadata?: SessionSendMetadata,
   ) => void
+  onInteractionReply: (request: InteractionReplyRequest) => Promise<InteractionReplyReceipt>
   onSecretarySend?: (content: string) => void
   onDeleteSession: (taskId: string) => void
   onTitleChange: (taskId: string, title: string) => void
@@ -291,6 +299,7 @@ export function WorkspacePage({
   onMoveTask,
   onCreateSession,
   onSessionSend,
+  onInteractionReply,
   onSecretarySend,
   onDeleteSession,
   onTitleChange,
@@ -617,16 +626,6 @@ export function WorkspacePage({
     if (!childDetailSession) return []
     return chatStore.getChannelMessages(childDetailSession.channelId)
   }, [chatStore.messages, chatStore.getChannelMessages, childDetailSession])
-  const latestPendingCheckpointReply = useMemo(
-    () => {
-      if (effectiveView.kind !== 'session') return undefined
-      return checkpointReplyMetadataForComposer(
-        analyzeCheckpointMessages(activeMessages).latestPendingReplyMetadata,
-      )
-    },
-    [activeMessages, effectiveView.kind],
-  )
-
   // Hide child sessions from sidebar in Company mode
   const sidebarSessions = useMemo(() => {
     const filtered = isCompanyMode ? sessions.filter(s => s.mode !== 'child') : sessions
@@ -1021,7 +1020,7 @@ export function WorkspacePage({
     taskId: string,
     content: string,
     attachments?: OutgoingAttachmentPayload[],
-    metadata?: CheckpointReplyMetadata,
+    metadata?: SessionSendMetadata,
   ) => {
     // Every send carries a client-generated ui_message_id so the backend can
     // deduplicate re-deliveries (WS pending-queue flush after a reconnect).
@@ -1040,37 +1039,69 @@ export function WorkspacePage({
       }
       const targetTaskId = activeSessionId
       if (!targetTaskId) return
-      const runtimeSession = activeConversation.runtimeSession ?? activeConversation.displaySession ?? activeSession
-      const runtimeCheckpointId = String(runtimeSession?.pendingRuntimeCheckpointId ?? '').trim()
-      let outgoingMetadata = latestPendingCheckpointReply
-        ?? (runtimeCheckpointId ? { response_to_checkpoint_id: runtimeCheckpointId } : undefined)
-      const checkpointReplyId = String(outgoingMetadata?.response_to_checkpoint_id ?? '').trim()
-      if (!checkpointReplyId) {
-        const uiMessageId = makeOptimisticUserMessageId()
-        outgoingMetadata = { ...(latestPendingCheckpointReply ?? {}), ui_message_id: uiMessageId }
-        const targetSession = activeConversation.displaySession ?? activeSession
-        chatStore.sendMessage({
-          channelId: targetSession?.channelId ?? `session:${targetTaskId}`,
-          sender: 'user',
-          senderName: 'You',
-          content,
-          metadata: { ui_message_id: uiMessageId },
-        })
-      }
+      const uiMessageId = makeOptimisticUserMessageId()
+      const outgoingMetadata = { ui_message_id: uiMessageId }
+      const targetSession = activeConversation.displaySession ?? activeSession
+      chatStore.sendMessage({
+        channelId: targetSession?.channelId ?? `session:${targetTaskId}`,
+        sender: 'user',
+        senderName: 'You',
+        content,
+        metadata: { ui_message_id: uiMessageId },
+      })
       dispatchSessionSend(targetTaskId, content, attachments, outgoingMetadata)
     },
-    [effectiveView.kind, activeSessionId, activeConversation.runtimeSession, activeConversation.displaySession, activeSession, latestPendingCheckpointReply, chatStore, dispatchSessionSend, onSecretarySend],
+    [effectiveView.kind, activeSessionId, activeConversation.displaySession, activeSession, chatStore, dispatchSessionSend, onSecretarySend],
   )
 
-  // ── MessageList send (checkpoint replies) ──
-  const handleMessageSend = useCallback(
-    (content: string, taskId?: string, metadata?: CheckpointReplyMetadata) => {
-      const targetTaskId = taskId ?? activeSessionId
-      if (!targetTaskId) return
-      dispatchSessionSend(targetTaskId, content, undefined, metadata)
-    },
-    [activeSessionId, dispatchSessionSend],
-  )
+  // ── MessageList explicit checkpoint decisions ──
+  const handleInteractionReply = useCallback(async (
+    content: string,
+    taskId?: string,
+    metadata?: CheckpointReplyMetadata,
+  ): Promise<InteractionReplyReceipt> => {
+    const checkpointId = String(metadata?.response_to_checkpoint_id ?? '').trim()
+    const checkpointType = String(metadata?.response_to_checkpoint_type ?? '').trim()
+    const checkpointRequesterSessionId = String(metadata?.interaction_requester_session_id ?? '').trim()
+    const checkpointRequesterTaskId = String(metadata?.interaction_requester_task_id ?? '').trim()
+    const targetTaskId = checkpointRequesterSessionId
+      ? (checkpointRequesterTaskId || undefined)
+      : (checkpointRequesterTaskId || taskId || activeSessionId || undefined)
+    const requesterSession = sessions.find(session => session.taskId === targetTaskId)
+    const requesterSessionId = checkpointRequesterSessionId || requesterSession?.sessionId
+    const clientRequestId = metadata?.ui_message_id || makeOptimisticUserMessageId()
+    if (!checkpointId || !checkpointType || (!targetTaskId && !requesterSessionId)) {
+      return {
+        ok: false,
+        accepted: false,
+        error: 'invalid_interaction_reply',
+        checkpoint_id: checkpointId,
+        checkpoint_type: checkpointType,
+        client_request_id: clientRequestId,
+      }
+    }
+    const decision: InteractionDecision = {
+      text: content,
+      ...(metadata?.interaction_option_id ? { option_id: metadata.interaction_option_id } : {}),
+      ...(metadata?.interaction_option_label ? { option_label: metadata.interaction_option_label } : {}),
+      ...(metadata?.checkpoint_reply_kind ? { checkpoint_reply_kind: metadata.checkpoint_reply_kind } : {}),
+      ...(metadata?.self_evolution_trigger !== undefined ? { self_evolution_trigger: metadata.self_evolution_trigger } : {}),
+      ...(metadata?.human_feedback_text !== undefined ? { human_feedback_text: metadata.human_feedback_text } : {}),
+      ...(metadata?.recruitment_role_agents ? { recruitment_role_agents: metadata.recruitment_role_agents } : {}),
+      ...(metadata?.recruitment_agent ? { recruitment_agent: metadata.recruitment_agent } : {}),
+      ...(metadata?.staffing_action ? { staffing_action: metadata.staffing_action } : {}),
+      ...(metadata?.staffing_selections ? { staffing_selections: metadata.staffing_selections } : {}),
+      ...(metadata?.user_input_answers ? { user_input_answers: metadata.user_input_answers } : {}),
+    }
+    return onInteractionReply({
+      checkpointId,
+      checkpointType,
+      clientRequestId,
+      requesterTaskId: targetTaskId,
+      requesterSessionId,
+      decision,
+    })
+  }, [activeSessionId, onInteractionReply, sessions])
 
   const handleOpenWorkItemSession = useCallback((executionTurnId: string) => {
     const session = sessions.find(s => (
@@ -1232,7 +1263,7 @@ export function WorkspacePage({
         onExpand={() => setPanelState('open')}
         onMaximize={() => setPanelState(prev => prev === 'maximized' ? 'open' : 'maximized')}
         onComposerSend={handleComposerSend}
-        onMessageSend={handleMessageSend}
+        onInteractionReply={handleInteractionReply}
         onSessionSend={dispatchSessionSend}
         onWorkItemClick={handleWorkItemClick}
         onWorkItemOpenSession={handleOpenWorkItemSession}

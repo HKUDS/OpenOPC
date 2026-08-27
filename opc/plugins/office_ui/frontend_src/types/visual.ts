@@ -249,6 +249,62 @@ export interface OrgRole {
   role_type?: string
   skill_refs?: string[]
   artifact_contract_ref?: string | null
+  capabilities?: string[]
+  execution_unit_kind?: string
+  external_team_binding_id?: string | null
+  external_team_boundary_role_id?: string | null
+  external_team_boundary?: boolean
+  covered_by_external_team?: boolean
+  selected_execution_agent?: string | null
+  staffing_locked?: boolean
+  staffing_mode?: string | null
+  external_team_capability_manifest?: ExternalTeamCapabilityManifest | null
+}
+
+export interface ExternalTeamCoveredRole {
+  role_id: string
+  name: string
+  responsibility: string
+  capabilities?: string[]
+  skill_refs?: string[]
+  tools?: string[]
+  prompt_refs?: string[]
+  artifact_contract_ref?: string | null
+}
+
+export interface ExternalTeamCapabilityManifest {
+  schema_version: number
+  execution_unit_id: string
+  organizational_identity: string
+  display_name: string
+  provider: string
+  provider_mode: string
+  scope: 'role' | 'subtree' | string
+  covered_role_ids: string[]
+  covered_roles: ExternalTeamCoveredRole[]
+  capabilities: string[]
+  skill_refs: string[]
+  tools: string[]
+  prompt_refs: string[]
+  deliverables: string[]
+  artifact_contract_refs: string[]
+  out_of_scope: string[]
+  review_owner_role_id: string
+  org_version: number
+  manifest_hash: string
+}
+
+export interface ExternalExecutionUnit {
+  binding_id: string
+  boundary_role_id: string
+  external_agent: string
+  covered_role_ids: string[]
+  canonical_seat_id: string
+  scope: 'role' | 'subtree' | string
+  collapse_subtree: boolean
+  review_owner_role_id: string
+  execution_unit_kind: 'opaque_external_team' | string
+  capability_manifest?: ExternalTeamCapabilityManifest
 }
 
 export interface OrgEmployee {
@@ -487,6 +543,9 @@ export interface OrgInfoPayload {
   runtime_topology_version: number
   installed_packages?: InstalledPackageInfo[]
   runtime_policy?: RuntimePolicy
+  external_team_bindings?: Array<Record<string, unknown>>
+  external_execution_units?: ExternalExecutionUnit[]
+  external_agent_profiles?: Array<Record<string, unknown>>
 }
 
 // ── Phase 4: Talent Market ────────────────────────────────────────────────
@@ -537,6 +596,7 @@ export interface ReorgChangesetSummary {
 }
 
 export interface ReorgProposalInfo {
+  project_id: string
   proposal_id: string
   title: string
   summary: string
@@ -547,10 +607,17 @@ export interface ReorgProposalInfo {
   initiated_by: string
   changeset: ReorgChangesetSummary
   impact_summary: Record<string, unknown>
+  user_confirmation_required: boolean
+  checkpoint_id: string
+  checkpoint_type: string
+  checkpoint_status: string
+  requester_task_id: string
+  requester_session_id: string
   created_at: number
   updated_at: number
 }
 
 export interface ReorgListPayload {
+  project_id: string
   proposals: ReorgProposalInfo[]
 }

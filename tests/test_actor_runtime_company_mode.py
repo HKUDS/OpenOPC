@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import tempfile
 import unittest
 from pathlib import Path
@@ -30,6 +31,7 @@ from opc.layer2_organization.work_item_identity import (
     WORK_ITEM_PROJECTION_ID_KEY,
     WORK_ITEM_TURN_TYPE_KEY,
     canonical_work_item_turn_type_for_kind,
+    company_work_item_gate_basis_hash,
     gate_rework_payload,
     mark_gate_rework_projection,
     mark_projected_work_item_task,
@@ -95,6 +97,14 @@ class ActorRuntimeOrgEngineTests(unittest.TestCase):
             self.assertEqual(seats_by_id["seat::team::cto::cto"]["manager_seat_id"], "seat::team::ceo::cto")
             self.assertEqual(seats_by_id["seat::team::ceo::cto"]["managed_team_id"], "team::cto")
             self.assertTrue(seats_by_id["seat::team::ceo::cto"]["metadata"]["configured_seat"])
+
+    def test_execution_model_comes_from_active_organization_config(self) -> None:
+        config = OPCConfig()
+        config.org.execution_model = "configured_actor_runtime"
+
+        engine = OrgEngine(config)
+
+        self.assertEqual(engine.get_execution_model(), "configured_actor_runtime")
 
 
 class WorkItemRuntimeMetadataTests(unittest.TestCase):
@@ -336,6 +346,56 @@ class WorkItemProjectionIdentityTests(unittest.TestCase):
         self.assertEqual(
             set(payload),
             {"review_projection_id", GATE_TARGET_PROJECTION_ID_KEY, GATE_REWORK_PROJECTION_ID_KEY},
+        )
+
+    def test_company_work_item_gate_basis_binds_policy_and_pending_decision(self) -> None:
+        task = Task(
+            id="gate-task",
+            project_id="project-a",
+            metadata=mark_work_item_projection(
+                {
+                    "claimed_work_item_attempt_seq": 3,
+                    "gate_harness_pending_decision": {
+                        "action": "await_user_decision",
+                        "constraints": ["keep audit evidence"],
+                        "blockers": ["owner confirmation required"],
+                    },
+                },
+                projection_id="review-output",
+                turn_type="review",
+            ),
+        )
+        gate = {
+            "type": "human_confirmation",
+            "instructions": "Confirm the reviewed output.",
+            "requires_human": True,
+            "on_reject": "rework",
+            "rework_projection_id": "draft-output",
+            "max_retries": 1,
+            "metadata": {
+                "source": "gate_harness",
+                "recommended_action": "await_user_decision",
+                "constraints": ["keep audit evidence"],
+                "blockers": ["owner confirmation required"],
+            },
+        }
+
+        baseline = company_work_item_gate_basis_hash(task, gate)
+        changed_gate = {
+            **gate,
+            "rework_projection_id": "different-output",
+        }
+        self.assertNotEqual(
+            baseline,
+            company_work_item_gate_basis_hash(task, changed_gate),
+        )
+        task.metadata["gate_harness_pending_decision"] = {
+            **task.metadata["gate_harness_pending_decision"],
+            "blockers": ["a different durable blocker"],
+        }
+        self.assertNotEqual(
+            baseline,
+            company_work_item_gate_basis_hash(task, gate),
         )
 
     def test_delegation_work_item_projection_field_is_canonical(self) -> None:
@@ -1531,6 +1591,164 @@ class ActorRuntimeManagerDispatchGuardTests(unittest.IsolatedAsyncioTestCase):
 
 
 class CompanyModeParallelIsolationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_dispatcher_waits_for_old_attempt_tail_before_self_rework_claim(self) -> None:
+        org_engine = SimpleNamespace(
+            get_agent=lambda role_id: SimpleNamespace(
+                role_id=role_id,
+                reports_to="owner",
+            )
+        )
+        executor = CompanyWorkItemExecutor(
+            org_engine=org_engine,
+            communication=SimpleNamespace(),
+            approval_engine=SimpleNamespace(),
+            memory=None,
+            execute_task=AsyncMock(),
+            save_task=AsyncMock(),
+            store=None,
+            llm=None,
+        )
+        executor.on_kanban_changed = AsyncMock()
+        task = Task(
+            id="delivery-task",
+            title="Delivery",
+            session_id="root-a",
+            parent_session_id="root-a",
+            project_id="proj1",
+            assigned_to="lead",
+            status=TaskStatus.PENDING,
+            metadata={
+                "runtime_model": "multi_team_org",
+                "work_item_projection_id": "lead::delivery::one",
+                "work_item_role_id": "lead",
+                "delegation_run_id": "run-1",
+                "employee_assignment": {
+                    "employee_id": "lead-a",
+                    "role_id": "lead",
+                },
+            },
+        )
+        set_linked_work_item_id(task, "delivery-wi")
+        work_item = DelegationWorkItem(
+            work_item_id="delivery-wi",
+            run_id="run-1",
+            cell_id="team::lead",
+            role_id="lead",
+            title="Delivery",
+            kind="delivery",
+            projection_id="lead::delivery::one",
+            phase=Phase.READY,
+            metadata={"runtime_model": "multi_team_org"},
+        )
+        member_session, role_session = executor.runtime.ensure_role_instance_session(
+            task
+        )
+        self.assertIsNotNone(role_session)
+        executor.runtime.bootstrap = AsyncMock()
+        executor.runtime.refresh_inbox_state = AsyncMock()
+        executor._load_delegation_work_items = AsyncMock(
+            side_effect=lambda _tasks: [work_item]
+        )
+        executor._refresh_ready_work_items = AsyncMock(
+            side_effect=lambda items, tasks=None: items
+        )
+        executor._materialize_work_item_tasks = AsyncMock(
+            side_effect=lambda tasks, _items: tasks
+        )
+        executor._queue_multi_team_response_tasks = AsyncMock(
+            side_effect=lambda tasks, items: (tasks, items)
+        )
+        executor._reconcile_role_serial_queues = AsyncMock(
+            side_effect=lambda items: items
+        )
+        executor._sync_task_projection_from_work_items = lambda _tasks, _items: None
+        executor._diagnose_work_item_runtime_projection_issues = AsyncMock()
+        executor._summarize_multi_team_org_results = lambda _tasks: "done"
+
+        old_tail_released_claim = asyncio.Event()
+        old_tail_may_finish = asyncio.Event()
+        excluded_claim_pass_seen = asyncio.Event()
+        second_attempt_started = asyncio.Event()
+        attempt_starts = 0
+        concurrent_owners = 0
+        max_concurrent_owners = 0
+        original_claim = executor.runtime.claim_runnable_tasks
+
+        async def observed_claim(tasks, work_items=None, **kwargs):
+            result = await original_claim(tasks, work_items=work_items, **kwargs)
+            if old_tail_released_claim.is_set() and not old_tail_may_finish.is_set():
+                self.assertIn(task.id, kwargs["excluded_task_ids"])
+                self.assertIn(work_item.work_item_id, kwargs["excluded_work_item_ids"])
+                self.assertIn(
+                    member_session.member_session_id,
+                    kwargs["excluded_member_session_ids"],
+                )
+                self.assertIn(
+                    member_session.role_session_id,
+                    kwargs["excluded_role_session_ids"],
+                )
+                self.assertEqual(result, [])
+                excluded_claim_pass_seen.set()
+            return result
+
+        executor.runtime.claim_runnable_tasks = observed_claim
+
+        async def run_claimed(member, claimed_task, _task_by_projection_id):
+            nonlocal attempt_starts, concurrent_owners, max_concurrent_owners
+            attempt_starts += 1
+            concurrent_owners += 1
+            max_concurrent_owners = max(max_concurrent_owners, concurrent_owners)
+            try:
+                executor.runtime._claimed_task_ids.discard(claimed_task.id)
+                executor.runtime._claimed_work_item_ids.discard(
+                    linked_work_item_id_for_task(claimed_task)
+                )
+                member.status = member.resident_status = "idle"
+                member.current_task_id = ""
+                member.focused_work_item_id = ""
+                assert role_session is not None
+                role_session.status = "idle"
+                role_session.focused_work_item_id = ""
+                work_item.claimed_by_role_runtime_session_id = ""
+                work_item.claimed_by_seat_id = ""
+                if attempt_starts == 1:
+                    work_item.phase = Phase.READY_FOR_REWORK
+                    claimed_task.status = TaskStatus.PENDING
+                    old_tail_released_claim.set()
+                    executor._signal_dispatcher_wake()
+                    await old_tail_may_finish.wait()
+                else:
+                    work_item.phase = Phase.APPROVED
+                    claimed_task.status = TaskStatus.DONE
+                    second_attempt_started.set()
+                return TaskResult(status=TaskStatus.DONE, content="done")
+            finally:
+                concurrent_owners -= 1
+
+        executor._run_claimed_work_item = run_claimed
+        dispatcher = asyncio.create_task(
+            executor._execute_multi_team_org_scoped(
+                SimpleNamespace(metadata={}),
+                [task],
+            )
+        )
+        try:
+            await asyncio.wait_for(old_tail_released_claim.wait(), timeout=2)
+            await asyncio.wait_for(excluded_claim_pass_seen.wait(), timeout=2)
+            self.assertEqual(attempt_starts, 1)
+            self.assertFalse(second_attempt_started.is_set())
+
+            old_tail_may_finish.set()
+            await asyncio.wait_for(second_attempt_started.wait(), timeout=2)
+            self.assertEqual(await asyncio.wait_for(dispatcher, timeout=2), "done")
+        finally:
+            if not dispatcher.done():
+                dispatcher.cancel()
+                await asyncio.gather(dispatcher, return_exceptions=True)
+
+        self.assertEqual(attempt_starts, 2)
+        self.assertEqual(max_concurrent_owners, 1)
+
     async def test_execute_multi_team_org_isolates_claimed_work_item_exception(self) -> None:
         executor = CompanyWorkItemExecutor(
             org_engine=SimpleNamespace(),
@@ -1629,7 +1847,7 @@ class CompanyModeParallelIsolationTests(unittest.IsolatedAsyncioTestCase):
         executor._summarize_multi_team_org_results = lambda tasks: "isolated"
         claimed_once = False
 
-        async def fake_claim_runnable_tasks(tasks, work_items=None):
+        async def fake_claim_runnable_tasks(tasks, work_items=None, **_kwargs):
             nonlocal claimed_once
             _ = (tasks, work_items)
             if claimed_once:

@@ -744,6 +744,10 @@ class SpawnDeliveryCardTests(unittest.IsolatedAsyncioTestCase):
                 "comms_workspace_root": "/tmp/ws",
                 "target_output_dir": "/tmp/ws/proj",
                 "runtime_model": "multi_team_org",
+                "employee_assignment": {
+                    "employee_id": "chief-of-staff",
+                    "role_id": "ceo",
+                },
             },
         )
         await self.store.save_delegation_work_item(intake_wi)
@@ -780,10 +784,18 @@ class SpawnDeliveryCardTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(d.metadata.get("review_owner_kind"), "human")
         self.assertEqual(d.metadata.get("work_kind"), "delivery")
+        self.assertEqual(d.metadata.get("current_turn_mode"), "deliver_required")
+        self.assertEqual(
+            d.metadata.get("employee_assignment"),
+            {"employee_id": "chief-of-staff", "role_id": "ceo"},
+        )
         self.assertEqual(d.metadata.get("intake_work_item_id"), "intake-1")
+        self.assertEqual(d.metadata.get("allowed_delegate_role_ids"), [])
         self.assertTrue(d.metadata.get("user_visible"))
         self.assertTrue(d.metadata.get("authoritative_output"))
         self.assertTrue(d.metadata.get("requires_user_feedback"))
+        self.assertIsInstance(d.metadata.get("prompt_contract"), dict)
+        self.assertTrue(d.metadata["prompt_contract"])
 
     async def test_spawn_delivery_card_respects_required_feedback_policy(self) -> None:
         from opc.layer2_organization.company_mode import CompanyWorkItemExecutor

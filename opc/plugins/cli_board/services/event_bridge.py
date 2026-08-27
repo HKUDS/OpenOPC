@@ -38,7 +38,7 @@ class CliBoardEventBridge:
                     await self._sink({"kind": "refresh", "reason": f"status:{status}"})
                 return
 
-        if event_type in {"task_created", "child_session_created", "escalation_created"}:
+        if event_type in {"task_created", "child_session_created"}:
             await self._sink({"kind": "refresh", "reason": event_type})
             return
 

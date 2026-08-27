@@ -7,6 +7,10 @@ import uuid
 from typing import TYPE_CHECKING, Any
 
 from opc.core.models import Task, TaskStatus
+from opc.core.interaction_protocol import (
+    OWNER_INTERACTION_CHECKPOINT_TYPES,
+    owner_interaction_actor_identity,
+)
 from opc.layer2_organization.work_item_transition import apply_task_status_transition
 from opc.presentation.kanban import column_to_task_status
 from opc.plugins.office_ui.services.factory import OfficeServiceFactory
@@ -205,15 +209,47 @@ class BoardActions:
         await self._resolve_related_checkpoints(task_id, status="cancelled")
 
     async def approve_checkpoint(self, task_id: str, *, approved: bool = True, reply: str | None = None) -> str:
+        engine = await self.facade.ensure_ready()
+        if not engine.store:
+            raise RuntimeError("OPC store is not available.")
+
         if reply is not None:
             message = reply
         else:
             message = "approve" if approved else "deny"
-        return await self.send_session_message(
-            task_id,
-            message,
-            allow_terminal=True,
+
+        checkpoint, requester_task_id, requester_session_id, requester_actor = (
+            await self._locate_owner_checkpoint(task_id)
         )
+        reply_text = str(reply or "").strip().lower()
+        denies = (not approved and reply is None) or reply_text.startswith("deny")
+        if (
+            checkpoint.checkpoint_type
+            in {"tool_permission", "action_permission"}
+            and not denies
+        ):
+            raise PermissionError(
+                "The CLI board cannot approve exact tool/action permissions; "
+                "review the complete payload in Office UI. Denial is allowed."
+            )
+        translate = getattr(engine, "build_compatibility_checkpoint_decision", None)
+        submit = getattr(engine, "submit_checkpoint_decision", None)
+        if not callable(translate) or not callable(submit):
+            raise RuntimeError("The engine does not support durable checkpoint replies.")
+        decision = translate(checkpoint, message, None)
+        receipt = await submit(
+            checkpoint_id=checkpoint.checkpoint_id,
+            checkpoint_type=checkpoint.checkpoint_type,
+            decision=decision,
+            client_request_id=f"cli-board:{checkpoint.checkpoint_id}:{uuid.uuid4().hex}",
+            requester_task_id=requester_task_id,
+            requester_session_id=requester_session_id or None,
+            requester_actor=requester_actor,
+        )
+        if not bool(receipt.get("accepted")):
+            reason = str(receipt.get("reason", "") or "invalid_decision").strip()
+            raise RuntimeError(f"Checkpoint response was not accepted ({reason}).")
+        return "Checkpoint response accepted."
 
     def is_running(self, task_id: str) -> bool:
         task = self._task_bg_map.get(task_id)
@@ -234,6 +270,108 @@ class BoardActions:
         if task is None:
             raise ValueError(f"Unknown task: {task_id}")
         return task
+
+    async def _locate_owner_checkpoint(
+        self,
+        target_id: str,
+    ) -> tuple[Any, str, str, dict[str, Any] | None]:
+        """Resolve one visible owner card without entering the conversation lock."""
+
+        engine = await self.facade.ensure_ready()
+        if not engine.store:
+            raise RuntimeError("OPC store is not available.")
+        target_id = str(target_id or "").strip()
+        if not target_id:
+            raise ValueError("A task or work-item id is required.")
+
+        target_task = await engine.store.get_task(target_id)
+        related_tasks = (
+            await self._collect_related_tasks(target_id)
+            if target_task is not None
+            else []
+        )
+        related_task_ids = {
+            str(task.id or "").strip()
+            for task in related_tasks
+            if str(task.id or "").strip()
+        }
+        related_session_ids = {
+            str(task.session_id or "").strip()
+            for task in related_tasks
+            if str(task.session_id or "").strip()
+        }
+        checkpoints = await engine.store.get_pending_checkpoints(
+            project_id=self._project_id,
+            checkpoint_types=sorted(OWNER_INTERACTION_CHECKPOINT_TYPES),
+        )
+        visibility_check = getattr(engine, "can_answer_checkpoint", None)
+        if not callable(visibility_check):
+            raise RuntimeError("The engine cannot authorize checkpoint replies.")
+
+        visible: list[tuple[Any, str, str, dict[str, Any] | None]] = []
+        for checkpoint in checkpoints:
+            if (
+                str(getattr(checkpoint, "checkpoint_type", "") or "").strip()
+                not in OWNER_INTERACTION_CHECKPOINT_TYPES
+            ):
+                continue
+            payload = dict(getattr(checkpoint, "payload", {}) or {})
+            interaction = dict(payload.get("interaction", {}) or {})
+            ownership = dict(interaction.get("ownership", {}) or {})
+            checkpoint_task_id = str(getattr(checkpoint, "task_id", "") or "").strip()
+            checkpoint_session_id = str(getattr(checkpoint, "session_id", "") or "").strip()
+            reference_ids = {
+                checkpoint_task_id,
+                checkpoint_session_id,
+                str(ownership.get("waiting_task_id", "") or "").strip(),
+                str(ownership.get("waiting_session_id", "") or "").strip(),
+                str(ownership.get("ui_anchor_task_id", "") or "").strip(),
+                str(ownership.get("ui_anchor_session_id", "") or "").strip(),
+                str(ownership.get("root_session_id", "") or "").strip(),
+                str(ownership.get("work_item_id", "") or "").strip(),
+            }
+            reference_ids.discard("")
+            if not (
+                target_id in reference_ids
+                or checkpoint_task_id in related_task_ids
+                or checkpoint_session_id in related_session_ids
+            ):
+                continue
+
+            requester_task_id, requester_session_id = (
+                owner_interaction_actor_identity(checkpoint)
+            )
+            requester_actor: dict[str, Any] | None = None
+            if not requester_task_id and not requester_session_id:
+                issue_actor = getattr(engine, "issue_project_owner_actor", None)
+                if not callable(issue_actor):
+                    continue
+                requester_actor = issue_actor(interface="cli_board")
+            allowed = visibility_check(
+                checkpoint,
+                requester_task_id=requester_task_id,
+                requester_session_id=requester_session_id or None,
+                requester_actor=requester_actor,
+            )
+            if asyncio.iscoroutine(allowed):
+                allowed = await allowed
+            if allowed:
+                visible.append(
+                    (
+                        checkpoint,
+                        requester_task_id,
+                        requester_session_id,
+                        requester_actor,
+                    )
+                )
+
+        if not visible:
+            raise ValueError("No pending owner checkpoint is available for this item.")
+        if len(visible) != 1:
+            raise ValueError(
+                "Multiple pending owner checkpoints are available; select an exact checkpoint."
+            )
+        return visible[0]
 
     async def _collect_related_tasks(self, task_id: str) -> list[Task]:
         engine = await self.facade.ensure_ready()
@@ -284,4 +422,26 @@ class BoardActions:
         checkpoints = await engine.store.get_pending_checkpoints(project_id=self._project_id)
         for checkpoint in checkpoints:
             if checkpoint.task_id in task_ids or checkpoint.session_id in session_ids:
-                await engine.store.resolve_execution_checkpoint(checkpoint.checkpoint_id, status=status)
+                if checkpoint.checkpoint_type in OWNER_INTERACTION_CHECKPOINT_TYPES:
+                    coordinator = getattr(engine, "interaction_coordinator", None)
+                    if coordinator is None:
+                        raise RuntimeError(
+                            "owner interaction coordinator is unavailable"
+                        )
+                    await coordinator.close_pending_owner_checkpoint(
+                        checkpoint.checkpoint_id,
+                        checkpoint_type=checkpoint.checkpoint_type,
+                        status=status,
+                        payload_patch={
+                            "administrative_reason": "cli_board_related_task_closed"
+                        },
+                    )
+                else:
+                    await engine.store.patch_execution_checkpoint_payload(
+                        checkpoint.checkpoint_id,
+                        project_id=self._project_id,
+                        checkpoint_type=checkpoint.checkpoint_type,
+                        expected_statuses=["pending"],
+                        payload_patch={},
+                        status=status,
+                    )

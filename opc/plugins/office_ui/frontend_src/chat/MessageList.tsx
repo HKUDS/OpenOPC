@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
-import type { AttachmentRefMeta, ChatMessage, CheckpointReplyMetadata } from '../types/chat'
+import type { AttachmentRefMeta, ChatMessage, CheckpointReplyMetadata, InteractionReplyReceipt } from '../types/chat'
 import type { ProgressEntry, RoleWorkItemSummary, Session, WorkItemProgressEntry } from '../types/kanban'
 import { progressEntryKey } from '../lib/progressEntryKey'
 import { stableMessageTimelineKey } from '../lib/messageTimelineIdentity'
@@ -136,7 +136,7 @@ interface MessageListProps {
   roleWorkItems?: Record<string, RoleWorkItemSummary>
   /** Display-only executor-role rollup for the Execution Progress card. */
   executorRoleWorkItems?: Record<string, RoleWorkItemSummary>
-  onSend?: (text: string, taskId?: string, metadata?: CheckpointReplyMetadata) => void
+  onInteractionReply?: (text: string, taskId?: string, metadata?: CheckpointReplyMetadata) => Promise<InteractionReplyReceipt>
   onWorkItemClick?: (executionTurnId: string) => void
   onWorkItemOpenSession?: (executionTurnId: string) => void
   onMarkRead?: () => void
@@ -1021,9 +1021,9 @@ interface AgentRowProps {
   suppressCheckpointPanel: boolean
   keepExpanded?: boolean
   onCopy: (id: string, content: string) => void
-  onSend?: (text: string, taskId?: string, metadata?: CheckpointReplyMetadata) => void
+  onInteractionReply?: (text: string, taskId?: string, metadata?: CheckpointReplyMetadata) => Promise<InteractionReplyReceipt>
 }
-const AgentRow = React.memo(function AgentRow({ msg, showDate, dateStr, isGrouped, isCopied, isCheckpointResponded, suppressCheckpointPanel, keepExpanded, onCopy, onSend }: AgentRowProps) {
+const AgentRow = React.memo(function AgentRow({ msg, showDate, dateStr, isGrouped, isCopied, isCheckpointResponded, suppressCheckpointPanel, keepExpanded, onCopy, onInteractionReply }: AgentRowProps) {
   const isDeleted = !!msg.senderDeleted
   const displayName = isDeleted ? '[Deleted]' : msg.senderName
   const color = agentColor(msg.sender === 'system' ? (msg.senderName || 'OPC') : msg.sender)
@@ -1033,6 +1033,44 @@ const AgentRow = React.memo(function AgentRow({ msg, showDate, dateStr, isGroupe
   const checkpointType = String(msg.metadata?.checkpoint_type ?? '').trim()
   const checkpointReplyMeta = toCheckpointReplyMetadata(msg.metadata)
   const hasCheckpointPanel = isCheckpointCardMetadata(msg.metadata) && !suppressCheckpointPanel
+  const [interactionAccepted, setInteractionAccepted] = useState(false)
+  const [interactionSubmitting, setInteractionSubmitting] = useState(false)
+  const [interactionError, setInteractionError] = useState('')
+  const interactionRequestIdRef = useRef<string>('')
+  if (!interactionRequestIdRef.current) {
+    const cryptoApi = globalThis.crypto
+    interactionRequestIdRef.current = cryptoApi && typeof cryptoApi.randomUUID === 'function'
+      ? `interaction-ui-${cryptoApi.randomUUID()}`
+      : `interaction-ui-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`
+  }
+  const checkpointResponded = isCheckpointResponded || interactionAccepted
+  const submitInteraction = useCallback(async (
+    text: string,
+    metadata?: CheckpointReplyMetadata,
+  ) => {
+    if (!onInteractionReply || interactionSubmitting || checkpointResponded) return false
+    setInteractionSubmitting(true)
+    setInteractionError('')
+    try {
+      const receipt = await onInteractionReply(text, replyTaskId, {
+        ...checkpointReplyMeta,
+        ...metadata,
+        ui_message_id: interactionRequestIdRef.current,
+      })
+      if (receipt.ok && receipt.accepted) {
+        setInteractionAccepted(true)
+        return true
+      } else {
+        setInteractionError(receipt.reason || receipt.error || 'Decision was not accepted.')
+        return false
+      }
+    } catch (error) {
+      setInteractionError(error instanceof Error ? error.message : 'Decision was not accepted.')
+      return false
+    } finally {
+      setInteractionSubmitting(false)
+    }
+  }, [checkpointReplyMeta, checkpointResponded, interactionSubmitting, onInteractionReply, replyTaskId])
 
   return (
     <div>
@@ -1060,52 +1098,57 @@ const AgentRow = React.memo(function AgentRow({ msg, showDate, dateStr, isGroupe
               {checkpointType === 'company_recruitment_confirmation' && (
                 <RecruitmentPanel
                   meta={msg.metadata!}
-                  onReply={(text, extraMetadata) => onSend?.(text, replyTaskId, extraMetadata)}
-                  responded={isCheckpointResponded}
+                  onReply={(text, extraMetadata) => submitInteraction(text, extraMetadata)}
+                  responded={checkpointResponded}
                 />
               )}
               {checkpointType === 'company_staffing_selection' && (
                 <StaffingSelectionPanel
                   meta={msg.metadata!}
-                  onReply={(text, extraMetadata) => onSend?.(text, replyTaskId, extraMetadata)}
-                  responded={isCheckpointResponded}
+                  onReply={(text, extraMetadata) => { void submitInteraction(text, extraMetadata) }}
+                  responded={checkpointResponded}
                 />
               )}
               {checkpointType === 'company_work_item_gate' && (
                 <EscalationPanel
                   meta={msg.metadata!}
-                  onReply={(text) => onSend?.(text, replyTaskId, checkpointReplyMeta)}
-                  responded={isCheckpointResponded}
+                  onReply={(text, extraMetadata) => { void submitInteraction(text, extraMetadata) }}
+                  responded={checkpointResponded}
+                  submitting={interactionSubmitting}
                 />
               )}
               {checkpointType === 'company_delivery_feedback' && (
                 <DeliveryFeedbackPanel
                   meta={msg.metadata!}
-                  onReply={(text, extraMetadata) => onSend?.(text, replyTaskId, extraMetadata ?? checkpointReplyMeta)}
-                  responded={isCheckpointResponded}
+                  onReply={(text, extraMetadata) => submitInteraction(text, extraMetadata)}
+                  responded={checkpointResponded}
+                  submitting={interactionSubmitting}
                 />
               )}
               {checkpointType === 'company_reorg_pending' && (
                 <ReorgPanel
                   meta={msg.metadata!}
-                  onReply={(text) => onSend?.(text, replyTaskId, checkpointReplyMeta)}
-                  responded={isCheckpointResponded}
+                  onReply={(text) => { void submitInteraction(text) }}
+                  responded={checkpointResponded}
                 />
               )}
-              {checkpointType === 'human_escalation' && (
+              {['tool_permission', 'action_permission'].includes(checkpointType) && (
                 <EscalationPanel
                   meta={msg.metadata!}
-                  onReply={(text) => onSend?.(text, replyTaskId, checkpointReplyMeta)}
-                  responded={isCheckpointResponded}
+                  onReply={(text, extraMetadata) => { void submitInteraction(text, extraMetadata) }}
+                  responded={checkpointResponded}
+                  submitting={interactionSubmitting}
                 />
               )}
-              {checkpointType === 'task_user_input' && (
+              {['task_user_input', 'route_clarification', 'company_runtime_selection', 'company_run_failure_review'].includes(checkpointType) && (
                 <TaskUserInputPanel
                   meta={msg.metadata!}
-                  onReply={(text, extraMetadata) => onSend?.(text, replyTaskId, { ...checkpointReplyMeta, ...extraMetadata } as CheckpointReplyMetadata)}
-                  responded={isCheckpointResponded}
+                  onReply={(text, extraMetadata) => { void submitInteraction(text, extraMetadata) }}
+                  responded={checkpointResponded}
                 />
               )}
+              {interactionSubmitting && <div className="ckpt-escalation-hint">Saving decision…</div>}
+              {interactionError && <div className="ckpt-escalation-hint" role="alert">{interactionError}</div>}
             </>
           ) : (
             <div className="msg-content-agent-card" style={{ borderLeftColor: color }}>
@@ -1157,7 +1200,7 @@ export const MessageList = React.memo(function MessageList({
   childSessions,
   roleWorkItems,
   executorRoleWorkItems,
-  onSend,
+  onInteractionReply,
   onWorkItemClick,
   onMarkRead,
   hasOlderHistory = false,
@@ -1235,10 +1278,10 @@ export const MessageList = React.memo(function MessageList({
     [filteredMessages],
   )
   const pendingCheckpointMessages = useMemo(
-    () => viewKind === 'session' && !!onSend
+    () => viewKind === 'session' && !!onInteractionReply
       ? filteredMessages.filter(message => checkpointAnalysis.pendingMessageIds.has(message.id))
       : [],
-    [checkpointAnalysis.pendingMessageIds, filteredMessages, onSend, viewKind],
+    [checkpointAnalysis.pendingMessageIds, filteredMessages, onInteractionReply, viewKind],
   )
   // Checkpoint cards never leave the chronological transcript. Their pending
   // state only controls the fixed reminder rendered outside the scroll flow.
@@ -2001,10 +2044,10 @@ export const MessageList = React.memo(function MessageList({
         isCheckpointResponded={checkpointAnalysis.respondedMessageIds.has(msg.id)}
         suppressCheckpointPanel={checkpointAnalysis.duplicateMessageIds.has(msg.id)}
         keepExpanded={keepExpanded}
-        onCopy={copyMsg} onSend={onSend}
+        onCopy={copyMsg} onInteractionReply={onInteractionReply}
       />
     )
-  }, [checkpointAnalysis, copiedId, copyMsg, detailMode, onSend, renderUserMarkdown, scrollScope])
+  }, [checkpointAnalysis, copiedId, copyMsg, detailMode, onInteractionReply, renderUserMarkdown, scrollScope])
 
   const welcome = WELCOME[viewKind]
 

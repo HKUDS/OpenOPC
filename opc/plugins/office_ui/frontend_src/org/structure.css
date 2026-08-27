@@ -640,6 +640,23 @@
   line-height: 1.2;
 }
 .is-owner .oc-canvas-node-meta { color: var(--text-secondary); }
+
+.oc-canvas-node-team {
+  display: block;
+  max-width: 148px;
+  margin-top: 2px;
+  overflow: hidden;
+  color: var(--accent);
+  font-size: 10px;
+  font-weight: 650;
+  line-height: 1.2;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.oc-canvas-node.is-external-team-boundary {
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 65%, transparent);
+}
 .oc-canvas-node-id {
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   opacity: 0.8;
@@ -845,6 +862,50 @@
 }
 .ri-radio:has(input:checked) { border-color: var(--accent); color: var(--accent); background: color-mix(in srgb, var(--accent) 8%, transparent); }
 .ri-radio input { margin: 0; accent-color: var(--accent); }
+
+.ri-scope-options { display: grid; gap: 7px; }
+.ri-scope-option {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 8px 9px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-xs);
+  color: var(--text-secondary);
+  cursor: pointer;
+}
+.ri-scope-option:has(input:checked) {
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 8%, transparent);
+  color: var(--text);
+}
+.ri-scope-option input { margin-top: 2px; accent-color: var(--accent); }
+.ri-scope-option span { display: flex; min-width: 0; flex-direction: column; gap: 2px; }
+.ri-scope-option b { font-size: 11.5px; font-weight: 600; }
+.ri-scope-option small { font-size: 10.5px; line-height: 1.4; color: var(--text-secondary); }
+.ri-team-notice,
+.ri-team-card {
+  padding: 9px 10px;
+  border: 1px solid color-mix(in srgb, var(--accent) 32%, var(--border));
+  border-radius: var(--radius-xs);
+  background: color-mix(in srgb, var(--accent) 7%, transparent);
+  font-size: 11px;
+  line-height: 1.45;
+  color: var(--text-secondary);
+}
+.ri-team-card { display: flex; flex-direction: column; gap: 8px; }
+.ri-team-card-title { display: flex; justify-content: space-between; gap: 8px; color: var(--text); font-weight: 600; }
+.ri-team-card-title code,
+.ri-team-card-copy code,
+.ri-team-notice code { font-size: 10px; color: var(--accent); }
+.ri-team-covered-list { display: grid; gap: 3px; }
+.ri-team-covered-role { display: flex; justify-content: space-between; gap: 8px; }
+.ri-team-covered-role code { color: var(--text-secondary); font-size: 9.5px; }
+.ri-team-capabilities { display: flex; flex-direction: column; gap: 3px; padding-top: 7px; border-top: 1px solid var(--border); }
+.ri-team-capabilities b { color: var(--text); }
+.ri-team-capabilities code { width: fit-content; color: var(--text-secondary); font-size: 9px; }
+.ri-field-hint { font-size: 10px; line-height: 1.4; color: var(--text-secondary); }
+.rt-team-agent { display: inline-flex; max-width: 190px; color: var(--accent); font-size: 10.5px; font-weight: 600; }
 
 /* ── Icon picker ──────────────────────────────────────────────── */
 

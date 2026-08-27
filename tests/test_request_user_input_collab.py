@@ -21,6 +21,7 @@ from opc.core.models import (
 )
 from opc.database.store import OPCStore
 from opc.engine import OPCEngine
+from opc.layer0_interaction.coordinator import InteractionCoordinator
 from opc.layer2_organization.communication import CommunicationManager
 from opc.layer2_organization.work_item_links import set_linked_work_item_id
 from opc.layer4_tools.collaboration import build_external_cli_tool_contract_lines, create_collaboration_tools
@@ -202,12 +203,33 @@ class RequestUserInputCollabTests(unittest.IsolatedAsyncioTestCase):
                         "execution_mode": ExecutionMode.SINGLE_AGENT.value,
                         "pause_request": pause_request,
                         "runtime_v2": {"runtime_session_id": "rt-1"},
+                        "interaction": {
+                            "kind": "task_user_input",
+                            "domain_key": "task-user-input:cp-resume-input",
+                            "ownership": {
+                                "waiting_task_id": task.id,
+                                "waiting_session_id": task.session_id,
+                                "ui_anchor_task_id": task.id,
+                                "ui_anchor_session_id": task.session_id,
+                            },
+                        },
                     },
                 )
-                await store.save_execution_checkpoint(checkpoint)
-                engine = OPCEngine.__new__(OPCEngine)
-                engine.store = store
-                engine.project_id = "proj1"
+                checkpoint, _created = await store.publish_owner_interaction_checkpoint(
+                    checkpoint,
+                    interaction_key="task-user-input:cp-resume-input",
+                    supersede_pending_scope=False,
+                )
+                engine = OPCEngine(project_id="proj1", store=store, owns_store=False)
+                engine.interaction_coordinator = InteractionCoordinator(
+                    store=store,
+                    project_id="proj1",
+                )
+                engine._initialized = True
+                # The test drives the claimed consumer synchronously after the
+                # durable ACK so the transport and domain boundaries are both
+                # asserted without a background-task race.
+                engine._schedule_interaction_consumption = lambda *_args: None
 
                 async def _ensure_checkpoint_runtime_v2_payload(cp: ExecutionCheckpoint) -> ExecutionCheckpoint:
                     return cp
@@ -219,17 +241,30 @@ class RequestUserInputCollabTests(unittest.IsolatedAsyncioTestCase):
                 engine._restore_runtime_state_from_checkpoint = lambda _task, _payload: None
                 engine._execute_single_agent = _execute_single_agent
 
-                response = await engine._resume_task_checkpoint(
-                    checkpoint,
-                    "Selected US East.",
+                receipt = await engine.submit_checkpoint_decision(
+                    checkpoint_id=checkpoint.checkpoint_id,
+                    checkpoint_type=checkpoint.checkpoint_type,
+                    decision={"text": "Selected US East."},
+                    client_request_id="task-input-reply-1",
+                    requester_task_id=task.id,
+                    requester_session_id=task.session_id,
+                )
+                self.assertTrue(receipt["accepted"])
+                self.assertEqual(receipt["status"], "answered")
+                await engine._consume_answered_interaction(
+                    checkpoint.checkpoint_id,
+                    checkpoint.checkpoint_type,
                 )
 
-                self.assertEqual(response, "resumed")
                 refreshed = await store.get_task(task.id)
                 self.assertEqual(refreshed.context_snapshot["user_supplied_input"], "Selected US East.")
                 self.assertNotIn("user_input_answers", refreshed.context_snapshot)
                 checkpoints = await store.get_execution_checkpoints(project_id="proj1")
                 self.assertEqual(checkpoints[0].status, "resolved")
+                self.assertEqual(
+                    checkpoints[0].payload["interaction_result"]["message"],
+                    "resumed",
+                )
             finally:
                 await store.close()
 

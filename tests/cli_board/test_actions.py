@@ -16,7 +16,7 @@ class _StubStore:
     def __init__(self) -> None:
         self.tasks: dict[str, Task] = {}
         self.checkpoints: list[ExecutionCheckpoint] = []
-        self.resolved: list[tuple[str, str]] = []
+        self.patched: list[tuple[str, str, tuple[str, ...]]] = []
 
     async def save_task(self, task: Task) -> None:
         self.tasks[task.id] = task
@@ -30,11 +30,28 @@ class _StubStore:
     async def get_pending_checkpoints(self, **_kw):
         return [checkpoint for checkpoint in self.checkpoints if checkpoint.status == "pending"]
 
-    async def resolve_execution_checkpoint(self, checkpoint_id: str, status: str = "resolved") -> None:
-        self.resolved.append((checkpoint_id, status))
+    async def patch_execution_checkpoint_payload(
+        self,
+        checkpoint_id: str,
+        *,
+        project_id: str,
+        checkpoint_type: str,
+        expected_statuses,
+        payload_patch,
+        status: str,
+    ):
+        expected = tuple(expected_statuses)
+        self.patched.append((checkpoint_id, status, expected))
         for checkpoint in self.checkpoints:
-            if checkpoint.checkpoint_id == checkpoint_id:
+            if (
+                checkpoint.checkpoint_id == checkpoint_id
+                and checkpoint.project_id == project_id
+                and checkpoint.checkpoint_type == checkpoint_type
+                and checkpoint.status in expected
+            ):
                 checkpoint.status = status
+                return checkpoint, True
+        return None, False
 
 
 class _StubMemory:
@@ -42,11 +59,116 @@ class _StubMemory:
         self.ensure_session = AsyncMock()
 
 
+class _StubInteractionCoordinator:
+    def __init__(self, store: _StubStore) -> None:
+        self.store = store
+
+    async def close_pending_owner_checkpoint(
+        self,
+        checkpoint_id: str,
+        *,
+        checkpoint_type: str,
+        status: str,
+        payload_patch,
+    ):
+        return await self.store.patch_execution_checkpoint_payload(
+            checkpoint_id,
+            project_id="demo",
+            checkpoint_type=checkpoint_type,
+            expected_statuses=["pending"],
+            payload_patch=payload_patch,
+            status=status,
+        )
+
+
 class _StubEngine:
     def __init__(self) -> None:
         self.store = _StubStore()
         self.memory = _StubMemory()
+        self.interaction_coordinator = _StubInteractionCoordinator(self.store)
         self.process_message = AsyncMock(return_value="ok")
+        self.submissions: list[dict] = []
+
+    async def can_answer_checkpoint(
+        self,
+        checkpoint: ExecutionCheckpoint,
+        *,
+        requester_task_id: str = "",
+        requester_session_id: str | None = None,
+        requester_actor: dict | None = None,
+    ) -> bool:
+        ownership = dict(
+            dict((checkpoint.payload or {}).get("interaction", {}) or {}).get(
+                "ownership", {}
+            )
+            or {}
+        )
+        expected_task_id = str(
+            ownership.get("ui_anchor_task_id") or checkpoint.task_id or ""
+        )
+        expected_session_id = str(
+            ownership.get("ui_anchor_session_id")
+            or ownership.get("root_session_id")
+            or checkpoint.session_id
+            or ""
+        )
+        if expected_task_id or expected_session_id:
+            return bool(
+                requester_task_id == expected_task_id
+                and str(requester_session_id or "") == expected_session_id
+            )
+        return bool(
+            not expected_task_id
+            and not expected_session_id
+            and dict(requester_actor or {}).get("capability") == "board-capability"
+        )
+
+    @staticmethod
+    def issue_project_owner_actor(*, interface: str) -> dict:
+        return {
+            "kind": "project_owner",
+            "project_id": "demo",
+            "interface": interface,
+            "capability": "board-capability",
+        }
+
+    @staticmethod
+    def build_compatibility_checkpoint_decision(
+        checkpoint: ExecutionCheckpoint,
+        message: str,
+        _metadata,
+    ) -> dict:
+        token = str(message or "").strip().lower()
+        if checkpoint.checkpoint_type in {"tool_permission", "action_permission"}:
+            return {
+                "option_id": "approve_once" if token == "approve" else token,
+                "text": message,
+            }
+        return {"option_id": token, "text": message}
+
+    async def submit_checkpoint_decision(self, **kwargs):
+        self.submissions.append(dict(kwargs))
+        checkpoint = next(
+            (
+                candidate
+                for candidate in self.store.checkpoints
+                if candidate.checkpoint_id == kwargs.get("checkpoint_id")
+                and candidate.checkpoint_type == kwargs.get("checkpoint_type")
+            ),
+            None,
+        )
+        if checkpoint is None:
+            return {"accepted": False, "reason": "checkpoint_not_found"}
+        if checkpoint.status != "pending":
+            return {"accepted": False, "reason": "invalid_state"}
+        checkpoint.status = "answered"
+        return {
+            "accepted": True,
+            "reason": "",
+            "status": "answered",
+            "checkpoint_id": checkpoint.checkpoint_id,
+            "checkpoint_type": checkpoint.checkpoint_type,
+        }
 
 
 class _StubFacade:
@@ -234,6 +356,245 @@ class BoardActionsTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(kwargs["session_id"], "session-1")
         self.assertEqual(kwargs["origin_task_id"], "task-1")
 
+    async def test_approve_checkpoint_bypasses_held_task_lock(self) -> None:
+        engine = _StubEngine()
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def _blocked_process_message(*_args, **_kwargs):
+            started.set()
+            await release.wait()
+            return "ok"
+
+        engine.process_message = AsyncMock(side_effect=_blocked_process_message)
+        task = Task(
+            id="root",
+            title="Root task",
+            status=TaskStatus.RUNNING,
+            session_id="session-root",
+            project_id="demo",
+        )
+        await engine.store.save_task(task)
+        checkpoint = ExecutionCheckpoint(
+            checkpoint_id="cp-tool",
+            project_id="demo",
+            session_id="session-root",
+            task_id="root",
+            checkpoint_type="company_work_item_gate",
+            payload={
+                "interaction": {
+                    "kind": "company_work_item_gate",
+                    "options": [
+                        {"id": "approve", "label": "Approve"},
+                        {"id": "deny", "label": "Deny"},
+                    ],
+                    "ownership": {
+                        "ui_anchor_task_id": "root",
+                        "ui_anchor_session_id": "session-root",
+                        "waiting_task_id": "root",
+                    },
+                }
+            },
+        )
+        engine.store.checkpoints.append(checkpoint)
+        actions, services = self._make_actions(engine)
+
+        running = asyncio.create_task(actions.send_session_message("root", "run"))
+        await asyncio.wait_for(started.wait(), timeout=5)
+        response = await asyncio.wait_for(
+            actions.approve_checkpoint("root", approved=True),
+            timeout=1,
+        )
+
+        self.assertEqual(response, "Checkpoint response accepted.")
+        self.assertEqual(checkpoint.status, "answered")
+        self.assertEqual(len(engine.submissions), 1)
+        self.assertEqual(
+            engine.submissions[0]["decision"]["option_id"],
+            "approve",
+        )
+        self.assertEqual(len(services.session.send_calls), 1)
+
+        release.set()
+        self.assertEqual(await running, "ok")
+
+    async def test_work_item_checkpoint_uses_durable_ui_anchor_actor(self) -> None:
+        engine = _StubEngine()
+        await engine.store.save_task(
+            Task(
+                id="root",
+                title="Company root",
+                session_id="session-root",
+                project_id="demo",
+            )
+        )
+        checkpoint = ExecutionCheckpoint(
+            checkpoint_id="cp-gate",
+            project_id="demo",
+            session_id="session-child",
+            task_id="child",
+            checkpoint_type="company_work_item_gate",
+            payload={
+                "interaction": {
+                    "kind": "company_work_item_gate",
+                    "ownership": {
+                        "work_item_id": "work-item-1",
+                        "ui_anchor_task_id": "root",
+                        "ui_anchor_session_id": "session-root",
+                        "waiting_task_id": "child",
+                    },
+                }
+            },
+        )
+        engine.store.checkpoints.append(checkpoint)
+        actions, services = self._make_actions(engine)
+
+        await actions.approve_checkpoint("work-item-1", approved=True)
+
+        self.assertEqual(checkpoint.status, "answered")
+        self.assertEqual(engine.submissions[0]["requester_task_id"], "root")
+        self.assertEqual(
+            engine.submissions[0]["requester_session_id"],
+            "session-root",
+        )
+        self.assertEqual(services.session.send_calls, [])
+
+    async def test_root_session_actor_never_falls_back_to_waiting_child(self) -> None:
+        engine = _StubEngine()
+        await engine.store.save_task(
+            Task(
+                id="waiting-child",
+                title="Native child",
+                session_id="session-child",
+                parent_session_id="session-root",
+                project_id="demo",
+            )
+        )
+        checkpoint = ExecutionCheckpoint(
+            checkpoint_id="cp-root-session-owner",
+            project_id="demo",
+            session_id="session-child",
+            task_id="waiting-child",
+            checkpoint_type="tool_permission",
+            payload={
+                "interaction": {
+                    "kind": "tool_permission",
+                    "ownership": {
+                        "ui_anchor_task_id": "",
+                        "ui_anchor_session_id": "session-root",
+                        "root_session_id": "session-root",
+                        "waiting_task_id": "waiting-child",
+                    },
+                }
+            },
+        )
+        engine.store.checkpoints.append(checkpoint)
+        engine.can_answer_checkpoint = AsyncMock(return_value=True)
+        actions, _services = self._make_actions(engine)
+
+        await actions.approve_checkpoint("waiting-child", approved=False)
+
+        engine.can_answer_checkpoint.assert_awaited_once_with(
+            checkpoint,
+            requester_task_id="",
+            requester_session_id="session-root",
+            requester_actor=None,
+        )
+        self.assertEqual(engine.submissions[0]["requester_task_id"], "")
+        self.assertEqual(
+            engine.submissions[0]["requester_session_id"],
+            "session-root",
+        )
+
+    async def test_cli_service_cannot_approve_exact_permission_but_can_deny(self) -> None:
+        engine = _StubEngine()
+        await engine.store.save_task(
+            Task(
+                id="root",
+                title="Root task",
+                session_id="session-root",
+                project_id="demo",
+            )
+        )
+        checkpoint = ExecutionCheckpoint(
+            checkpoint_id="cp-exact-cli",
+            project_id="demo",
+            session_id="session-root",
+            task_id="root",
+            checkpoint_type="tool_permission",
+            payload={
+                "interaction": {
+                    "kind": "tool_permission",
+                    "prompt": "  \nif True:\n    print('<tag>')\n\n" + "x" * 4_000,
+                    "options": [
+                        {"id": "approve_once", "label": "Approve once"},
+                        {"id": "deny", "label": "Deny"},
+                    ],
+                    "ownership": {
+                        "ui_anchor_task_id": "root",
+                        "ui_anchor_session_id": "session-root",
+                        "waiting_task_id": "root",
+                    },
+                }
+            },
+        )
+        engine.store.checkpoints.append(checkpoint)
+        actions, _services = self._make_actions(engine)
+
+        with self.assertRaises(PermissionError):
+            await actions.approve_checkpoint("root", approved=True)
+        self.assertEqual(engine.submissions, [])
+        self.assertEqual(checkpoint.status, "pending")
+
+        response = await actions.approve_checkpoint("root", approved=False)
+        self.assertEqual(response, "Checkpoint response accepted.")
+        self.assertEqual(
+            engine.submissions[0]["decision"]["option_id"],
+            "deny",
+        )
+
+    async def test_cleanup_pending_cas_preserves_concurrent_answer(self) -> None:
+        engine = _StubEngine()
+        task = Task(
+            id="root",
+            title="Root task",
+            session_id="session-root",
+            project_id="demo",
+        )
+        await engine.store.save_task(task)
+        checkpoint = ExecutionCheckpoint(
+            checkpoint_id="cp-race",
+            project_id="demo",
+            session_id="session-root",
+            task_id="root",
+            checkpoint_type="tool_permission",
+        )
+        engine.store.checkpoints.append(checkpoint)
+        actions, _services = self._make_actions(engine)
+        entered_cas = asyncio.Event()
+        release_cas = asyncio.Event()
+        real_close = engine.interaction_coordinator.close_pending_owner_checkpoint
+
+        async def _blocked_close(*args, **kwargs):
+            entered_cas.set()
+            await release_cas.wait()
+            return await real_close(*args, **kwargs)
+
+        engine.interaction_coordinator.close_pending_owner_checkpoint = _blocked_close
+        cleanup = asyncio.create_task(
+            actions._resolve_related_checkpoints("root", status="cancelled")
+        )
+        await asyncio.wait_for(entered_cas.wait(), timeout=5)
+        checkpoint.status = "answered"
+        release_cas.set()
+        await cleanup
+
+        self.assertEqual(checkpoint.status, "answered")
+        self.assertEqual(
+            engine.store.patched,
+            [("cp-race", "cancelled", ("pending",))],
+        )
+
     async def test_cancel_task_marks_related_tasks_and_checkpoints_cancelled(self) -> None:
         engine = _StubEngine()
         started = asyncio.Event()
@@ -283,6 +644,9 @@ class BoardActionsTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(engine.store.tasks["root"].status, TaskStatus.CANCELLED)
         self.assertEqual(engine.store.tasks["child"].status, TaskStatus.CANCELLED)
-        self.assertEqual(engine.store.resolved, [("cp-root", "cancelled")])
+        self.assertEqual(
+            engine.store.patched,
+            [("cp-root", "cancelled", ("pending",))],
+        )
         self.assertEqual(len(services.session.stop_calls), 1)
         self.assertEqual(services.session.stop_calls[0]["task_id"], "root")

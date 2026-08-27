@@ -607,8 +607,7 @@ export function selectCompanySummaryMessages(
     const checkpointId = String(metadata.checkpoint_id ?? '').trim()
     const checkpointType = String(metadata.checkpoint_type ?? '').trim()
     const checkpointResponseId = String(metadata.response_to_checkpoint_id ?? '').trim()
-    const escalationResponseId = String(metadata.response_to_escalation_id ?? '').trim()
-    if ((checkpointId && checkpointType) || checkpointResponseId || escalationResponseId) {
+    if ((checkpointId && checkpointType) || checkpointResponseId) {
       durableMessages.push(message)
       continue
     }

@@ -8,10 +8,90 @@ from unittest.mock import patch
 from opc.core.models import Task
 from opc.layer4_tools.file_ops import apply_patch, file_read, glob, grep
 from opc.layer4_tools.registry import ToolDefinition, ToolRegistry
-from opc.layer4_tools.web_search import web_fetch
+from opc.layer4_tools.web_search import web_fetch, web_search
 
 
 class NativeToolStackTests(unittest.IsolatedAsyncioTestCase):
+    async def test_web_search_preserves_nested_snippet_and_decodes_redirect(self) -> None:
+        class FakeResponse:
+            text = """
+                <div class="result">
+                  <a rel="nofollow" class="result__a"
+                     href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.test%2Freport%3Fa%3D1%26b%3D2&amp;rut=abc">
+                    <b>NVIDIA</b> &amp; AMD results
+                  </a>
+                  <a class="result__snippet" href="//duckduckgo.com/l/">
+                    Revenue <b>grew</b> 262% &amp; the outlook <span>remains strong</span>.
+                  </a>
+                </div>
+            """
+
+            def raise_for_status(self) -> None:
+                return None
+
+        class FakeClient:
+            def __init__(self, *args, **kwargs) -> None:
+                pass
+
+            async def __aenter__(self) -> "FakeClient":
+                return self
+
+            async def __aexit__(self, *args) -> None:
+                return None
+
+            async def get(self, *args, **kwargs) -> FakeResponse:
+                return FakeResponse()
+
+        with patch("opc.layer4_tools.web_search.httpx.AsyncClient", FakeClient):
+            result = await web_search("semiconductor results")
+
+        self.assertEqual(result["query"], "semiconductor results")
+        self.assertEqual(
+            result["results"],
+            [
+                {
+                    "title": "NVIDIA & AMD results",
+                    "url": "https://example.test/report?a=1&b=2",
+                    "snippet": "Revenue grew 262% & the outlook remains strong.",
+                }
+            ],
+        )
+
+    async def test_web_search_retains_safe_redirect_when_uddg_target_is_invalid(self) -> None:
+        class FakeResponse:
+            text = """
+                <a href="//duckduckgo.com/l/?uddg=not-a-http-url&amp;rut=xyz" class="result__a">
+                  Example&#39;s result
+                </a>
+                <div class="result__snippet">First <b>highlight</b>, then the rest.</div>
+            """
+
+            def raise_for_status(self) -> None:
+                return None
+
+        class FakeClient:
+            def __init__(self, *args, **kwargs) -> None:
+                pass
+
+            async def __aenter__(self) -> "FakeClient":
+                return self
+
+            async def __aexit__(self, *args) -> None:
+                return None
+
+            async def get(self, *args, **kwargs) -> FakeResponse:
+                return FakeResponse()
+
+        with patch("opc.layer4_tools.web_search.httpx.AsyncClient", FakeClient):
+            result = await web_search("fallback")
+
+        self.assertEqual(result["results"][0]["title"], "Example's result")
+        self.assertEqual(result["results"][0]["snippet"], "First highlight, then the rest.")
+        self.assertEqual(
+            result["results"][0]["url"],
+            "https://duckduckgo.com/l/?uddg=not-a-http-url&rut=xyz",
+        )
+
     async def test_glob_and_grep_return_matches(self) -> None:
         root = Path.cwd() / ".tmp-test" / f"native-tool-stack-{uuid.uuid4().hex}"
         root.mkdir(parents=True, exist_ok=True)

@@ -9,6 +9,7 @@ from typing import Any
 from loguru import logger
 
 from opc.core.config import TalentTemplateConfig
+from opc.core.execution_agents import EXECUTION_AGENTS, normalize_execution_agent
 from opc.core.models import (
     RecruitmentCandidateRecommendation,
     RecruitmentEmployeeRecommendation,
@@ -112,13 +113,9 @@ Rules:
 - Return JSON only.
 """
 
-RECRUITMENT_AGENT_CHOICES = frozenset({
-    "native",
-    "codex",
-    "claude_code",
-    "cursor",
-    "opencode",
-})
+# Backwards-compatible public name. Recruitment, task execution, company
+# execution, and checkpoint restoration must all accept the same identities.
+RECRUITMENT_AGENT_CHOICES = EXECUTION_AGENTS
 DEFAULT_RECRUITMENT_EXECUTION_AGENT = "codex"
 VALID_RECRUITMENT_STATUSES = frozenset({
     "existing_staff",
@@ -129,13 +126,7 @@ VALID_RECRUITMENT_STATUSES = frozenset({
 
 
 def normalize_recruitment_agent_choice(value: Any, default: str | None = None) -> str | None:
-    normalized = str(value or "").strip().lower().replace("-", "_")
-    if normalized in RECRUITMENT_AGENT_CHOICES:
-        return normalized
-    fallback = str(default or "").strip().lower().replace("-", "_")
-    if fallback in RECRUITMENT_AGENT_CHOICES:
-        return fallback
-    return None
+    return normalize_execution_agent(value, default=default)
 
 
 def resolve_effective_execution_agent(
@@ -367,6 +358,23 @@ class CompanyRecruiter:
         self.org_engine = org_engine
         self.talent_market = talent_market
 
+    def _opaque_external_team_covered_roles(self) -> set[str]:
+        if self.org_engine is None:
+            return set()
+        from opc.layer2_organization.external_team_compiler import (
+            compile_external_team_bindings,
+        )
+
+        topology = self.org_engine.build_runtime_delegation_topology()
+        return {
+            role_id
+            for binding in compile_external_team_bindings(
+                self.org_engine,
+                runtime_topology=topology,
+            )
+            for role_id in binding.covered_role_ids
+        }
+
     def _build_organization_payload(self) -> dict[str, Any]:
         agents = list(self.org_engine.list_agents()) if self.org_engine else []
         role_ids = {
@@ -595,10 +603,15 @@ class CompanyRecruiter:
             or ""
         ).strip()
         grouped: dict[str, RecruitmentNeed] = {}
+        externally_staffed_role_ids = self._opaque_external_team_covered_roles()
         # Roles in the active topology.
         for agent in self.org_engine.list_agents():
             role_id = str(getattr(agent, "role_id", "") or "").strip()
-            if not role_id or role_id == "task_generalist":
+            if (
+                not role_id
+                or role_id == "task_generalist"
+                or role_id in externally_staffed_role_ids
+            ):
                 continue
             grouped[role_id] = RecruitmentNeed(
                 role_id=role_id,
@@ -615,7 +628,12 @@ class CompanyRecruiter:
             extra_employees = []
         for employee in extra_employees:
             role_id = str(getattr(employee, "role_id", "") or "").strip()
-            if not role_id or role_id == "task_generalist" or role_id in grouped:
+            if (
+                not role_id
+                or role_id == "task_generalist"
+                or role_id in grouped
+                or role_id in externally_staffed_role_ids
+            ):
                 continue
             grouped[role_id] = RecruitmentNeed(
                 role_id=role_id,

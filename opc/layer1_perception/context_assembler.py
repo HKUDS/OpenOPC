@@ -11,7 +11,7 @@ from opc.core.company_tools import (
     company_collaboration_enabled_for_task,
     resolve_company_turn_mode,
 )
-from opc.core.models import Phase, Task, TaskStatus
+from opc.core.models import Task, TaskStatus
 from opc.layer2_organization import comms as _comms
 from opc.layer2_organization.collaboration_policy import render_ownership_contract
 from opc.layer2_organization.prompt_contract import (
@@ -20,7 +20,13 @@ from opc.layer2_organization.prompt_contract import (
     normalize_prompt_text_list,
     render_assignment_context_from_contract,
 )
-from opc.layer2_organization.turn_mode import TurnMode, infer_turn_mode
+from opc.layer2_organization.turn_mode import (
+    TurnMode,
+    authoritative_gate_harness_rework_metadata,
+    has_gate_harness_rework,
+    infer_turn_mode,
+    safe_rework_count,
+)
 from opc.layer2_organization.work_item_context_view import WorkItemContextView
 from opc.layer2_organization.work_item_identity import turn_type_for_task
 from opc.layer2_organization.work_item_links import linked_work_item_id_for_task
@@ -316,14 +322,38 @@ class ContextAssembler:
         stateless ``infer_turn_mode``. Returns ``TurnMode.EXECUTE``
         as a safe default when the work item can't be loaded.
         """
-        is_review_entry = bool(
-            (task.metadata or {}).get("review_execution_work_item", False)
-            or (task.metadata or {}).get("review_task", False)
+        task_metadata = dict(task.metadata or {})
+        task_turn_type = turn_type_for_task(task, fallback="")
+        current_turn_mode = resolve_company_turn_mode(task)
+        is_report_entry = bool(
+            task_metadata.get("report_execution_work_item", False)
+            or task_turn_type == "report"
+            or current_turn_mode == "report_required"
         )
+        is_review_entry = bool(
+            task_metadata.get("review_execution_work_item", False)
+            or task_metadata.get("review_task", False)
+            or task_turn_type == "review"
+            or current_turn_mode == "review_execute"
+        )
+        # Task projection identity is the current execution envelope.  Report
+        # stays above review, matching ``infer_turn_mode`` priority.
+        if is_report_entry:
+            return TurnMode.REPORT
         work_item = await self._load_task_work_item(task)
         if work_item is None:
-            return TurnMode.REVIEW if is_review_entry else TurnMode.EXECUTE
-        return infer_turn_mode(work_item, is_review_entry=is_review_entry)
+            if is_review_entry:
+                return TurnMode.REVIEW
+            return (
+                TurnMode.REWORK
+                if has_gate_harness_rework(task_metadata)
+                else TurnMode.EXECUTE
+            )
+        return infer_turn_mode(
+            work_item,
+            is_review_entry=is_review_entry,
+            supplemental_metadata=task.metadata,
+        )
 
     async def build_turn_mode_context(self, task: Task) -> str:
         """Render a compact ``## Turn Mode`` header so the agent knows
@@ -370,8 +400,9 @@ class ContextAssembler:
                 "delegate again unless there is a remedial gap."
             ),
             TurnMode.REWORK: (
-                "Your previous turn was rejected by the reviewer. "
-                "Address each item in the Reviewer Feedback section and "
+                "Your previous output was rejected by review or failed a "
+                "deterministic gate. Address every item in the first-class "
+                "rework feedback section and "
                 "resubmit. Do not restart from scratch unless the "
                 "feedback explicitly says so."
             ),
@@ -387,24 +418,36 @@ class ContextAssembler:
         lines.append(f"- Required action: {action}")
         return "## Turn Mode\n" + "\n".join(lines)
 
-    async def build_rework_feedback_context(self, task: Task) -> str:
-        """Inject the reviewer's reject reason when this is a rework
-        turn. Without this block the agent's second attempt has no
-        visibility into *why* the reviewer rejected the first attempt
-        and either repeats the same mistake or rewrites blindly.
+    async def build_rework_feedback_context(
+        self,
+        task: Task,
+        *,
+        include_previous_submission: bool = True,
+    ) -> str:
+        """Inject review or deterministic-gate failures on a rework turn.
 
-        Gating is by ``rework_feedback`` content, NOT by phase: the
-        dispatcher transitions the work item to RUNNING before the
-        prompt is assembled, so a phase==READY_FOR_REWORK gate would
-        silently swallow the feedback. Approval clears the field to
-        an empty string (see ``_finalize_review_work_item``), so a
-        non-empty value is itself the "this is a rework" signal.
+        Without this block the agent's next attempt has no prominent,
+        actionable explanation of why the previous output was rejected and
+        can repeat the same mistake or merely re-verify an unchanged artifact.
 
-        Reads the work item fresh from the store so the latest
-        feedback wins; falls back to ``task.metadata`` (set when the
-        task was materialized) if the store lookup misses.
+        Gating is by the review or gate-harness metadata trail, NOT by phase:
+        the dispatcher transitions the work item to RUNNING before the prompt
+        is assembled, so a phase==READY_FOR_REWORK gate would silently swallow
+        the feedback.
+
+        Reads the work item fresh from the store for manager-review feedback.
+        Controller-owned deterministic validation fields live on the Task, so
+        their presence selects the Task group authoritatively; the WorkItem is
+        only a compatibility fallback when the Task has no gate fields.
         """
         if bool((task.metadata or {}).get("suppress_company_rework_feedback_context", False)):
+            return ""
+        # Review/report auxiliary cards can inherit stale gate fields from the
+        # business WorkItem they inspect.  Their canonical mode wins: gate
+        # correction instructions belong only to the execute/rework owner and
+        # must not be exposed as the auxiliary card's assignment.
+        actual_mode = await self._infer_turn_mode(task)
+        if actual_mode in {TurnMode.REVIEW, TurnMode.REPORT}:
             return ""
         work_metadata: dict[str, Any] = {}
         work_item = await self._load_task_work_item(task)
@@ -412,18 +455,113 @@ class ContextAssembler:
             work_metadata = dict(getattr(work_item, "metadata", {}) or {})
         if not work_metadata:
             work_metadata = dict(task.metadata or {})
+        task_metadata = dict(task.metadata or {})
         feedback = str(work_metadata.get("rework_feedback", "") or "").strip()
         if not feedback:
-            feedback = str((task.metadata or {}).get("rework_feedback", "") or "").strip()
-        if not feedback:
+            feedback = str(task_metadata.get("rework_feedback", "") or "").strip()
+
+        # Task-owned controller state is authoritative as one group, even when
+        # it explicitly contains empty/zero values.  Only a Task with no gate
+        # keys at all may fall back to a WorkItem projection.
+        gate_metadata = authoritative_gate_harness_rework_metadata(
+            task_metadata=task_metadata,
+            work_item_metadata=work_metadata,
+        )
+        raw_gate_request = gate_metadata.get("gate_harness_rework_request", {})
+        gate_request = (
+            dict(raw_gate_request)
+            if isinstance(raw_gate_request, dict)
+            else {}
+        )
+
+        gate_feedback = str(gate_request.get("feedback", "") or "").strip()
+        if not gate_feedback:
+            gate_feedback = str(
+                gate_metadata.get("gate_harness_rework_feedback", "")
+                or ""
+            ).strip()
+        gate_rework_count = max(
+            safe_rework_count(
+                gate_metadata.get("gate_harness_rework_count", 0)
+            ),
+            safe_rework_count(gate_request.get("rework_round", 0)),
+        )
+        gate_signal = has_gate_harness_rework(gate_metadata)
+        if not feedback and not gate_signal:
             return ""
+
+        # A manager-review rejection is the immediate cause when both trails
+        # exist; gate fields intentionally remain durable across attempts.
+        # Otherwise promote deterministic validation to its own unambiguous
+        # rework block instead of burying it in the generic working summary.
+        if not feedback and gate_signal:
+            blockers = self._safe_rework_text_items(
+                gate_request.get("blockers", [])
+            )
+            constraints = self._safe_rework_text_items(
+                gate_request.get("constraints", [])
+            )
+            lines = [
+                "## Deterministic Gate Feedback (Rework Required)",
+                "",
+                "Your previous submission FAILED deterministic validation. "
+                "This is a correction turn, not a request to re-verify or "
+                "resubmit unchanged output.",
+                "",
+            ]
+            if gate_rework_count > 0:
+                lines.append(f"Rework attempt: #{gate_rework_count}")
+            requested_by = str(
+                gate_request.get("source_work_item_title", "") or ""
+            ).strip()
+            if requested_by:
+                lines.append(f"Requested by: {requested_by}")
+            if gate_rework_count > 0 or requested_by:
+                lines.append("")
+            if gate_feedback:
+                lines.append("### Deterministic Validation Failure")
+                lines.append(gate_feedback)
+            if blockers:
+                lines.append("")
+                lines.append("### Blocking Issues (must fix before resubmission)")
+                lines.extend(f"- {item}" for item in blockers[:12])
+            if constraints:
+                lines.append("")
+                lines.append("### Constraints To Preserve")
+                lines.extend(f"- {item}" for item in constraints[:12])
+            lines.extend(
+                [
+                    "",
+                    "### Required Corrective Action",
+                    "- Modify the owned deliverable(s) so every blocking issue above is actually fixed.",
+                    "- Do not claim success based only on syntax checks, file existence, or an unchanged artifact.",
+                    "- Re-run every task-specific evidence and verification step required for the corrected content.",
+                    "- Read back the corrected output and confirm each blocker is absent before resubmitting.",
+                ]
+            )
+            previous = (
+                self._previous_submission_excerpt(task)
+                if include_previous_submission
+                else ""
+            )
+            if previous:
+                lines.extend(
+                    [
+                        "",
+                        "### Your Previous Submission (excerpt)",
+                        "The deterministic failure above refers to this prior output. Do not repeat it unchanged.",
+                        "",
+                        previous,
+                    ]
+                )
+            return "\n".join(lines).rstrip() + "\n"
+
         verdict = dict(work_metadata.get("structured_review_verdict", {}) or {})
         if not verdict:
-            verdict = dict((task.metadata or {}).get("structured_review_verdict", {}) or {})
-        rework_count = int(
+            verdict = dict(task_metadata.get("structured_review_verdict", {}) or {})
+        rework_count = safe_rework_count(
             work_metadata.get("review_rework_count", 0)
-            or (task.metadata or {}).get("review_rework_count", 0)
-            or 0
+            or task_metadata.get("review_rework_count", 0)
         )
         reviewer_role = str(work_metadata.get("review_owner_role_id", "") or "").strip()
         lines: list[str] = [
@@ -462,7 +600,11 @@ class ContextAssembler:
             lines.append("### Follow-ups (nice-to-have, non-blocking)")
             for item in followups[:12]:
                 lines.append(f"- {item}")
-        previous = self._previous_submission_excerpt(task)
+        previous = (
+            self._previous_submission_excerpt(task)
+            if include_previous_submission
+            else ""
+        )
         if previous:
             lines.append("")
             lines.append("### Your Previous Submission (excerpt)")
@@ -474,6 +616,24 @@ class ContextAssembler:
             lines.append("")
             lines.append(previous)
         return "\n".join(lines).rstrip() + "\n"
+
+    @staticmethod
+    def _safe_rework_text_items(value: Any) -> list[str]:
+        """Normalize trusted text collections without iterating scalars."""
+
+        if isinstance(value, str):
+            rendered = value.strip()
+            return [rendered] if rendered else []
+        if not isinstance(value, (list, tuple, set)):
+            return []
+        rendered_items: list[str] = []
+        for item in value:
+            if isinstance(item, (dict, list, tuple, set)):
+                continue
+            rendered = str(item or "").strip()
+            if rendered:
+                rendered_items.append(rendered)
+        return rendered_items
 
     @staticmethod
     def _previous_submission_excerpt(task: Task, *, budget: int = 1200) -> str:
@@ -1920,7 +2080,9 @@ class ContextAssembler:
             if not isinstance(review_verdict, dict):
                 review_verdict = {}
             reviewer_role = str(review_verdict.get("reviewer_role", "") or "").strip()
-            review_round = int(task.metadata.get("review_rework_count", 0) or 0) + 1
+            review_round = safe_rework_count(
+                task.metadata.get("review_rework_count", 0)
+            ) + 1
             blocking = [
                 str(item).strip()
                 for item in list(review_verdict.get("blocking_issues", []) or [])
@@ -1945,7 +2107,7 @@ class ContextAssembler:
                 "Address ALL blocking issues above and resubmit — do not repeat the previous submission."
             )
         gate_harness_feedback = str(task.metadata.get("gate_harness_rework_feedback", "")).strip()
-        if gate_harness_feedback:
+        if gate_harness_feedback and not self._suppress_gate_harness_working_summary(task):
             lines.append("## Gate Harness Rework")
             lines.append(f"LLM judge feedback:\n{gate_harness_feedback}")
             lines.append("Fix the issues above before resubmitting this work item.")
@@ -1974,6 +2136,25 @@ class ContextAssembler:
             lines.append(f"Missing required outputs:\n{contract_feedback}")
             lines.append("Fix every missing item above before claiming the work item is complete.")
         return "\n".join(lines).strip()
+
+    @staticmethod
+    def _suppress_gate_harness_working_summary(task: Task) -> bool:
+        """Keep stale business-turn gate state out of auxiliary prompts."""
+
+        metadata = dict(task.metadata or {})
+        turn_type = turn_type_for_task(task, fallback="")
+        current_turn_mode = resolve_company_turn_mode(task)
+        return bool(
+            metadata.get("suppress_company_rework_feedback_context", False)
+            or turn_type in {"review", "report", "self_evolution"}
+            or current_turn_mode in {"review_execute", "report_required"}
+            or metadata.get("review_execution_work_item", False)
+            or metadata.get("report_execution_work_item", False)
+            or metadata.get("self_evolution_work_item", False)
+            or metadata.get("attention_work_item", False)
+            or metadata.get("runtime_auxiliary_task", False)
+            or metadata.get("company_runtime_auxiliary_task", False)
+        )
 
     def _build_readiness_summary(self, task: Task) -> str:
         lines: list[str] = []

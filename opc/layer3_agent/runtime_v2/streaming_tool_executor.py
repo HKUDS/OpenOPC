@@ -9,8 +9,15 @@ import uuid
 from typing import Any, Awaitable, Callable
 
 from opc.core.models import PermissionResolution
+from opc.layer2_organization.company_runtime_identity import (
+    is_company_runtime_task,
+)
 from opc.layer3_agent.runtime_v2.permissions import RuntimePermissionAdapter
-from opc.layer3_agent.runtime_v2.tool_hooks import RuntimeToolHookBus, RuntimeToolHookContext
+from opc.layer3_agent.runtime_v2.tool_hooks import (
+    RuntimeCompanyControllerToolFence,
+    RuntimeToolHookBus,
+    RuntimeToolHookContext,
+)
 from opc.layer3_agent.runtime_v2.tool_planner import ToolBatch, ToolPlanner
 from opc.layer4_tools.registry import ToolRegistry
 
@@ -53,6 +60,7 @@ class StreamingToolExecutor:
         planner: ToolPlanner,
         permission_resolver: RuntimePermissionAdapter,
         hook_bus: RuntimeToolHookBus | None = None,
+        controller_tool_fence: RuntimeCompanyControllerToolFence | None = None,
         runtime_tool_handler: RuntimeToolHandler | None = None,
         emit_event: RuntimeEventCallback | None = None,
         max_parallel_read_tools: int = 6,
@@ -62,6 +70,9 @@ class StreamingToolExecutor:
         self.planner = planner
         self.permission_resolver = permission_resolver
         self.hook_bus = hook_bus
+        self.controller_tool_fence = (
+            controller_tool_fence or RuntimeCompanyControllerToolFence()
+        )
         self.runtime_tool_handler = runtime_tool_handler
         self.emit_event = emit_event
         self.max_parallel_read_tools = max(1, int(max_parallel_read_tools or 1))
@@ -202,10 +213,12 @@ class StreamingToolExecutor:
         if batch_state is not None and self.converge_on_parallel_failure and batch_state["cascade_event"].is_set():
             return await self._build_converged_result(call, batch_state, batch_id=batch_id)
 
+        hook_call = dict(call)
+        hook_call["batch_id"] = batch_id
         hook_context = RuntimeToolHookContext(
             phase="pre",
             tool_name=tool_name,
-            call=call,
+            call=hook_call,
             task=task,
             tool=tool,
             arguments=dict(arguments),
@@ -299,16 +312,13 @@ class StreamingToolExecutor:
 
             heartbeat_task = asyncio.create_task(_heartbeat())
             try:
-                if tool is not None and tool.runtime_managed and self.runtime_tool_handler is not None:
-                    result = await self.runtime_tool_handler(tool_name, arguments)
-                else:
-                    result = await self.registry.execute(
-                        tool_name,
-                        arguments,
-                        task=task,
-                        on_progress=_tool_progress,
-                        skip_approval=True,
-                    )
+                result = await self._invoke_tool_effect(
+                    tool_name=tool_name,
+                    arguments=arguments,
+                    task=task,
+                    on_progress=_tool_progress,
+                    call=hook_context.call,
+                )
                 result = await self._maybe_retry_with_escalated_sandbox(
                     tool_name=tool_name,
                     arguments=arguments,
@@ -316,7 +326,7 @@ class StreamingToolExecutor:
                     result=result,
                     on_progress=_tool_progress,
                     batch_id=batch_id,
-                    call=call,
+                    call=hook_context.call,
                 )
             finally:
                 heartbeat_active["value"] = False
@@ -419,24 +429,24 @@ class StreamingToolExecutor:
                     "started_at_ms": retry_started_at_ms,
                 },
             )
-        sandbox_context["mode"] = next_mode
-        execution_context["sandbox"] = sandbox_context
-        task.metadata = dict(getattr(task, "metadata", {}) or {})
-        task.metadata["_execution_context"] = execution_context
+        company_exact_call = is_company_runtime_task(task)
+        if not company_exact_call:
+            sandbox_context["mode"] = next_mode
+            execution_context["sandbox"] = sandbox_context
+            task.metadata = dict(getattr(task, "metadata", {}) or {})
+            task.metadata["_execution_context"] = execution_context
         try:
-            if self.registry.get(tool_name) is not None and getattr(self.registry.get(tool_name), "runtime_managed", False) and self.runtime_tool_handler is not None:
-                retry_result = await self.runtime_tool_handler(tool_name, arguments)
-            else:
-                retry_result = await self.registry.execute(
-                    tool_name,
-                    arguments,
-                    task=task,
-                    on_progress=on_progress,
-                    skip_approval=True,
-                )
+            retry_result = await self._invoke_tool_effect(
+                tool_name=tool_name,
+                arguments=arguments,
+                task=task,
+                on_progress=on_progress,
+                call=call,
+            )
         finally:
-            original_context["sandbox"] = original_sandbox
-            task.metadata["_execution_context"] = original_context
+            if not company_exact_call:
+                original_context["sandbox"] = original_sandbox
+                task.metadata["_execution_context"] = original_context
         if self.emit_event:
             await self.emit_event(
                 "sandbox_retry_completed",
@@ -453,6 +463,46 @@ class StreamingToolExecutor:
                 },
             )
         return retry_result
+
+    async def _invoke_tool_effect(
+        self,
+        *,
+        tool_name: str,
+        arguments: dict[str, Any],
+        task: Any,
+        on_progress: Any,
+        call: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """The sole registry/runtime-managed handler effect boundary."""
+
+        tool = self.registry.get(tool_name)
+
+        async def _effect() -> dict[str, Any]:
+            if (
+                tool is not None
+                and tool.runtime_managed
+                and self.runtime_tool_handler is not None
+            ):
+                return await self.runtime_tool_handler(tool_name, arguments)
+            return await self.registry.execute(
+                tool_name,
+                arguments,
+                task=task,
+                on_progress=on_progress,
+                skip_approval=True,
+            )
+
+        return await self.controller_tool_fence.run(
+            task=task,
+            tool_name=tool_name,
+            tool_category=str(getattr(tool, "category", "") or ""),
+            tool_effect_kind=str(
+                getattr(tool, "company_effect_kind", "") or ""
+            ),
+            arguments=arguments,
+            tool_call=dict(call or {}),
+            effect=_effect,
+        )
 
     @staticmethod
     def _next_sandbox_mode(current_mode: str) -> str:

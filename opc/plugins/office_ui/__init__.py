@@ -161,10 +161,11 @@ def register_cli(parent_app: typer.Typer) -> None:
             shutil.rmtree(_FRONTEND_DIST)
         _ensure_frontend()
 
-        from opc.core.config import OPCConfig, get_opc_home
+        # Reuse the CLI bootstrap so project-controlled config is trusted
+        # before the web server constructs and initializes its engine.
+        from opc.cli.app import _get_config
 
-        config_dir = get_opc_home() / "config"
-        config = OPCConfig.load(config_dir) if config_dir.exists() else OPCConfig()
+        config = _get_config()
 
         from opc.plugins.office_ui.server import run_server
 

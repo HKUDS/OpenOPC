@@ -14,6 +14,7 @@ import { MarkdownBody } from './MessageList'
 import { IconClose, IconHandoff, IconTimeline, IconSearch, IconChevron } from './SvgIcons'
 import { TERMINAL_SESSION_STATUSES, getSessionRuntimeStatus, isSessionWorking } from '../lib/sessionRuntime'
 import { getWorkItemRoleLabel } from '../lib/workItemIdentity'
+import { executionAgentLabel } from '../lib/externalAgents'
 
 interface AgentWorkPanelProps {
   sessions: Session[]
@@ -100,14 +101,6 @@ function terminalClass(status: string): string {
   if (status === 'failed') return 'awp-terminal-failed'
   if (status === 'cancelled') return 'awp-terminal-cancelled'
   return ''
-}
-
-const EXECUTION_AGENT_LABELS: Record<string, string> = {
-  native: 'Native',
-  codex: 'Codex',
-  claude_code: 'Claude Code',
-  cursor: 'Cursor',
-  opencode: 'OpenCode',
 }
 
 const RESULT_BANNER: Record<string, { cls: string; text: string }> = {
@@ -618,7 +611,7 @@ function AgentWorkPanelLegacyView({ sessions, agents, onOpenChildDetail, onOpenE
                 )}
                 {selected.selectedExecutionAgent && (
                   <span className="awp-detail-employee">
-                    Agent: {EXECUTION_AGENT_LABELS[selected.selectedExecutionAgent] ?? selected.selectedExecutionAgent}
+                    Agent: {executionAgentLabel(selected.selectedExecutionAgent)}
                   </span>
                 )}
                 {selected.workItemProjectionId && (

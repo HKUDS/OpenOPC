@@ -11,10 +11,21 @@ from opc.core.active_task_runs import (
     ActiveTaskRunAdmissionClosed,
     ActiveTaskRunRegistry,
 )
-from opc.core.models import CompanyMemberSession, Task, TaskResult, TaskStatus
+from opc.core.models import (
+    CompanyMemberSession,
+    ExecutionCheckpoint,
+    Task,
+    TaskResult,
+    TaskStatus,
+)
+from opc.layer0_interaction.coordinator import InteractionDecisionLease
 from opc.engine import OPCEngine
 from opc.layer2_organization.company_mode import CompanyWorkItemExecutor
-from opc.layer2_organization.company_runtime_identity import is_company_runtime_task
+from opc.layer2_organization.custom_runtime import CustomRuntimeRunner
+from opc.layer2_organization.company_runtime_identity import (
+    is_company_runtime_task,
+    requires_native_company_execution,
+)
 from opc.layer2_organization.org_work_item_planner import CompanyWorkItemRuntimePlan
 
 
@@ -62,6 +73,42 @@ def test_plain_child_task_is_not_classified_as_company_runtime_scope() -> None:
     assert not is_company_runtime_task(task)
 
 
+def test_task_mode_role_identity_does_not_trigger_company_native_fence() -> None:
+    task = Task(
+        id="task-mode-external",
+        title="Task mode external execution",
+        project_id="project-a",
+        assigned_external_agent="jiuwen",
+        metadata={
+            "mode": "task",
+            "execution_mode": "task_mode",
+            "task_mode_contract": "single_full_capability_main_agent",
+            "work_item_role_id": "task_generalist",
+        },
+    )
+
+    assert not is_company_runtime_task(task)
+    assert not requires_native_company_execution(task)
+
+
+def test_canonical_company_work_item_marker_outranks_stale_task_mode_hint() -> None:
+    task = Task(
+        id="company-work-item",
+        title="Company work item",
+        project_id="project-a",
+        assigned_external_agent="jiuwen",
+        metadata={
+            "mode": "task",
+            "execution_mode": "task_mode",
+            "work_item_runtime": True,
+            "work_item_role_id": "engineer",
+        },
+    )
+
+    assert is_company_runtime_task(task)
+    assert requires_native_company_execution(task)
+
+
 def test_closing_admission_preserves_existing_attempts_and_rejects_new_ones() -> None:
     registry = ActiveTaskRunRegistry()
     token = registry.register("project-a", "task-1")
@@ -89,6 +136,86 @@ def test_closed_admission_allows_only_nested_live_driver_attempts() -> None:
     with pytest.raises(ActiveTaskRunAdmissionClosed):
         registry.register("project-a", "new-ingress")
     registry.unregister("project-a", "driver-task", driver_token)
+
+
+@_async_test
+async def test_shutdown_cancels_and_joins_registered_coroutine_owner() -> None:
+    registry = ActiveTaskRunRegistry()
+    started = asyncio.Event()
+
+    async def execute() -> None:
+        current = asyncio.current_task()
+        assert current is not None
+        token = registry.register(
+            "project-a",
+            "task-1",
+            owner_task=current,
+        )
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            registry.unregister("project-a", "task-1", token)
+
+    owner = asyncio.create_task(execute())
+    await started.wait()
+
+    await registry.cancel_and_wait_for_owner_tasks()
+
+    assert owner.cancelled()
+    assert registry.active_owner_tasks() == set()
+    assert not registry.is_active("project-a", "task-1")
+
+
+@_async_test
+async def test_custom_child_normal_teardown_unregisters_and_is_idempotent() -> None:
+    parent = OPCEngine(project_id="project-a")
+    child = OPCEngine(
+        project_id="project-a",
+        active_task_run_registry=parent._active_task_run_registry,
+        owns_active_task_run_registry=False,
+    )
+    runner = CustomRuntimeRunner(parent)
+    ingress = parent._register_runtime_child(child)
+    runner._runtime_ingress_tasks[id(child)] = ingress
+
+    await runner._shutdown_runtime(child)
+    await runner._shutdown_runtime(child)
+
+    assert child._shutdown_complete
+    assert child not in parent._runtime_child_engines
+    assert asyncio.current_task() not in parent._runtime_child_ingress_tasks
+
+
+@_async_test
+async def test_normal_borrowed_custom_child_does_not_suspend_peer_scope() -> None:
+    registry = ActiveTaskRunRegistry()
+    parent = OPCEngine(
+        project_id="project-a",
+        active_task_run_registry=registry,
+        owns_active_task_run_registry=True,
+    )
+    child = OPCEngine(
+        project_id="project-a",
+        store=SimpleNamespace(is_ready=True),  # type: ignore[arg-type]
+        owns_store=False,
+        active_task_run_registry=registry,
+        owns_active_task_run_registry=False,
+    )
+    child.prepare_active_company_runtimes_for_shutdown = AsyncMock(
+        side_effect=AssertionError("normal child must not scan peer scopes")
+    )
+    runner = CustomRuntimeRunner(parent)
+    ingress = parent._register_runtime_child(child)
+    runner._runtime_ingress_tasks[id(child)] = ingress
+    peer_token = registry.register("project-a", "peer-scope-task")
+
+    await runner._shutdown_runtime(child)
+
+    child.prepare_active_company_runtimes_for_shutdown.assert_not_awaited()
+    assert registry.is_active("project-a", "peer-scope-task")
+    assert not registry.admission_closed
+    registry.unregister("project-a", "peer-scope-task", peer_token)
 
 
 @_async_test
@@ -415,6 +542,7 @@ async def test_work_item_claim_and_spawn_share_stop_scope_lock() -> None:
         _tasks: list[Task],
         *,
         work_items: list[object],
+        **_kwargs: object,
     ) -> list[tuple[CompanyMemberSession, Task]]:
         del work_items
         claim_entered.set()
@@ -547,3 +675,360 @@ async def test_engine_shutdown_does_not_close_store_when_durable_prepare_fails()
 
     engine.message_bus.stop.assert_not_called()
     engine.store.close.assert_not_awaited()
+
+
+@_async_test
+async def test_nested_delegate_init_gap_is_joined_before_each_owned_store_closes(
+    tmp_path,
+) -> None:
+    from opc.database.store import OPCStore
+
+    registry = ActiveTaskRunRegistry()
+    root_store = OPCStore(tmp_path / "root.db")
+    delegate_store = OPCStore(tmp_path / "delegate.db")
+    await root_store.initialize()
+    await delegate_store.initialize()
+    root = OPCEngine(
+        project_id="project-root",
+        store=root_store,
+        owns_store=True,
+        active_task_run_registry=registry,
+        owns_active_task_run_registry=True,
+    )
+    delegate = OPCEngine(
+        project_id="project-delegate",
+        store=delegate_store,
+        owns_store=True,
+        active_task_run_registry=registry,
+        owns_active_task_run_registry=False,
+    )
+    child = OPCEngine(
+        project_id="project-delegate",
+        store=delegate_store,
+        owns_store=False,
+        active_task_run_registry=registry,
+        owns_active_task_run_registry=False,
+    )
+    root._project_engine_delegates["project-delegate"] = delegate
+    events: list[str] = []
+    original_delegate_close = delegate_store.close
+    original_root_close = root_store.close
+
+    async def delegate_close() -> None:
+        events.append("delegate_store_close")
+        await original_delegate_close()
+
+    async def root_close() -> None:
+        events.append("root_store_close")
+        await original_root_close()
+
+    delegate_store.close = delegate_close  # type: ignore[method-assign]
+    root_store.close = root_close  # type: ignore[method-assign]
+    entered_gap = asyncio.Event()
+
+    async def initialize_gap() -> None:
+        ingress = delegate._register_runtime_child(child)
+        entered_gap.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            assert delegate_store.is_ready
+            events.append("delegate_ingress_joined")
+            raise
+        finally:
+            await child.shutdown()
+            delegate._unregister_runtime_child(child, ingress)
+
+    ingress_task = asyncio.create_task(initialize_gap())
+    await entered_gap.wait()
+    try:
+        await root.shutdown()
+        await root.shutdown()
+
+        assert ingress_task.cancelled()
+        assert delegate._runtime_child_engines == set()
+        assert delegate._runtime_child_ingress_tasks == set()
+        assert root._project_engine_delegates == {}
+        assert events == [
+            "delegate_ingress_joined",
+            "delegate_store_close",
+            "root_store_close",
+        ]
+        assert not delegate_store.is_ready
+        assert not root_store.is_ready
+    finally:
+        if not ingress_task.done():
+            ingress_task.cancel()
+            await asyncio.gather(ingress_task, return_exceptions=True)
+        if delegate_store.is_ready:
+            await original_delegate_close()
+        if root_store.is_ready:
+            await original_root_close()
+
+
+@_async_test
+async def test_delegate_child_cleanup_failure_keeps_all_stores_open_for_retry() -> None:
+    registry = ActiveTaskRunRegistry()
+
+    class FakeStore:
+        def __init__(self) -> None:
+            self.is_ready = True
+            self.close_count = 0
+
+        async def close(self) -> None:
+            self.close_count += 1
+            self.is_ready = False
+
+    root_store = FakeStore()
+    delegate_store = FakeStore()
+    root = OPCEngine(
+        project_id="project-root",
+        store=root_store,  # type: ignore[arg-type]
+        owns_store=True,
+        active_task_run_registry=registry,
+        owns_active_task_run_registry=True,
+    )
+    delegate = OPCEngine(
+        project_id="project-delegate",
+        store=delegate_store,  # type: ignore[arg-type]
+        owns_store=True,
+        active_task_run_registry=registry,
+        owns_active_task_run_registry=False,
+    )
+    class FailingChild:
+        def __init__(self) -> None:
+            self.prepare_active_company_runtimes_for_shutdown = AsyncMock(
+                return_value=[]
+            )
+            self.shutdown = AsyncMock(
+                side_effect=[RuntimeError("child cleanup failed"), None]
+            )
+
+    child = FailingChild()
+    delegate._runtime_child_engines.add(child)  # type: ignore[arg-type]
+    root._project_engine_delegates["project-delegate"] = delegate
+
+    with pytest.raises(RuntimeError, match="child cleanup failed"):
+        await root.shutdown()
+
+    assert root_store.is_ready and delegate_store.is_ready
+    assert not root._shutdown_complete and not delegate._shutdown_complete
+    assert root._project_engine_delegates["project-delegate"] is delegate
+    assert child in delegate._runtime_child_engines
+    assert root_store.close_count == delegate_store.close_count == 0
+
+    await root.shutdown()
+
+    assert root._shutdown_complete and delegate._shutdown_complete
+    assert root._project_engine_delegates == {}
+    assert delegate._runtime_child_engines == set()
+    assert root_store.close_count == delegate_store.close_count == 1
+
+
+@_async_test
+async def test_interaction_cleanup_failure_fails_closed_then_shutdown_retries() -> None:
+    engine = OPCEngine(project_id="project-a")
+
+    class FakeStore:
+        is_ready = True
+        close_count = 0
+
+        async def close(self) -> None:
+            self.close_count += 1
+            self.is_ready = False
+
+    store = FakeStore()
+    engine.store = store  # type: ignore[assignment]
+    engine.prepare_active_company_runtimes_for_shutdown = AsyncMock(return_value=[])
+    started = asyncio.Event()
+
+    async def consumer() -> None:
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError as exc:
+            raise RuntimeError("durable release failed") from exc
+
+    task = asyncio.create_task(consumer())
+    engine._interaction_consumer_tasks.add(task)
+    task.add_done_callback(engine._interaction_consumer_finished)
+    await started.wait()
+
+    with pytest.raises(RuntimeError, match="durable release failed"):
+        await engine.shutdown()
+
+    assert store.is_ready
+    assert store.close_count == 0
+    assert not engine._shutdown_complete
+
+    await engine.shutdown()
+
+    assert engine._shutdown_complete
+    assert store.close_count == 1
+    assert not store.is_ready
+
+
+@_async_test
+async def test_shutdown_joins_exact_tool_operation_before_store_close() -> None:
+    engine = OPCEngine(project_id="project-a")
+    task = Task(id="worker", title="Worker", project_id="project-a")
+    cleanup_observation: list[object] = []
+
+    class FakeStore:
+        is_ready = True
+
+        async def claim_runtime_tool_continuation(self, **_kwargs):
+            return SimpleNamespace(
+                acquired=True,
+                outcome="acquired",
+                claim_id="continuation-claim",
+                request_generation=1,
+            )
+
+        async def begin_runtime_tool_continuation(self, **_kwargs):
+            return SimpleNamespace(acquired=True, outcome="started")
+
+        async def get_task(self, _task_id):
+            return task
+
+        async def renew_runtime_tool_continuation(self, **_kwargs):
+            return SimpleNamespace(acquired=True, outcome="renewed")
+
+        async def finish_runtime_tool_continuation(self, **_kwargs):
+            return SimpleNamespace(outcome="finished", request_generation=1)
+
+        async def close(self) -> None:
+            cleanup_observation.append("store_close")
+            self.is_ready = False
+
+    store = FakeStore()
+    engine.store = store  # type: ignore[assignment]
+    engine.prepare_active_company_runtimes_for_shutdown = AsyncMock(return_value=[])
+    run_started = asyncio.Event()
+
+    async def run_once(_task: Task) -> str:
+        run_started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cleanup_observation.extend([store.is_ready, "operation_joined"])
+
+    lease = InteractionDecisionLease(
+        checkpoint=ExecutionCheckpoint(
+            checkpoint_id="permission",
+            project_id="project-a",
+            session_id="root-session",
+            checkpoint_type="tool_permission",
+            task_id=task.id,
+        ),
+        decision={"option_id": "approve_once"},
+        consumer_id="consumer",
+        claim_id="interaction-claim",
+    )
+    consumer = asyncio.create_task(
+        engine._run_runtime_tool_continuation_singleflight(
+            task=task,
+            runtime_session_id="runtime-1",
+            interaction_lease=lease,
+            run_once=run_once,
+        )
+    )
+    engine._interaction_consumer_tasks.add(consumer)
+    consumer.add_done_callback(engine._interaction_consumer_finished)
+    await run_started.wait()
+
+    await engine.shutdown()
+
+    assert consumer.cancelled()
+    assert cleanup_observation == [True, "operation_joined", "store_close"]
+    assert not any(
+        not pending.done()
+        and (
+            pending.get_name().startswith("tool-continuation:")
+            or pending is consumer
+        )
+        for pending in asyncio.all_tasks()
+    )
+
+
+@_async_test
+async def test_delegate_construction_gap_cannot_publish_after_root_shutdown() -> None:
+    registry = ActiveTaskRunRegistry()
+    root = OPCEngine(
+        project_id="project-root",
+        active_task_run_registry=registry,
+        owns_active_task_run_registry=True,
+    )
+    initialize_entered = asyncio.Event()
+    allow_initialize = asyncio.Event()
+    delegate_closed = asyncio.Event()
+    created: list[object] = []
+
+    class FakeDelegate:
+        def __init__(self, **_kwargs: object) -> None:
+            self.store = SimpleNamespace(is_ready=True)
+            self._shutdown_complete = False
+            created.append(self)
+
+        async def initialize(self) -> None:
+            initialize_entered.set()
+            await allow_initialize.wait()
+
+        async def shutdown(self) -> None:
+            self.store.is_ready = False
+            self._shutdown_complete = True
+            delegate_closed.set()
+
+        async def prepare_active_company_runtimes_for_shutdown(self, **_kwargs):
+            return []
+
+    with patch("opc.engine.OPCEngine", FakeDelegate):
+        construction = asyncio.create_task(root._get_project_delegate("project-b"))
+        await initialize_entered.wait()
+        shutdown = asyncio.create_task(root.shutdown())
+        await shutdown
+
+    assert construction.cancelled()
+    assert delegate_closed.is_set()
+    assert created and not created[0].store.is_ready
+    assert root._project_engine_delegates == {}
+    assert root._project_delegate_candidates == {}
+    assert root._project_delegate_construction_tasks == set()
+    with pytest.raises(ActiveTaskRunAdmissionClosed):
+        await root._get_project_delegate("project-c")
+
+
+@_async_test
+async def test_same_project_message_ingress_rejected_during_and_after_shutdown() -> None:
+    engine = OPCEngine(project_id="project-a")
+    handler = AsyncMock(return_value=SimpleNamespace(content="unexpected"))
+    engine.message_bus.set_handler(handler)
+    engine._initialized = True
+    engine.prepare_active_company_runtimes_for_shutdown = AsyncMock(return_value=[])
+    close_entered = asyncio.Event()
+    allow_close = asyncio.Event()
+
+    class BlockingStore:
+        is_ready = True
+
+        async def close(self) -> None:
+            close_entered.set()
+            await allow_close.wait()
+            self.is_ready = False
+
+    engine.store = BlockingStore()  # type: ignore[assignment]
+    shutting_down = asyncio.create_task(engine.shutdown())
+    await close_entered.wait()
+
+    with pytest.raises(ActiveTaskRunAdmissionClosed):
+        await engine.process_message("late", project_id="project-a")
+    with pytest.raises(ActiveTaskRunAdmissionClosed):
+        await engine._get_project_delegate("project-a")
+    handler.assert_not_awaited()
+
+    allow_close.set()
+    await shutting_down
+
+    with pytest.raises(ActiveTaskRunAdmissionClosed):
+        await engine.process_message("after", project_id="project-a")
+    handler.assert_not_awaited()

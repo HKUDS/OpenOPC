@@ -212,13 +212,6 @@ class MeetingStatus(str, Enum):
     CANCELLED = "cancelled"
 
 
-class EscalationType(str, Enum):
-    INFO_NEEDED = "info_needed"
-    DECISION_NEEDED = "decision_needed"
-    RISK_WARNING = "risk_warning"
-    RECOMMENDATION = "recommendation"
-
-
 class RiskLevel(str, Enum):
     LOW = "low"
     MEDIUM = "medium"
@@ -260,9 +253,11 @@ class ReorgRiskLevel(str, Enum):
 class ReorgProposalStatus(str, Enum):
     PROPOSED = "proposed"
     APPROVED = "approved"
+    APPLYING = "applying"
     DENIED = "denied"
     APPLIED = "applied"
     FAILED = "failed"
+    EXECUTION_UNKNOWN = "execution_unknown"
     CANCELLED = "cancelled"
 
 
@@ -434,6 +429,15 @@ class DelegationRun:
     recovery_pointer: dict[str, Any] = field(default_factory=dict)
     project_dossier: dict[str, Any] = field(default_factory=dict)
     metadata: dict[str, Any] = field(default_factory=dict)
+    # Durable single-controller lease.  These fields live on the run row so
+    # controller ownership has exactly the same project/run/root scope as the
+    # workflow it fences; normal DelegationRun saves deliberately do not own
+    # them (the Store CAS methods below do).
+    controller_owner_token: str = ""
+    controller_lease_generation: int = 0
+    controller_lease_acquired_at: datetime | None = None
+    controller_lease_heartbeat_at: datetime | None = None
+    controller_lease_expires_at: datetime | None = None
     created_at: datetime = field(default_factory=datetime.now)
     updated_at: datetime = field(default_factory=datetime.now)
 
@@ -860,6 +864,38 @@ class ReorgProposal:
     updated_at: datetime = field(default_factory=datetime.now)
 
 
+@dataclass(frozen=True)
+class ReorgApplicationClaimReceipt:
+    outcome: str
+    operation_token: str
+    proposal: ReorgProposal | None = None
+
+    @property
+    def acquired(self) -> bool:
+        return self.outcome == "acquired"
+
+
+@dataclass(frozen=True)
+class ReorgApplicationFinishReceipt:
+    outcome: str
+    operation_token: str
+    proposal: ReorgProposal | None = None
+
+    @property
+    def applied(self) -> bool:
+        return self.outcome in {"applied", "duplicate"}
+
+
+@dataclass(frozen=True)
+class ReorgDecisionReceipt:
+    outcome: str
+    proposal: ReorgProposal | None = None
+
+    @property
+    def applied(self) -> bool:
+        return self.outcome in {"applied", "duplicate"}
+
+
 @dataclass
 class TaskResult:
     status: TaskStatus
@@ -939,6 +975,149 @@ class ExecutionCheckpoint:
     payload: dict[str, Any] = field(default_factory=dict)
     created_at: datetime = field(default_factory=datetime.now)
     updated_at: datetime = field(default_factory=datetime.now)
+
+
+CheckpointDecisionOutcome = Literal[
+    "accepted",
+    "duplicate",
+    "conflict",
+    "invalid_state",
+    "not_found",
+    "empty_decision",
+    "option_id_required",
+    "invalid_option_id",
+    "input_required",
+    "invalid_user_input_answers",
+    "invalid_gate_action",
+    "invalid_delivery_action",
+    "feedback_text_required",
+    "invalid_staffing_action",
+    "invalid_staffing_selections",
+    "invalid_recruitment_action",
+    "invalid_recruitment_role_agents",
+    "invalid_reorg_action",
+    "invalid_failure_review_action",
+    "unsupported_checkpoint_type",
+]
+
+
+@dataclass(frozen=True)
+class ExecutionCheckpointDecisionReceipt:
+    """Durable result of submitting one human decision.
+
+    ``duplicate`` is a successful idempotent replay of the exact same decision
+    hash and value; transport request ids may differ after reconnect.  A
+    ``conflict`` means a different answer already owns the checkpoint and must
+    never be silently replaced.
+    """
+
+    outcome: CheckpointDecisionOutcome
+    checkpoint: ExecutionCheckpoint | None = None
+    live_waiter_notified: bool = False
+
+    @property
+    def acknowledged(self) -> bool:
+        return self.outcome in {"accepted", "duplicate"}
+
+
+CheckpointClaimOutcome = Literal[
+    "claimed",
+    "reclaimed",
+    "renewed",
+    "started",
+    "duplicate",
+    "busy",
+    "controller_busy",
+    "invalid_state",
+    "not_found",
+]
+
+
+@dataclass(frozen=True)
+class ExecutionCheckpointClaimReceipt:
+    """Result of acquiring the lease for an answered checkpoint."""
+
+    outcome: CheckpointClaimOutcome
+    checkpoint: ExecutionCheckpoint | None = None
+    claim_id: str = ""
+
+    @property
+    def acquired(self) -> bool:
+        return self.outcome in {
+            "claimed",
+            "reclaimed",
+            "renewed",
+            "started",
+            "duplicate",
+        }
+
+
+CheckpointConsumptionOutcome = Literal[
+    "finished",
+    "released",
+    "duplicate",
+    "conflict",
+    "invalid_state",
+    "not_found",
+]
+
+
+@dataclass(frozen=True)
+class ExecutionCheckpointConsumptionReceipt:
+    """Result of finishing or releasing a checkpoint consumption lease."""
+
+    outcome: CheckpointConsumptionOutcome
+    checkpoint: ExecutionCheckpoint | None = None
+
+    @property
+    def applied(self) -> bool:
+        return self.outcome in {"finished", "released", "duplicate"}
+
+
+RuntimeToolContinuationClaimOutcome = Literal[
+    "claimed",
+    "reclaimed",
+    "renewed",
+    "duplicate",
+    "busy",
+    "conflict",
+    "not_found",
+]
+
+
+@dataclass(frozen=True)
+class RuntimeToolContinuationClaimReceipt:
+    """Durable single-flight lease for one task/runtime continuation."""
+
+    outcome: RuntimeToolContinuationClaimOutcome
+    claim_id: str = ""
+    consumer_id: str = ""
+    request_generation: int = 0
+    lease_expires_at: str = ""
+
+    @property
+    def acquired(self) -> bool:
+        return self.outcome in {"claimed", "reclaimed", "renewed", "duplicate"}
+
+
+RuntimeToolContinuationFinishOutcome = Literal[
+    "finished",
+    "more_work",
+    "conflict",
+    "not_found",
+]
+
+
+@dataclass(frozen=True)
+class RuntimeToolContinuationFinishReceipt:
+    """Result of releasing a continuation runner after draining permits."""
+
+    outcome: RuntimeToolContinuationFinishOutcome
+    request_generation: int = 0
+
+    @property
+    def applied(self) -> bool:
+        return self.outcome in {"finished", "more_work"}
 
 
 # ---------------------------------------------------------------------------

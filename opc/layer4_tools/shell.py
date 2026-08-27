@@ -13,7 +13,13 @@ from opc.layer4_tools.execution_context import (
     resolve_task_execution_context,
     wrap_command_for_context,
 )
-from opc.layer4_tools.registry import ToolDefinition
+from opc.layer4_tools.opaque_execution import (
+    OpaqueExecutionEnvelopeError,
+    OpaqueExecutionPlan,
+    current_opaque_execution_plan,
+    verify_opaque_execution_plan,
+)
+from opc.layer4_tools.registry import COMPANY_EFFECT_OPAQUE_EXACT, ToolDefinition
 from opc.layer2_organization.work_item_identity import work_item_turn_type_from_metadata
 
 
@@ -68,11 +74,78 @@ async def _run_shell_command(
     timeout: int = _DEFAULT_SHELL_TIMEOUT,
     task: Any | None = None,
     on_progress: Any = None,
+    frozen_plan: OpaqueExecutionPlan | None = None,
 ) -> dict[str, Any]:
-    cwd = _resolve_working_directory(working_directory, task)
-    cwd_path = Path(cwd).expanduser()
-    resolved_cwd = str(cwd_path.resolve(strict=False))
-    if not cwd_path.exists() or not cwd_path.is_dir():
+    if frozen_plan is not None:
+        resolved_cwd = frozen_plan.cwd
+        context = frozen_plan.context
+        command = frozen_plan.effective_command
+        args = list(frozen_plan.argv)
+        env = frozen_plan.environment
+        sandbox_meta = frozen_plan.sandbox
+        timeout = frozen_plan.timeout
+        preparation_error = frozen_plan.preparation_error
+    else:
+        cwd = _resolve_working_directory(working_directory, task)
+        cwd_path = Path(cwd).expanduser()
+        resolved_cwd = str(cwd_path.resolve(strict=False))
+        preparation_error = ""
+        if not cwd_path.exists() or not cwd_path.is_dir():
+            preparation_error = f"Working directory does not exist: {resolved_cwd}"
+        if task is not None:
+            meta = getattr(task, "metadata", {}) or {}
+            override = meta.get("shell_timeout_override")
+            if override is not None:
+                try:
+                    timeout = max(int(override), timeout)
+                except (ValueError, TypeError):
+                    pass
+            elif work_item_turn_type_from_metadata(meta, fallback="") == "setup":
+                timeout = max(timeout, _SETUP_STAGE_DEFAULT_TIMEOUT)
+            shell_prefix = ""
+            shell_prefix_win = ""
+            inherited = meta.get("inherited_environment")
+            if isinstance(inherited, dict):
+                shell_prefix = str(inherited.get("shell_prefix", "") or "").strip()
+                shell_prefix_win = str(inherited.get("shell_prefix_win", "") or "").strip()
+            if not shell_prefix:
+                manifest = meta.get("environment_manifest")
+                if isinstance(manifest, dict):
+                    shell_prefix = str(manifest.get("shell_prefix", "") or "").strip()
+                    shell_prefix_win = str(manifest.get("shell_prefix_win", "") or "").strip()
+            is_powershell = shell_name == "powershell"
+            active_prefix = shell_prefix_win if (is_powershell and shell_prefix_win) else shell_prefix
+            if active_prefix and active_prefix not in command:
+                separator = _POWERSHELL_CMD_SEPARATOR if is_powershell else _BASH_CMD_SEPARATOR
+                command = f"{active_prefix}{separator}{command}"
+                # Replace only the trailing command argument. PowerShell args are
+                # [exe, "-NoProfile", "-Command", command] (4 elements); the previous
+                # ``[args[0], args[1], command]`` dropped the "-Command" flag and left
+                # PowerShell unable to interpret the prefixed command. Bash args are
+                # [bash, "-lc", command] (3 elements), handled identically here.
+                args = [*args[:-1], command] if len(args) >= 1 else args
+        context = resolve_task_execution_context(task)
+        if resolved_cwd and not context.get("workspace_root"):
+            context["workspace_root"] = resolved_cwd
+        env = build_subprocess_env(context)
+        try:
+            args, sandbox_meta = wrap_command_for_context(
+                args,
+                cwd=resolved_cwd,
+                context=context,
+            )
+        except RuntimeError as exc:
+            preparation_error = str(exc)
+            sandbox_cfg = dict(context.get("sandbox", {}) or {})
+            sandbox_meta = {
+                "platform": str(sandbox_cfg.get("platform", "") or ""),
+                "requested_mode": str(sandbox_cfg.get("mode", "") or ""),
+                "effective_mode": "off",
+                "available": False,
+                "fallback_used": False,
+            }
+
+    if preparation_error:
         return {
             "success": False,
             "shell": shell_name,
@@ -82,74 +155,28 @@ async def _run_shell_command(
             "stderr": "",
             "exit_code": -1,
             "timed_out": False,
-            "error": f"Working directory does not exist: {resolved_cwd}",
-            "sandbox": {
-                "platform": "",
-                "requested_mode": "",
-                "effective_mode": "off",
-                "available": False,
-                "fallback_used": False,
-            },
-            "execution_context": {},
-        }
-    if task is not None:
-        meta = getattr(task, "metadata", {}) or {}
-        override = meta.get("shell_timeout_override")
-        if override is not None:
-            try:
-                timeout = max(int(override), timeout)
-            except (ValueError, TypeError):
-                pass
-        elif work_item_turn_type_from_metadata(meta, fallback="") == "setup":
-            timeout = max(timeout, _SETUP_STAGE_DEFAULT_TIMEOUT)
-        shell_prefix = ""
-        shell_prefix_win = ""
-        inherited = meta.get("inherited_environment")
-        if isinstance(inherited, dict):
-            shell_prefix = str(inherited.get("shell_prefix", "") or "").strip()
-            shell_prefix_win = str(inherited.get("shell_prefix_win", "") or "").strip()
-        if not shell_prefix:
-            manifest = meta.get("environment_manifest")
-            if isinstance(manifest, dict):
-                shell_prefix = str(manifest.get("shell_prefix", "") or "").strip()
-                shell_prefix_win = str(manifest.get("shell_prefix_win", "") or "").strip()
-        is_powershell = shell_name == "powershell"
-        active_prefix = shell_prefix_win if (is_powershell and shell_prefix_win) else shell_prefix
-        if active_prefix and active_prefix not in command:
-            separator = _POWERSHELL_CMD_SEPARATOR if is_powershell else _BASH_CMD_SEPARATOR
-            command = f"{active_prefix}{separator}{command}"
-            # Replace only the trailing command argument. PowerShell args are
-            # [exe, "-NoProfile", "-Command", command] (4 elements); the previous
-            # ``[args[0], args[1], command]`` dropped the "-Command" flag and left
-            # PowerShell unable to interpret the prefixed command. Bash args are
-            # [bash, "-lc", command] (3 elements), handled identically here.
-            args = [*args[:-1], command] if len(args) >= 1 else args
-    context = resolve_task_execution_context(task)
-    if resolved_cwd and not context.get("workspace_root"):
-        context["workspace_root"] = resolved_cwd
-    env = build_subprocess_env(context)
-    try:
-        wrapped_args, sandbox_meta = wrap_command_for_context(args, cwd=resolved_cwd, context=context)
-    except RuntimeError as exc:
-        return {
-            "success": False,
-            "shell": shell_name,
-            "command": command,
-            "cwd": resolved_cwd,
-            "stdout": "",
-            "stderr": "",
-            "exit_code": -1,
-            "timed_out": False,
-            "error": str(exc),
-            "sandbox": {
-                "platform": (context.get("sandbox", {}) or {}).get("platform", ""),
-                "requested_mode": (context.get("sandbox", {}) or {}).get("mode", ""),
-                "effective_mode": "off",
-                "available": False,
-                "fallback_used": False,
-            },
+            "error": preparation_error,
+            "sandbox": sandbox_meta,
             "execution_context": _context_preview(context),
         }
+    if frozen_plan is not None:
+        try:
+            verify_opaque_execution_plan(frozen_plan)
+        except OpaqueExecutionEnvelopeError as exc:
+            return {
+                "success": False,
+                "shell": shell_name,
+                "command": command,
+                "cwd": resolved_cwd,
+                "stdout": "",
+                "stderr": "",
+                "exit_code": -1,
+                "timed_out": False,
+                "error": str(exc),
+                "sandbox": sandbox_meta,
+                "execution_context": _context_preview(context),
+            }
+    wrapped_args = list(args)
     proc: asyncio.subprocess.Process | None = None
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -292,6 +319,20 @@ async def shell_exec(
     on_progress: Any = None,
 ) -> dict[str, Any]:
     """Compatibility wrapper that selects bash or PowerShell."""
+    frozen_plan = current_opaque_execution_plan("shell_exec")
+    if frozen_plan is not None:
+        return await _run_shell_command(
+            shell_name=str(
+                frozen_plan.envelope.get("shell_kind", "") or "shell"
+            ),
+            command=command,
+            args=list(frozen_plan.argv),
+            working_directory=working_directory,
+            timeout=timeout,
+            task=None,
+            on_progress=on_progress,
+            frozen_plan=frozen_plan,
+        )
     normalized = str(shell or "").strip().lower()
     if normalized == "powershell":
         return await powershell_exec(
@@ -352,6 +393,7 @@ def create_shell_tools() -> list[ToolDefinition]:
             requires_confirmation=True,
             concurrency_safe=False,
             read_only=False,
+            company_effect_kind=COMPANY_EFFECT_OPAQUE_EXACT,
         ),
     ]
 

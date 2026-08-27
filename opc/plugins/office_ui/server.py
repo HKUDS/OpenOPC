@@ -20,6 +20,7 @@ import aiosqlite
 from loguru import logger
 
 from opc.core.config import OPCConfig, get_opc_home
+from opc.core.workspace_trust import WorkspaceTrustRequired
 from opc.engine import OPCEngine
 from opc.plugins.office_ui.agent_store import AgentStore
 from opc.plugins.office_ui.chat_store import ChatStore
@@ -100,6 +101,8 @@ async def create_app(
             try:
                 config = OPCConfig.load(config_dir)
                 logger.info(f"Loaded config from {config_dir}")
+            except WorkspaceTrustRequired:
+                raise
             except Exception as e:
                 logger.warning(f"Failed to load config from {config_dir}: {e}")
 

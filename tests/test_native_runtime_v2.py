@@ -2,21 +2,29 @@ from __future__ import annotations
 
 import asyncio
 import json
+import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 from opc.core.config import AutonomyConfig, LLMConfig, NativeSubagentProfileConfig, OPCConfig, PermissionsV2Config
 from opc.core.models import PermissionResolution
 from opc.core.models import PermissionScope, RiskLevel, Task, TaskResult, TaskStatus
+from opc.database.store import OPCStore
+from opc.engine import OPCEngine
 from opc.layer2_organization.approval import ApprovalEngine
 from opc.layer3_agent.runtime_v2.permissions import RuntimePermissionAdapter
 from opc.layer3_agent.runtime_v2.runtime import NativeRuntimeV2
 from opc.layer3_agent.runtime_v2.streaming_tool_executor import StreamingToolExecutor
-from opc.layer3_agent.runtime_v2.subagents import SubagentManager
+from opc.layer3_agent.runtime_v2.subagents import SubagentManager, SubagentState
 from opc.layer3_agent.runtime_v2.tool_planner import ToolPlanner
 from opc.layer4_tools.agent_runtime import create_agent_runtime_tools
-from opc.layer4_tools.registry import ToolDefinition, ToolRegistry
+from opc.layer4_tools.registry import (
+    ToolDefinition,
+    ToolInvocationValidationError,
+    ToolRegistry,
+)
 from opc.layer4_tools.todo import create_todo_tools
 from opc.llm.provider import LLMProvider
 
@@ -57,6 +65,20 @@ class _StubLLM:
         yield type("Evt", (), {"event_type": "message_stop", "payload": {"finish_reason": "stop"}, "model": "stub"})()
 
 
+class _BlockingLLM(_StubLLM):
+    def __init__(self) -> None:
+        super().__init__()
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def chat_stream(self, messages, tools=None):
+        _ = (messages, tools)
+        self.entered.set()
+        await self.release.wait()
+        if False:  # pragma: no cover - make this an async generator
+            yield None
+
+
 class _StubStore:
     def __init__(self) -> None:
         self.project_grants: list[dict[str, object]] = []
@@ -85,6 +107,13 @@ class _StubStore:
     async def get_session_transcript(self, session_id: str) -> list[dict[str, object]]:
         _ = session_id
         return list(self.transcript)
+
+    async def delegation_run_controller_lease_is_current(self, *args, **kwargs) -> bool:
+        _ = (args, kwargs)
+        return True
+
+    async def save_task(self, task: Task) -> None:
+        _ = task
 
 
 class _StubPart:
@@ -134,12 +163,22 @@ class _SubagentStore:
     def __init__(self) -> None:
         self.subagent_runs: list[dict[str, object]] = []
         self.worktree_sessions: list[dict[str, object]] = []
+        self.saved_tasks: list[Task] = []
 
     async def save_runtime_subagent_run(self, **kwargs) -> None:
         self.subagent_runs.append(dict(kwargs))
 
     async def save_runtime_worktree_session(self, **kwargs) -> None:
         self.worktree_sessions.append(dict(kwargs))
+
+    async def save_task(self, task: Task) -> None:
+        self.saved_tasks.append(task)
+
+
+def _verification_enabled_config() -> OPCConfig:
+    config = OPCConfig()
+    config.system.native_runtime.verification_policy.enabled = True
+    return config
 
 
 class NativeRuntimeV2Tests(unittest.IsolatedAsyncioTestCase):
@@ -148,7 +187,7 @@ class NativeRuntimeV2Tests(unittest.IsolatedAsyncioTestCase):
             llm=_StubLLM(),
             tool_registry=ToolRegistry(),
             event_bus=_StubEventBus(),
-            config=OPCConfig(),
+            config=_verification_enabled_config(),
         )
 
     async def test_task_mode_does_not_require_automatic_verification(self) -> None:
@@ -178,6 +217,103 @@ class NativeRuntimeV2Tests(unittest.IsolatedAsyncioTestCase):
                 "observed_risky_tools": ["shell_exec"],
             },
         ))
+
+    async def test_cancelled_runtime_is_suspended_without_losing_resume_state(
+        self,
+    ) -> None:
+        """Cancellation joins its durable terminal write before returning."""
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            store = OPCStore(Path(tmp_dir) / "tasks.db")
+            await store.initialize()
+            runner: asyncio.Task[TaskResult] | None = None
+            try:
+                llm = _BlockingLLM()
+                memory = _StubMemoryManager(store)  # type: ignore[arg-type]
+                task = Task(
+                    id="cancelled-runtime-task",
+                    title="Cancelled native runtime",
+                    session_id="cancelled-runtime-session",
+                    project_id="project-a",
+                    metadata={
+                        "mode": "task",
+                        "execution_mode": "task_mode",
+                        "runtime_kind": "task_mode_agent_turn",
+                        "runtime_v2": {
+                            "runtime_session_id": "rt-cancel-barrier",
+                        },
+                    },
+                )
+                await store.save_task(task)
+                runtime = NativeRuntimeV2(
+                    llm=llm,
+                    tool_registry=ToolRegistry(),
+                    memory_manager=memory,
+                    event_bus=_StubEventBus(),
+                    config=OPCConfig(),
+                )
+                runner = asyncio.create_task(
+                    runtime.run(
+                        system_prompt="Block until cancelled.",
+                        user_message="Preserve this turn for resume.",
+                        task=task,
+                    )
+                )
+                await asyncio.wait_for(llm.entered.wait(), timeout=2)
+                running = await store.get_runtime_session("rt-cancel-barrier")
+                assert running is not None and running["status"] == "running"
+                transcript_before = await store.list_runtime_transcript_entries(
+                    "rt-cancel-barrier"
+                )
+                self.assertEqual(len(transcript_before), 1)
+                await store.save_runtime_session(
+                    runtime_session_id="rt-cancel-barrier",
+                    project_id="project-a",
+                    session_id="cancelled-runtime-session",
+                    task_id="cancelled-runtime-task",
+                    status="running",
+                    metadata={
+                        **dict(running["metadata"]),
+                        "resume_marker": {"cursor": 7},
+                        "artifact_manifest": [{"path": "kept.md"}],
+                    },
+                )
+
+                runner.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await runner
+
+                self.assertTrue(store.is_ready)
+                suspended = await store.get_runtime_session(
+                    "rt-cancel-barrier"
+                )
+                assert suspended is not None
+                self.assertEqual(suspended["status"], "suspended")
+                self.assertEqual(suspended["task_id"], "cancelled-runtime-task")
+                self.assertEqual(
+                    suspended["session_id"], "cancelled-runtime-session"
+                )
+                self.assertEqual(
+                    suspended["metadata"]["resume_marker"], {"cursor": 7}
+                )
+                self.assertEqual(
+                    suspended["metadata"]["artifact_manifest"],
+                    [{"path": "kept.md"}],
+                )
+                self.assertEqual(
+                    await store.list_runtime_transcript_entries(
+                        "rt-cancel-barrier"
+                    ),
+                    transcript_before,
+                )
+                self.assertEqual(
+                    task.metadata["runtime_v2"]["status"], "suspended"
+                )
+            finally:
+                if runner is not None and not runner.done():
+                    runner.cancel()
+                    await asyncio.gather(runner, return_exceptions=True)
+                await store.close()
 
     async def test_task_mode_explicit_verification_is_advisory_and_does_not_append_footer(self) -> None:
         runtime = self._runtime_for_unit_checks()
@@ -240,7 +376,7 @@ class NativeRuntimeV2Tests(unittest.IsolatedAsyncioTestCase):
                     ),
                 }
 
-        result = await runtime._run_verification_gate(
+        result = await runtime._run_verification_audit(
             runtime_session_id="rt-task",
             task=task,
             subagents=_Subagents(),
@@ -253,6 +389,48 @@ class NativeRuntimeV2Tests(unittest.IsolatedAsyncioTestCase):
         verification = runtime_notes["verification"]
         self.assertFalse(verification["passed"])
         self.assertEqual(verification["evidence"]["verdict"], "fail")
+
+    async def test_legacy_awaiting_review_remains_manager_only(self) -> None:
+        engine = OPCEngine(project_id="proj1")
+        engine._save_execution_checkpoint = AsyncMock()
+        task = Task(
+            id="legacy-manager-review",
+            project_id="proj1",
+            session_id="session-1",
+            metadata={"execution_mode": "company_mode"},
+        )
+
+        await engine._save_task_pause_checkpoint(
+            task,
+            TaskResult(
+                status=TaskStatus.AWAITING_REVIEW,
+                content="Compatibility manager review wait.",
+                artifacts={},
+            ),
+        )
+
+        engine._save_execution_checkpoint.assert_not_awaited()
+
+        manager = SubagentManager(
+            parent_task=task,
+            config=OPCConfig(),
+            child_agent_factory=None,
+        )
+        state = SubagentState(
+            agent_id="legacy-review-child",
+            profile="review",
+            task_result=TaskResult(
+                status=TaskStatus.AWAITING_REVIEW,
+                content="Awaiting internal manager review.",
+            ),
+        )
+        payload = manager._result_payload(state)
+
+        self.assertEqual(
+            manager._resident_notification_kind(state.task_result),
+            "blocked",
+        )
+        self.assertNotIn("requires_user_input", payload)
 
     async def test_task_mode_thinking_is_persisted_once_with_final_turn(self) -> None:
         class _ThinkingLLM:
@@ -481,6 +659,37 @@ class NativeRuntimeV2Tests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(metadata["ui_message_id"], "runtime-v2-assistant:ui-turn:task")
         self.assertNotIn("company_runtime_raw_turn", metadata)
 
+    async def test_registry_returns_structured_model_correctable_validation_error(
+        self,
+    ) -> None:
+        registry = ToolRegistry()
+
+        async def reject_cycle() -> None:
+            raise ToolInvocationValidationError(
+                "dependency cycle: a -> b -> a",
+                code="delegate_dependency_cycle",
+                correction="Remove one hard-dependency edge and retry.",
+                details={"cycle": "a -> b -> a"},
+            )
+
+        registry.register(
+            ToolDefinition(
+                name="reject_cycle",
+                description="Reject a cyclic test graph.",
+                parameters={"type": "object", "properties": {}},
+                func=reject_cycle,
+            )
+        )
+
+        result = await registry.invoke("reject_cycle", {})
+
+        self.assertFalse(result["success"])
+        self.assertEqual(result["error_type"], "validation_error")
+        self.assertEqual(result["error_code"], "delegate_dependency_cycle")
+        self.assertTrue(result["retryable"])
+        self.assertEqual(result["details"]["cycle"], "a -> b -> a")
+        self.assertNotIn("traceback", result)
+
     async def test_runtime_executes_tool_then_returns_second_turn_answer(self) -> None:
         registry = ToolRegistry()
 
@@ -521,23 +730,16 @@ class NativeRuntimeV2Tests(unittest.IsolatedAsyncioTestCase):
                 project_id="proj1",
                 metadata={
                     "mode": "task",
-                    "work_item_projection_id": "implement_work_item",
-                    "work_item_projection_title": "Implement Work Item",
-                    "company_profile": "corporate",
+                    "execution_mode": "task_mode",
                 },
             ),
         )
 
         self.assertEqual(result.status, TaskStatus.DONE)
-        self.assertTrue(result.content.startswith("done"))
-        self.assertIn("Verification:", result.content)
+        self.assertEqual(result.content, "done")
         self.assertEqual(result.artifacts["runtime_session_id"][:3], "rt_")
         runtime_events = [evt for evt in event_bus.events if getattr(evt, "event_type", "") == "runtime_event"]
         self.assertTrue(runtime_events)
-        self.assertTrue(any(
-            getattr(evt, "payload", {}).get("work_item_projection_id") == "implement_work_item"
-            for evt in runtime_events
-        ))
         self.assertTrue(any(
             getattr(evt, "payload", {}).get("type") == "prompt_prefix_state"
             for evt in runtime_events
@@ -784,7 +986,7 @@ class NativeRuntimeV2Tests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result["success"])
         self.assertEqual(captured["mode"], "bypass_permissions")
 
-    async def test_verification_gate_blocks_completion_when_verifier_reports_issues(self) -> None:
+    async def test_company_intake_partial_verification_is_audit_not_owner_wait(self) -> None:
         class _VerifyThenFinishLLM:
             def __init__(self) -> None:
                 self.calls = 0
@@ -832,12 +1034,12 @@ class NativeRuntimeV2Tests(unittest.IsolatedAsyncioTestCase):
                 return TaskResult(
                     status=TaskStatus.DONE,
                     content=(
-                        "ISSUES: missing validation evidence\n"
-                        "Check: Validation coverage\n"
-                        "Command: pytest -q tests/test_runtime.py\n"
-                        "Observed Output: rollback validation test is missing\n"
-                        "Result: FAIL\n"
-                        "VERDICT: FAIL"
+                        "ISSUES: delegated child outputs are not available yet\n"
+                        "Check: Child work-item completion\n"
+                        "Command: inspect company work-item board\n"
+                        "Observed Output: analyst and risk work items are still running\n"
+                        "Result: PARTIAL\n"
+                        "VERDICT: PARTIAL"
                     ),
                 )
 
@@ -852,37 +1054,70 @@ class NativeRuntimeV2Tests(unittest.IsolatedAsyncioTestCase):
                 llm=_VerifyThenFinishLLM(),
                 tool_registry=registry,
                 memory_manager=_StubMemoryManager(_StubStore()),
-                config=OPCConfig(),
+                config=_verification_enabled_config(),
                 child_agent_factory=lambda profile, allowed_tools, prompt: _VerifierAgent(),
                 max_iterations=4,
             )
 
+            company_task = Task(
+                title="Investment intake",
+                description="Delegate analysis and wait for both child work items.",
+                session_id="sess-verify",
+                project_id="proj1",
+                metadata={
+                    "execution_mode": "company_mode",
+                    "delegation_run_id": "verification-run",
+                    "company_run_controller_owner_token": "verification-owner",
+                    "company_run_controller_lease_generation": 1,
+                    "claimed_work_item_attempt_seq": 1,
+                    "runtime_model": "multi_team_org",
+                    "work_item_projection_id": "intake",
+                    "work_item_turn_type": "intake",
+                    "work_kind": "intake",
+                    "user_visible": True,
+                    "delegation_wait_for_work_item_ids": [
+                        "investment-analysis",
+                        "risk-analysis",
+                    ],
+                    "company_profile": "corporate",
+                },
+            )
             result = await runtime.run(
                 system_prompt="You are a verifier-aware runtime.",
                 user_message="Complete the task.",
-                task=Task(
-                    title="verify-runtime",
-                    description="verify-runtime",
-                    session_id="sess-verify",
-                    project_id="proj1",
-                    metadata={
-                        "execution_mode": "company_mode",
-                        "work_item_projection_id": "verify_runtime",
-                        "work_item_turn_type": "execute",
-                        "company_profile": "corporate",
-                    },
-                ),
+                task=company_task,
             )
 
-        self.assertEqual(result.status, TaskStatus.AWAITING_HUMAN)
-        self.assertIn("ISSUES:", result.content)
-        self.assertIn("verification", result.artifacts)
+        self.assertEqual(result.status, TaskStatus.DONE)
+        self.assertNotIn("pause_request", result.artifacts)
+        verification = dict(result.artifacts.get("verification", {}) or {})
+        self.assertFalse(verification.get("passed", True))
+        self.assertEqual(
+            dict(result.artifacts.get("verification_evidence", {}) or {}).get("verdict"),
+            "partial",
+        )
 
-    async def test_verification_failure_completes_hidden_company_turn_instead_of_blocking(self) -> None:
-        """A failed verification on a non-user-visible company card (e.g. the
-        hidden worker report/handoff turn) must complete as DONE rather than
-        park on AWAITING_HUMAN — a hidden card can never surface an approval
-        card, so blocking would deadlock the whole company run."""
+        # Production result mapping: only review-wait statuses call the owner
+        # checkpoint producer. Advisory verification completes normally, so a
+        # parent that is still waiting for delegated children remains an
+        # internal company concern and never creates ``task_user_input``.
+        engine = OPCEngine(project_id="proj1")
+        engine.store = SimpleNamespace(
+            get_task=AsyncMock(return_value=None),
+            save_task=AsyncMock(),
+        )
+        engine.memory = None
+        engine._run_task_once = AsyncMock(return_value=result)
+        engine._apply_runtime_state_to_task = lambda task, runtime_result: None
+        engine._save_task_pause_checkpoint = AsyncMock()
+
+        mapped = await engine._execute_task(company_task)
+
+        self.assertEqual(mapped.status, TaskStatus.DONE)
+        engine._save_task_pause_checkpoint.assert_not_awaited()
+
+    async def test_verification_failure_is_advisory_for_hidden_company_turn(self) -> None:
+        """Hidden company turns retain failed verifier evidence without a wait."""
         class _VerifyThenFinishLLM:
             def __init__(self) -> None:
                 self.calls = 0
@@ -950,7 +1185,7 @@ class NativeRuntimeV2Tests(unittest.IsolatedAsyncioTestCase):
                 llm=_VerifyThenFinishLLM(),
                 tool_registry=registry,
                 memory_manager=_StubMemoryManager(_StubStore()),
-                config=OPCConfig(),
+                config=_verification_enabled_config(),
                 child_agent_factory=lambda profile, allowed_tools, prompt: _VerifierAgent(),
                 max_iterations=4,
             )
@@ -965,6 +1200,10 @@ class NativeRuntimeV2Tests(unittest.IsolatedAsyncioTestCase):
                     project_id="proj1",
                     metadata={
                         "execution_mode": "company_mode",
+                        "delegation_run_id": "verification-run",
+                        "company_run_controller_owner_token": "verification-owner",
+                        "company_run_controller_lease_generation": 1,
+                        "claimed_work_item_attempt_seq": 1,
                         "work_item_projection_id": "report_runtime",
                         "work_item_turn_type": "report",
                         "company_profile": "corporate",
@@ -1042,7 +1281,7 @@ class NativeRuntimeV2Tests(unittest.IsolatedAsyncioTestCase):
                 llm=_VerifyThenFinishLLM(),
                 tool_registry=registry,
                 memory_manager=_StubMemoryManager(_StubStore()),
-                config=OPCConfig(),
+                config=_verification_enabled_config(),
                 child_agent_factory=lambda profile, allowed_tools, prompt: _VerifierAgent(),
                 max_iterations=4,
             )
@@ -1057,6 +1296,10 @@ class NativeRuntimeV2Tests(unittest.IsolatedAsyncioTestCase):
                     project_id="proj1",
                     metadata={
                         "execution_mode": "company_mode",
+                        "delegation_run_id": "verification-run",
+                        "company_run_controller_owner_token": "verification-owner",
+                        "company_run_controller_lease_generation": 1,
+                        "claimed_work_item_attempt_seq": 1,
                         "work_item_projection_id": "verify_runtime",
                         "work_item_turn_type": "execute",
                         "company_profile": "corporate",
@@ -1166,7 +1409,7 @@ class NativeRuntimeV2Tests(unittest.IsolatedAsyncioTestCase):
                 llm=_VerifyThenFinishLLM(),
                 tool_registry=registry,
                 memory_manager=_StubMemoryManager(_StubStore()),
-                config=OPCConfig(),
+                config=_verification_enabled_config(),
                 child_agent_factory=_child_agent_factory,
                 max_iterations=4,
             )
@@ -1181,6 +1424,10 @@ class NativeRuntimeV2Tests(unittest.IsolatedAsyncioTestCase):
                     project_id="proj1",
                     metadata={
                         "execution_mode": "company_mode",
+                        "delegation_run_id": "verification-run",
+                        "company_run_controller_owner_token": "verification-owner",
+                        "company_run_controller_lease_generation": 1,
+                        "claimed_work_item_attempt_seq": 1,
                         "work_item_projection_id": "verify_runtime_repair",
                         "work_item_turn_type": "execute",
                         "company_profile": "corporate",
@@ -1723,7 +1970,6 @@ def _build_permission_policy(
         store=_ApprovalStoreStub(),
         preferences=_ApprovalPrefsStub(opc_home),
         memory=_ApprovalMemoryStub(),
-        escalation=None,
         config=config or AutonomyConfig(),
     )
 
@@ -1789,7 +2035,7 @@ class PermissionAdapterTests(unittest.TestCase):
             decision = policy.predict(tool, {"path": "/tmp/opc-home/memory/projects/proj1.md"})
         self.assertEqual(decision.resolution, PermissionResolution.ALLOW)
 
-    def test_low_risk_data_acquisition_shell_prefix_auto_allows_single_command(self) -> None:
+    def test_data_acquisition_shell_requires_exact_tool_permission(self) -> None:
         policy = _build_permission_policy()
         tool = ToolDefinition(
             name="shell_exec",
@@ -1816,8 +2062,50 @@ class PermissionAdapterTests(unittest.TestCase):
             },
             task=task,
         )
-        self.assertEqual(decision.resolution, PermissionResolution.ALLOW)
-        self.assertEqual(decision.risk_level, RiskLevel.LOW)
+        self.assertEqual(decision.resolution, PermissionResolution.ASK)
+        self.assertEqual(decision.risk_level, RiskLevel.MEDIUM)
+        self.assertEqual(decision.source, "company_exact_tool_permission")
+
+    def test_company_opaque_gate_precedes_disabled_and_allow_tool_config(self) -> None:
+        tool = ToolDefinition(
+            name="shell_exec",
+            description="shell",
+            parameters={"type": "object", "properties": {}},
+            func=lambda **_: None,  # type: ignore[arg-type]
+            requires_confirmation=False,
+            concurrency_safe=False,
+            read_only=False,
+        )
+        task = Task(
+            metadata={
+                "execution_mode": "company_mode",
+                "delegation_run_id": "run-1",
+            },
+        )
+        configs = (
+            AutonomyConfig(enabled=False),
+            AutonomyConfig(
+                permissions_v2=PermissionsV2Config(enabled=False),
+            ),
+            AutonomyConfig(
+                permissions_v2=PermissionsV2Config(
+                    allow_tools=["shell_exec"],
+                ),
+            ),
+        )
+
+        for config in configs:
+            with self.subTest(config=config):
+                decision = _build_permission_policy(config).predict(
+                    tool,
+                    {"command": "touch output.txt"},
+                    task=task,
+                )
+                self.assertEqual(decision.resolution, PermissionResolution.ASK)
+                self.assertEqual(
+                    decision.source,
+                    "company_exact_tool_permission",
+                )
 
     def test_download_prefix_requires_work_item_context(self) -> None:
         policy = _build_permission_policy()
@@ -1862,17 +2150,18 @@ class PermissionAdapterTests(unittest.TestCase):
             read_only=False,
         )
         for command in (
-            "awk '{print $1}' data.csv",
-            "od -c file.bin | head -20",
+            "od -c file.bin",
             "jq '.items[]' resp.json",
             "sed -n 1,50p main.py",
-            "git log --oneline -5 && git status",
+            "git log --oneline -5",
         ):
             decision = policy.predict(tool, {"command": command})
             self.assertEqual(decision.resolution, PermissionResolution.ALLOW, command)
         for command in (
+            "od -c file.bin | head -20",
+            "git log --oneline -5 && git status",
             "find . -name '*.pyc' -delete",
-            "sort -o hijacked.txt input.txt",
+            "awk '{print $1}' data.csv",
             "awk 'BEGIN{system(\"id\")}' x",
         ):
             decision = policy.predict(tool, {"command": command})
@@ -2072,6 +2361,59 @@ class StreamingToolExecutorTests(unittest.IsolatedAsyncioTestCase):
 
 
 class SubagentManagerTests(unittest.IsolatedAsyncioTestCase):
+    async def test_company_resident_persists_each_fresh_child_before_execute(self) -> None:
+        store = _SubagentStore()
+        executed_ids: list[str] = []
+
+        class _ChildAgent:
+            async def execute(self, child_task: Task) -> TaskResult:
+                executed_ids.append(child_task.id)
+                return TaskResult(
+                    status=TaskStatus.DONE,
+                    content=f"done:{child_task.description}",
+                )
+
+        parent = Task(
+            id="company-parent",
+            session_id="company-parent-session",
+            project_id="proj1",
+            metadata={
+                "execution_mode": "company_mode",
+                "delegation_run_id": "company-run",
+                "company_run_controller_owner_token": "owner",
+                "company_run_controller_lease_generation": 1,
+                "claimed_work_item_attempt_seq": 1,
+            },
+        )
+        manager = SubagentManager(
+            parent_task=parent,
+            config=OPCConfig(),
+            child_agent_factory=lambda *args: _ChildAgent(),
+            store=store,
+            runtime_session_id="rt-company-resident",
+        )
+        spawned = await manager.spawn(
+            profile="implement",
+            prompt="first",
+            background=True,
+            isolation="shared",
+            resident=True,
+            name="company-helper",
+        )
+        first = await manager.wait(spawned["agent_id"], timeout_seconds=3)
+        self.assertEqual(first["resident_status"], "idle")
+        await manager.send(spawned["agent_id"], "second")
+        for _ in range(40):
+            if len(executed_ids) >= 2:
+                break
+            await asyncio.sleep(0)
+        self.assertEqual(len(executed_ids), 2)
+        self.assertEqual(len(set(executed_ids)), 2)
+        self.assertEqual(
+            [task.id for task in store.saved_tasks],
+            executed_ids,
+        )
+
     async def test_background_subagent_receives_message_and_wait_returns_result(self) -> None:
         async def execute_with_message(child_task: Task) -> TaskResult:
             queue = getattr(child_task, "_runtime_inbox_queue")

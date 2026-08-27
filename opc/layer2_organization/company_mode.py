@@ -8,9 +8,11 @@ import hashlib
 import inspect
 import json
 import re
+import threading
 import time
 import uuid
 from contextvars import ContextVar, Token
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -22,10 +24,20 @@ from opc.core.active_task_runs import (
     ActiveTaskRunAdmissionClosed,
     ActiveTaskRunRegistry,
 )
+from opc.core.company_controller import (
+    CompanyControllerAttemptContext,
+    CompanyControllerAttemptSuperseded,
+    CompanyRunControllerBusy,
+    CompanyRunControllerLeaseLost,
+)
 from opc.core.config import (
     DEFAULT_EXTERNAL_AGENT_STARTUP_TIMEOUT_SECONDS,
     DEFAULT_ORGANIZATION_ID,
     validate_organization_id,
+)
+from opc.core.interaction_protocol import (
+    OriginOwnerInteractionLease,
+    PreparedOwnerInteractionPublication,
 )
 from opc.core.models import (
     AdaptiveRoleProfile,
@@ -41,7 +53,6 @@ from opc.core.models import (
     EnvironmentManifest,
     Phase,
     RouterDecision,
-    StructuredReviewVerdict,
     Task,
     TaskResult,
     TaskStatus,
@@ -51,6 +62,10 @@ from opc.core.models import (
 )
 from opc.core.worker_envelope import classify_worker_message, worker_message_is_actionable
 from opc.layer2_organization.company_runtime import CompanyRuntime, canonical_role_session_id
+from opc.layer2_organization.company_runtime_identity import (
+    is_runtime_auxiliary_task,
+    requires_native_company_execution,
+)
 from opc.layer2_organization.phase import (
     DONE_PHASES,
     IN_PROGRESS_PHASES,
@@ -90,6 +105,7 @@ from opc.layer2_organization.gate_harness import GateHarness, GateHarnessDecisio
 from opc.layer2_organization.metadata_ownership import (
     append_work_item_progress,
     build_work_item_owner_execution_copy,
+    clear_current_final_delivery_outputs,
     copy_work_item_execution_metadata,
     strip_disallowed_work_item_metadata_from_runtime_task,
     update_runtime_task_owned_metadata,
@@ -101,6 +117,10 @@ from opc.layer2_organization.prompt_contract import (
     make_prompt_contract,
     prompt_contract_from_work_item,
 )
+from opc.layer2_organization.pre_delivery_validation import (
+    delivery_package_sha256,
+    validation_record_matches_current_delivery,
+)
 from opc.layer2_organization.org_work_item_planner import (
     CompanyWorkItemRuntimePlan,
     WorkItemGatePolicy,
@@ -108,28 +128,36 @@ from opc.layer2_organization.org_work_item_planner import (
     deserialize_company_work_item_plan,
     serialize_company_work_item_plan,
 )
-from opc.layer2_organization.recruiter import (
-    normalize_recruitment_agent_choice,
-    resolve_effective_execution_agent,
-)
+from opc.layer2_organization.recruiter import resolve_effective_execution_agent
 from opc.layer2_organization.seat_executor import SeatExecutor
 from opc.layer2_organization.work_item_transition import (
     DEPENDENCY_CLASS_DEFAULT,
     compute_doomed_work_item_ids,
+    has_final_delivery_dependency_drift,
     has_pending_settlement_release,
     normalize_dependency_work_item_ids,
+    refresh_dependents_for_controller,
     refresh_dependents_for_run,
     settle_open_attempt_as_interrupted,
     settled_failure_dependency_ids,
     transition_work_item,
     transition_work_item_from_task,
 )
+from opc.layer2_organization.work_item_gate_decision import (
+    COMPANY_REWORK_OUTPUT_METADATA_KEYS,
+    build_company_gate_harness_rework_record,
+    build_company_gate_rework_record,
+    plan_company_work_item_done_routing,
+)
 from opc.layer2_organization.work_item_identity import (
     WORK_ITEM_TURN_TYPE_KEY,
     canonical_work_item_turn_type_for_kind,
+    initial_current_turn_mode_for_work_item,
+    company_work_item_gate_attempt,
+    company_work_item_gate_basis_hash,
+    company_work_item_gate_human_fallback_payload,
     gate_rework_payload,
     is_delivery_turn,
-    is_manager_reviewable_turn,
     mark_projected_work_item_task,
     mark_gate_rework_projection,
     mark_work_item_projection,
@@ -163,6 +191,11 @@ from opc.layer2_organization.work_item_runtime_invariants import (
 from opc.layer4_tools.output_budget import clip_text
 from opc.llm.provider import ProviderQuotaExhaustedError
 from opc.llm.retry import LLMRetryError, call_llm_json_with_retry
+from opc.database.store import (
+    CompanyControllerRunLifecycleMutation,
+    CompanyControllerWorkItemMutation,
+    company_controller_task_preimage_hash,
+)
 
 
 # Maximum consecutive idle dispatcher ticks (5s each) tolerated while every
@@ -170,6 +203,115 @@ from opc.llm.retry import LLMRetryError, call_llm_json_with_retry
 # checkpoint on record yet (e.g. a park write racing this snapshot).  Once
 # exhausted the turn exits with a parked summary instead of spinning forever.
 _HUMAN_WAIT_MAX_STALL_TICKS = 24
+
+# A healthy controller refreshes from a dedicated thread, so a synchronous
+# provider/tool section cannot starve its lease merely by blocking asyncio.
+_COMPANY_RUN_CONTROLLER_LEASE_SECONDS = 30.0
+_COMPANY_RUN_CONTROLLER_HEARTBEAT_SECONDS = 5.0
+
+
+PreDeliveryValidator = Callable[
+    [Task, "CompanyWorkItemRuntimePlan", list[Task], dict[str, Any]],
+    Awaitable[Mapping[str, Any]],
+]
+
+
+class _PreDeliveryReworkCounterConflict(RuntimeError):
+    """The durable bounded-rework counter changed before atomic reopen."""
+
+_REWORK_OUTPUT_METADATA_KEYS = COMPANY_REWORK_OUTPUT_METADATA_KEYS
+
+# These fields describe one *active* gate-harness correction.  The bounded
+# audit trails (``gate_harness_history`` and ``gate_harness_rework_requests``)
+# deliberately are not part of this set.
+_ACTIVE_GATE_HARNESS_REWORK_TASK_KEYS = (
+    "gate_harness_rework_feedback",
+    "gate_harness_rework_count",
+    "gate_harness_rework_request",
+)
+_ACTIVE_GATE_HARNESS_REWORK_CONTEXT_KEYS = (
+    "latest_gate_harness_rework",
+    "upstream_gate_harness_rework_source_projection_id",
+)
+_ACTIVE_GATE_HARNESS_PASS_WORK_ITEM_UNSET = (
+    *_ACTIVE_GATE_HARNESS_REWORK_TASK_KEYS,
+    "upstream_gate_harness_rework_source_projection_id",
+)
+
+
+class _CompanyRunControllerHeartbeat:
+    """Keep a run lease alive independently of the asyncio event loop."""
+
+    def __init__(
+        self,
+        *,
+        store: Any,
+        run_id: str,
+        project_id: str,
+        root_session_id: str,
+        owner_token: str,
+        generation: int,
+        lease_seconds: float,
+        interval_seconds: float,
+    ) -> None:
+        self.store = store
+        self.run_id = run_id
+        self.project_id = project_id
+        self.root_session_id = root_session_id
+        self.owner_token = owner_token
+        self.generation = int(generation)
+        self.lease_seconds = float(lease_seconds)
+        self.interval_seconds = float(interval_seconds)
+        self._stop = threading.Event()
+        self._lost = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run,
+            name=f"openopc-run-lease-{run_id[:12]}",
+            daemon=True,
+        )
+
+    @property
+    def lost(self) -> bool:
+        return self._lost.is_set()
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        # The wait normally wakes immediately.  Do not hold engine shutdown on
+        # a SQLite busy timeout; the fenced release below makes a late renew a
+        # no-op even if the thread is still unwinding.
+        self._thread.join(timeout=0.25)
+
+    def _run(self) -> None:
+        renew = getattr(
+            self.store,
+            "renew_delegation_run_controller_lease_sync",
+            None,
+        )
+        if not callable(renew):
+            self._lost.set()
+            return
+        while not self._stop.wait(self.interval_seconds):
+            try:
+                renewed = renew(
+                    self.run_id,
+                    project_id=self.project_id,
+                    root_session_id=self.root_session_id,
+                    owner_token=self.owner_token,
+                    generation=self.generation,
+                    lease_seconds=self.lease_seconds,
+                )
+            except Exception:
+                logger.opt(exception=True).warning(
+                    "company controller heartbeat failed for run {}",
+                    self.run_id,
+                )
+                continue
+            if not renewed:
+                self._lost.set()
+                return
 
 # Matches the manager dispatch guard's escape line while tolerating the
 # markdown decoration models routinely wrap protocol tokens in — bold
@@ -282,6 +424,7 @@ Return strict JSON:
 Rules:
 - The user should only receive owner-facing delivery when the runtime is genuinely ready.
 - If the delivery package contains unresolved open issues, failed/blocked work items, rejected reviews, or other blockers that make the work not ready, set `deliverable=false`.
+- `current_delivery_prepublication_state.expected=true` means only that exact final-delivery Task's `awaiting_human` status is the normal prepublication lifecycle state, not an unresolved blocker. Explicit gate feedback/pending state on it is still a blocker, and another Task's `awaiting_human` remains a blocker.
 - Use the provided role/work-item assignment map so the executive clearly knows who owns each part.
 - Target the exact work item that should continue working inside its existing session history.
 - Use only projection ids that appear in the provided work_item_tasks data.
@@ -485,6 +628,7 @@ class CompanyExecutorDriverOwnership:
     project_id: str
     task_id: str
     attempt_token: str
+    controller_admission: CompanyRunControllerAdmission | None = None
 
     def bind(self):
         return self.registry.bind_driver_attempt(self.attempt_token)
@@ -495,6 +639,19 @@ class CompanyExecutorDriverOwnership:
             self.task_id,
             self.attempt_token,
         )
+
+
+@dataclass
+class CompanyRunControllerAdmission:
+    """A durable run lease acquired before any resume-side mutation."""
+
+    run_id: str
+    project_id: str
+    root_session_id: str
+    owner_token: str
+    generation: int
+    heartbeat: _CompanyRunControllerHeartbeat
+    released: bool = False
 
 
 def serialize_company_runtime_spec(spec: CompanyRuntimeSpec | None) -> dict[str, Any]:
@@ -519,7 +676,21 @@ def deserialize_company_runtime_spec(data: dict[str, Any] | None) -> CompanyRunt
         or metadata.get("original_request")
         or ""
     )
-    runtime_model = str(payload.get("runtime_model") or metadata.get("runtime_model") or "multi_team_org")
+    # New records keep the public organization contract in execution_model and
+    # the scheduler implementation in runtime_model.  Older records used
+    # execution_model for the latter, so only fall back to that legacy field
+    # when the canonical runtime_model is absent.
+    raw_runtime_model = str(
+        payload.get("runtime_model") or metadata.get("runtime_model") or ""
+    ).strip()
+    legacy_execution_model = str(
+        payload.get("execution_model") or metadata.get("execution_model") or ""
+    ).strip()
+    runtime_model = (
+        raw_runtime_model
+        or ("multi_team_org" if legacy_execution_model == "multi_team_org" else "")
+        or "multi_team_org"
+    )
     work_item_driven = bool(payload.get("work_item_driven", metadata.get("work_item_driven", True)))
     metadata.setdefault("original_request", original_request)
     metadata.setdefault("runtime_model", runtime_model)
@@ -1323,6 +1494,18 @@ class CompanyRuntimeWorkItemHelper:
 class CompanyRuntimeSpecBuilder(CompanyRuntimeWorkItemHelper):
     """Builds the lightweight company runtime spec used before recruitment."""
 
+    def _organization_execution_model(self) -> str:
+        getter = getattr(self.org_engine, "get_execution_model", None)
+        if callable(getter):
+            value = str(getter() or "").strip()
+            if value:
+                return value
+        org_config = getattr(getattr(self.org_engine, "config", None), "org", None)
+        return (
+            str(getattr(org_config, "execution_model", "") or "").strip()
+            or "actor_runtime"
+        )
+
     def build_spec(self, decision: RouterDecision, *, original_message: str = "") -> CompanyRuntimeSpec:
         profile = str(
             getattr(decision, "company_profile", None)
@@ -1330,6 +1513,7 @@ class CompanyRuntimeSpecBuilder(CompanyRuntimeWorkItemHelper):
             or "corporate"
         ).strip() or "corporate"
         org_config = getattr(self.org_engine.config, "org", None)
+        execution_model = self._organization_execution_model()
         selected_org_id = ""
         if profile == "custom":
             try:
@@ -1353,7 +1537,7 @@ class CompanyRuntimeSpecBuilder(CompanyRuntimeWorkItemHelper):
         metadata: dict[str, Any] = {
             "source": "work_item_runtime",
             "execution_mode": "company_mode",
-            "execution_model": "multi_team_org",
+            "execution_model": execution_model,
             "runtime_model": "multi_team_org",
             "work_item_driven": True,
             "company_profile": profile,
@@ -1390,6 +1574,12 @@ class CompanyExecutorRunState:
     kanban_dirty: bool = False
     kanban_broadcast_task: asyncio.Task[None] | None = None
     runtime_invariant_issue_keys: set[tuple[str, str, str, str]] = field(default_factory=set)
+    controller_run_id: str = ""
+    controller_project_id: str = ""
+    controller_root_session_id: str = ""
+    controller_owner_token: str = ""
+    controller_lease_generation: int = 0
+    controller_heartbeat: _CompanyRunControllerHeartbeat | None = None
 
 
 class CompanyWorkItemExecutor:
@@ -1412,6 +1602,10 @@ class CompanyWorkItemExecutor:
         save_runtime_session: Callable[..., Awaitable[None]] | None = None,
         progress_callback: Callable[..., Awaitable[None]] | None = None,
         checkpoint_callback: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
+        checkpoint_prepare_callback: Callable[
+            [dict[str, Any]], Awaitable[PreparedOwnerInteractionPublication]
+        ] | None = None,
+        checkpoint_notify_callback: Callable[[Any], Awaitable[None]] | None = None,
         agent_selector: Callable[[Task, Any | None], Awaitable[str | None]] | None = None,
         emit_runtime_event: Callable[[str, dict[str, Any]], Awaitable[None]] | None = None,
         on_kanban_changed: Callable[[], Awaitable[None]] | None = None,
@@ -1420,6 +1614,7 @@ class CompanyWorkItemExecutor:
         llm: Any | None = None,
         role_prompt_runner: Callable[[Task, str, dict[str, Any], str, bool], Awaitable[str | None]] | None = None,
         active_task_run_registry: ActiveTaskRunRegistry | None = None,
+        pre_delivery_validator: PreDeliveryValidator | None = None,
     ) -> None:
         self.org_engine = org_engine
         self.communication = communication
@@ -1434,17 +1629,24 @@ class CompanyWorkItemExecutor:
         self.save_runtime_session = save_runtime_session
         self.progress_callback = progress_callback
         self.checkpoint_callback = checkpoint_callback
+        self.checkpoint_prepare_callback = checkpoint_prepare_callback
+        self.checkpoint_notify_callback = checkpoint_notify_callback
         self.agent_selector = agent_selector
         self.emit_runtime_event = emit_runtime_event
         self.on_kanban_changed = on_kanban_changed
         self.work_item_timeout = work_item_timeout
         self.role_prompt_runner = role_prompt_runner
         self.active_task_run_registry = active_task_run_registry
+        self.pre_delivery_validator = pre_delivery_validator
         self._default_run_state = CompanyExecutorRunState()
         self._run_state_var: ContextVar[CompanyExecutorRunState | None] = ContextVar(
             f"company-executor-run-state:{id(self)}",
             default=None,
         )
+        # Credentials are cached only so shutdown/error paths can present the
+        # owner+generation to the durable Store fence.  This map is not a
+        # liveness or mutual-exclusion source.
+        self._active_controller_leases: dict[str, dict[str, Any]] = {}
 
         self._active_plan = None
         self._active_tasks = []
@@ -1605,7 +1807,8 @@ class CompanyWorkItemExecutor:
         work_item_tasks = [
             task
             for task in all_tasks
-            if str(getattr(task, "parent_session_id", "") or "").strip() == parent_session_id
+            if not is_runtime_auxiliary_task(task)
+            and str(getattr(task, "parent_session_id", "") or "").strip() == parent_session_id
             and projection_id_for_task(task)
         ]
         if not work_item_tasks:
@@ -1635,6 +1838,36 @@ class CompanyWorkItemExecutor:
             ),
         )
         return plan, refreshed_tasks
+
+    @staticmethod
+    def _tasks_for_company_dispatch_reload(
+        all_tasks: list[Task],
+        active_tasks: list[Task],
+        *,
+        parent_session_id: str,
+    ) -> list[Task]:
+        """Select only business execution Tasks for a dispatcher tick."""
+
+        if not active_tasks:
+            return []
+        run_id = str(
+            (active_tasks[0].metadata or {}).get("delegation_run_id", "") or ""
+        ).strip()
+        return [
+            task
+            for task in all_tasks
+            if not is_runtime_auxiliary_task(task)
+            and str(
+                (task.metadata or {}).get("delegation_run_id", "") or ""
+            ).strip()
+            == run_id
+            and (
+                str(getattr(task, "parent_session_id", "") or "").strip()
+                == parent_session_id
+                or str(getattr(task, "session_id", "") or "").strip()
+                == parent_session_id
+            )
+        ]
 
     async def _emit_runtime_signal(self, event_type: str, payload: dict[str, Any]) -> None:
         if self.emit_runtime_event is None:
@@ -1908,6 +2141,11 @@ class CompanyWorkItemExecutor:
                 prompt_kind,
                 force_new_session,
             )
+        except (CompanyRunControllerLeaseLost, ProviderQuotaExhaustedError):
+            # These are control-flow/infrastructure outcomes owned by the
+            # company dispatcher.  Turning either into an empty nested
+            # assessment would bypass lease fencing or quota parking.
+            raise
         except Exception as exc:
             logger.debug(f"Role prompt runner failed for `{prompt_kind}` on task `{source_task.id}`: {exc}")
             return None
@@ -1931,12 +2169,58 @@ class CompanyWorkItemExecutor:
 
     @staticmethod
     def _parse_role_prompt_json(raw: str) -> dict[str, Any] | None:
-        text = CompanyWorkItemExecutor._strip_markdown_fences(str(raw or ""))
+        """Parse one unambiguous role-prompt JSON object.
+
+        Native Runtime V2 may append exactly one ``Verification: ...``
+        paragraph to otherwise bare or fenced JSON.  Accept that known
+        runtime annotation, but reject narration, multiple JSON values,
+        unterminated fences, or arbitrary trailing text.  ``raw_decode`` is
+        used before inspecting the remainder so strings containing the word
+        ``Verification`` cannot be mistaken for a footer.
+        """
+
+        text = str(raw or "").strip()
         if not text:
             return None
+        candidate = text
+        if text.startswith("```"):
+            opening = re.match(r"^```(?:json)?[ \t]*\r?\n", text, re.IGNORECASE)
+            if opening is None:
+                return None
+            closing = re.search(
+                r"(?m)^```[ \t]*\r?$",
+                text[opening.end() :],
+            )
+            if closing is None:
+                return None
+            closing_start = opening.end() + closing.start()
+            closing_end = opening.end() + closing.end()
+            candidate = text[opening.end() : closing_start]
+            remainder = text[closing_end:]
+        else:
+            candidate = text
+            remainder = ""
+        decoder = json.JSONDecoder()
         try:
-            data = json.loads(text)
+            leading = len(candidate) - len(candidate.lstrip())
+            data, end = decoder.raw_decode(candidate, leading)
         except json.JSONDecodeError:
+            return None
+        candidate_remainder = candidate[end:]
+        if text.startswith("```"):
+            # The JSON fence itself contains JSON only.  Runtime's status
+            # annotation, when present, follows the closing fence.
+            if candidate_remainder.strip():
+                return None
+            if remainder and not re.fullmatch(
+                r"\r?\n\r?\nVerification: [^\r\n]+\s*",
+                remainder,
+            ):
+                return None
+        elif candidate_remainder and not re.fullmatch(
+            r"\r?\n\r?\nVerification: [^\r\n]+\s*",
+            candidate_remainder,
+        ):
             return None
         return dict(data) if isinstance(data, dict) else None
 
@@ -2237,6 +2521,23 @@ class CompanyWorkItemExecutor:
             ),
             None,
         )
+        run_state = self._run_state()
+        controller_owner_token = str(
+            run_state.controller_owner_token or ""
+        ).strip()
+        try:
+            controller_lease_generation = int(
+                run_state.controller_lease_generation or 0
+            )
+        except (TypeError, ValueError) as exc:
+            raise CompanyRunControllerLeaseLost(
+                "runtime Task projection sync has a malformed "
+                "run-controller generation"
+            ) from exc
+        if bool(controller_owner_token) != (controller_lease_generation > 0):
+            raise CompanyRunControllerLeaseLost(
+                "attention scheduler has an incomplete run controller lease"
+            )
         current_dependency_ids: list[str] = []
         current_dependencies_done = True
         if current_work_item is not None:
@@ -2267,24 +2568,87 @@ class CompanyWorkItemExecutor:
                         if current_work_item.phase in IN_PROGRESS_PHASES
                         else Phase.READY
                     )
-                    await self.store.update_delegation_work_item(
-                        current_work_item.work_item_id,
-                        phase=target_phase,
-                        metadata_updates={
-                            "last_attention_source_message_id": source_message_id,
-                            "last_attention_at": datetime.now().isoformat(),
+                attention_metadata_updates = {
+                    "last_attention_source_message_id": source_message_id,
+                    "last_attention_at": datetime.now().isoformat(),
+                }
+                if controller_owner_token and controller_lease_generation > 0:
+                    resume_target = getattr(
+                        self.store,
+                        "update_delegation_work_item_dependency_frontier_for_controller",
+                        None,
+                    )
+                    if not callable(resume_target):
+                        raise CompanyRunControllerLeaseLost(
+                            "company Store cannot fence manager-attention resume"
+                        )
+                    resumed = await resume_target(
+                        current_work_item,
+                        project_id=(
+                            str(
+                                run_state.controller_project_id
+                                or root_task.project_id
+                                or "default"
+                            ).strip()
+                            or "default"
+                        ),
+                        controller_owner_token=controller_owner_token,
+                        controller_lease_generation=(
+                            controller_lease_generation
+                        ),
+                        phase=(
+                            target_phase
+                            if target_phase != current_work_item.phase
+                            else None
+                        ),
+                        metadata_updates=attention_metadata_updates,
+                        wake_role_runtime_session_id=(
+                            role_runtime_session_id
+                        ),
+                        expected_role_session_focus=(
+                            current_work_item_id
+                        ),
+                        linked_task_metadata_updates={
+                            "message_priority": "seat_attention",
                         },
                     )
-                if current_task.status in {TaskStatus.BLOCKED, TaskStatus.AWAITING_PEER, TaskStatus.IDLE}:
-                    # Phase A: sync local task.status to match the phase the
-                    # hook just projected. Hardcoded PENDING was a latent bug
-                    # when target_phase was RUNNING (work_item was in
-                    # IN_PROGRESS_PHASES) — the subsequent save_task would
-                    # overwrite the hook's task.status=RUNNING with PENDING.
-                    current_task.status = task_status_for_phase(target_phase)
-                    current_task.metadata = dict(current_task.metadata or {})
-                    current_task.metadata["message_priority"] = "seat_attention"
-                    await self.save_task(current_task)
+                    if resumed is None:
+                        return tasks, await self.store.list_delegation_work_items(
+                            run_id
+                        )
+                    current_work_item = resumed
+                else:
+                    # Explicit compatibility path for generation-zero
+                    # fixtures and maintenance tools.
+                    await self.store.update_delegation_work_item(
+                        current_work_item.work_item_id,
+                        phase=(
+                            target_phase
+                            if target_phase != current_work_item.phase
+                            else None
+                        ),
+                        metadata_updates=attention_metadata_updates,
+                    )
+                    if current_task.status in {
+                        TaskStatus.BLOCKED,
+                        TaskStatus.AWAITING_PEER,
+                        TaskStatus.IDLE,
+                    }:
+                        current_task.status = task_status_for_phase(
+                            target_phase
+                        )
+                        current_task.metadata = dict(
+                            current_task.metadata or {}
+                        )
+                        current_task.metadata[
+                            "message_priority"
+                        ] = "seat_attention"
+                        await self.save_task(current_task)
+                current_task.status = task_status_for_phase(
+                    current_work_item.phase
+                )
+                current_task.metadata = dict(current_task.metadata or {})
+                current_task.metadata["message_priority"] = "seat_attention"
                 # A manager who parked "blocked" waiting on children becomes
                 # eligible again the moment they receive actionable mail
                 # (review request, completion update, blocker). Without
@@ -2308,7 +2672,8 @@ class CompanyWorkItemExecutor:
             None,
         )
         target_phase: Phase | None = None
-        if attention_work_item is None:
+        new_attention_work_item = attention_work_item is None
+        if new_attention_work_item:
             attention_projection_id = f"attention::{seat_id}::{work_kind}::{uuid.uuid4().hex[:8]}"
             attention_work_item = DelegationWorkItem(
                 run_id=run_id,
@@ -2353,7 +2718,6 @@ class CompanyWorkItemExecutor:
                     turn_type=self._runtime_work_kind_to_work_item_turn_type(work_kind),
                 ),
             )
-            await self.store.save_delegation_work_item(attention_work_item)
         else:
             # Re-trigger an existing attention card: bring it back to a
             # runnable state so the dispatcher will re-spawn the agent loop.
@@ -2361,16 +2725,52 @@ class CompanyWorkItemExecutor:
                 target_phase = Phase.RUNNING
             elif attention_work_item.phase in TODO_PHASES and attention_work_item.phase != Phase.READY:
                 target_phase = Phase.READY
+            if target_phase is not None:
+                attention_work_item.phase = target_phase
+            attention_work_item.summary = summary or attention_work_item.summary
+            attention_work_item.metadata = {
+                **dict(attention_work_item.metadata or {}),
+                **attention_inherited_metadata,
+                "attention_source_message_id": source_message_id,
+                "last_attention_source_message_id": source_message_id,
+                "last_attention_at": datetime.now().isoformat(),
+            }
+
+        if controller_owner_token and controller_lease_generation > 0:
+            upsert_attention = getattr(
+                self.store,
+                "upsert_company_attention_work_item_for_controller",
+                None,
+            )
+            if not callable(upsert_attention):
+                raise CompanyRunControllerLeaseLost(
+                    "company Store cannot fence manager-attention scheduling"
+                )
+            persisted_attention = await upsert_attention(
+                attention_work_item,
+                project_id=(
+                    str(run_state.controller_project_id or root_task.project_id or "default").strip()
+                    or "default"
+                ),
+                controller_owner_token=controller_owner_token,
+                controller_lease_generation=controller_lease_generation,
+                expected_role_session_focus=current_work_item_id,
+            )
+            if persisted_attention is None:
+                # A same-generation focus/version race is recoverable.  The
+                # next DB-driven dispatcher tick will recompute attention
+                # from the winning role-session state.
+                return tasks, await self.store.list_delegation_work_items(run_id)
+            attention_work_item = persisted_attention
+        elif new_attention_work_item:
+            # Explicit compatibility path for gen-0 fixtures and maintenance.
+            await self.store.save_delegation_work_item(attention_work_item)
+        else:
             await self.store.update_delegation_work_item(
                 attention_work_item.work_item_id,
                 phase=target_phase,
-                summary=summary or attention_work_item.summary,
-                metadata_updates={
-                    **attention_inherited_metadata,
-                    "attention_source_message_id": source_message_id,
-                    "last_attention_source_message_id": source_message_id,
-                    "last_attention_at": datetime.now().isoformat(),
-                },
+                summary=attention_work_item.summary,
+                metadata_updates=dict(attention_work_item.metadata or {}),
             )
             attention_work_item = await self.store.get_delegation_work_item(
                 attention_work_item.work_item_id
@@ -2392,14 +2792,16 @@ class CompanyWorkItemExecutor:
             # status check above said it's still BLOCKED/AWAITING_PEER/IDLE,
             # meaning materialize projected them. Fall back to PENDING
             # (historical default) in that edge case.
-            projected_task.status = (
-                task_status_for_phase(target_phase)
-                if target_phase is not None
-                else TaskStatus.PENDING
+            projected_task.status = task_status_for_phase(
+                attention_work_item.phase
             )
             projected_task.metadata = dict(projected_task.metadata or {})
             projected_task.metadata["message_priority"] = "seat_attention"
-            await self.save_task(projected_task)
+            if not (
+                controller_owner_token
+                and controller_lease_generation > 0
+            ):
+                await self.save_task(projected_task)
         # Same rationale as the current_work_item branch above: a manager
         # session parked "blocked" after delegating children will be
         # skipped by ``claim_runnable_tasks`` unless we flip it back to
@@ -2420,8 +2822,6 @@ class CompanyWorkItemExecutor:
             return tasks, work_items
         refreshed_tasks = list(tasks)
         root_task = sorted(refreshed_tasks, key=lambda item: (item.created_at, item.id))[0]
-        work_item_by_id = {str(item.work_item_id or "").strip(): item for item in work_items if str(item.work_item_id or "").strip()}
-        task_by_work_item_id = await self._task_by_work_item_id(refreshed_tasks)
         for session in self.runtime.member_sessions.values():
             session_status = normalize_role_runtime_status(
                 session.status,
@@ -2452,7 +2852,6 @@ class CompanyWorkItemExecutor:
                     break
             if source_message is None:
                 continue
-            source_message_id = str(source_message.get("msg_id", "") or "").strip()
             refreshed_tasks, work_items = await self._upsert_attention_work_item(
                 root_task=root_task,
                 tasks=refreshed_tasks,
@@ -2460,8 +2859,6 @@ class CompanyWorkItemExecutor:
                 session=session,
                 source_message=source_message,
             )
-            work_item_by_id = {str(item.work_item_id or "").strip(): item for item in work_items if str(item.work_item_id or "").strip()}
-            task_by_work_item_id = await self._task_by_work_item_id(refreshed_tasks)
         return refreshed_tasks, work_items
 
     async def _load_delegation_work_items(self, tasks: list[Task]) -> list[DelegationWorkItem]:
@@ -2471,14 +2868,6 @@ class CompanyWorkItemExecutor:
         if not run_id or not hasattr(self.store, "list_delegation_work_items"):
             return []
         return await self.store.list_delegation_work_items(run_id)
-
-    @staticmethod
-    def _review_status_for_level(review_level: str) -> TaskStatus:
-        return (
-            TaskStatus.AWAITING_MANAGER_REVIEW
-            if str(review_level or "").strip().lower() == "manager"
-            else TaskStatus.AWAITING_HUMAN
-        )
 
     def _review_chain_for_task(self, task: Task) -> list[str]:
         direct_manager = str(task.metadata.get("manager_role_id", "") or "").strip()
@@ -2574,34 +2963,11 @@ class CompanyWorkItemExecutor:
         return (False, "")
 
     @staticmethod
-    def _checkpoint_basis_hash(task: Task) -> str:
-        output_metadata = dict((getattr(task, "context_snapshot", {}) or {}).get("work_item_owned_outputs", {}) or {})
-        if isinstance(task.result, dict):
-            result_content = str(task.result.get("content", "") or "").strip()
-        elif task.result:
-            result_content = str(task.result or "").strip()
-        else:
-            result_content = ""
-        payload = {
-            "task_id": task.id,
-            **work_item_identity_payload_for_task(task),
-            "delivery_revision": task.metadata.get("delivery_revision", ""),
-            "owner_directive_revision": task.metadata.get("owner_directive_revision", ""),
-            "result_content": result_content,
-            "work_item_summary": str(output_metadata.get("work_item_summary", "") or task.metadata.get("work_item_summary", "") or "").strip(),
-            "work_item_summary_for_downstream": str(
-                output_metadata.get("work_item_summary_for_downstream", "")
-                or task.metadata.get("work_item_summary_for_downstream", "")
-                or ""
-            ).strip(),
-            "artifact_index": list(output_metadata.get("work_item_artifact_index", []) or task.metadata.get("work_item_artifact_index", []) or []),
-            "verification_status": dict(output_metadata.get("verification_status", {}) or task.metadata.get("verification_status", {}) or {}),
-            "verification_evidence": dict(output_metadata.get("verification_evidence", {}) or task.metadata.get("verification_evidence", {}) or {}),
-            "verification_verdict": str(task.metadata.get("verification_verdict", "") or "").strip(),
-            "delivery_package": output_metadata.get("delivery_package") or task.metadata.get("delivery_package") or {},
-        }
-        encoded = json.dumps(payload, sort_keys=True, ensure_ascii=False, default=str)
-        return hashlib.sha1(encoded.encode("utf-8")).hexdigest()
+    def _checkpoint_basis_hash(
+        task: Task,
+        gate: Mapping[str, Any] | WorkItemGatePolicy | None = None,
+    ) -> str:
+        return company_work_item_gate_basis_hash(task, gate)
 
     @staticmethod
     def _normalize_adaptive_metadata(value: Any) -> dict[str, Any]:
@@ -3538,11 +3904,60 @@ class CompanyWorkItemExecutor:
             )
             task.metadata[WORK_ITEM_TURN_TYPE_KEY] = canonical_turn_type
 
+        if work_kind in {"deliver", "delivery"}:
+            # Synthetic final delivery is a terminal synthesis unit.  Empty
+            # is meaningful here (and execution-copy helpers intentionally
+            # omit empty values), so clear any delegate scope retained by a
+            # pre-fix runtime Task explicitly.
+            task.metadata["allowed_delegate_role_ids"] = []
+
         execution_metadata = copy_work_item_execution_metadata(work_item)
         for key in _STALE_REWORK_TASK_METADATA_KEYS:
             if key not in execution_metadata:
                 task.metadata.pop(key, None)
         task.metadata.update(execution_metadata)
+
+        # Adding a late intake child invalidates any package and owner-review
+        # closure produced by the older dependency snapshot.  The WorkItem
+        # carries the durable invalidation marker; clear every Task-side cache
+        # exactly once before this delivery is dispatched again.
+        delivery_inputs_invalidated_at = str(
+            work_item_metadata.get("delivery_inputs_invalidated_at", "") or ""
+        ).strip()
+        if (
+            work_kind in {"deliver", "delivery"}
+            and delivery_inputs_invalidated_at
+            and str(
+                task.metadata.get(
+                    "delivery_outputs_reset_for_inputs_invalidated_at", ""
+                )
+                or ""
+            ).strip()
+            != delivery_inputs_invalidated_at
+        ):
+            clear_current_final_delivery_outputs(task)
+            for key in (
+                "feedback_closed_at",
+                "feedback_resolution",
+                "human_review_closed_at",
+                "human_review_resolution",
+                "feedback_superseded_at",
+                "self_evolution_review_completed_at",
+            ):
+                task.metadata.pop(key, None)
+            task.metadata.update(
+                {
+                    "requires_user_feedback": True,
+                    "feedback_closed": False,
+                    "feedback_resolved": False,
+                    "human_review_closed": False,
+                    "feedback_superseded": False,
+                    "self_evolution_review_completed": False,
+                    "delivery_outputs_reset_for_inputs_invalidated_at": (
+                        delivery_inputs_invalidated_at
+                    ),
+                }
+            )
 
         dispatch_hold = str(work_item_metadata.get("dispatch_hold", "") or "").strip()
         if dispatch_hold:
@@ -3575,6 +3990,11 @@ class CompanyWorkItemExecutor:
             "cell_id": work_item.cell_id,
             "parent_work_item_id": work_item.parent_work_item_id,
         }
+        # Resume/rework can reuse a legacy runtime Task that still carries
+        # WorkItem-owned journals such as ``progress_log``.  Remove those
+        # stale mirrors while projecting the authoritative WorkItem so the
+        # first resumed dispatch does not report a false ownership conflict.
+        strip_disallowed_work_item_metadata_from_runtime_task(task)
         if task.metadata != before_metadata:
             changed = True
         return changed
@@ -3584,6 +4004,33 @@ class CompanyWorkItemExecutor:
         tasks: list[Task],
         work_items: list[DelegationWorkItem],
     ) -> None:
+        run_state = self._run_state()
+        controller_owner_token = str(
+            run_state.controller_owner_token or ""
+        ).strip()
+        controller_lease_generation = int(
+            run_state.controller_lease_generation or 0
+        )
+        if bool(controller_owner_token) != (
+            controller_lease_generation > 0
+        ):
+            raise CompanyRunControllerLeaseLost(
+                "runtime Task projection sync has an incomplete "
+                "run-controller lease"
+            )
+        controller_project_id = str(
+            run_state.controller_project_id or "default"
+        ).strip() or "default"
+        save_unclaimed_projection = getattr(
+            self.store,
+            "save_unclaimed_runtime_task_projection_for_company_controller",
+            None,
+        )
+        if controller_owner_token and not callable(save_unclaimed_projection):
+            raise CompanyRunControllerLeaseLost(
+                "company Store cannot fence an unclaimed runtime Task "
+                "projection"
+            )
         task_by_work_item_id = {
             work_item_id: task
             for work_item_id, task in task_by_linked_work_item_id(tasks).items()
@@ -3596,8 +4043,71 @@ class CompanyWorkItemExecutor:
             changed = self._apply_work_item_projection_to_task(task, work_item)
             if changed and self.store and hasattr(self.store, "save_task"):
                 try:
-                    await self.store.save_task(task)
+                    if controller_owner_token:
+                        task_metadata = dict(task.metadata or {})
+                        task_owner_token = str(
+                            task_metadata.get(
+                                "company_run_controller_owner_token",
+                                "",
+                            )
+                            or ""
+                        ).strip()
+                        try:
+                            task_generation = int(
+                                task_metadata.get(
+                                    "company_run_controller_lease_generation",
+                                    0,
+                                )
+                                or 0
+                            )
+                            task_attempt_seq = int(
+                                task_metadata.get(
+                                    "claimed_work_item_attempt_seq",
+                                    0,
+                                )
+                                or 0
+                            )
+                        except (TypeError, ValueError) as exc:
+                            raise CompanyRunControllerLeaseLost(
+                                "runtime Task projection has a malformed "
+                                "attempt credential"
+                            ) from exc
+                        credential_is_empty = not (
+                            task_owner_token
+                            or task_generation != 0
+                            or task_attempt_seq != 0
+                        )
+                        credential_is_current_attempt = bool(
+                            task_owner_token == controller_owner_token
+                            and task_generation
+                            == controller_lease_generation
+                            and task_attempt_seq > 0
+                        )
+                        if credential_is_empty:
+                            await save_unclaimed_projection(
+                                task,
+                                project_id=controller_project_id,
+                                controller_owner_token=(
+                                    controller_owner_token
+                                ),
+                                controller_lease_generation=(
+                                    controller_lease_generation
+                                ),
+                            )
+                        elif credential_is_current_attempt:
+                            await self.store.save_task(task)
+                        else:
+                            raise CompanyRunControllerLeaseLost(
+                                "runtime Task projection has a partial or "
+                                "foreign attempt credential"
+                            )
+                    else:
+                        await self.store.save_task(task)
+                except CompanyRunControllerLeaseLost:
+                    raise
                 except Exception:
+                    if controller_owner_token:
+                        raise
                     logger.opt(exception=True).debug("Best-effort runtime Task projection sync failed")
 
     async def _refresh_ready_work_items(
@@ -3608,7 +4118,42 @@ class CompanyWorkItemExecutor:
     ) -> list[DelegationWorkItem]:
         if not self.store or not work_items:
             return work_items
-        work_items = await self._reconcile_missing_review_chain(work_items)
+        work_items = await self._reconcile_missing_review_chain(
+            work_items,
+            tasks=tasks,
+        )
+        try:
+            run_state = self._run_state()
+        except Exception:
+            run_state = None
+        controller_owner_token = str(
+            getattr(run_state, "controller_owner_token", "") or ""
+        ).strip()
+        controller_generation = int(
+            getattr(run_state, "controller_lease_generation", 0) or 0
+        )
+        controller_project_id = str(
+            getattr(run_state, "controller_project_id", "") or ""
+        ).strip()
+
+        async def update_frontier_item(
+            expected_item: DelegationWorkItem,
+            **updates: Any,
+        ) -> bool:
+            if controller_owner_token and controller_generation > 0:
+                updated = await self.store.update_delegation_work_item_dependency_frontier_for_controller(
+                    expected_item,
+                    project_id=controller_project_id or "default",
+                    controller_owner_token=controller_owner_token,
+                    controller_lease_generation=controller_generation,
+                    **updates,
+                )
+                return updated is not None
+            await self.store.update_delegation_work_item(
+                expected_item.work_item_id,
+                **updates,
+            )
+            return True
         work_item_by_id = {item.work_item_id: item for item in work_items}
         changed = False
         for work_item in work_items:
@@ -3623,13 +4168,12 @@ class CompanyWorkItemExecutor:
                     if dependency_state["dependency_ids"] and not dependency_state["satisfied"]
                     else Phase.READY
                 )
-                await self.store.update_delegation_work_item(
-                    work_item.work_item_id,
+                changed = await update_frontier_item(
+                    work_item,
                     phase=target,
                     blocked_reason="" if target == Phase.READY else None,
                     metadata_updates=dependency_state["metadata_updates"] or None,
-                )
-                changed = True
+                ) or changed
                 continue
             # WAITING_DEPENDENCIES → READY when all upstream is approved.
             if work_item.phase == Phase.WAITING_DEPENDENCIES and dependency_state["satisfied"]:
@@ -3638,33 +4182,46 @@ class CompanyWorkItemExecutor:
                     if str(metadata.get("rework_feedback", "") or "").strip()
                     else Phase.READY
                 )
-                await self.store.update_delegation_work_item(
-                    work_item.work_item_id,
+                changed = await update_frontier_item(
+                    work_item,
                     phase=target_phase,
                     blocked_reason="",
                     metadata_updates=dependency_state["metadata_updates"] or None,
-                )
-                changed = True
+                ) or changed
             elif work_item.phase == Phase.WAITING_DEPENDENCIES and dependency_state["metadata_updates"]:
-                await self.store.update_delegation_work_item(
-                    work_item.work_item_id,
+                changed = await update_frontier_item(
+                    work_item,
                     metadata_updates=dependency_state["metadata_updates"],
-                )
-                changed = True
-        # Failure frontier for late-created cards: a delivery/aggregate card
-        # created AFTER its dependency already failed never sees a failure
-        # transition hook, and the per-item pass above only releases on
-        # all-approved. Detection is cheap and idempotent — released cards
-        # (stamp present, phase moved) stop matching.
-        if has_pending_settlement_release(work_item_by_id):
+                ) or changed
+        # The full frontier also owns two graph-wide invariants that the
+        # per-item release loop above cannot derive: late failure settlement,
+        # and final-delivery dependency closure when intake adds a child after
+        # the delivery card already exists. Detection is cheap and idempotent.
+        if (
+            has_pending_settlement_release(work_item_by_id)
+            or has_final_delivery_dependency_drift(work_item_by_id)
+        ):
             run_id = str(work_items[0].run_id or "").strip()
             if run_id:
                 try:
-                    if await refresh_dependents_for_run(self.store, run_id=run_id):
+                    if controller_owner_token and controller_generation > 0:
+                        frontier_changed = await refresh_dependents_for_controller(
+                            self.store,
+                            run_id=run_id,
+                            project_id=controller_project_id or "default",
+                            controller_owner_token=controller_owner_token,
+                            controller_lease_generation=controller_generation,
+                        )
+                    else:
+                        frontier_changed = await refresh_dependents_for_run(
+                            self.store,
+                            run_id=run_id,
+                        )
+                    if frontier_changed:
                         changed = True
                 except Exception:
                     logger.opt(exception=True).debug(
-                        "Best-effort settlement frontier refresh failed for run "
+                        "Best-effort dependency frontier refresh failed for run "
                         f"{run_id}"
                     )
         if not changed:
@@ -3679,6 +4236,226 @@ class CompanyWorkItemExecutor:
             logger.opt(exception=True).debug("Best-effort kanban notify after dependency release failed")
         run_id = str(work_items[0].run_id or "").strip()
         return await self.store.list_delegation_work_items(run_id)
+
+    async def _reconcile_company_work_item_gate_continuations(
+        self,
+        tasks: list[Task],
+        work_items: list[DelegationWorkItem],
+    ) -> bool:
+        """Resume only post-gate completion work, never the worker turn.
+
+        Manager-review and approved routes are already recoverable from the
+        WorkItem phase.  A final delivery intentionally remains
+        ``AWAITING_HUMAN`` after the gate is accepted, so its durable marker
+        is the extra fact that tells startup to run validation/final handoff.
+        """
+
+        item_by_id = {
+            str(item.work_item_id or "").strip(): item
+            for item in work_items
+        }
+        changed = False
+        for task in tasks:
+            marker = dict(
+                (task.metadata or {}).get(
+                    "company_work_item_gate_continuation", {}
+                )
+                or {}
+            )
+            kind = str(marker.get("kind", "") or "").strip()
+            if (
+                str(marker.get("status", "") or "").strip() != "pending"
+                or kind
+                not in {
+                    "finalize",
+                    "manager_review",
+                    "refresh_dependents",
+                    "dispatch_rework",
+                    "failure_settlement",
+                }
+            ):
+                continue
+            work_item_id = linked_work_item_id_for_task(task)
+            item = item_by_id.get(work_item_id)
+            if item is None:
+                continue
+            state = self._run_state()
+            try:
+                attempt_seq = int(
+                    dict(item.metadata or {}).get("attempt_seq", 0) or 0
+                )
+            except (TypeError, ValueError):
+                attempt_seq = 0
+            # The live run admission is the authority.  A Task may still carry
+            # the generation that committed the gate even though a restart has
+            # admitted G+1; using that stale snapshot wedges every non-final
+            # continuation behind a permanent lease mismatch.
+            controller_context = CompanyControllerAttemptContext(
+                run_id=str(item.run_id or "").strip(),
+                project_id=str(task.project_id or "default").strip()
+                or "default",
+                owner_token=str(state.controller_owner_token or "").strip(),
+                generation=int(state.controller_lease_generation or 0),
+                task_id=str(task.id or "").strip(),
+                work_item_id=work_item_id,
+                attempt_seq=attempt_seq,
+            )
+            if not controller_context.complete:
+                controller_context = self._controller_attempt_context_for_task(
+                    task
+                )
+            if controller_context is None or not controller_context.complete:
+                raise CompanyRunControllerLeaseLost(
+                    "resolved company gate continuation lacks controller identity"
+                )
+            complete = getattr(
+                self.store,
+                "complete_company_work_item_gate_continuation_for_controller",
+                None,
+            )
+            completed = (
+                await complete(
+                    controller_context,
+                    checkpoint_id=str(marker.get("checkpoint_id", "") or ""),
+                    continuation_kind=kind,
+                )
+                if callable(complete)
+                else False
+            )
+            if completed:
+                marker["status"] = "completed"
+                marker["completed_at"] = datetime.now().isoformat()
+                task.metadata = dict(task.metadata or {})
+                task.metadata["company_work_item_gate_continuation"] = marker
+                changed = True
+                continue
+            expected_phase_by_kind = {
+                "finalize": Phase.AWAITING_HUMAN,
+                "manager_review": Phase.AWAITING_MANAGER_REVIEW,
+                "refresh_dependents": Phase.APPROVED,
+                "dispatch_rework": Phase.READY_FOR_REWORK,
+                "failure_settlement": Phase.FAILED,
+            }
+            if item.phase != expected_phase_by_kind[kind]:
+                # A validator/assessment may have durably routed the delivery
+                # to rework or failure.  Keep the original marker until that
+                # rework is actually dispatched (new attempt) or the run is
+                # durably closed_failed; merely reaching READY_FOR_REWORK is
+                # not an acknowledgement and must survive a crash.
+                continue
+            # Always cross the named Store identity boundary before the
+            # non-transactional validator/assessment work.  This both proves
+            # marker↔checkpoint identity and rebases a settled source from the
+            # committing generation onto the currently admitted controller.
+            adopt = getattr(
+                self.store,
+                "adopt_company_work_item_gate_continuation_for_controller",
+                None,
+            )
+            adopted = (
+                await adopt(
+                    controller_context,
+                    checkpoint_id=str(marker.get("checkpoint_id", "") or ""),
+                    continuation_kind=kind,
+                )
+                if callable(adopt)
+                else None
+            )
+            if adopted is None:
+                raise CompanyRunControllerLeaseLost(
+                    "resolved company gate continuation failed its exact "
+                    "identity/admission fence"
+                )
+            task.__dict__.update(copy.deepcopy(adopted.__dict__))
+            if kind == "manager_review":
+                opaque_completion_report = self._opaque_external_team_completion_report(item)
+                if opaque_completion_report:
+                    spawned = await self._ensure_review_work_item_for_work_item(
+                        work_item_id,
+                        worker_task=task,
+                        completion_report=opaque_completion_report,
+                        run_items=work_items,
+                        controller_task=task,
+                    )
+                else:
+                    spawned = await self._ensure_report_work_item_for_work_item(
+                        work_item_id,
+                        worker_task=task,
+                        run_items=work_items,
+                    )
+                if spawned is not None:
+                    changed = True
+                continue
+            if kind == "refresh_dependents":
+                await refresh_dependents_for_controller(
+                    self.store,
+                    run_id=controller_context.run_id,
+                    project_id=controller_context.project_id,
+                    controller_owner_token=controller_context.owner_token,
+                    controller_lease_generation=controller_context.generation,
+                    source_work_item_id=controller_context.work_item_id,
+                    source_task_id=controller_context.task_id,
+                    source_role_id=str(item.role_id or "").strip() or None,
+                    source_cell_id=str(item.cell_id or "").strip() or None,
+                )
+                acknowledge = getattr(
+                    self.store,
+                    "ack_company_work_item_gate_dependency_refresh_for_controller",
+                    None,
+                )
+                if not callable(acknowledge) or not await acknowledge(
+                    controller_context,
+                    checkpoint_id=str(marker.get("checkpoint_id", "") or ""),
+                ):
+                    raise CompanyRunControllerLeaseLost(
+                        "approved gate dependency refresh lost its exact fence"
+                    )
+                completed = (
+                    await complete(
+                        controller_context,
+                        checkpoint_id=str(marker.get("checkpoint_id", "") or ""),
+                        continuation_kind=kind,
+                    )
+                    if callable(complete)
+                    else False
+                )
+                if completed:
+                    marker["status"] = "completed"
+                    marker["completed_at"] = datetime.now().isoformat()
+                    task.metadata = dict(task.metadata or {})
+                    task.metadata[
+                        "company_work_item_gate_continuation"
+                    ] = marker
+                    changed = True
+                continue
+            if kind != "finalize":
+                # Rework dispatch and failure convergence happen through the
+                # normal dispatcher after this exact adoption.  Their marker
+                # remains pending until the Store observes the true durable
+                # postcondition (a newer attempt, or closed run + owner card).
+                continue
+            await self._finalize_completed_work_item(task)
+            completed = (
+                await complete(
+                    controller_context,
+                    checkpoint_id=str(marker.get("checkpoint_id", "") or ""),
+                    continuation_kind=kind,
+                )
+                if callable(complete)
+                else False
+            )
+            if not completed:
+                # No Store-stamped final feedback was published.  Canonical
+                # finalization may instead have initiated rework/failure; the
+                # marker remains pending until the dispatcher/lifecycle durable
+                # postcondition is observable on a later tick.
+                continue
+            marker["status"] = "completed"
+            marker["completed_at"] = datetime.now().isoformat()
+            task.metadata = dict(task.metadata or {})
+            task.metadata["company_work_item_gate_continuation"] = marker
+            changed = True
+        return changed
 
     @staticmethod
     def _dependency_release_state(
@@ -3746,6 +4523,8 @@ class CompanyWorkItemExecutor:
     async def _reconcile_missing_review_chain(
         self,
         work_items: list[DelegationWorkItem],
+        *,
+        tasks: list[Task] | None = None,
     ) -> list[DelegationWorkItem]:
         """Converge every passive review parent to one report/review chain.
 
@@ -3757,15 +4536,44 @@ class CompanyWorkItemExecutor:
         """
         if not self.store or not work_items or not hasattr(self.store, "save_delegation_work_item"):
             return work_items
+        repaired_ids = await self._retire_live_legacy_human_review_resolutions(
+            work_items
+        )
+        if repaired_ids and hasattr(self.store, "list_delegation_work_items"):
+            run_id = str(work_items[0].run_id or "").strip()
+            if run_id:
+                work_items = await self.store.list_delegation_work_items(run_id)
         waiting = [
             item for item in work_items
             if item.phase == Phase.AWAITING_MANAGER_REVIEW
         ]
         if not waiting:
+            if not repaired_ids:
+                return work_items
+            run_id = str(work_items[0].run_id or "").strip()
+            if run_id and hasattr(self.store, "list_delegation_work_items"):
+                return await self.store.list_delegation_work_items(run_id)
             return work_items
-        repaired_ids: list[str] = []
+        task_by_work_item_id = {
+            work_item_id: task
+            for work_item_id, task in task_by_linked_work_item_id(
+                list(tasks or [])
+            ).items()
+        }
+        try:
+            run_state = self._run_state()
+        except Exception:
+            run_state = None
+        controller_active = bool(
+            str(getattr(run_state, "controller_owner_token", "") or "").strip()
+            and int(
+                getattr(run_state, "controller_lease_generation", 0) or 0
+            )
+            > 0
+        )
         for parent in waiting:
             target_id = parent.work_item_id
+            worker_task = task_by_work_item_id.get(target_id)
             active_report = self._active_auxiliary_item(
                 work_items,
                 target_id,
@@ -3792,6 +4600,7 @@ class CompanyWorkItemExecutor:
                 == "applied"
             ]
             source_report = applied_reports[-1] if applied_reports else None
+            opaque_completion_report = self._opaque_external_team_completion_report(parent)
             linked_reviews = []
             if source_report is not None:
                 linked_reviews = [
@@ -3804,6 +4613,17 @@ class CompanyWorkItemExecutor:
                         or ""
                     ).strip()
                     == source_report.work_item_id
+                ]
+            elif opaque_completion_report:
+                linked_reviews = [
+                    review
+                    for review in reviews
+                    if not str(
+                        (review.metadata or {}).get(
+                            "review_source_report_work_item_id", ""
+                        )
+                        or ""
+                    ).strip()
                 ]
             latest_linked_review = linked_reviews[-1] if linked_reviews else None
             resolution = dict(
@@ -3891,10 +4711,34 @@ class CompanyWorkItemExecutor:
                     # Repair the parent projection before making review
                     # runnable. If this write fails, the terminal report
                     # remains the retryable durability point.
-                    await self.store.update_delegation_work_item(
-                        target_id,
-                        metadata_updates=parent_updates,
-                    )
+                    if controller_active:
+                        if worker_task is None:
+                            raise CompanyRunControllerLeaseLost(
+                                "review-chain reconciliation lacks its linked "
+                                "controller Task"
+                            )
+                        parent_result = await self._execute_authoritative_command(
+                            worker_task,
+                            operation="repair_review_parent_projection",
+                            mutations=(
+                                CompanyControllerWorkItemMutation(
+                                    work_item_id=target_id,
+                                    expected_phases=(
+                                        Phase.AWAITING_MANAGER_REVIEW,
+                                    ),
+                                    metadata_updates=parent_updates,
+                                ),
+                            ),
+                        )
+                        if parent_result is None or not parent_result.applied:
+                            raise CompanyRunControllerLeaseLost(
+                                "review parent repair lost its controller fence"
+                            )
+                    else:
+                        await self.store.update_delegation_work_item(
+                            target_id,
+                            metadata_updates=parent_updates,
+                        )
                     retry_updates: dict[str, Any] = {}
                     if linked_outcome == "verdict_parse_failed":
                         retry_updates = {
@@ -3907,10 +4751,36 @@ class CompanyWorkItemExecutor:
                         }
                     spawned = await self._ensure_review_work_item_for_work_item(
                         target_id,
+                        worker_task=worker_task,
                         completion_report=completion_report,
                         metadata_updates=retry_updates,
                         source_report_item=source_report,
                         run_items=work_items,
+                        controller_task=worker_task,
+                    )
+                elif opaque_completion_report:
+                    retry_updates: dict[str, Any] = {}
+                    if linked_outcome == "verdict_parse_failed":
+                        retry_updates = {
+                            "review_retry_hint": _REVIEW_VERDICT_PARSE_RETRY_HINT,
+                            "review_retry_reason": "verdict_parse_failed",
+                            "review_retry_of_attempt": self._auxiliary_attempt_number(
+                                latest_linked_review,
+                                kind="review",
+                            ),
+                        }
+                    if controller_active and worker_task is None:
+                        raise CompanyRunControllerLeaseLost(
+                            "opaque-team review reconciliation lacks its linked "
+                            "controller Task"
+                        )
+                    spawned = await self._ensure_review_work_item_for_work_item(
+                        target_id,
+                        worker_task=worker_task,
+                        completion_report=opaque_completion_report,
+                        metadata_updates=retry_updates,
+                        run_items=work_items,
+                        controller_task=worker_task,
                     )
                 else:
                     # No unconsumed durable report exists. This is either the
@@ -3922,8 +4792,14 @@ class CompanyWorkItemExecutor:
                         work_items=work_items,
                     ):
                         continue
+                    if controller_active and worker_task is None:
+                        raise CompanyRunControllerLeaseLost(
+                            "manager-review reconciliation lacks its linked "
+                            "controller Task"
+                        )
                     spawned = await self._ensure_report_work_item_for_work_item(
                         target_id,
+                        worker_task=worker_task,
                         run_items=work_items,
                     )
             except Exception:
@@ -3945,6 +4821,66 @@ class CompanyWorkItemExecutor:
             return await self.store.list_delegation_work_items(run_id)
         return work_items
 
+    async def _retire_live_legacy_human_review_resolutions(
+        self,
+        work_items: list[DelegationWorkItem],
+    ) -> list[str]:
+        """Finish pre-state-machine review journals found by live reconcile.
+
+        Startup performs the same one-time retirement transactionally. This
+        narrow live path covers a database restored/imported after startup and
+        the old crash shape where the target phase was already written as
+        AWAITING_HUMAN but its applied stamp was not. It never handles a normal
+        owner gate: an exact terminal review journal with target_phase set to
+        AWAITING_HUMAN is required.
+        """
+        by_id = {
+            str(item.work_item_id or "").strip(): item
+            for item in work_items
+            if str(item.work_item_id or "").strip()
+        }
+        repaired: list[str] = []
+        for review_item in work_items:
+            if review_item.kind != "review" or review_item.phase not in DONE_PHASES:
+                continue
+            review_metadata = dict(review_item.metadata or {})
+            if str(review_metadata.get("review_resolution_state", "") or "").strip() == "stale":
+                continue
+            resolution = dict(review_metadata.get("review_resolution", {}) or {})
+            if str(resolution.get("target_phase", "") or "").strip() != Phase.AWAITING_HUMAN.value:
+                continue
+            target_id = str(resolution.get("target_work_item_id", "") or "").strip()
+            target_item = by_id.get(target_id)
+            if target_item is None:
+                continue
+            applied_id = str(
+                (target_item.metadata or {}).get(
+                    "review_resolution_applied_work_item_id", ""
+                )
+                or ""
+            ).strip()
+            if target_item.phase not in {
+                Phase.AWAITING_HUMAN,
+                Phase.APPROVED,
+            }:
+                continue
+            if target_item.phase == Phase.APPROVED and applied_id != review_item.work_item_id:
+                continue
+            try:
+                applied = await self._apply_review_resolution(
+                    review_item,
+                    target_item,
+                )
+            except Exception:
+                logger.opt(exception=True).warning(
+                    "Failed to retire live legacy human review resolution for "
+                    f"work_item_id={target_id}"
+                )
+                applied = None
+            if applied is not None:
+                repaired.append(target_id)
+        return list(dict.fromkeys(repaired))
+
     async def _reconcile_role_serial_queues(
         self,
         work_items: list[DelegationWorkItem],
@@ -3954,7 +4890,19 @@ class CompanyWorkItemExecutor:
         run_id = str(work_items[0].run_id or "").strip()
         if not run_id:
             return work_items
-        result = await reconcile_role_serial_queues(self.store, run_id)
+        state = self._run_state()
+        result = await reconcile_role_serial_queues(
+            self.store,
+            run_id,
+            project_id=str(state.controller_project_id or "default").strip()
+            or "default",
+            controller_owner_token=str(
+                state.controller_owner_token or ""
+            ).strip(),
+            controller_lease_generation=int(
+                state.controller_lease_generation or 0
+            ),
+        )
         if (
             result.get("cleared_markers")
             or result.get("pruned_pending_ids")
@@ -3963,144 +4911,6 @@ class CompanyWorkItemExecutor:
         ):
             return await self.store.list_delegation_work_items(run_id)
         return work_items
-
-    async def _promote_manager_work_items_from_inbox(
-        self,
-        tasks: list[Task],
-        work_items: list[DelegationWorkItem],
-    ) -> list[DelegationWorkItem]:
-        if not self.store or not work_items:
-            return work_items
-        session_by_key: dict[str, CompanyMemberSession] = {}
-        for session in self.runtime.member_sessions.values():
-            seat_id = str(session.seat_id or (session.metadata or {}).get("seat_id", "") or "").strip()
-            if seat_id:
-                session_by_key[seat_id] = session
-            if str(session.role_id or "").strip():
-                session_by_key.setdefault(str(session.role_id).strip(), session)
-        changed = False
-        task_by_work_item_id = await self._task_by_work_item_id(tasks)
-        for work_item in work_items:
-            metadata = dict(work_item.metadata or {})
-            phase = work_item.phase
-            manager_session = (
-                session_by_key.get(str(work_item.manager_seat_id or "").strip())
-                or session_by_key.get(str(work_item.manager_role_id or "").strip())
-            )
-            if manager_session is not None and phase == Phase.QUEUED:
-                matched, matched_msg_id = self._mailbox_release_matched(manager_session, work_item)
-                if matched:
-                    metadata["mailbox_release_satisfied"] = True
-                    metadata["mailbox_release_message_id"] = matched_msg_id
-                    metadata["mailbox_release_checked_at"] = datetime.now().isoformat()
-                    await self.store.update_delegation_work_item(
-                        work_item.work_item_id,
-                        phase=Phase.READY,
-                        metadata_updates=metadata,
-                    )
-                    work_item = await self.store.get_delegation_work_item(work_item.work_item_id) or work_item
-                    metadata = dict(work_item.metadata or {})
-                    phase = work_item.phase
-                    changed = True
-                    if hasattr(self.store, "save_delegation_event"):
-                        try:
-                            await self.store.save_delegation_event(
-                                DelegationEvent(
-                                    run_id=str(work_item.run_id or "").strip(),
-                                    work_item_id=work_item.work_item_id,
-                                    cell_id=work_item.cell_id,
-                                    role_id=work_item.role_id,
-                                    event_type="manager_work_item_released_from_mailbox",
-                                    payload={
-                                        "manager_seat_id": str(work_item.manager_seat_id or "").strip(),
-                                        "message_id": matched_msg_id,
-                                        "release_policy": str(metadata.get("release_policy", "") or "").strip(),
-                                    },
-                                )
-                            )
-                        except Exception:
-                            logger.debug("Best-effort mailbox release event persistence failed")
-            if phase in DONE_PHASES:
-                continue
-            work_kind = str(
-                metadata.get("work_kind")
-                or metadata.get("delegation_turn_kind")
-                or work_item.kind
-                or ""
-            ).strip().lower()
-            if work_kind not in {"aggregate", "deliver", "synthesize", "review"}:
-                continue
-            session = session_by_key.get(str(work_item.seat_id or "").strip()) or session_by_key.get(str(work_item.role_id or "").strip())
-            if session is None:
-                continue
-            fingerprint = self._manager_inbox_fingerprint(session)
-            if not fingerprint:
-                continue
-            last_fingerprint = str(metadata.get("last_ready_from_inbox_fingerprint", "") or "").strip()
-            if fingerprint == last_fingerprint:
-                continue
-            metadata["last_ready_from_inbox_fingerprint"] = fingerprint
-            metadata["needs_manager_attention"] = True
-            task = task_by_work_item_id.get(str(work_item.work_item_id or "").strip())
-            if task is not None:
-                metadata["last_ready_from_checkpoint_basis_hash"] = self._checkpoint_basis_hash(task)
-            target_phase = phase
-            if phase == Phase.RUNNING:
-                target_phase = Phase.NEEDS_ATTENTION
-            await self.store.update_delegation_work_item(
-                work_item.work_item_id,
-                phase=target_phase if target_phase != phase else None,
-                metadata_updates=metadata,
-            )
-            if task is not None and phase in IN_REVIEW_PHASES:
-                supersede = getattr(self.store, "supersede_pending_checkpoints", None)
-                if callable(supersede):
-                    await supersede(
-                        project_id=task.project_id or "default",
-                        task_id=task.id,
-                        checkpoint_types=["company_work_item_gate"],
-                    )
-            session_status = normalize_role_runtime_status(
-                session.status,
-                session.focused_work_item_id,
-            )
-            if session_status != "running":
-                session.status = "idle"
-                session.resident_status = "idle"
-                session.focused_work_item_id = ""
-                role_session = self.runtime._role_session_for_member_session(session)
-                if role_session is not None:
-                    role_session.status = "idle"
-                    role_session.focused_work_item_id = ""
-                    role_session.updated_at = datetime.now()
-                    if hasattr(self.store, "save_delegation_role_session"):
-                        await self.store.save_delegation_role_session(role_session)
-                await self.runtime._persist_session(session, task=task)
-            changed = True
-            if hasattr(self.store, "save_delegation_event"):
-                try:
-                    await self.store.save_delegation_event(
-                        DelegationEvent(
-                            run_id=str(work_item.run_id or "").strip(),
-                            work_item_id=work_item.work_item_id,
-                            cell_id=work_item.cell_id,
-                            role_id=work_item.role_id,
-                            event_type="manager_work_item_promoted",
-                            payload={
-                                "seat_id": work_item.seat_id,
-                                "fingerprint": fingerprint,
-                                "work_kind": work_kind,
-                                "previous_status": status,
-                                "needs_manager_attention": True,
-                            },
-                        )
-                    )
-                except Exception:
-                    logger.debug("Best-effort manager promotion event persistence failed")
-        if not changed:
-            return work_items
-        run_id = str(work_items[0].run_id or "").strip()
-        return await self.store.list_delegation_work_items(run_id)
 
     async def _task_by_work_item_id(self, tasks: list[Task]) -> dict[str, Task]:
         if self.store and hasattr(self.store, "hydrate_task_work_item_links"):
@@ -4276,6 +5086,20 @@ class CompanyWorkItemExecutor:
         existing_work_item_ids = set(task_by_linked_work_item_id(existing_tasks))
         root_task = sorted(existing_tasks, key=lambda item: (item.created_at, item.id))[0]
         root_metadata = dict(root_task.metadata or {})
+        run_state = self._run_state()
+        controller_owner_token = str(
+            run_state.controller_owner_token or ""
+        ).strip()
+        controller_lease_generation = int(
+            run_state.controller_lease_generation or 0
+        )
+        if bool(controller_owner_token) != (controller_lease_generation > 0):
+            raise CompanyRunControllerLeaseLost(
+                "runtime Task materialization has an incomplete run controller lease"
+            )
+        controller_project_id = str(
+            run_state.controller_project_id or root_task.project_id or "default"
+        ).strip() or "default"
         custom_runtime = str(root_metadata.get("company_profile", "") or "").strip().lower() == "custom"
         runtime_org_id = str(
             getattr(root_task, "org_id", "")
@@ -4287,7 +5111,13 @@ class CompanyWorkItemExecutor:
             runtime_org_id = None
         if runtime_org_id:
             for existing_task in existing_tasks:
-                if self._sync_runtime_org_identity(existing_task, runtime_org_id):
+                if self._sync_runtime_org_identity(
+                    existing_task,
+                    runtime_org_id,
+                ) and not (
+                    controller_owner_token
+                    and controller_lease_generation > 0
+                ):
                     await self.store.save_task(existing_task)
         runtime_topology = dict(root_metadata.get("runtime_topology", {}) or {})
         root_parent_session_id = str(
@@ -4309,6 +5139,7 @@ class CompanyWorkItemExecutor:
                 continue
             phase = work_item.phase
             metadata = dict(work_item.metadata or {})
+            attention_work_item = metadata.get("attention_work_item") is True
             review_execution_work_item = is_review_execution_work_item_metadata(metadata)
             report_execution_work_item = is_report_execution_work_item_metadata(metadata)
             if (
@@ -4320,12 +5151,39 @@ class CompanyWorkItemExecutor:
             if phase in DONE_PHASES:
                 continue
             persisted = None
+            ensure_runtime_task = getattr(
+                self.store,
+                "ensure_runtime_task_for_work_item",
+                None,
+            )
+            if (
+                controller_owner_token
+                and controller_lease_generation > 0
+                and not callable(ensure_runtime_task)
+            ):
+                raise CompanyRunControllerLeaseLost(
+                    "company Store cannot fence runtime Task materialization"
+                )
             get_runtime_task = getattr(self.store, "get_runtime_task_for_work_item", None)
             if callable(get_runtime_task):
                 persisted = await get_runtime_task(work_item_id)
             if persisted is not None:
+                if callable(ensure_runtime_task):
+                    persisted = await ensure_runtime_task(
+                        work_item,
+                        lambda persisted=persisted: persisted,
+                        project_id=controller_project_id,
+                        controller_owner_token=controller_owner_token,
+                        controller_lease_generation=controller_lease_generation,
+                    )
                 set_linked_work_item_id(persisted, work_item_id)
-                if self._sync_runtime_org_identity(persisted, runtime_org_id):
+                if self._sync_runtime_org_identity(
+                    persisted,
+                    runtime_org_id,
+                ) and not (
+                    controller_owner_token
+                    and controller_lease_generation > 0
+                ):
                     await self.store.save_task(persisted)
                 self._raise_for_runtime_projection_issues(persisted, work_item, work_item_by_id)
                 if persisted.id not in existing_task_ids:
@@ -4359,10 +5217,24 @@ class CompanyWorkItemExecutor:
                 )
             )
             resolved_force_native_execution = bool((root_task.metadata or {}).get("force_native_execution", False) or role_force_native_execution)
-            if resolved_force_native_execution:
+            work_item_metadata = dict(getattr(work_item, "metadata", {}) or {})
+            external_team_binding = dict(work_item_metadata.get("external_team_binding", {}) or {})
+            company_external_execution_allowed = bool(
+                assigned_external_agent
+                and (
+                    work_item_metadata.get("external_company_execution_allowed") is True
+                    or topology_seat.get("company_external_execution_capable") is True
+                )
+            )
+            if company_external_execution_allowed:
+                resolved_force_native_execution = False
+            else:
+                # Fail closed for every provider that has not explicitly
+                # attested to the company artifact fence.
+                resolved_force_native_execution = True
                 selected_execution_agent = "native"
                 assigned_external_agent = None
-            preferred_external_agent = assigned_external_agent
+                preferred_external_agent = None
             turn_type = self._runtime_work_kind_to_work_item_turn_type(work_kind)
             current_turn_mode = self._initial_current_turn_mode_for_work_item(
                 turn_type,
@@ -4419,21 +5291,62 @@ class CompanyWorkItemExecutor:
                 "force_native_execution": resolved_force_native_execution,
                 "preferred_external_agent": preferred_external_agent,
                 "selected_execution_agent": selected_execution_agent,
-                "execution_agent_locked": bool(topology_seat.get("execution_agent_locked", False)),
+                "execution_agent_locked": True,
                 "selected_execution_agent_source": (
-                    str(topology_seat.get("selected_execution_agent_source", "") or "").strip()
-                    or (
-                        "recruitment_user_override"
-                        if bool(topology_seat.get("execution_agent_locked", False))
-                        else ""
-                    )
+                    "external_team_binding"
+                    if external_team_binding
+                    else "company_external_capability"
+                    if company_external_execution_allowed
+                    else "company_isolation_boundary"
                 ),
+                "company_native_execution_enforced": not company_external_execution_allowed,
+                "external_company_execution_allowed": company_external_execution_allowed,
+                "external_company_execution_fence": str(
+                    work_item_metadata.get("external_company_execution_fence")
+                    or external_team_binding.get("artifact_isolation")
+                    or ("validated_workspace" if company_external_execution_allowed else "")
+                ).strip(),
+                "execution_unit_kind": str(
+                    work_item_metadata.get("execution_unit_kind")
+                    or topology_seat.get("execution_unit_kind")
+                    or ("external_agent" if company_external_execution_allowed else "role")
+                ).strip(),
+                "external_team_binding": copy.deepcopy(external_team_binding),
+                "covered_role_ids": list(work_item_metadata.get("covered_role_ids", []) or []),
+                "capability_manifest": copy.deepcopy(
+                    work_item_metadata.get("capability_manifest")
+                    or external_team_binding.get("capability_manifest")
+                    or {}
+                ),
+                "delegation_capability_catalog": copy.deepcopy(
+                    work_item_metadata.get("delegation_capability_catalog")
+                    or topology_seat.get("delegation_capability_catalog")
+                    or []
+                ),
+                "external_session_scope": str(
+                    work_item_metadata.get("external_session_scope")
+                    or external_team_binding.get("session_scope")
+                    or "work_item"
+                ).strip(),
+                "external_max_inflight": int(
+                    work_item_metadata.get("external_max_inflight")
+                    or external_team_binding.get("max_inflight")
+                    or 1
+                ),
+                "external_failure_policy": str(
+                    work_item_metadata.get("external_failure_policy")
+                    or external_team_binding.get("failure_policy")
+                    or "fail_closed"
+                ).strip(),
+                "jiuwen_provider_mode": str(
+                    work_item_metadata.get("jiuwen_provider_mode")
+                    or external_team_binding.get("provider_mode")
+                    or ""
+                ).strip(),
                 "work_item_execution_strategy": (
-                    WorkItemExecutionStrategy.NATIVE.value
-                    if resolved_force_native_execution
-                    else WorkItemExecutionStrategy.EXTERNAL.value
-                    if assigned_external_agent
-                    else WorkItemExecutionStrategy.AUTO.value
+                    WorkItemExecutionStrategy.EXTERNAL.value
+                    if company_external_execution_allowed
+                    else WorkItemExecutionStrategy.NATIVE.value
                 ),
                 "adaptive": copy.deepcopy(dict((getattr(work_item, "metadata", {}) or {}).get("adaptive", {}) or {})),
                 "execution_task_ids": [work_item_id],
@@ -4450,6 +5363,19 @@ class CompanyWorkItemExecutor:
                 "review_execution_work_item": review_execution_work_item,
                 "report_execution_work_item": report_execution_work_item,
                 "skip_work_item_sync": review_execution_work_item or report_execution_work_item,
+                **(
+                    {
+                        "origin_owner_interaction": copy.deepcopy(
+                            metadata.get("origin_owner_interaction")
+                            or root_metadata.get("origin_owner_interaction")
+                        )
+                    }
+                    if (
+                        metadata.get("origin_owner_interaction")
+                        or root_metadata.get("origin_owner_interaction")
+                    )
+                    else {}
+                ),
             }, version=work_item_runtime_version(root_task.metadata)),
                 projection_id=projection_id,
                 turn_type=turn_type,
@@ -4457,6 +5383,8 @@ class CompanyWorkItemExecutor:
             task_metadata.update(copy_work_item_execution_metadata(work_item))
             task_metadata.update(owner_execution_copy)
             task_metadata[WORK_ITEM_TURN_TYPE_KEY] = turn_type
+            if attention_work_item:
+                task_metadata["message_priority"] = "seat_attention"
             if custom_runtime:
                 task_metadata["org_id"] = runtime_org_id or ""
                 task_metadata["organization_id"] = runtime_org_id or ""
@@ -4506,11 +5434,24 @@ class CompanyWorkItemExecutor:
                 metadata=task_metadata,
             )
             set_linked_work_item_id(task, work_item_id)
-            await self.store.save_delegation_work_item(work_item)
-            ensure_runtime_task = getattr(self.store, "ensure_runtime_task_for_work_item", None)
+            if not (
+                controller_owner_token
+                and controller_lease_generation > 0
+            ):
+                await self.store.save_delegation_work_item(work_item)
             if callable(ensure_runtime_task):
-                task = await ensure_runtime_task(work_item, lambda task=task: task)
+                task = await ensure_runtime_task(
+                    work_item,
+                    lambda task=task: task,
+                    project_id=controller_project_id,
+                    controller_owner_token=controller_owner_token,
+                    controller_lease_generation=controller_lease_generation,
+                )
             else:
+                if controller_owner_token and controller_lease_generation > 0:
+                    raise CompanyRunControllerLeaseLost(
+                        "company Store cannot fence runtime Task materialization"
+                    )
                 await self.store.save_task(task)
                 link_runtime_task = getattr(self.store, "link_work_item_runtime_task", None)
                 if callable(link_runtime_task):
@@ -4520,7 +5461,10 @@ class CompanyWorkItemExecutor:
                             "failed to link new runtime Task "
                             f"{task.id} for WorkItem {work_item_id}"
                         )
-            if self._sync_runtime_org_identity(task, runtime_org_id):
+            if self._sync_runtime_org_identity(task, runtime_org_id) and not (
+                controller_owner_token
+                and controller_lease_generation > 0
+            ):
                 await self.store.save_task(task)
             set_linked_work_item_id(task, work_item_id)
             self._raise_for_runtime_projection_issues(task, work_item, work_item_by_id)
@@ -4558,7 +5502,11 @@ class CompanyWorkItemExecutor:
                 if not list(task.dependencies or []):
                     continue
                 await self._record_handoffs(task, task_by_projection_id)
-                await self.save_task(task)
+                if not (
+                    controller_owner_token
+                    and controller_lease_generation > 0
+                ):
+                    await self.save_task(task)
         return existing_tasks
 
     @staticmethod
@@ -4590,22 +5538,18 @@ class CompanyWorkItemExecutor:
         review_execution_work_item: bool = False,
         report_execution_work_item: bool = False,
     ) -> str:
-        normalized_turn = canonical_work_item_turn_type_for_kind(turn_type)
-        if normalized_turn == "deliver":
-            return "deliver_required"
-        if normalized_turn == "aggregate":
-            return "synthesize_required"
-        if report_execution_work_item or normalized_turn == "report":
-            return "report_required"
-        if review_execution_work_item or normalized_turn == "review":
-            return "review_execute"
         seat = dict(topology_seat or {})
         direct_reports = list(seat.get("direct_report_seat_ids", []) or [])
         allowed_delegates = list(seat.get("allowed_delegate_role_ids", []) or [])
         managed_team_id = str(seat.get("managed_team_id", "") or "").strip()
-        if direct_reports or allowed_delegates or managed_team_id:
-            return "dispatch_required"
-        return "worker_execute"
+        return initial_current_turn_mode_for_work_item(
+            turn_type,
+            manager_can_delegate=bool(
+                direct_reports or allowed_delegates or managed_team_id
+            ),
+            review_execution_work_item=review_execution_work_item,
+            report_execution_work_item=report_execution_work_item,
+        )
 
     @staticmethod
     def _driver_ownership_task(
@@ -4647,7 +5591,11 @@ class CompanyWorkItemExecutor:
             return None
         project_id = str(task.project_id or "default").strip() or "default"
         try:
-            attempt_token = registry.register(project_id, task.id)
+            attempt_token = registry.register(
+                project_id,
+                task.id,
+                owner_task=asyncio.current_task(),
+            )
         except ActiveTaskRunAdmissionClosed as exc:
             raise asyncio.CancelledError(str(exc)) from exc
         return CompanyExecutorDriverOwnership(
@@ -4661,22 +5609,60 @@ class CompanyWorkItemExecutor:
         self,
         plan: CompanyWorkItemRuntimePlan,
         tasks: list[Task],
+        *,
+        controller_admission: CompanyRunControllerAdmission | None = None,
+        release_controller_admission_on_exit: bool = True,
     ) -> str:
-        ownership = self.acquire_driver_ownership(tasks)
+        ownership: CompanyExecutorDriverOwnership | None = None
         try:
+            ownership = self.acquire_driver_ownership(tasks)
             plan = _coerce_company_work_item_runtime_plan(plan) or CompanyWorkItemRuntimePlan()
             plan.metadata = {
                 **dict(plan.metadata or {}),
                 "execution_model": "multi_team_org",
                 "runtime_model": "multi_team_org",
             }
+            scheduler = self._execute_multi_team_org
+            scheduler_parameters = inspect.signature(scheduler).parameters
+            scheduler_accepts_kwargs = any(
+                parameter.kind is inspect.Parameter.VAR_KEYWORD
+                for parameter in scheduler_parameters.values()
+            )
+            scheduler_kwargs: dict[str, Any] = {}
+            if (
+                scheduler_accepts_kwargs
+                or "controller_admission" in scheduler_parameters
+            ):
+                scheduler_kwargs["controller_admission"] = controller_admission
+            if (
+                scheduler_accepts_kwargs
+                or "release_controller_admission_on_exit"
+                in scheduler_parameters
+            ):
+                scheduler_kwargs["release_controller_admission_on_exit"] = (
+                    release_controller_admission_on_exit
+                )
             if ownership is None:
-                return await self._execute_multi_team_org(plan, tasks)
+                return await scheduler(
+                    plan,
+                    tasks,
+                    **scheduler_kwargs,
+                )
             with ownership.bind():
-                return await self._execute_multi_team_org(plan, tasks)
+                return await scheduler(
+                    plan,
+                    tasks,
+                    **scheduler_kwargs,
+                )
         finally:
             if ownership is not None:
                 ownership.release()
+            if (
+                release_controller_admission_on_exit
+                and controller_admission is not None
+                and not controller_admission.released
+            ):
+                await self.release_controller_admission(controller_admission)
 
     def wake_live_run_dispatcher(self, run_id: str) -> bool:
         """Wake the live dispatcher for ``run_id``; False when none is live.
@@ -4693,6 +5679,12 @@ class CompanyWorkItemExecutor:
         self._signal_dispatcher_wake()
         return True
 
+    def controller_lease_credential(self, run_id: str) -> dict[str, Any] | None:
+        credential = self._active_controller_leases.get(
+            str(run_id or "").strip()
+        )
+        return dict(credential) if credential is not None else None
+
     @staticmethod
     def _delegation_run_id_for_tasks(tasks: list[Task]) -> str:
         for task in tasks:
@@ -4703,29 +5695,387 @@ class CompanyWorkItemExecutor:
                 return run_id
         return ""
 
+    async def acquire_controller_admission(
+        self,
+        tasks: list[Task],
+        *,
+        retry_busy_at_observed_expiry: bool = False,
+        adopt_released_task_ids: set[str] | None = None,
+    ) -> CompanyRunControllerAdmission | None:
+        """CAS-acquire the run controller before any caller mutates resume state.
+
+        ``None`` is reserved for isolated legacy fixtures whose Store path has
+        no project identity.  A production project Store with a company Task
+        but no ``delegation_runs`` row fails closed.
+        """
+
+        run_id = self._delegation_run_id_for_tasks(tasks)
+        project_id, root_session_id = self._runtime_scope_for_tasks(tasks)
+        return await self.acquire_controller_admission_for_scope(
+            run_id=run_id,
+            project_id=project_id,
+            root_session_id=root_session_id,
+            retry_busy_at_observed_expiry=retry_busy_at_observed_expiry,
+            adopt_released_task_ids=adopt_released_task_ids,
+        )
+
+    async def acquire_controller_admission_for_scope(
+        self,
+        *,
+        run_id: str,
+        project_id: str,
+        root_session_id: str,
+        retry_busy_at_observed_expiry: bool = False,
+        adopt_released_task_ids: set[str] | None = None,
+    ) -> CompanyRunControllerAdmission | None:
+        """CAS-acquire an exact durable run scope without a Task credential.
+
+        Parked owner-gate Tasks intentionally lose their old controller
+        credential on graceful release.  Recovery therefore admits from the
+        immutable checkpoint ownership/run scope, then lets the Store bind the
+        new generation to the settled WorkItem attempt.
+        """
+
+        run_id = str(run_id or "").strip()
+        project_id = str(project_id or "default").strip() or "default"
+        root_session_id = str(root_session_id or "").strip()
+        acquire = getattr(
+            self.store,
+            "acquire_delegation_run_controller_lease",
+            None,
+        )
+        if not run_id or not root_session_id or not callable(acquire):
+            if getattr(self.store, "project_id", None):
+                raise RuntimeError(
+                    "production company run cannot start without durable "
+                    "controller admission "
+                    f"(run_id={run_id or '<missing>'}, "
+                    f"root_session_id={root_session_id or '<missing>'})"
+                )
+            return None
+
+        owner_token = uuid.uuid4().hex
+        receipt = await acquire(
+            run_id,
+            project_id=project_id,
+            root_session_id=root_session_id,
+            owner_token=owner_token,
+            lease_seconds=_COMPANY_RUN_CONTROLLER_LEASE_SECONDS,
+        )
+        if (
+            retry_busy_at_observed_expiry
+            and str(getattr(receipt, "outcome", "") or "") == "busy"
+            and getattr(receipt, "expires_at", None) is not None
+        ):
+            observed_expiry = receipt.expires_at
+            retry_delay = max(
+                0.0,
+                min(
+                    (observed_expiry - datetime.now()).total_seconds(),
+                    _COMPANY_RUN_CONTROLLER_LEASE_SECONDS,
+                ),
+            )
+            if retry_delay:
+                await asyncio.sleep(retry_delay + 0.05)
+            receipt = await acquire(
+                run_id,
+                project_id=project_id,
+                root_session_id=root_session_id,
+                owner_token=owner_token,
+                lease_seconds=_COMPANY_RUN_CONTROLLER_LEASE_SECONDS,
+            )
+        outcome = str(getattr(receipt, "outcome", "") or "")
+        if outcome == "missing":
+            if getattr(self.store, "project_id", None):
+                raise RuntimeError(
+                    "production company run is missing its DelegationRun row "
+                    f"(run_id={run_id})"
+                )
+            return None
+        if not bool(getattr(receipt, "acquired", False)):
+            raise CompanyRunControllerBusy(
+                "company run already has a live controller "
+                f"(run_id={run_id}, generation="
+                f"{int(getattr(receipt, 'generation', 0) or 0)})"
+            )
+
+        generation = int(getattr(receipt, "generation", 0) or 0)
+        heartbeat: _CompanyRunControllerHeartbeat | None = None
+        try:
+            settle = getattr(
+                self.store,
+                "settle_stale_delegation_run_claims_for_controller",
+                None,
+            )
+            if callable(settle):
+                await settle(
+                    run_id,
+                    project_id=project_id,
+                    root_session_id=root_session_id,
+                    owner_token=owner_token,
+                    generation=generation,
+                    adopt_released_task_ids=adopt_released_task_ids,
+                )
+            heartbeat = _CompanyRunControllerHeartbeat(
+                store=self.store,
+                run_id=run_id,
+                project_id=project_id,
+                root_session_id=root_session_id,
+                owner_token=owner_token,
+                generation=generation,
+                lease_seconds=_COMPANY_RUN_CONTROLLER_LEASE_SECONDS,
+                interval_seconds=_COMPANY_RUN_CONTROLLER_HEARTBEAT_SECONDS,
+            )
+            admission = CompanyRunControllerAdmission(
+                run_id=run_id,
+                project_id=project_id,
+                root_session_id=root_session_id,
+                owner_token=owner_token,
+                generation=generation,
+                heartbeat=heartbeat,
+            )
+            self._active_controller_leases[run_id] = {
+                "run_id": run_id,
+                "project_id": project_id,
+                "root_session_id": root_session_id,
+                "owner_token": owner_token,
+                "generation": generation,
+            }
+            heartbeat.start()
+            return admission
+        except BaseException:
+            if heartbeat is not None:
+                heartbeat.stop()
+            credential = self._active_controller_leases.get(run_id)
+            if (
+                credential is not None
+                and credential.get("owner_token") == owner_token
+                and int(credential.get("generation", 0) or 0) == generation
+            ):
+                self._active_controller_leases.pop(run_id, None)
+            release = getattr(
+                self.store,
+                "release_delegation_run_controller_lease",
+                None,
+            )
+            if callable(release):
+                try:
+                    await release(
+                        run_id,
+                        project_id=project_id,
+                        root_session_id=root_session_id,
+                        owner_token=owner_token,
+                        generation=generation,
+                    )
+                except BaseException as release_error:
+                    if isinstance(release_error, (KeyboardInterrupt, SystemExit)):
+                        raise
+                    logger.opt(exception=True).warning(
+                        "failed to release company controller lease after "
+                        "admission setup error run_id={}",
+                        run_id,
+                    )
+            raise
+
+    async def release_controller_admission(
+        self,
+        admission: CompanyRunControllerAdmission | None,
+    ) -> None:
+        if admission is None or admission.released:
+            return
+        admission.released = True
+        admission.heartbeat.stop()
+        release = getattr(
+            self.store,
+            "release_delegation_run_controller_lease",
+            None,
+        )
+        if callable(release):
+            try:
+                await release(
+                    admission.run_id,
+                    project_id=admission.project_id,
+                    root_session_id=admission.root_session_id,
+                    owner_token=admission.owner_token,
+                    generation=admission.generation,
+                )
+            except Exception:
+                logger.opt(exception=True).warning(
+                    "failed to release company controller lease for run {}",
+                    admission.run_id,
+                )
+        credential = self._active_controller_leases.get(admission.run_id)
+        if (
+            credential is not None
+            and credential.get("owner_token") == admission.owner_token
+            and int(credential.get("generation", 0) or 0)
+            == admission.generation
+        ):
+            self._active_controller_leases.pop(admission.run_id, None)
+
+    async def _controller_lease_is_current(self) -> bool:
+        state = self._run_state()
+        if not state.controller_owner_token:
+            # In-memory/unit-test executors without a durable DelegationRun do
+            # not participate in the cross-process protocol.
+            return True
+        heartbeat = state.controller_heartbeat
+        if heartbeat is not None and heartbeat.lost:
+            return False
+        validate = getattr(
+            self.store,
+            "delegation_run_controller_lease_is_current",
+            None,
+        )
+        if not callable(validate):
+            return False
+        return bool(
+            await validate(
+                state.controller_run_id,
+                project_id=state.controller_project_id,
+                root_session_id=state.controller_root_session_id,
+                owner_token=state.controller_owner_token,
+                generation=state.controller_lease_generation,
+            )
+        )
+
+    async def _require_current_controller_lease(self) -> None:
+        if not await self._controller_lease_is_current():
+            state = self._run_state()
+            raise CompanyRunControllerLeaseLost(
+                "company run controller lease was lost "
+                f"(run_id={state.controller_run_id}, generation="
+                f"{state.controller_lease_generation})"
+            )
+
+    @staticmethod
+    def _controller_attempt_context_for_task(
+        task: Task,
+    ) -> CompanyControllerAttemptContext | None:
+        """Return the typed durable-attempt context for a live executor Task.
+
+        Legacy fixtures and explicit maintenance paths have no controller
+        token and retain their existing Store APIs.  Once a Task carries a
+        token, however, incomplete credentials fail closed rather than
+        silently degrading to an unfenced business write.
+        """
+
+        metadata = dict(task.metadata or {})
+        if not str(
+            metadata.get("company_run_controller_owner_token", "") or ""
+        ).strip():
+            return None
+        context = CompanyControllerAttemptContext.from_task(
+            task,
+            work_item_id=linked_work_item_id_for_task(task),
+        )
+        if not context.complete:
+            raise CompanyRunControllerLeaseLost(
+                "company Task has an incomplete authoritative attempt credential"
+            )
+        return context
+
+    async def _execute_authoritative_command(
+        self,
+        task: Task,
+        *,
+        operation: str,
+        mutations: tuple[CompanyControllerWorkItemMutation, ...] = (),
+        insert_work_items: tuple[DelegationWorkItem, ...] = (),
+        task_snapshot: Task | None = None,
+        task_snapshots: tuple[Task, ...] = (),
+        task_preimage_hashes: dict[str, str] | None = None,
+        run_mutation: CompanyControllerRunLifecycleMutation | None = None,
+        owner_publication: PreparedOwnerInteractionPublication | None = None,
+        origin_owner_interaction: OriginOwnerInteractionLease | None = None,
+    ) -> Any | None:
+        """Single live-runtime ingress for controller-owned business writes."""
+
+        context = self._controller_attempt_context_for_task(task)
+        if context is None:
+            return None
+        execute = getattr(
+            self.store,
+            "execute_company_controller_authoritative_command",
+            None,
+        )
+        if not callable(execute):
+            raise CompanyRunControllerLeaseLost(
+                "company Store cannot fence an authoritative command"
+            )
+        return await execute(
+            context,
+            operation=operation,
+            mutations=mutations,
+            insert_work_items=insert_work_items,
+            task_snapshot=task_snapshot,
+            task_snapshots=task_snapshots,
+            task_preimage_hashes=task_preimage_hashes,
+            run_mutation=run_mutation,
+            owner_publication=owner_publication,
+            origin_owner_interaction=origin_owner_interaction,
+        )
+
     async def _execute_multi_team_org(
         self,
         plan: CompanyWorkItemRuntimePlan,
         tasks: list[Task],
+        *,
+        controller_admission: CompanyRunControllerAdmission | None = None,
+        release_controller_admission_on_exit: bool = True,
     ) -> str:
         run_token = self._use_run_state(
             CompanyExecutorRunState(active_plan=plan, active_tasks=list(tasks))
         )
-        runtime_token = self.runtime.use_state(self.runtime.create_state())
+        runtime_state = self.runtime.create_state()
+        runtime_token = self.runtime.use_state(runtime_state)
         run_id = self._delegation_run_id_for_tasks(tasks)
-        if run_id:
-            self._live_run_dispatchers[run_id] = (
-                self._live_run_dispatchers.get(run_id, 0) + 1
-            )
+        lease_generation = 0
+        admission = controller_admission
+        registered_live_dispatcher = False
         try:
-            return await self._execute_multi_team_org_scoped(plan, tasks)
-        finally:
+            if admission is None:
+                admission = await self.acquire_controller_admission(tasks)
+            elif admission.run_id != run_id or admission.released:
+                raise CompanyRunControllerLeaseLost(
+                    "pre-acquired controller admission does not match this run"
+                )
+            if admission is not None:
+                lease_generation = admission.generation
+                state = self._run_state()
+                state.controller_run_id = admission.run_id
+                state.controller_project_id = admission.project_id
+                state.controller_root_session_id = admission.root_session_id
+                state.controller_owner_token = admission.owner_token
+                state.controller_lease_generation = admission.generation
+                state.controller_heartbeat = admission.heartbeat
+                runtime_state.controller_owner_token = admission.owner_token
+                runtime_state.controller_lease_generation = admission.generation
             if run_id:
+                self._live_run_dispatchers[run_id] = (
+                    self._live_run_dispatchers.get(run_id, 0) + 1
+                )
+                registered_live_dispatcher = True
+            try:
+                return await self._execute_multi_team_org_scoped(plan, tasks)
+            except CompanyRunControllerLeaseLost as exc:
+                logger.warning(
+                    "company dispatcher fenced after controller lease loss: "
+                    "run_id={} generation={} detail={}",
+                    run_id,
+                    lease_generation,
+                    str(exc),
+                )
+                raise
+        finally:
+            if run_id and registered_live_dispatcher:
                 remaining = self._live_run_dispatchers.get(run_id, 0) - 1
                 if remaining > 0:
                     self._live_run_dispatchers[run_id] = remaining
                 else:
                     self._live_run_dispatchers.pop(run_id, None)
+            if release_controller_admission_on_exit:
+                await self.release_controller_admission(admission)
             self.runtime.reset_state(runtime_token)
             self._reset_run_state(run_token)
 
@@ -4758,22 +6108,22 @@ class CompanyWorkItemExecutor:
         active_work_poll_timeout_sec = 5.0
         try:
             while True:
+                await self._require_current_controller_lease()
+                if await self._provider_quota_backoff_defers_dispatcher_tick(
+                    active_work_item_tasks
+                ):
+                    continue
                 if self.store:
                     project_id = str(tasks[0].project_id or "default").strip() if tasks else "default"
                     parent_session_id = str(
                         getattr(tasks[0], "parent_session_id", "") or (tasks[0].metadata or {}).get("parent_session_id", "") or ""
                     ).strip() if tasks else ""
                     all_tasks = await self.store.get_tasks(project_id=project_id)
-                    tasks = [
-                        task
-                        for task in all_tasks
-                        if str((task.metadata or {}).get("delegation_run_id", "") or "").strip()
-                        == str((self._active_tasks[0].metadata or {}).get("delegation_run_id", "") or "").strip()
-                        and (
-                            str(getattr(task, "parent_session_id", "") or "").strip() == parent_session_id
-                            or str(getattr(task, "session_id", "") or "").strip() == parent_session_id
-                        )
-                    ] or list(self._active_tasks)
+                    tasks = self._tasks_for_company_dispatch_reload(
+                        all_tasks,
+                        self._active_tasks,
+                        parent_session_id=parent_session_id,
+                    ) or list(self._active_tasks)
                 self._active_tasks = tasks
                 # Consumer half of `_park_for_blocking_comms`: blocking
                 # replies arrive as durable inbox files, so each tick checks
@@ -4796,7 +6146,24 @@ class CompanyWorkItemExecutor:
                     work_items,
                     active_work_item_tasks,
                 )
-                work_items = await self._refresh_ready_work_items(work_items, tasks=tasks)
+                if await self._reconcile_company_work_item_gate_continuations(
+                    tasks,
+                    work_items,
+                ):
+                    all_tasks = await self.store.get_tasks(
+                        project_id=project_id
+                    )
+                    tasks = self._tasks_for_company_dispatch_reload(
+                        all_tasks,
+                        self._active_tasks,
+                        parent_session_id=parent_session_id,
+                    ) or list(self._active_tasks)
+                    self._active_tasks = tasks
+                    work_items = await self._load_delegation_work_items(tasks)
+                work_items = await self._refresh_ready_work_items(
+                    work_items,
+                    tasks=tasks,
+                )
                 tasks = await self._materialize_work_item_tasks(tasks, work_items)
                 self._active_tasks = tasks
                 work_items = await self._load_delegation_work_items(tasks)
@@ -4952,22 +6319,40 @@ class CompanyWorkItemExecutor:
                     except (asyncio.CancelledError, Exception):
                         pass
                 # Harvest any work items that finished during this tick.
-                for completed in [t for t in list(active_work_item_tasks.keys()) if t.done()]:
-                    session_task = active_work_item_tasks.pop(completed, None)
-                    if session_task is None:
-                        continue
-                    claimed_member_session, claimed_task = session_task
-                    exc = completed.exception()
-                    if exc is not None:
-                        await self._handle_claimed_work_item_exception(
-                            claimed_member_session,
-                            claimed_task,
-                            exc,
-                        )
+                await self._harvest_completed_work_item_tasks(
+                    active_work_item_tasks
+                )
                 # Debounced UI push — fire-and-forget so the hot path
                 # never awaits `build_collab_sync`.
                 self._schedule_kanban_notification()
+        except CompanyRunControllerLeaseLost:
+            # A newer generation now owns every durable mutation.  Cancel the
+            # stale controller's local coroutines, but deliberately perform no
+            # claim/session cleanup: the takeover CAS owns that convergence.
+            for work_item_task in list(active_work_item_tasks.keys()):
+                if not work_item_task.done():
+                    work_item_task.cancel()
+            if active_work_item_tasks:
+                await asyncio.gather(
+                    *list(active_work_item_tasks.keys()),
+                    return_exceptions=True,
+                )
+                active_work_item_tasks.clear()
+            raise
         except asyncio.CancelledError:
+            if not await self._controller_lease_is_current():
+                for work_item_task in list(active_work_item_tasks.keys()):
+                    if not work_item_task.done():
+                        work_item_task.cancel()
+                if active_work_item_tasks:
+                    await asyncio.gather(
+                        *list(active_work_item_tasks.keys()),
+                        return_exceptions=True,
+                    )
+                    active_work_item_tasks.clear()
+                raise CompanyRunControllerLeaseLost(
+                    "stale controller cancellation cleanup fenced"
+                )
             claimed_pairs = list(active_work_item_tasks.values())
             # Coroutines that already died on a real exception must settle
             # their attempt BEFORE this turn unwinds. The old gather(...,
@@ -4984,6 +6369,12 @@ class CompanyWorkItemExecutor:
                 if crash_exc is None or isinstance(crash_exc, asyncio.CancelledError):
                     continue
                 crashed_member_session, crashed_task = session_task
+                if isinstance(crash_exc, CompanyControllerAttemptSuperseded):
+                    self._record_superseded_attempt_tail(
+                        crashed_task,
+                        crash_exc,
+                    )
+                    continue
                 crashed_pairs.append((crashed_member_session, crashed_task, crash_exc))
             for crashed_member_session, crashed_task, crash_exc in crashed_pairs:
                 try:
@@ -5041,6 +6432,7 @@ class CompanyWorkItemExecutor:
                         or ""
                     ).strip()
                     if role_session_id and callable(update_role_session) and store_ready:
+                        controller_state = self._run_state()
                         await update_role_session(
                             role_session_id,
                             focused_work_item_id="",
@@ -5050,6 +6442,12 @@ class CompanyWorkItemExecutor:
                                 "last_suspend_memory_reset_at": datetime.now().isoformat(),
                                 "last_suspend_task_id": claimed_task.id,
                             },
+                            controller_owner_token=(
+                                controller_state.controller_owner_token
+                            ),
+                            controller_lease_generation=(
+                                controller_state.controller_lease_generation
+                            ),
                         )
                 except Exception:
                     logger.opt(exception=True).debug("company runtime cancellation: failed session idle reset")
@@ -5066,6 +6464,11 @@ class CompanyWorkItemExecutor:
                 for (completed_task, (drained_session, drained_task)), res in zip(
                     list(active_work_item_tasks.items()), drain_results
                 ):
+                    if isinstance(res, CompanyControllerAttemptSuperseded):
+                        self._record_superseded_attempt_tail(drained_task, res)
+                        continue
+                    if isinstance(res, CompanyRunControllerLeaseLost):
+                        raise res
                     if isinstance(res, Exception):
                         await self._handle_claimed_work_item_exception(
                             drained_session,
@@ -5078,6 +6481,99 @@ class CompanyWorkItemExecutor:
         except Exception:
             logger.opt(exception=True).debug("run failure settlement skipped")
         return self._summarize_multi_team_org_results(tasks)
+
+    async def _provider_quota_backoff_defers_dispatcher_tick(
+        self,
+        active_work_item_tasks: dict[
+            asyncio.Task[TaskResult | None],
+            tuple[CompanyMemberSession, Task],
+        ],
+    ) -> bool:
+        """Wait without running a full dispatcher reload during quota park.
+
+        The wait remains event-driven and cancellable: Stop/shutdown task
+        cancellation interrupts it immediately, while a dispatcher wake runs
+        one fresh reconciliation tick.  A short cap periodically rechecks the
+        controller lease without restoring the former 2 Hz DB busy loop.
+        """
+
+        if active_work_item_tasks or not self._quota_park_until:
+            return False
+        remaining = self._quota_park_until - time.monotonic()
+        if remaining <= 0:
+            return False
+        wait_timeout = min(remaining, 5.0)
+        try:
+            await asyncio.wait_for(
+                self._dispatcher_wake.wait(),
+                timeout=wait_timeout,
+            )
+        except asyncio.TimeoutError:
+            # The cap elapsed, not the quota window.  Skip the expensive DB
+            # reload and immediately begin another capped wait while the park
+            # remains active.
+            return time.monotonic() < self._quota_park_until
+        self._dispatcher_wake.clear()
+        return False
+
+    @staticmethod
+    def _record_superseded_attempt_tail(
+        task: Task,
+        exc: CompanyControllerAttemptSuperseded,
+    ) -> None:
+        logger.info(
+            "company dispatcher harvested superseded attempt tail "
+            "task={} work_item={} detail={}",
+            task.id,
+            linked_work_item_id_for_task(task),
+            str(exc),
+        )
+
+    async def _harvest_completed_work_item_tasks(
+        self,
+        active_work_item_tasks: dict[
+            asyncio.Task[TaskResult | None],
+            tuple[CompanyMemberSession, Task],
+        ],
+    ) -> None:
+        """Harvest completed attempts without widening a local fence outcome.
+
+        Superseded attempt tails are already durably fenced and are removed
+        locally.  A real run-controller lease loss still propagates to the
+        surrounding dispatcher guard, which cancels every remaining sibling.
+        """
+
+        completed_tasks = [
+            task for task in list(active_work_item_tasks) if task.done()
+        ]
+        for completed in completed_tasks:
+            session_task = active_work_item_tasks.pop(completed, None)
+            if session_task is None:
+                continue
+            claimed_member_session, claimed_task = session_task
+            try:
+                exc = completed.exception()
+            except CompanyRunControllerLeaseLost:
+                raise
+            except asyncio.CancelledError:
+                # Ordinary local cancellation is already settled by the
+                # surrounding stop/suspend path and is not a failed attempt.
+                logger.debug(
+                    "company dispatcher harvested cancelled work-item task={}",
+                    claimed_task.id,
+                )
+                continue
+            if isinstance(exc, CompanyControllerAttemptSuperseded):
+                self._record_superseded_attempt_tail(claimed_task, exc)
+                continue
+            if isinstance(exc, CompanyRunControllerLeaseLost):
+                raise exc
+            if exc is not None:
+                await self._handle_claimed_work_item_exception(
+                    claimed_member_session,
+                    claimed_task,
+                    exc,
+                )
 
     @staticmethod
     def _runtime_scope_for_tasks(tasks: list[Task]) -> tuple[str, str]:
@@ -5112,9 +6608,42 @@ class CompanyWorkItemExecutor:
         """Keep durable claim and coroutine ownership in one scope boundary."""
 
         async def claim_and_create() -> list[tuple[CompanyMemberSession, Task]]:
+            excluded_task_ids = {
+                str(claimed_task.id or "").strip()
+                for _member_session, claimed_task in active_work_item_tasks.values()
+                if str(claimed_task.id or "").strip()
+            }
+            excluded_work_item_ids = {
+                linked_work_item_id_for_task(claimed_task)
+                for _member_session, claimed_task in active_work_item_tasks.values()
+                if linked_work_item_id_for_task(claimed_task)
+            }
+            excluded_member_session_ids = {
+                str(member_session.member_session_id or "").strip()
+                for member_session, _claimed_task in active_work_item_tasks.values()
+                if str(member_session.member_session_id or "").strip()
+            }
+            excluded_role_session_ids: set[str] = set()
+            for member_session, _claimed_task in active_work_item_tasks.values():
+                role_session_id = str(
+                    member_session.role_session_id or ""
+                ).strip()
+                if not role_session_id:
+                    role_session = self.runtime._role_session_for_member_session(
+                        member_session
+                    )
+                    role_session_id = str(
+                        getattr(role_session, "role_session_id", "") or ""
+                    ).strip()
+                if role_session_id:
+                    excluded_role_session_ids.add(role_session_id)
             claims = await self.runtime.claim_runnable_tasks(
                 tasks,
                 work_items=work_items,
+                excluded_task_ids=excluded_task_ids,
+                excluded_work_item_ids=excluded_work_item_ids,
+                excluded_member_session_ids=excluded_member_session_ids,
+                excluded_role_session_ids=excluded_role_session_ids,
             )
             for member_session, claimed_task in claims:
                 work_item_task = self._create_claimed_work_item_task(
@@ -5164,7 +6693,10 @@ class CompanyWorkItemExecutor:
                     registry.unregister(project_id, task.id, attempt_token)
 
         try:
-            return asyncio.create_task(run_owned())
+            owned_task = asyncio.create_task(run_owned())
+            if registry is not None and attempt_token:
+                registry.bind_attempt_task(attempt_token, owned_task)
+            return owned_task
         except BaseException:
             if registry is not None and attempt_token:
                 registry.unregister(project_id, task.id, attempt_token)
@@ -5279,32 +6811,66 @@ class CompanyWorkItemExecutor:
             f"(streak {self._quota_park_streak}). {str(exc)[:300]}"
         )
         logger.warning(summary)
-        if self._claimed_work_item_needs_cleanup(member_session, task):
+        claim_active = self._claimed_work_item_needs_cleanup(member_session, task)
+        if claim_active:
             try:
-                await transition_work_item_from_task(
+                role_session = self.runtime._role_session_for_member_session(
+                    member_session
+                )
+                role_session_id = str(
+                    getattr(role_session, "role_session_id", "")
+                    or member_session.role_session_id
+                    or ""
+                ).strip()
+                if not role_session_id:
+                    raise CompanyRunControllerLeaseLost(
+                        "provider quota park lacks its role-session identity"
+                    )
+                parked_at = datetime.now().isoformat()
+                transitioned = await transition_work_item_from_task(
                     self.store, task,
                     target_status_or_phase=Phase.READY,
                     reason="provider_quota_exhausted",
                     summary=summary or None,
                     release_claim=True,
                     attempt_outcome="interrupted",
+                    release_role_session_id=role_session_id,
+                    release_role_session_metadata_updates={
+                        "last_provider_quota_park_at": parked_at,
+                        "last_provider_quota_park_task_id": task.id,
+                        "last_provider_quota_park_work_item_id": (
+                            linked_work_item_id_for_task(task)
+                        ),
+                    },
                 )
+                if not transitioned:
+                    raise RuntimeError(
+                        "provider quota park requires a linked WorkItem"
+                    )
+                # The Store commit above atomically released the WorkItem and
+                # durable role session.  Detect a takeover immediately before
+                # touching this controller's local scheduler projection.
+                await self._require_current_controller_lease()
+                await self.runtime.release_claim_for_provider_quota(
+                    member_session,
+                    task,
+                )
+            except CompanyRunControllerLeaseLost:
+                raise
             except Exception:
                 logger.opt(exception=True).error(
-                    f"[Company:{projection_id}] quota park: READY transition failed"
+                    f"[Company:{projection_id}] quota park durable release failed"
                 )
-        self.runtime._claimed_task_ids.discard(task.id)
-        work_item_id = linked_work_item_id_for_task(task)
-        if work_item_id:
-            self.runtime._claimed_work_item_ids.discard(work_item_id)
-        member_session.status = "idle"
-        member_session.resident_status = "idle"
-        member_session.current_task_id = ""
-        member_session.focused_work_item_id = ""
-        member_session.current_work_item = {}
-        member_session.current_assignment = {}
-        member_session.updated_at = datetime.now()
-        await self._emit_progress(summary, task_id=task.id)
+                raise
+        try:
+            await self._emit_progress(summary, task_id=task.id)
+        except Exception:
+            # The READY/Task/role-session transaction already committed.
+            # Progress transport is telemetry and must not turn a recoverable
+            # quota park into a claimed-work-item crash.
+            logger.opt(exception=True).warning(
+                f"[Company:{projection_id}] quota park progress emission failed"
+            )
 
     async def _handle_claimed_work_item_exception(
         self,
@@ -5312,6 +6878,10 @@ class CompanyWorkItemExecutor:
         task: Task,
         exc: Exception,
     ) -> None:
+        # Error cleanup is a mutation just like a successful result.  Once a
+        # newer generation owns the run, the stale coroutine may neither mark
+        # its card FAILED nor release the winner's claim.
+        await self._require_current_controller_lease()
         if self._exception_is_provider_quota(exc):
             await self._park_claimed_work_item_for_quota(member_session, task, exc)
             return
@@ -5823,6 +7393,31 @@ class CompanyWorkItemExecutor:
             target_status_or_phase=Phase.RUNNING,
             reason="pre_execution_claim",
         )
+        if requires_native_company_execution(task):
+            task.assigned_external_agent = None
+            task.metadata.update(
+                {
+                    "force_native_execution": True,
+                    "selected_execution_agent": "native",
+                    "preferred_external_agent": None,
+                    "work_item_execution_strategy": WorkItemExecutionStrategy.NATIVE.value,
+                    "execution_agent_locked": True,
+                    "selected_execution_agent_source": "company_isolation_boundary",
+                    "company_native_execution_enforced": True,
+                }
+            )
+            for key in (
+                "_company_runtime_resume_execution_agent_pin",
+                "external_resume_session_id",
+                "external_resume_session_scope_id",
+                "external_resume_agent_type",
+                "__external_resume_session",
+            ):
+                task.metadata.pop(key, None)
+        else:
+            task.metadata["force_native_execution"] = False
+            task.metadata["company_native_execution_enforced"] = False
+        await self.save_task(task)
         if self.agent_selector:
             # The selector also owns checkpoint attempt pins.  Forced-native
             # work must pass through it so a resumed native pin is validated
@@ -5879,6 +7474,7 @@ class CompanyWorkItemExecutor:
                     ),
                     timeout=self.work_item_timeout,
                 )
+                await self._require_current_controller_lease()
             except asyncio.CancelledError:
                 # Suspension is a checkpoint transition owned by OPCEngine.
                 # This task object may be stale by the time cancellation is
@@ -5910,7 +7506,7 @@ class CompanyWorkItemExecutor:
                         target_status_or_phase=phase_for_task_status(result.status),
                         reason="work_item_awaiting_review",
                     )
-                    review_level = "manager" if result.status == TaskStatus.AWAITING_MANAGER_REVIEW else "human"
+                    review_level = "human" if result.status == TaskStatus.AWAITING_HUMAN else "manager"
                     await self._append_progress(task, f"Work item paused awaiting {review_level} review.")
                     await self._emit_progress(
                         f"[Company:{projection_id}] awaiting {review_level} review",
@@ -6090,9 +7686,32 @@ class CompanyWorkItemExecutor:
             else:
                 if gate:
                     await self._append_progress(task, f"Work-item gate `{gate.gate_type}` skipped by runtime policy.")
+                # Persist the completed output projection while the attempt is
+                # still RUNNING.  The pure harness evaluation below may then
+                # change only its named decision fields before an atomic
+                # human-pause publication compares the exact preimage.
+                await self.save_task(task)
+                gate_harness_decision = (
+                    await self._evaluate_and_record_gate_harness(
+                        task,
+                        task_by_projection_id,
+                    )
+                )
+                if await self._commit_pre_done_gate_harness_wait(
+                    task,
+                    gate_harness_decision,
+                ):
+                    return result
                 await self._append_progress(task, f"Work item completed by role {task.assigned_to}.")
                 await self._apply_done_transition(task, result=result)
-                completion_action = await self._finalize_work_item_with_gate_harness(task, task_by_projection_id)
+                gate_harness_action = await self._apply_gate_harness(
+                    task,
+                    task_by_projection_id,
+                    evaluated_decision=gate_harness_decision,
+                    evaluation_recorded=True,
+                )
+                if gate_harness_action in {"pass", "pass_with_constraints"}:
+                    await self._finalize_completed_work_item(task)
                 if task.status == TaskStatus.DONE:
                     # Append completion summary to shared scratchpad
                     self._append_to_scratchpad(task, result)
@@ -6121,36 +7740,12 @@ class CompanyWorkItemExecutor:
                             task_id=task.id,
                         )
                 elif task.status in _REVIEW_WAITING_STATUSES:
-                    review_label = "manager review" if task.status == TaskStatus.AWAITING_MANAGER_REVIEW else "human review"
+                    review_label = "human review" if task.status == TaskStatus.AWAITING_HUMAN else "manager review"
                     await self._emit_progress(
                         f"[Company:{projection_id}] awaiting {review_label}",
                         task_id=task.id,
                     )
             return result
-
-    # Turn types whose completion is review-exempt only when THIS attempt
-    # actually changed the delegated business board.  Historical children do
-    # not describe what the current turn produced.
-    _DELEGATION_OUTPUT_TURN_TYPES = frozenset({"dispatch", "intake", "plan"})
-
-    def _has_agent_manager_above(self, task: Task, linked_work_item: Any) -> bool:
-        """True when the card's manager is a real agent role that can run a
-        review turn. Top seats report to the human ``owner`` and intentionally
-        auto-approve their own zero-delegation output; subsequent refinement
-        happens through the existing owner/final-decider conversation."""
-        manager_role_id = (
-            str((task.metadata or {}).get("manager_role_id", "") or "").strip()
-            or str(getattr(linked_work_item, "manager_role_id", "") or "").strip()
-        )
-        if not manager_role_id or manager_role_id == "owner":
-            return False
-        get_agent = getattr(getattr(self, "org_engine", None), "get_agent", None)
-        if callable(get_agent):
-            try:
-                return get_agent(manager_role_id) is not None
-            except Exception:
-                return True
-        return True
 
     async def _apply_done_transition(
         self,
@@ -6233,17 +7828,9 @@ class CompanyWorkItemExecutor:
                 linked_work_item = await self.store.get_delegation_work_item(work_item_id)
             except Exception:
                 linked_work_item = None
-        linked_work_item_metadata = dict(getattr(linked_work_item, "metadata", {}) or {})
-        task.metadata = dict(task.metadata or {})
-        for key in (
-            "user_visible",
-            "authoritative_output",
-            "review_owner_kind",
-            "requires_user_feedback",
-            "feedback_scope",
-        ):
-            if key not in task.metadata and key in linked_work_item_metadata:
-                task.metadata[key] = copy.deepcopy(linked_work_item_metadata[key])
+        linked_work_item_metadata = dict(
+            getattr(linked_work_item, "metadata", {}) or {}
+        )
 
         # Determine summary from result (preferred) or task.result (legacy).
         summary = ""
@@ -6252,107 +7839,32 @@ class CompanyWorkItemExecutor:
         elif task.result and isinstance(task.result, dict):
             summary = str(task.result.get("content", "") or "").strip()
 
-        # Route DONE to one of {APPROVED, AWAITING_HUMAN, AWAITING_MANAGER_REVIEW}.
-        raw_work_kind = self._turn_type_for_task(
+        routing_item = linked_work_item or DelegationWorkItem(
+            work_item_id=work_item_id,
+            run_id=str((task.metadata or {}).get("delegation_run_id", "") or ""),
+            kind=str((task.metadata or {}).get("work_kind", "") or "execute"),
+            projection_id=self._projection_id_for_task(task),
+            manager_role_id=str(
+                (task.metadata or {}).get("manager_role_id", "") or ""
+            ),
+            manager_seat_id=str(
+                (task.metadata or {}).get("manager_seat_id", "") or ""
+            ),
+            metadata=linked_work_item_metadata,
+        )
+        routing_plan = plan_company_work_item_done_routing(
             task,
-            fallback=str(task.metadata.get("work_kind", "") or "execute"),
+            routing_item,
+            summary=summary,
         )
-        work_kind = canonical_work_item_turn_type_for_kind(raw_work_kind, fallback="")
-        linked_attention_id = str((task.metadata or {}).get("attention_work_item_id", "") or "").strip()
-        is_attention_work_item = (
-            bool((task.metadata or {}).get("attention_work_item", False))
-            or bool(linked_work_item_metadata.get("attention_work_item", False))
-            or (bool(linked_attention_id) and linked_attention_id == work_item_id)
+        target_phase = routing_plan.target_phase
+        manager_turn_context = dict(routing_plan.manager_turn_context)
+        task.metadata = copy.deepcopy(routing_plan.task_metadata)
+        metadata_updates = copy.deepcopy(
+            routing_plan.work_item_metadata_updates
         )
-        manager_reviewable = is_manager_reviewable_turn(work_kind) if work_kind else True
-        is_delivery_card = (
-            is_delivery_turn(task.metadata)
-            or str(task.metadata.get("review_owner_kind", "") or "").strip().lower() == "human"
-        )
-        manager_turn_context: dict[str, str] = {}
-        if (
-            not manager_reviewable
-            and not is_attention_work_item
-            and not is_delivery_card
-            and work_kind in self._DELEGATION_OUTPUT_TURN_TYPES
-        ):
-            board_mutated = bool(
-                (task.metadata or {}).get("manager_board_mutation_performed", False)
-            )
-            justification = str(
-                (task.metadata or {}).get("manager_no_delegation_justification", "") or ""
-            ).strip()
-            unresolved = str(
-                (task.metadata or {}).get("manager_dispatch_guard_unresolved", "") or ""
-            ).strip()
-            manager_turn_context = {
-                "outcome": "delegated" if board_mutated else "self_produced",
-                "source": (
-                    "board_mutation"
-                    if board_mutated
-                    else "justified"
-                    if justification
-                    else "dispatch_guard_exhausted"
-                    if unresolved
-                    else "no_board_mutation"
-                ),
-            }
-            note = justification or unresolved
-            if note:
-                manager_turn_context["note"] = note
-            if not board_mutated and self._has_agent_manager_above(
-                task, linked_work_item,
-            ):
-                manager_reviewable = True
-        if is_attention_work_item:
-            # Attention work items are wake-up wrappers that let a parked
-            # manager consume inbox/board state and call orchestration tools.
-            # They are not business deliverables, so completing one must not
-            # spawn a report/review chain for the wrapper itself.
-            target_phase = Phase.APPROVED
-        elif is_delivery_card:
-            target_phase = (
-                Phase.AWAITING_HUMAN
-                if self._requires_user_feedback(task)
-                else Phase.APPROVED
-            )
-        elif not manager_reviewable:
-            # Dispatch cards deliver the child work-item set, while aggregate /
-            # synthesize cards roll approved child results up to the parent.
-            # These turn types are explicitly non-reviewable; routing them to
-            # AWAITING_MANAGER_REVIEW leaves no review card able to consume them.
-            target_phase = Phase.APPROVED
-        else:
-            target_phase = Phase.AWAITING_MANAGER_REVIEW
 
-        # Persist the evidence and reviewer identity on the authoritative
-        # WorkItem when it enters a passive review phase.
-        metadata_updates: dict[str, Any] = {
-            **work_item_identity_payload_for_task(task),
-            "adaptive": dict(task.metadata.get("adaptive", {}) or {}),
-        }
-        if is_attention_work_item:
-            metadata_updates["attention_work_item_outcome"] = "completed"
         if target_phase in {Phase.AWAITING_MANAGER_REVIEW, Phase.AWAITING_HUMAN}:
-            review_owner_role_id = str(task.metadata.get("manager_role_id", "") or "").strip()
-            review_owner_seat_id = str(task.metadata.get("manager_seat_id", "") or "").strip()
-            if not review_owner_role_id or not review_owner_seat_id:
-                if linked_work_item is not None:
-                    if not review_owner_role_id:
-                        review_owner_role_id = str(getattr(linked_work_item, "manager_role_id", "") or "").strip()
-                    if not review_owner_seat_id:
-                        review_owner_seat_id = str(getattr(linked_work_item, "manager_seat_id", "") or "").strip()
-            if target_phase == Phase.AWAITING_MANAGER_REVIEW and not review_owner_role_id:
-                logger.warning(
-                    "_apply_done_transition auto-approved manager-reviewable work item "
-                    "because no manager reviewer role was available; non-final work items "
-                    f"must not enter human review. task_id={task.id} work_item_id={work_item_id}"
-                )
-                target_phase = Phase.APPROVED
-            metadata_updates["review_owner_role_id"] = review_owner_role_id
-            metadata_updates["review_owner_seat_id"] = review_owner_seat_id
-            if summary:
-                metadata_updates["completion_report"] = summary
             review_evidence = self._build_review_evidence(task, summary)
             if manager_turn_context:
                 review_evidence = dict(review_evidence or {})
@@ -6411,6 +7923,7 @@ class CompanyWorkItemExecutor:
         # spawn / refresh side effects if the transition actually landed
         # at our requested target.
         persisted_phase: Phase | None = None
+        refreshed_item: DelegationWorkItem | None = None
         if hasattr(self.store, "get_delegation_work_item"):
             try:
                 refreshed_item = await self.store.get_delegation_work_item(work_item_id)
@@ -6420,20 +7933,25 @@ class CompanyWorkItemExecutor:
                 persisted_phase = None
 
         if persisted_phase == Phase.AWAITING_MANAGER_REVIEW:
-            # Two-turn worker→review handoff: spawn a hidden report card
-            # first (NOT the review card directly). The same worker session
-            # resumes under a report-generation prompt to produce a clean
-            # structured handoff. Only after the report card completes
-            # (handled in _apply_report_done_transition) do we spawn the
-            # actual review card. The completion_report we just stamped
-            # onto the parent metadata is the worker's last execute-turn
-            # prose — used as fallback if the report turn never produces
-            # output; it will be overwritten by the report turn's content
-            # when that turn finishes.
-            await self._ensure_report_work_item_for_work_item(
-                work_item_id,
-                worker_task=task,
-            )
+            review_item = refreshed_item if refreshed_item is not None else linked_work_item
+            opaque_completion_report = self._opaque_external_team_completion_report(review_item)
+            if opaque_completion_report:
+                # The provider envelope is already the opaque team's durable
+                # handoff. Review it directly instead of invoking Jiuwen a
+                # second time merely to restate the same report.
+                await self._ensure_review_work_item_for_work_item(
+                    work_item_id,
+                    worker_task=task,
+                    completion_report=opaque_completion_report,
+                    controller_task=task,
+                )
+            else:
+                # Ordinary workers keep the two-turn worker→report→review
+                # flow so their execute prose is converted to a clean handoff.
+                await self._ensure_report_work_item_for_work_item(
+                    work_item_id,
+                    worker_task=task,
+                )
 
         # Delegation audit event. Best-effort — never let persistence
         # failure propagate into the state machine.
@@ -6491,26 +8009,63 @@ class CompanyWorkItemExecutor:
         """
         meta = dict(task.metadata or {})
         report_card_id = linked_work_item_id_for_task(task)
+        controller_context = self._controller_attempt_context_for_task(task)
+
+        async def close_report_card(
+            *,
+            outcome: str,
+            extra_metadata: dict[str, Any] | None = None,
+        ) -> DelegationWorkItem | None:
+            metadata_updates = {
+                "claimed_by_role_session_id": "",
+                "claimed_task_id": "",
+                "report_card_outcome": outcome,
+                **dict(extra_metadata or {}),
+            }
+            if controller_context is not None:
+                command_result = await self._execute_authoritative_command(
+                    task,
+                    operation=f"close_report:{outcome}",
+                    mutations=(
+                        CompanyControllerWorkItemMutation(
+                            work_item_id=report_card_id,
+                            expected_phases=(Phase.RUNNING,),
+                            phase=Phase.APPROVED,
+                            clear_claim=True,
+                            metadata_updates=metadata_updates,
+                        ),
+                    ),
+                )
+                if command_result is None or not bool(command_result.applied):
+                    return None
+                return (
+                    command_result.work_items[0]
+                    if command_result.work_items
+                    else None
+                )
+            if report_card_id and hasattr(
+                self.store, "update_delegation_work_item"
+            ):
+                return await self.store.update_delegation_work_item(
+                    report_card_id,
+                    phase=Phase.APPROVED,
+                    claimed_by_role_runtime_session_id="",
+                    claimed_by_seat_id="",
+                    metadata_updates=metadata_updates,
+                )
+            return None
+
         parent_work_item_id = str(meta.get("report_target_work_item_id", "") or "").strip()
         if not parent_work_item_id:
             # Defensive: report card with no parent pointer is corrupt;
             # close it and bail. Won't lose data — a future worker DONE
             # would re-spawn a new report card.
-            if report_card_id and hasattr(self.store, "update_delegation_work_item"):
-                try:
-                    await self.store.update_delegation_work_item(
-                        report_card_id,
-                        phase=Phase.APPROVED,
-                        claimed_by_role_runtime_session_id="",
-                        claimed_by_seat_id="",
-                        metadata_updates={
-                            "claimed_by_role_session_id": "",
-                            "claimed_task_id": "",
-                            "report_card_outcome": "no_parent",
-                        },
-                    )
-                except Exception:
-                    logger.opt(exception=True).debug("Best-effort close of orphan report card failed")
+            try:
+                await close_report_card(outcome="no_parent")
+            except Exception:
+                logger.opt(exception=True).debug(
+                    "Best-effort close of orphan report card failed"
+                )
             return None
 
         # The report turn's prose IS the handoff. Try a structured parse
@@ -6531,43 +8086,32 @@ class CompanyWorkItemExecutor:
                 parent_item = None
         if parent_item is None:
             # Parent disappeared — nothing we can do; close the report card.
-            if report_card_id and hasattr(self.store, "update_delegation_work_item"):
-                try:
-                    await self.store.update_delegation_work_item(
-                        report_card_id,
-                        phase=Phase.APPROVED,
-                        claimed_by_role_runtime_session_id="",
-                        claimed_by_seat_id="",
-                        metadata_updates={
-                            "claimed_by_role_session_id": "",
-                            "claimed_task_id": "",
-                            "report_card_outcome": "parent_missing",
-                        },
-                    )
-                except Exception:
-                    logger.opt(exception=True).debug("Best-effort close of orphan report card failed")
+            try:
+                await close_report_card(outcome="parent_missing")
+            except Exception:
+                logger.opt(exception=True).debug(
+                    "Best-effort close of orphan report card failed"
+                )
             return None
 
         parent_metadata = dict(getattr(parent_item, "metadata", {}) or {})
         if getattr(parent_item, "phase", None) != Phase.AWAITING_MANAGER_REVIEW:
-            if report_card_id and hasattr(self.store, "update_delegation_work_item"):
-                try:
-                    await self.store.update_delegation_work_item(
-                        report_card_id,
-                        phase=Phase.APPROVED,
-                        claimed_by_role_runtime_session_id="",
-                        claimed_by_seat_id="",
-                        metadata_updates={
-                            "claimed_by_role_session_id": "",
-                            "claimed_task_id": "",
-                            "report_card_outcome": "parent_not_awaiting_review",
-                            "report_parent_phase": str(
-                                getattr(getattr(parent_item, "phase", None), "value", "") or ""
-                            ),
-                        },
-                    )
-                except Exception:
-                    logger.opt(exception=True).debug("Best-effort close of non-reviewable report card failed")
+            try:
+                await close_report_card(
+                    outcome="parent_not_awaiting_review",
+                    extra_metadata={
+                        "report_parent_phase": str(
+                            getattr(
+                                getattr(parent_item, "phase", None), "value", ""
+                            )
+                            or ""
+                        ),
+                    },
+                )
+            except Exception:
+                logger.opt(exception=True).debug(
+                    "Best-effort close of non-reviewable report card failed"
+                )
             await self._record_work_item_runtime_diagnostic(
                 code="report_parent_not_awaiting_review",
                 severity="info",
@@ -6604,7 +8148,45 @@ class CompanyWorkItemExecutor:
         # creating review.  A crash after this write can be repaired using
         # the terminal report alone.
         persisted_report: DelegationWorkItem | None = None
-        if report_card_id and hasattr(self.store, "update_delegation_work_item"):
+        if controller_context is not None:
+            command_result = await self._execute_authoritative_command(
+                task,
+                operation="finalize_report_payload",
+                mutations=(
+                    CompanyControllerWorkItemMutation(
+                        work_item_id=report_card_id,
+                        expected_phases=(Phase.RUNNING,),
+                        phase=Phase.APPROVED,
+                        clear_claim=True,
+                        metadata_updates={
+                            "claimed_by_role_session_id": "",
+                            "claimed_task_id": "",
+                            "report_card_outcome": "applied",
+                            "completion_report": completion_report,
+                            "review_evidence": review_evidence,
+                            "report_completion_raw": report_raw,
+                            "last_report_turn_finished_at": datetime.now().isoformat(),
+                        },
+                    ),
+                    CompanyControllerWorkItemMutation(
+                        work_item_id=parent_work_item_id,
+                        expected_phases=(Phase.AWAITING_MANAGER_REVIEW,),
+                        metadata_updates=parent_metadata_updates,
+                    ),
+                ),
+            )
+            if command_result is not None and bool(command_result.applied):
+                persisted_report = next(
+                    (
+                        item
+                        for item in command_result.work_items
+                        if item.work_item_id == report_card_id
+                    ),
+                    None,
+                )
+            else:
+                persisted_report = None
+        elif report_card_id and hasattr(self.store, "update_delegation_work_item"):
             try:
                 persisted_report = await self.store.update_delegation_work_item(
                     report_card_id,
@@ -6629,20 +8211,22 @@ class CompanyWorkItemExecutor:
             # Do not create a review from volatile data. The report card stays
             # active. Release its persisted claim so the live dispatcher can
             # retry immediately; restart recovery is not required.
-            await self._release_auxiliary_claim_for_retry(report_card_id)
+            if controller_context is None:
+                await self._release_auxiliary_claim_for_retry(report_card_id)
             return None
 
-        try:
-            await self.store.update_delegation_work_item(
-                parent_work_item_id,
-                metadata_updates=parent_metadata_updates,
-            )
-        except Exception:
-            logger.opt(exception=True).warning(
-                "report_done: failed to update parent metadata with report payload"
-            )
-            await self._notify_kanban_changed()
-            return Phase.APPROVED
+        if controller_context is None:
+            try:
+                await self.store.update_delegation_work_item(
+                    parent_work_item_id,
+                    metadata_updates=parent_metadata_updates,
+                )
+            except Exception:
+                logger.opt(exception=True).warning(
+                    "report_done: failed to update parent metadata with report payload"
+                )
+                await self._notify_kanban_changed()
+                return Phase.APPROVED
 
         review_owner_role_id = str(
             parent_metadata.get("review_owner_role_id", "")
@@ -6672,6 +8256,7 @@ class CompanyWorkItemExecutor:
                     "review_owner_seat_id": review_owner_seat_id,
                 },
                 source_report_item=persisted_report,
+                controller_task=task,
             )
         await self._notify_kanban_changed()
         return Phase.APPROVED
@@ -6904,6 +8489,31 @@ class CompanyWorkItemExecutor:
         ]
         return active[-1] if active else None
 
+    @staticmethod
+    def _opaque_external_team_completion_report(
+        item: DelegationWorkItem | None,
+    ) -> str:
+        """Return the provider-owned handoff already present on an opaque team.
+
+        A JiuwenSwarm Team finishes its single provider run with a structured
+        OpenOPC envelope. That envelope is already the worker handoff report,
+        so resuming the external team in a second hidden ``report`` WorkItem
+        would violate the opaque-boundary contract. The manager still receives
+        an independent review turn.
+        """
+        metadata = dict(getattr(item, "metadata", {}) or {})
+        envelope = metadata.get("opaque_external_team_result")
+        if not isinstance(envelope, dict) or not envelope:
+            return ""
+        return str(
+            envelope.get("summary")
+            or metadata.get("completion_report")
+            or metadata.get("work_item_summary_for_downstream")
+            or metadata.get("work_item_summary")
+            or getattr(item, "deliverable_summary", "")
+            or ""
+        ).strip()
+
     @classmethod
     def _consecutive_failed_auxiliary_attempts(
         cls,
@@ -6957,6 +8567,7 @@ class CompanyWorkItemExecutor:
         parent_item: DelegationWorkItem,
         *,
         work_items: list[DelegationWorkItem] | None = None,
+        controller_task: Task | None = None,
     ) -> bool:
         """True when reconcile must stop minting new report cards for parent.
 
@@ -6998,27 +8609,50 @@ class CompanyWorkItemExecutor:
             "preserved on the card; rework retries the handoff."
         )
         try:
-            await transition_work_item(
-                self.store,
-                parent_item.work_item_id,
-                target_phase=Phase.FAILED,
-                reason="report_chain_failure",
-                summary=summary_text,
-                metadata_updates={
-                    "report_chain_failed_attempts": consecutive_failures,
-                },
-                release_claim=True,
-            )
-            try:
-                await self.store.update_delegation_work_item(
-                    parent_item.work_item_id,
-                    blocked_reason=block_reason,
+            if controller_task is not None and self._controller_attempt_context_for_task(
+                controller_task
+            ) is not None:
+                command_result = await self._execute_authoritative_command(
+                    controller_task,
+                    operation="terminalize_report_chain_failure",
+                    mutations=(
+                        CompanyControllerWorkItemMutation(
+                            work_item_id=parent_item.work_item_id,
+                            expected_phases=(Phase.AWAITING_MANAGER_REVIEW,),
+                            phase=Phase.FAILED,
+                            summary=summary_text,
+                            blocked_reason=block_reason,
+                            clear_claim=True,
+                            metadata_updates={
+                                "report_chain_failed_attempts": consecutive_failures,
+                            },
+                        ),
+                    ),
                 )
-            except Exception:
-                logger.opt(exception=True).debug(
-                    "report_chain_failure blocked_reason write failed for {}",
+                if command_result is None or not command_result.applied:
+                    return True
+            else:
+                await transition_work_item(
+                    self.store,
                     parent_item.work_item_id,
+                    target_phase=Phase.FAILED,
+                    reason="report_chain_failure",
+                    summary=summary_text,
+                    metadata_updates={
+                        "report_chain_failed_attempts": consecutive_failures,
+                    },
+                    release_claim=True,
                 )
+                try:
+                    await self.store.update_delegation_work_item(
+                        parent_item.work_item_id,
+                        blocked_reason=block_reason,
+                    )
+                except Exception:
+                    logger.opt(exception=True).debug(
+                        "report_chain_failure blocked_reason write failed for {}",
+                        parent_item.work_item_id,
+                    )
             await self._emit_progress(
                 f"[Company:{projection_id_for_work_item(parent_item)}] {summary_text}"
             )
@@ -7375,7 +9009,14 @@ class CompanyWorkItemExecutor:
         verification_status = dict(verification_results.get("status", {}) or {})
         verification_label = str(verification_status.get("label", "") or "").strip().lower()
         verification_summary = str(verification_status.get("summary", "") or "").strip()
-        if verification_label in {"failed", "fail", "blocked", "missing", "missing_evidence"}:
+        if verification_label in {
+            "failed",
+            "fail",
+            "partial",
+            "blocked",
+            "missing",
+            "missing_evidence",
+        }:
             return (
                 "Reviewer approved the work, but verification evidence is "
                 f"`{verification_label}`"
@@ -7422,6 +9063,7 @@ class CompanyWorkItemExecutor:
         metadata_updates: dict[str, Any] | None = None,
         source_report_item: DelegationWorkItem | None = None,
         run_items: list[DelegationWorkItem] | None = None,
+        controller_task: Task | None = None,
     ) -> DelegationWorkItem | None:
         """Ensure one active review card from durable WorkItem state.
 
@@ -7485,10 +9127,31 @@ class CompanyWorkItemExecutor:
         )
         if not has_prompt_contract(worker_metadata.get("prompt_contract")):
             try:
-                await self.store.update_delegation_work_item(
-                    target_work_item_id,
-                    metadata_updates={"prompt_contract": target_prompt_contract},
-                )
+                if controller_task is not None and self._controller_attempt_context_for_task(
+                    controller_task
+                ) is not None:
+                    command_result = await self._execute_authoritative_command(
+                        controller_task,
+                        operation="snapshot_review_target_prompt_contract",
+                        mutations=(
+                            CompanyControllerWorkItemMutation(
+                                work_item_id=target_work_item_id,
+                                expected_phases=(Phase.AWAITING_MANAGER_REVIEW,),
+                                metadata_updates={
+                                    "prompt_contract": target_prompt_contract
+                                },
+                            ),
+                        ),
+                    )
+                    if command_result is None or not command_result.applied:
+                        return None
+                else:
+                    await self.store.update_delegation_work_item(
+                        target_work_item_id,
+                        metadata_updates={
+                            "prompt_contract": target_prompt_contract
+                        },
+                    )
                 worker_metadata = {**worker_metadata, "prompt_contract": target_prompt_contract}
             except Exception:
                 logger.opt(exception=True).debug("Best-effort target prompt_contract snapshot update failed")
@@ -7547,12 +9210,43 @@ class CompanyWorkItemExecutor:
                     existing_card.work_item_id,
                     phase=Phase.CANCELLED,
                     outcome="superseded_by_newer_report",
+                    controller_task=controller_task,
                 )
                 if closed is None:
                     return None
                 existing_card = None
             else:
                 try:
+                    if controller_task is not None and self._controller_attempt_context_for_task(
+                        controller_task
+                    ) is not None:
+                        command_result = await self._execute_authoritative_command(
+                            controller_task,
+                            operation="refresh_active_review_card",
+                            mutations=(
+                                CompanyControllerWorkItemMutation(
+                                    work_item_id=existing_card.work_item_id,
+                                    summary=(
+                                        "Review the completed child deliverable and decide whether to "
+                                        "approve it or request rework."
+                                    ),
+                                    metadata_updates={
+                                        "review_completion_report": durable_completion,
+                                        "review_evidence": review_evidence,
+                                        "review_source_report_work_item_id": source_report_id,
+                                        "review_target_prompt_contract": target_prompt_contract,
+                                        "prompt_contract": review_prompt_contract,
+                                    },
+                                ),
+                            ),
+                        )
+                        if command_result is None or not command_result.applied:
+                            return None
+                        return (
+                            command_result.work_items[0]
+                            if command_result.work_items
+                            else None
+                        )
                     return await self.store.update_delegation_work_item(
                         existing_card.work_item_id,
                         summary=(
@@ -7586,6 +9280,26 @@ class CompanyWorkItemExecutor:
         session_scope_id = str(worker_metadata.get("session_scope_id", "") or "").strip()
         if worker_task is not None:
             session_scope_id = task_session_scope_id(worker_task) or session_scope_id
+        runtime_topology = dict(
+            worker_metadata.get("runtime_topology")
+            or task_metadata.get("runtime_topology")
+            or {}
+        )
+        manager_assignment: dict[str, Any] = {}
+        for raw_seat in list(runtime_topology.get("seats", []) or []):
+            if not isinstance(raw_seat, dict):
+                continue
+            candidate_seat_id = str(raw_seat.get("seat_id", "") or "").strip()
+            candidate_role_id = str(raw_seat.get("role_id", "") or "").strip()
+            if (
+                (manager_seat_id and candidate_seat_id == manager_seat_id)
+                or candidate_role_id == manager_role_id
+            ):
+                manager_assignment = copy.deepcopy(
+                    dict(raw_seat.get("employee_assignment", {}) or {})
+                )
+                if manager_assignment:
+                    break
         review_metadata: dict[str, Any] = mark_work_item_projection(mark_work_item_runtime({
             "runtime_model": "multi_team_org",
             "session_scope_id": session_scope_id,
@@ -7614,6 +9328,11 @@ class CompanyWorkItemExecutor:
             "user_visible": False,
             "authoritative_output": False,
             "skip_work_item_sync": True,
+            **(
+                {"employee_assignment": manager_assignment}
+                if manager_assignment
+                else {}
+            ),
             **{
                 key: copy.deepcopy(updates[key])
                 for key in (
@@ -7656,9 +9375,33 @@ class CompanyWorkItemExecutor:
             metadata=review_metadata,
         )
         try:
-            persisted_review, created = await self._insert_auxiliary_work_item_if_absent(
-                review_work_item
-            )
+            if controller_task is not None and self._controller_attempt_context_for_task(
+                controller_task
+            ) is not None:
+                command_result = await self._execute_authoritative_command(
+                    controller_task,
+                    operation="create_review_work_item",
+                    mutations=(
+                        CompanyControllerWorkItemMutation(
+                            work_item_id=target_work_item_id,
+                            expected_phases=(Phase.AWAITING_MANAGER_REVIEW,),
+                            metadata_updates={"review_attempt_count": attempt_no},
+                        ),
+                    ),
+                    insert_work_items=(review_work_item,),
+                )
+                if command_result is None or not command_result.applied:
+                    return None
+                created = review_work_item.work_item_id in set(
+                    command_result.inserted_work_item_ids
+                )
+                persisted_review = await self.store.get_delegation_work_item(
+                    review_work_item.work_item_id
+                )
+            else:
+                persisted_review, created = await self._insert_auxiliary_work_item_if_absent(
+                    review_work_item
+                )
         except Exception:
             logger.opt(exception=True).debug("Best-effort review work-item create failed")
             return None
@@ -7670,13 +9413,18 @@ class CompanyWorkItemExecutor:
             # observe it and choose the following deterministic attempt.
             return None
         # Cache only. Card identity remains authoritative if this write fails.
-        try:
-            await self.store.update_delegation_work_item(
-                target_work_item_id,
-                metadata_updates={"review_attempt_count": attempt_no},
-            )
-        except Exception:
-            logger.opt(exception=True).debug("Best-effort review_attempt_count update failed")
+        if controller_task is None or self._controller_attempt_context_for_task(
+            controller_task
+        ) is None:
+            try:
+                await self.store.update_delegation_work_item(
+                    target_work_item_id,
+                    metadata_updates={"review_attempt_count": attempt_no},
+                )
+            except Exception:
+                logger.opt(exception=True).debug(
+                    "Best-effort review_attempt_count update failed"
+                )
         return persisted_review
 
     async def _ensure_report_work_item_for_work_item(
@@ -7725,6 +9473,11 @@ class CompanyWorkItemExecutor:
             return None
         worker_metadata = dict(worker_item.metadata or {})
         task_metadata = dict(getattr(worker_task, "metadata", {}) or {})
+        controller_context = (
+            self._controller_attempt_context_for_task(worker_task)
+            if worker_task is not None
+            else None
+        )
         run_id = str(worker_item.run_id or "").strip()
         if not run_id:
             return None
@@ -7754,10 +9507,29 @@ class CompanyWorkItemExecutor:
         )
         if not has_prompt_contract(worker_metadata.get("prompt_contract")):
             try:
-                await self.store.update_delegation_work_item(
-                    target_work_item_id,
-                    metadata_updates={"prompt_contract": target_prompt_contract},
-                )
+                if controller_context is not None:
+                    command_result = await self._execute_authoritative_command(
+                        worker_task,
+                        operation="snapshot_report_target_prompt_contract",
+                        mutations=(
+                            CompanyControllerWorkItemMutation(
+                                work_item_id=target_work_item_id,
+                                expected_phases=(Phase.AWAITING_MANAGER_REVIEW,),
+                                metadata_updates={
+                                    "prompt_contract": target_prompt_contract
+                                },
+                            ),
+                        ),
+                    )
+                    if command_result is None or not command_result.applied:
+                        return None
+                else:
+                    await self.store.update_delegation_work_item(
+                        target_work_item_id,
+                        metadata_updates={
+                            "prompt_contract": target_prompt_contract
+                        },
+                    )
                 worker_metadata = {**worker_metadata, "prompt_contract": target_prompt_contract}
             except Exception:
                 logger.opt(exception=True).debug("Best-effort target prompt_contract update before report failed")
@@ -7788,6 +9560,7 @@ class CompanyWorkItemExecutor:
         if await self._should_hold_report_chain(
             worker_item,
             work_items=all_run_items,
+            controller_task=worker_task,
         ):
             return None
         existing_card = self._active_auxiliary_item(
@@ -7797,16 +9570,33 @@ class CompanyWorkItemExecutor:
         )
         if existing_card is not None:
             try:
-                await self.store.update_delegation_work_item(
-                    existing_card.work_item_id,
-                    metadata_updates={
-                        "report_target_prompt_contract": target_prompt_contract,
-                        "prompt_contract": report_prompt_contract,
-                        "report_source_summary": report_source["summary"],
-                        "report_source_result_content": report_source["result_content"],
-                        "report_source_evidence": report_source["evidence"],
-                    },
-                )
+                report_updates = {
+                    "report_target_prompt_contract": target_prompt_contract,
+                    "prompt_contract": report_prompt_contract,
+                    "report_source_summary": report_source["summary"],
+                    "report_source_result_content": report_source[
+                        "result_content"
+                    ],
+                    "report_source_evidence": report_source["evidence"],
+                }
+                if controller_context is not None:
+                    command_result = await self._execute_authoritative_command(
+                        worker_task,
+                        operation="refresh_active_report_card",
+                        mutations=(
+                            CompanyControllerWorkItemMutation(
+                                work_item_id=existing_card.work_item_id,
+                                metadata_updates=report_updates,
+                            ),
+                        ),
+                    )
+                    if command_result is None or not command_result.applied:
+                        return None
+                else:
+                    await self.store.update_delegation_work_item(
+                        existing_card.work_item_id,
+                        metadata_updates=report_updates,
+                    )
             except Exception:
                 logger.opt(exception=True).debug("Best-effort in-flight report refresh failed")
             return existing_card
@@ -7885,9 +9675,31 @@ class CompanyWorkItemExecutor:
             metadata=report_metadata,
         )
         try:
-            persisted_report, created = await self._insert_auxiliary_work_item_if_absent(
-                report_work_item
-            )
+            if controller_context is not None:
+                command_result = await self._execute_authoritative_command(
+                    worker_task,
+                    operation="create_report_work_item",
+                    mutations=(
+                        CompanyControllerWorkItemMutation(
+                            work_item_id=target_work_item_id,
+                            expected_phases=(Phase.AWAITING_MANAGER_REVIEW,),
+                            metadata_updates={"report_attempt_count": attempt_no},
+                        ),
+                    ),
+                    insert_work_items=(report_work_item,),
+                )
+                if command_result is None or not command_result.applied:
+                    return None
+                created = report_work_item.work_item_id in set(
+                    command_result.inserted_work_item_ids
+                )
+                persisted_report = await self.store.get_delegation_work_item(
+                    report_work_item.work_item_id
+                )
+            else:
+                persisted_report, created = await self._insert_auxiliary_work_item_if_absent(
+                    report_work_item
+                )
         except Exception:
             logger.opt(exception=True).debug("Best-effort report work-item create failed")
             return None
@@ -7898,13 +9710,16 @@ class CompanyWorkItemExecutor:
             # attempt.  Preserve it and let fresh reconciliation advance.
             return None
         # Cache only. Card identity remains authoritative if this write fails.
-        try:
-            await self.store.update_delegation_work_item(
-                target_work_item_id,
-                metadata_updates={"report_attempt_count": attempt_no},
-            )
-        except Exception:
-            logger.opt(exception=True).debug("Best-effort report_attempt_count update failed")
+        if controller_context is None:
+            try:
+                await self.store.update_delegation_work_item(
+                    target_work_item_id,
+                    metadata_updates={"report_attempt_count": attempt_no},
+                )
+            except Exception:
+                logger.opt(exception=True).debug(
+                    "Best-effort report_attempt_count update failed"
+                )
         return persisted_report
 
     async def _release_auxiliary_claim_for_retry(
@@ -7972,6 +9787,7 @@ class CompanyWorkItemExecutor:
         metadata_updates: dict[str, Any],
         review_outcome: str,
         source_report_work_item_id: str,
+        controller_task: Task | None = None,
     ) -> DelegationWorkItem | None:
         """Commit a review verdict before projecting it to the child."""
         resolution = self._build_review_resolution(
@@ -7988,6 +9804,7 @@ class CompanyWorkItemExecutor:
             phase=Phase.APPROVED,
             outcome=review_outcome,
             resolution=resolution,
+            controller_task=controller_task,
         )
 
     async def _persist_terminal_review_card(
@@ -7997,6 +9814,7 @@ class CompanyWorkItemExecutor:
         phase: Phase,
         outcome: str,
         resolution: dict[str, Any] | None = None,
+        controller_task: Task | None = None,
     ) -> DelegationWorkItem | None:
         """Persist a terminal review card or release its claim for retry."""
         metadata_updates: dict[str, Any] = {
@@ -8019,16 +9837,44 @@ class CompanyWorkItemExecutor:
             }
             if current is None or current.phase not in DONE_PHASES or current.phase == phase:
                 update_kwargs["phase"] = phase
-            persisted = await self.store.update_delegation_work_item(
-                review_work_item_id,
-                **update_kwargs,
-            )
+            if controller_task is not None and self._controller_attempt_context_for_task(
+                controller_task
+            ) is not None:
+                target_phase = update_kwargs.get("phase")
+                command_result = await self._execute_authoritative_command(
+                    controller_task,
+                    operation=f"close_review:{outcome}",
+                    mutations=(
+                        CompanyControllerWorkItemMutation(
+                            work_item_id=review_work_item_id,
+                            expected_phases=(current.phase,) if current is not None else (),
+                            phase=target_phase,
+                            clear_claim=True,
+                            metadata_updates=metadata_updates,
+                        ),
+                    ),
+                )
+                persisted = (
+                    command_result.work_items[0]
+                    if command_result is not None
+                    and command_result.applied
+                    and command_result.work_items
+                    else None
+                )
+            else:
+                persisted = await self.store.update_delegation_work_item(
+                    review_work_item_id,
+                    **update_kwargs,
+                )
         except Exception:
             logger.opt(exception=True).warning(
                 "review_done: failed to persist terminal review card"
             )
             persisted = None
-        if persisted is None:
+        if persisted is None and (
+            controller_task is None
+            or self._controller_attempt_context_for_task(controller_task) is None
+        ):
             await self._release_auxiliary_claim_for_retry(review_work_item_id)
         return persisted
 
@@ -8037,22 +9883,42 @@ class CompanyWorkItemExecutor:
         review_item: DelegationWorkItem,
         *,
         reason: str,
+        controller_task: Task | None = None,
     ) -> None:
         """Retire a late verdict without mutating its target WorkItem."""
         try:
-            await self.store.update_delegation_work_item(
-                review_item.work_item_id,
-                metadata_updates={
-                    "review_resolution_state": "stale",
-                    "review_resolution_stale_reason": str(reason or "").strip(),
-                    "review_resolution_stale_at": datetime.now().isoformat(),
-                    "review_work_item_outcome": (
-                        "target_no_longer_awaiting_manager_review"
-                        if reason == "target_phase_changed"
-                        else "superseded_by_newer_report"
+            metadata_updates = {
+                "review_resolution_state": "stale",
+                "review_resolution_stale_reason": str(reason or "").strip(),
+                "review_resolution_stale_at": datetime.now().isoformat(),
+                "review_work_item_outcome": (
+                    "target_no_longer_awaiting_manager_review"
+                    if reason == "target_phase_changed"
+                    else "superseded_by_newer_report"
+                ),
+            }
+            if controller_task is not None and self._controller_attempt_context_for_task(
+                controller_task
+            ) is not None:
+                command_result = await self._execute_authoritative_command(
+                    controller_task,
+                    operation="mark_review_resolution_stale",
+                    mutations=(
+                        CompanyControllerWorkItemMutation(
+                            work_item_id=review_item.work_item_id,
+                            metadata_updates=metadata_updates,
+                        ),
                     ),
-                },
-            )
+                )
+                if command_result is None or not command_result.applied:
+                    raise CompanyRunControllerLeaseLost(
+                        "stale-review marker lost its claimed attempt"
+                    )
+            else:
+                await self.store.update_delegation_work_item(
+                    review_item.work_item_id,
+                    metadata_updates=metadata_updates,
+                )
         except Exception:
             logger.opt(exception=True).warning(
                 "Failed to mark stale review resolution: "
@@ -8064,15 +9930,25 @@ class CompanyWorkItemExecutor:
         *,
         target_work_item_id: str,
         source_report_work_item_id: str,
+        legacy_human_retirement: bool = False,
     ) -> tuple[DelegationWorkItem | None, str]:
-        """Return the authoritative target and an empty reason when current."""
+        """Return the authoritative target and an empty reason when current.
+
+        Normal review application accepts only AWAITING_MANAGER_REVIEW. The
+        named compatibility flag additionally recognizes AWAITING_HUMAN only
+        while retiring a persisted legacy manager verdict; it is not a generic
+        phase override.
+        """
         try:
             target = await self.store.get_delegation_work_item(
                 target_work_item_id
             )
         except Exception:
             target = None
-        if target is None or target.phase != Phase.AWAITING_MANAGER_REVIEW:
+        expected_phases = {Phase.AWAITING_MANAGER_REVIEW}
+        if legacy_human_retirement:
+            expected_phases.add(Phase.AWAITING_HUMAN)
+        if target is None or target.phase not in expected_phases:
             return target, "target_phase_changed"
         run_items = await self._run_items_for_parent(target)
         applied_reports = [
@@ -8101,6 +9977,8 @@ class CompanyWorkItemExecutor:
         self,
         review_item: DelegationWorkItem,
         target_item: DelegationWorkItem,
+        *,
+        controller_task: Task | None = None,
     ) -> DelegationWorkItem | None:
         """Idempotently project a durable terminal review onto its child."""
         if review_item.phase not in DONE_PHASES:
@@ -8114,6 +9992,34 @@ class CompanyWorkItemExecutor:
         ).strip()
         if not target_work_item_id or target_work_item_id != target_item.work_item_id:
             return None
+        try:
+            target_phase = Phase(str(resolution.get("target_phase", "") or ""))
+        except ValueError:
+            return None
+        legacy_human_retirement = target_phase == Phase.AWAITING_HUMAN
+        if legacy_human_retirement:
+            # Old AWAITING_HUMAN review journals overlap with legitimate
+            # final-delivery and explicit request_user_input workflows.  Ask
+            # the durable Store classifier before this method can stale or
+            # apply any journal row; owner-owned workflows are never migration
+            # candidates.
+            protection_method = getattr(
+                type(self.store),
+                "legacy_human_review_retirement_is_protected",
+                None,
+            )
+            if callable(protection_method):
+                try:
+                    if await self.store.legacy_human_review_retirement_is_protected(
+                        target_work_item_id
+                    ):
+                        return None
+                except Exception:
+                    logger.opt(exception=True).warning(
+                        "Could not classify legacy human review target; "
+                        f"leaving journal untouched for work_item_id={target_work_item_id}"
+                    )
+                    return None
         resolution_source_id = str(
             resolution.get("source_report_work_item_id", "") or ""
         ).strip()
@@ -8126,19 +10032,88 @@ class CompanyWorkItemExecutor:
             await self._mark_review_resolution_stale(
                 review_item,
                 reason="source_report_superseded",
+                controller_task=controller_task,
             )
             return None
         source_report_work_item_id = resolution_source_id or review_source_id
-        authoritative_target, stale_reason = (
-            await self._current_review_resolution_target(
-                target_work_item_id=target_work_item_id,
-                source_report_work_item_id=source_report_work_item_id,
+        try:
+            persisted_target = await self.store.get_delegation_work_item(
+                target_work_item_id
             )
+        except Exception:
+            persisted_target = None
+        if persisted_target is not None and (
+            persisted_target.phase == Phase.APPROVED
+            and str(
+                (persisted_target.metadata or {}).get(
+                    "review_resolution_applied_work_item_id", ""
+                )
+                or ""
+            ).strip()
+            == review_item.work_item_id
+        ):
+            marker_updates: dict[str, Any] = {"review_resolution_state": "applied"}
+            if legacy_human_retirement:
+                marker_updates.update(
+                    {
+                        "review_work_item_outcome": (
+                            "legacy_awaiting_human_resolution_retired_to_approved"
+                        ),
+                        "review_resolution_retirement": dict(
+                            (persisted_target.metadata or {}).get(
+                                "review_resolution_retirement", {}
+                            )
+                            or {}
+                        ),
+                    }
+                )
+            try:
+                if controller_task is not None and self._controller_attempt_context_for_task(
+                    controller_task
+                ) is not None:
+                    command_result = await self._execute_authoritative_command(
+                        controller_task,
+                        operation="mark_review_resolution_already_applied",
+                        mutations=(
+                            CompanyControllerWorkItemMutation(
+                                work_item_id=review_item.work_item_id,
+                                metadata_updates=marker_updates,
+                            ),
+                        ),
+                    )
+                    if command_result is None or not command_result.applied:
+                        raise CompanyRunControllerLeaseLost(
+                            "review marker lost its claimed attempt"
+                        )
+                else:
+                    await self.store.update_delegation_work_item(
+                        review_item.work_item_id,
+                        metadata_updates=marker_updates,
+                    )
+            except Exception:
+                logger.opt(exception=True).debug(
+                    "Best-effort review resolution applied marker failed"
+                )
+            return persisted_target
+        authoritative_target, stale_reason = await self._current_review_resolution_target(
+            target_work_item_id=target_work_item_id,
+            source_report_work_item_id=source_report_work_item_id,
+            legacy_human_retirement=legacy_human_retirement,
         )
-        if stale_reason:
+        recover_stale_legacy_human = (
+            legacy_human_retirement
+            and authoritative_target is not None
+            and authoritative_target.phase == Phase.AWAITING_HUMAN
+            and stale_reason in {
+                "source_report_missing",
+                "source_report_superseded",
+            }
+        )
+        if stale_reason and not recover_stale_legacy_human:
             await self._mark_review_resolution_stale(
                 review_item,
                 reason=stale_reason,
+                controller_task=controller_task,
             )
             return None
         if authoritative_target is None:
@@ -8150,14 +10125,9 @@ class CompanyWorkItemExecutor:
             or ""
         ).strip() == review_item.work_item_id:
             return authoritative_target
-        try:
-            target_phase = Phase(str(resolution.get("target_phase", "") or ""))
-        except ValueError:
-            return None
-        if target_phase not in {
+        if not legacy_human_retirement and target_phase not in {
             Phase.APPROVED,
             Phase.READY_FOR_REWORK,
-            Phase.AWAITING_HUMAN,
         }:
             return None
         metadata_updates = resolution.get("metadata_updates", {})
@@ -8167,41 +10137,159 @@ class CompanyWorkItemExecutor:
         metadata_updates["review_resolution_applied_work_item_id"] = (
             review_item.work_item_id
         )
-        atomic_apply = getattr(
-            self.store,
-            "apply_delegation_review_resolution",
-            None,
-        )
-        if callable(atomic_apply):
-            applied = await atomic_apply(
+        retirement_audit: dict[str, Any] = {}
+        if (
+            controller_task is not None
+            and self._controller_attempt_context_for_task(controller_task)
+            is not None
+            and not legacy_human_retirement
+        ):
+            marker_updates = {"review_resolution_state": "applied"}
+            command_result = await self._execute_authoritative_command(
+                controller_task,
+                operation="apply_review_resolution",
+                mutations=(
+                    CompanyControllerWorkItemMutation(
+                        work_item_id=target_work_item_id,
+                        expected_phases=(Phase.AWAITING_MANAGER_REVIEW,),
+                        phase=target_phase,
+                        blocked_reason=str(
+                            resolution.get("blocked_reason", "") or ""
+                        ),
+                        metadata_updates=metadata_updates,
+                        latest_applied_report_work_item_id=(
+                            source_report_work_item_id
+                        ),
+                    ),
+                    CompanyControllerWorkItemMutation(
+                        work_item_id=review_item.work_item_id,
+                        metadata_updates=marker_updates,
+                    ),
+                ),
+            )
+            if command_result is None or not command_result.applied:
+                applied = None
+            else:
+                applied = next(
+                    (
+                        item
+                        for item in command_result.work_items
+                        if item.work_item_id == target_work_item_id
+                    ),
+                    None,
+                )
+        elif legacy_human_retirement:
+            retirement_audit = {
+                "kind": "legacy_manager_review_awaiting_human_resolution",
+                "review_work_item_id": review_item.work_item_id,
+                "source_report_work_item_id": source_report_work_item_id,
+                "original_target_phase": Phase.AWAITING_HUMAN.value,
+                "normalized_target_phase": Phase.APPROVED.value,
+                "retired_at": datetime.now().isoformat(),
+            }
+            metadata_updates["review_resolution_retirement"] = retirement_audit
+            retire_legacy = getattr(
+                self.store,
+                "retire_legacy_human_review_resolution",
+                None,
+            )
+            if not callable(retire_legacy):
+                return None
+            applied = await retire_legacy(
                 target_work_item_id,
                 source_report_work_item_id=source_report_work_item_id,
-                target_phase=target_phase,
-                blocked_reason=str(resolution.get("blocked_reason", "") or ""),
                 metadata_updates=metadata_updates,
             )
         else:
-            applied = await self.store.update_delegation_work_item(
-                target_work_item_id,
-                phase=target_phase,
-                blocked_reason=str(resolution.get("blocked_reason", "") or ""),
-                metadata_updates=metadata_updates,
+            atomic_apply = getattr(
+                self.store,
+                "apply_delegation_review_resolution",
+                None,
             )
+            if callable(atomic_apply):
+                applied = await atomic_apply(
+                    target_work_item_id,
+                    source_report_work_item_id=source_report_work_item_id,
+                    target_phase=target_phase,
+                    blocked_reason=str(resolution.get("blocked_reason", "") or ""),
+                    metadata_updates=metadata_updates,
+                )
+            else:
+                applied = await self.store.update_delegation_work_item(
+                    target_work_item_id,
+                    phase=target_phase,
+                    blocked_reason=str(resolution.get("blocked_reason", "") or ""),
+                    metadata_updates=metadata_updates,
+                )
         if applied is None:
             _target, stale_reason = await self._current_review_resolution_target(
                 target_work_item_id=target_work_item_id,
                 source_report_work_item_id=source_report_work_item_id,
+                legacy_human_retirement=legacy_human_retirement,
             )
+            recovered_target = None
+            if (
+                legacy_human_retirement
+                and _target is not None
+                and _target.phase == Phase.AWAITING_HUMAN
+                and stale_reason in {
+                    "source_report_missing",
+                    "source_report_superseded",
+                }
+            ):
+                recovery_audit = {
+                    "kind": "legacy_human_review_target_recovered",
+                    "stale_review_work_item_id": review_item.work_item_id,
+                    "stale_source_report_work_item_id": source_report_work_item_id,
+                    "reason": stale_reason,
+                    "prior_phase": Phase.AWAITING_HUMAN.value,
+                    "normalized_phase": Phase.AWAITING_MANAGER_REVIEW.value,
+                    "retired_at": datetime.now().isoformat(),
+                }
+                recover_legacy = getattr(
+                    self.store,
+                    "recover_legacy_human_review_target_from_stale_resolution",
+                    None,
+                )
+                if callable(recover_legacy):
+                    recovered_target = await recover_legacy(
+                        target_work_item_id,
+                        stale_source_report_work_item_id=source_report_work_item_id,
+                        metadata_updates={
+                            "review_resolution_retirement": recovery_audit,
+                        },
+                    )
             if stale_reason:
                 await self._mark_review_resolution_stale(
                     review_item,
                     reason=stale_reason,
+                    controller_task=controller_task,
                 )
-            return None
+            return recovered_target
+        if (
+            controller_task is not None
+            and self._controller_attempt_context_for_task(controller_task)
+            is not None
+            and not legacy_human_retirement
+        ):
+            # The live controller command applied the child phase and this
+            # marker atomically. Reconciliation retains the generic two-step
+            # journal path below.
+            return applied
         try:
+            marker_updates = {"review_resolution_state": "applied"}
+            if legacy_human_retirement:
+                marker_updates.update(
+                    {
+                        "review_work_item_outcome": (
+                            "legacy_awaiting_human_resolution_retired_to_approved"
+                        ),
+                        "review_resolution_retirement": retirement_audit,
+                    }
+                )
             await self.store.update_delegation_work_item(
                 review_item.work_item_id,
-                metadata_updates={"review_resolution_state": "applied"},
+                metadata_updates=marker_updates,
             )
         except Exception:
             logger.opt(exception=True).debug(
@@ -8271,6 +10359,7 @@ class CompanyWorkItemExecutor:
                 review_work_item_id,
                 phase=Phase.APPROVED,
                 outcome="target_no_longer_awaiting_manager_review",
+                controller_task=review_task,
             )
             await self._notify_kanban_changed()
             return
@@ -8362,6 +10451,7 @@ class CompanyWorkItemExecutor:
                 metadata_updates=child_metadata_updates,
                 review_outcome="verdict_parse_failed_auto_done",
                 source_report_work_item_id=source_report_work_item_id,
+                controller_task=review_task,
             )
             if persisted_review is None:
                 await self._notify_kanban_changed()
@@ -8370,6 +10460,7 @@ class CompanyWorkItemExecutor:
                 applied_child = await self._apply_review_resolution(
                     persisted_review,
                     child_item,
+                    controller_task=review_task,
                 )
             except Exception:
                 logger.opt(exception=True).warning(
@@ -8412,7 +10503,6 @@ class CompanyWorkItemExecutor:
                 "rework_feedback": "" if next_phase == Phase.APPROVED else feedback,
                 "structured_review_verdict": verdict or {},
             }
-            escalation_reason: str | None = None
             if next_phase == Phase.READY_FOR_REWORK:
                 prior_rework_count = int(
                     dict(getattr(child_item, "metadata", {}) or {}).get(
@@ -8443,11 +10533,6 @@ class CompanyWorkItemExecutor:
                     child_metadata_updates["review_feedback_updated_at"] = datetime.now().isoformat()
             elif next_phase == Phase.APPROVED:
                 child_metadata_updates["review_rework_count"] = 0
-            blocked_reason = (
-                ""
-                if next_phase == Phase.APPROVED
-                else str(escalation_reason or "")
-            )
             source_report_work_item_id = str(
                 dict(getattr(review_item, "metadata", {}) or {}).get(
                     "review_source_report_work_item_id", ""
@@ -8459,10 +10544,11 @@ class CompanyWorkItemExecutor:
                 review_work_item_id=review_work_item_id,
                 target_work_item_id=target_work_item_id,
                 target_phase=next_phase,
-                blocked_reason=blocked_reason,
+                blocked_reason="",
                 metadata_updates=child_metadata_updates,
                 review_outcome=review_outcome,
                 source_report_work_item_id=source_report_work_item_id,
+                controller_task=review_task,
             )
             if persisted_review is None:
                 await self._notify_kanban_changed()
@@ -8471,6 +10557,7 @@ class CompanyWorkItemExecutor:
                 applied_child = await self._apply_review_resolution(
                     persisted_review,
                     child_item,
+                    controller_task=review_task,
                 )
             except Exception:
                 logger.opt(exception=True).warning(
@@ -8484,42 +10571,6 @@ class CompanyWorkItemExecutor:
                 return
             child_item = applied_child
             child_phase = applied_child.phase
-            if (
-                next_phase == Phase.AWAITING_HUMAN
-                and child_phase == Phase.AWAITING_HUMAN
-                and feedback
-            ):
-                try:
-                    target_task = await self._load_review_target_task(
-                        review_task=review_task,
-                        child_item=child_item,
-                    )
-                    if target_task is not None:
-                        target_task = copy.deepcopy(target_task)
-                        target_task.metadata = dict(target_task.metadata or {})
-                        target_task.metadata.update({
-                            "rework_feedback": feedback,
-                            "review_owner_role_id": str(child_item.manager_role_id or "").strip(),
-                            "review_owner_seat_id": str(child_item.manager_seat_id or "").strip(),
-                            "review_feedback_version": int(
-                                child_metadata_updates.get("review_feedback_version", prior_feedback_version) or 0
-                            ),
-                        })
-                        if callable(getattr(self, "save_task", None)):
-                            await self.save_task(target_task)
-                        await self._save_review_rework_human_checkpoint(
-                            target_task,
-                            feedback=feedback,
-                            review_owner_role_id=str(child_item.manager_role_id or "").strip(),
-                            review_feedback_version=int(
-                                child_metadata_updates.get("review_feedback_version", prior_feedback_version) or 0
-                            ),
-                            escalation_reason=escalation_reason or "",
-                        )
-                except Exception:
-                    logger.opt(exception=True).warning(
-                        "_finalize_review_work_item: failed to persist human-intervention checkpoint"
-                    )
         if persisted_review is None:
             # The target moved before this reviewer finished. Close the
             # auxiliary card, but never apply a stale verdict to that newer
@@ -8528,6 +10579,7 @@ class CompanyWorkItemExecutor:
                 review_work_item_id,
                 phase=Phase.APPROVED,
                 outcome="target_no_longer_awaiting_review",
+                controller_task=review_task,
             )
             if persisted_review is None:
                 await self._notify_kanban_changed()
@@ -8546,7 +10598,10 @@ class CompanyWorkItemExecutor:
                 self._signal_dispatcher_wake()
             except Exception:
                 logger.opt(exception=True).debug("_signal_dispatcher_wake failed")
-        if child_phase == Phase.APPROVED:
+        if (
+            child_phase == Phase.APPROVED
+            and self._controller_attempt_context_for_task(review_task) is None
+        ):
             await self._refresh_delegation_dependents(review_task)
         await self._notify_kanban_changed()
 
@@ -8833,6 +10888,7 @@ class CompanyWorkItemExecutor:
             review_work_item_id,
             phase=Phase.CANCELLED,
             outcome="verdict_parse_failed",
+            controller_task=review_task,
         )
         if persisted_prior is None:
             return False
@@ -8840,13 +10896,29 @@ class CompanyWorkItemExecutor:
         # Cache only. The terminal review card above is the durable retry
         # count and recovery point if this parent metadata write fails.
         try:
-            await self.store.update_delegation_work_item(
-                target_work_item_id,
-                metadata_updates={
-                    "review_verdict_parse_retry_count": new_retry_count,
-                    "review_verdict_parse_retry_at": datetime.now().isoformat(),
-                },
-            )
+            retry_counter_updates = {
+                "review_verdict_parse_retry_count": new_retry_count,
+                "review_verdict_parse_retry_at": datetime.now().isoformat(),
+            }
+            if self._controller_attempt_context_for_task(review_task) is not None:
+                command_result = await self._execute_authoritative_command(
+                    review_task,
+                    operation="stamp_review_parse_retry",
+                    mutations=(
+                        CompanyControllerWorkItemMutation(
+                            work_item_id=target_work_item_id,
+                            expected_phases=(Phase.AWAITING_MANAGER_REVIEW,),
+                            metadata_updates=retry_counter_updates,
+                        ),
+                    ),
+                )
+                if command_result is None or not command_result.applied:
+                    return False
+            else:
+                await self.store.update_delegation_work_item(
+                    target_work_item_id,
+                    metadata_updates=retry_counter_updates,
+                )
         except Exception:
             logger.opt(exception=True).debug(
                 "verdict-parse-retry: failed to stamp counter on child"
@@ -8869,6 +10941,7 @@ class CompanyWorkItemExecutor:
                 "review_retry_reason": "verdict_parse_failed",
             },
             source_report_item=source_report_item,
+            controller_task=review_task,
         )
         if new_review_item is None:
             return False
@@ -8877,17 +10950,37 @@ class CompanyWorkItemExecutor:
                 "Review the completed child deliverable and decide whether to "
                 "approve it or request rework."
             )
-            await self.store.update_delegation_work_item(
-                getattr(new_review_item, "work_item_id", ""),
-                summary=base_summary + _REVIEW_VERDICT_PARSE_RETRY_HINT,
-                metadata_updates={
-                    "review_retry_hint": _REVIEW_VERDICT_PARSE_RETRY_HINT,
-                    "review_retry_reason": "verdict_parse_failed",
-                    "review_retry_of_attempt": int(
-                        review_metadata.get("review_attempt", 0) or 0
+            new_review_updates = {
+                "review_retry_hint": _REVIEW_VERDICT_PARSE_RETRY_HINT,
+                "review_retry_reason": "verdict_parse_failed",
+                "review_retry_of_attempt": int(
+                    review_metadata.get("review_attempt", 0) or 0
+                ),
+            }
+            if self._controller_attempt_context_for_task(review_task) is not None:
+                command_result = await self._execute_authoritative_command(
+                    review_task,
+                    operation="enrich_review_parse_retry",
+                    mutations=(
+                        CompanyControllerWorkItemMutation(
+                            work_item_id=getattr(
+                                new_review_item, "work_item_id", ""
+                            ),
+                            summary=(
+                                base_summary + _REVIEW_VERDICT_PARSE_RETRY_HINT
+                            ),
+                            metadata_updates=new_review_updates,
+                        ),
                     ),
-                },
-            )
+                )
+                if command_result is None or not command_result.applied:
+                    return False
+            else:
+                await self.store.update_delegation_work_item(
+                    getattr(new_review_item, "work_item_id", ""),
+                    summary=base_summary + _REVIEW_VERDICT_PARSE_RETRY_HINT,
+                    metadata_updates=new_review_updates,
+                )
         except Exception:
             logger.opt(exception=True).debug(
                 "verdict-parse-retry: extending new summary failed"
@@ -8940,133 +11033,6 @@ class CompanyWorkItemExecutor:
             == "verdict_parse_failed"
         )
         return max(cached, durable)
-
-    async def _load_review_target_task(
-        self,
-        *,
-        review_task: Task,
-        child_item: DelegationWorkItem | None,
-    ) -> Task | None:
-        if not self.store or not hasattr(self.store, "get_task"):
-            return None
-        candidate_task_ids: list[str] = []
-        if child_item is not None:
-            get_runtime_task = getattr(self.store, "get_runtime_task_for_work_item", None)
-            if callable(get_runtime_task):
-                try:
-                    linked_task = await get_runtime_task(str(getattr(child_item, "work_item_id", "") or "").strip())
-                except Exception:
-                    linked_task = None
-                linked_task_id = str(getattr(linked_task, "id", "") or "").strip()
-                if linked_task_id:
-                    candidate_task_ids.append(linked_task_id)
-        for raw in (
-            (review_task.metadata or {}).get("review_target_worker_task_id"),
-        ):
-            value = str(raw or "").strip()
-            if value and value not in candidate_task_ids:
-                candidate_task_ids.append(value)
-        for task_id in candidate_task_ids:
-            try:
-                target = await self.store.get_task(task_id)
-            except Exception:
-                target = None
-            if target is not None:
-                return target
-        return None
-
-    async def _save_review_rework_human_checkpoint(
-        self,
-        task: Task,
-        *,
-        feedback: str,
-        review_owner_role_id: str,
-        review_feedback_version: int,
-        escalation_reason: str,
-    ) -> None:
-        if not self.checkpoint_callback:
-            return
-
-        pending_getter = getattr(self.store, "get_pending_checkpoints", None)
-        if callable(pending_getter):
-            try:
-                pending = await pending_getter(
-                    project_id=str(task.project_id or "default"),
-                    session_id=str(task.session_id or "").strip() or None,
-                    checkpoint_types=["task_user_input"],
-                )
-            except Exception:
-                pending = []
-            for checkpoint in pending:
-                payload = dict(getattr(checkpoint, "payload", {}) or {})
-                existing_task_id = str(
-                    payload.get("task_id")
-                    or payload.get("waiting_task_id")
-                    or ""
-                ).strip()
-                if existing_task_id != str(task.id or "").strip():
-                    continue
-                if str(payload.get("manual_intervention_source", "") or "").strip() != "review_rework_escalation":
-                    continue
-                if self._review_feedback_version(payload) == review_feedback_version:
-                    return
-
-        runtime_payload = self._runtime_checkpoint_payload(task)
-        work_item_payload = self._work_item_checkpoint_payload(task)
-        summary = (
-            str(escalation_reason or "").strip()
-            or "Manual intervention required before this work item can continue."
-        )
-        prompt = "\n\n".join(
-            part for part in (
-                summary,
-                "Please decide how this work item should continue.",
-                "Reviewer feedback:",
-                feedback,
-            )
-            if str(part).strip()
-        ).strip()
-        pause_request = {
-            "reason": summary,
-            "questions": [
-                "Should this work item get another rework attempt, be approved as-is, or be redirected?"
-            ],
-            "required_fields": ["decision"],
-            "context_note": (
-                f"Reviewer: {review_owner_role_id}" if review_owner_role_id else "Reviewer feedback is attached below."
-            ),
-            "resume_hint": "Reply with the decision and any guidance the resumed work item should follow.",
-        }
-        await self.checkpoint_callback(
-            {
-                "checkpoint_type": "task_user_input",
-                "project_id": task.project_id,
-                "session_id": task.session_id,
-                "task_id": task.id,
-                "payload": {
-                    "task_id": task.id,
-                    "waiting_task_id": task.id,
-                    "session_id": task.session_id,
-                    "execution_mode": str(task.metadata.get("execution_mode", "company_mode") or "company_mode"),
-                    "task_ids": [t.id for t in self._active_tasks] if self._active_tasks else [task.id],
-                    **work_item_identity_payload_for_task(task),
-                    "org_version": task.metadata.get("org_version", 1),
-                    "runtime_topology_version": task.metadata.get("runtime_topology_version", 1),
-                    "reorg_proposal_id": task.metadata.get("reorg_proposal_id", ""),
-                    "prompt": prompt,
-                    "pause_request": pause_request,
-                    "review_level": "human",
-                    "review_target_role_id": "owner",
-                    "review_chain_role_ids": [],
-                    "manual_intervention_source": "review_rework_escalation",
-                    "review_owner_role_id": review_owner_role_id,
-                    "review_feedback_version": review_feedback_version,
-                    "review_feedback": feedback,
-                    **work_item_payload,
-                    **runtime_payload,
-                },
-            }
-        )
 
     async def _refresh_delegation_dependents(self, task: Task) -> None:
         """Propagate dependency completion/escalation into parent phases.
@@ -10133,6 +12099,12 @@ class CompanyWorkItemExecutor:
         This helper is also called by ``CommsReactivationSweeper`` so any
         evolution of the guard logic applies uniformly to both callers.
         """
+        if is_runtime_auxiliary_task(task):
+            # Durable auxiliary Tasks are closed, private runtime envelopes,
+            # not reusable role work.  Keep this guard at the mutation
+            # boundary as well as in the background sweeper so direct callers
+            # cannot turn a completed internal prompt back into queued work.
+            return False
         multi_team_org = str((task.metadata or {}).get("runtime_model", "") or "").strip() == "multi_team_org"
         if multi_team_org:
             # Company runtime routes inbound attention through role/session
@@ -10262,6 +12234,7 @@ class CompanyWorkItemExecutor:
             if str(item).strip()
         ]
         parent_work_item = await self.store.get_delegation_work_item(parent_work_item_id)
+        pruned_dependency_ids: list[str] = []
         if parent_work_item is not None:
             dependency_ids = list(
                 dict.fromkeys(
@@ -10290,7 +12263,11 @@ class CompanyWorkItemExecutor:
                 work_item_by_id,
                 owner_work_item_id=parent_work_item_id,
             )
-            if pruned_dependency_ids and hasattr(self.store, "update_delegation_work_item"):
+            if (
+                pruned_dependency_ids
+                and hasattr(self.store, "update_delegation_work_item")
+                and self._controller_attempt_context_for_task(task) is None
+            ):
                 try:
                     await self.store.update_delegation_work_item(
                         parent_work_item_id,
@@ -10344,10 +12321,11 @@ class CompanyWorkItemExecutor:
             and not bool((parent_work_item.metadata or {}).get("intake_delivery_spawned", False))
         ):
             try:
-                await self._spawn_delivery_card_after_intake(
+                intake_closed_authoritatively = await self._spawn_delivery_card_after_intake(
                     task=task,
                     intake_work_item=parent_work_item,
                     dependency_ids=dependency_ids,
+                    pruned_dependency_ids=pruned_dependency_ids,
                 )
             except Exception:
                 logger.opt(exception=True).warning(
@@ -10355,6 +12333,8 @@ class CompanyWorkItemExecutor:
                     parent_work_item_id,
                 )
             else:
+                if intake_closed_authoritatively:
+                    return False
                 task.metadata = dict(task.metadata)
                 task.metadata.pop("delegation_pending_work_item_ids", None)
                 task.metadata.pop("delegated_children_pending", None)
@@ -10527,7 +12507,8 @@ class CompanyWorkItemExecutor:
         task: Task,
         intake_work_item: Any,
         dependency_ids: list[str],
-    ) -> None:
+        pruned_dependency_ids: list[str] | None = None,
+    ) -> bool:
         """Create the user-facing delivery work item once intake dispatches.
 
         Runs once per intake (idempotent via ``intake_delivery_spawned``
@@ -10544,13 +12525,22 @@ class CompanyWorkItemExecutor:
               upper-level agent (there is none above the root).
         """
         if not self.store or not hasattr(self.store, "save_delegation_work_item"):
-            return
+            return False
         run_id = str(getattr(intake_work_item, "run_id", "") or "").strip()
         if not run_id:
-            return
+            return False
         intake_meta = dict(getattr(intake_work_item, "metadata", {}) or {})
         role_id = str(getattr(intake_work_item, "role_id", "") or "").strip()
-        delivery_projection_id = f"{role_id or 'root'}::delivery::{uuid.uuid4().hex[:8]}"
+        intake_work_item_id = str(
+            getattr(intake_work_item, "work_item_id", "") or ""
+        ).strip()
+        delivery_digest = hashlib.sha256(
+            f"{run_id}|{intake_work_item_id}|final-delivery".encode("utf-8")
+        ).hexdigest()[:16]
+        delivery_projection_id = (
+            f"{role_id or 'root'}::delivery::{delivery_digest}"
+        )
+        delivery_work_item_id = f"delivery::{delivery_digest}"
         intake_title = str(getattr(intake_work_item, "title", "") or "").strip()
         delivery_title = (
             f"Deliver final result to user: {intake_title}"
@@ -10619,22 +12609,43 @@ class CompanyWorkItemExecutor:
             "waiting_on_work_item_ids": list(dependency_ids),
             "assigned_role_runtime_id": str(getattr(intake_work_item, "role_runtime_session_id", "") or intake_meta.get("assigned_role_runtime_id", "") or "").strip(),
             "contact_role_ids": list(intake_meta.get("contact_role_ids", []) or []),
-            "allowed_delegate_role_ids": list(intake_meta.get("allowed_delegate_role_ids", []) or []),
+            # Delivery is a terminal synthesis/handoff turn, not a second
+            # planning pass.  Rework is routed through the review protocol;
+            # inheriting intake delegates here lets the final decider create
+            # duplicate sibling work after the approved frontier converges.
+            "allowed_delegate_role_ids": [],
             "delegation_playbook": dict(intake_meta.get("delegation_playbook", {}) or {}),
             "comms_workspace_root": str(intake_meta.get("comms_workspace_root", "") or "").strip(),
             "target_output_dir": str(intake_meta.get("target_output_dir", "") or "").strip(),
             "review_owner_kind": "human",
+            "current_turn_mode": "deliver_required",
+            **(
+                {"employee_assignment": copy.deepcopy(intake_meta["employee_assignment"])}
+                if isinstance(intake_meta.get("employee_assignment"), dict)
+                and intake_meta.get("employee_assignment")
+                else {}
+            ),
             "original_message": original_message,
-            "intake_work_item_id": str(getattr(intake_work_item, "work_item_id", "") or "").strip(),
+            "intake_work_item_id": intake_work_item_id,
             "user_visible": bool(delivery_policy.get("user_visible", True)),
             "authoritative_output": bool(delivery_policy.get("authoritative_output", True)),
             "requires_user_feedback": bool(delivery_policy.get("requires_user_feedback", True)),
             "feedback_scope": "final",
+            **(
+                {
+                    "origin_owner_interaction": copy.deepcopy(
+                        intake_meta.get("origin_owner_interaction")
+                    )
+                }
+                if intake_meta.get("origin_owner_interaction")
+                else {}
+            ),
         }, version=work_item_runtime_version(intake_meta)),
             projection_id=delivery_projection_id,
             turn_type="deliver",
         )
         delivery_work_item = DelegationWorkItem(
+            work_item_id=delivery_work_item_id,
             run_id=run_id,
             cell_id=str(getattr(intake_work_item, "cell_id", "") or "").strip() or role_id,
             team_instance_id=delivery_metadata["team_instance_id"],
@@ -10643,25 +12654,169 @@ class CompanyWorkItemExecutor:
             seat_id=delivery_metadata["seat_id"],
             seat_state_id=delivery_metadata["seat_state_id"],
             role_runtime_session_id=delivery_metadata["assigned_role_runtime_id"],
-            parent_work_item_id=str(getattr(intake_work_item, "work_item_id", "") or "").strip(),
+            parent_work_item_id=intake_work_item_id,
             source_role_id=role_id or None,
             source_seat_id=delivery_metadata["seat_id"] or None,
             title=delivery_title,
             summary=(
                 "Synthesise all sub-team approved outputs and hand a final, "
-                "user-facing result back to the requester. Do not re-delegate unless "
-                "a critical gap is discovered — the team's work is done."
+                "user-facing result back to the requester. Do not delegate new work. "
+                "If a critical gap is discovered, report it through the delivery "
+                "review/rework protocol — the team's execution work is done."
             ),
             kind="delivery",
             projection_id=delivery_projection_id,
             phase=Phase.WAITING_DEPENDENCIES,
             batch_id=delivery_metadata["batch_id"],
             batch_index=int(getattr(intake_work_item, "batch_index", 0) or 0) + 1,
-            continuation_source=str(getattr(intake_work_item, "work_item_id", "") or "").strip(),
+            continuation_source=intake_work_item_id,
             manager_role_id=delivery_metadata["manager_role_id"],
             manager_seat_id=delivery_metadata["manager_seat_id"],
             metadata=delivery_metadata,
         )
+        self._ensure_prompt_contract_on_work_item(
+            delivery_work_item,
+            task_metadata=dict(task.metadata or {}),
+            task_description=str(
+                delivery_work_item.summary or original_message
+            ).strip(),
+        )
+        controller_context = self._controller_attempt_context_for_task(task)
+        if controller_context is not None:
+            progress_message = (
+                "Intake dispatched; delivery card spawned, intake approved."
+            )
+            task.metadata = dict(task.metadata)
+            task.metadata.pop("delegation_pending_work_item_ids", None)
+            task.metadata.pop("delegated_children_pending", None)
+            task.metadata.pop("delegation_wait_for_work_item_ids", None)
+            task.status = TaskStatus.DONE
+            durable_task = await self.store.get_task(task.id)
+            if durable_task is None:
+                raise CompanyRunControllerLeaseLost(
+                    "intake delivery Task disappeared before authoritative commit"
+                )
+            durable_preimage = company_controller_task_preimage_hash(
+                durable_task
+            )
+            task_snapshot = durable_task
+            task_snapshot.metadata = dict(task_snapshot.metadata or {})
+            task_snapshot.metadata.pop(
+                "delegation_pending_work_item_ids", None
+            )
+            task_snapshot.metadata.pop("delegated_children_pending", None)
+            task_snapshot.metadata.pop(
+                "delegation_wait_for_work_item_ids", None
+            )
+            task_snapshot.status = TaskStatus.DONE
+            command_result = await self._execute_authoritative_command(
+                task,
+                operation="spawn_delivery_after_intake",
+                mutations=(
+                    CompanyControllerWorkItemMutation(
+                        work_item_id=intake_work_item_id,
+                        expected_phases=(
+                            Phase.RUNNING,
+                            Phase.WAITING_FOR_CHILDREN,
+                        ),
+                        phase=Phase.APPROVED,
+                        blocked_reason="",
+                        clear_claim=True,
+                        transition_reason="intake_delivery_spawned",
+                        attempt_outcome=Phase.APPROVED.value,
+                        allow_via_running=True,
+                        metadata_updates={
+                            "dependency_work_item_ids": list(dependency_ids),
+                            "waiting_on_work_item_ids": [],
+                            "delegated_children_pending": False,
+                            "intake_delivery_spawned": True,
+                            "intake_delivery_work_item_id": delivery_work_item_id,
+                            "frontier": "intake_delivery_spawned",
+                            **(
+                                {
+                                    "pruned_dependency_work_item_ids": list(
+                                        pruned_dependency_ids or []
+                                    ),
+                                    "dependency_pruned_at": datetime.now().isoformat(),
+                                }
+                                if pruned_dependency_ids
+                                else {}
+                            ),
+                        },
+                        metadata_list_appends={
+                            "progress_log": (progress_message,),
+                        },
+                    ),
+                ),
+                insert_work_items=(delivery_work_item,),
+                task_snapshot=task_snapshot,
+                task_preimage_hashes={task.id: durable_preimage},
+            )
+            if command_result is None:
+                raise CompanyRunControllerLeaseLost(
+                    "intake delivery command lost its controller context"
+                )
+            if not bool(command_result.applied):
+                existing_delivery = await self.store.get_delegation_work_item(
+                    delivery_work_item_id
+                )
+                current_intake = await self.store.get_delegation_work_item(
+                    intake_work_item_id
+                )
+                already_applied = bool(
+                    existing_delivery is not None
+                    and str(existing_delivery.run_id or "").strip() == run_id
+                    and str(
+                        (existing_delivery.metadata or {}).get(
+                            "intake_work_item_id", ""
+                        )
+                        or ""
+                    ).strip()
+                    == intake_work_item_id
+                    and current_intake is not None
+                    and current_intake.phase == Phase.APPROVED
+                    and bool(
+                        (current_intake.metadata or {}).get(
+                            "intake_delivery_spawned", False
+                        )
+                    )
+                    and str(
+                        (current_intake.metadata or {}).get(
+                            "intake_delivery_work_item_id", ""
+                        )
+                        or ""
+                    ).strip()
+                    == delivery_work_item_id
+                )
+                if not already_applied:
+                    raise CompanyRunControllerLeaseLost(
+                        "intake delivery command lost its claimed attempt"
+                    )
+            else:
+                task.__dict__.update(copy.deepcopy(task_snapshot.__dict__))
+            created_delivery = delivery_work_item_id in set(
+                command_result.inserted_work_item_ids
+            )
+            if created_delivery and hasattr(self.store, "save_delegation_event"):
+                try:
+                    await self.store.save_delegation_event(
+                        DelegationEvent(
+                            run_id=run_id,
+                            work_item_id=delivery_work_item_id,
+                            cell_id=delivery_work_item.cell_id,
+                            role_id=delivery_work_item.role_id,
+                            event_type="delivery_work_item_created",
+                            payload={
+                                "intake_work_item_id": intake_work_item_id,
+                                "dependency_work_item_ids": list(dependency_ids),
+                            },
+                        )
+                    )
+                except Exception:
+                    logger.debug(
+                        "Best-effort delivery work-item event persistence failed"
+                    )
+            return True
         await self.store.save_delegation_work_item(delivery_work_item)
         if hasattr(self.store, "save_delegation_event"):
             try:
@@ -10680,6 +12835,7 @@ class CompanyWorkItemExecutor:
                 )
             except Exception:
                 logger.debug("Best-effort delivery work-item event persistence failed")
+        return False
 
     async def _park_for_blocking_comms(self, task: Task) -> bool:
         """If `task`'s role sent any blocking messages this turn whose
@@ -11148,20 +13304,41 @@ class CompanyWorkItemExecutor:
         target_task: Task,
         decision: GateHarnessDecision,
         rework_round: int,
+        target_feedback: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
-        target_projection_id = self._projection_id_for_task(target_task)
-        return {
-            "source_projection_id": self._projection_id_for_task(source_task),
-            "source_work_item_title": source_task.title,
-            **gate_rework_payload(target_projection_id=target_projection_id),
-            "target_work_item_title": target_task.title,
-            "feedback": decision.summary,
-            "blockers": list(decision.blockers),
-            "blocker_types": list(decision.blocker_types),
-            "constraints": list(decision.constraints),
-            "rework_round": rework_round,
-            "requested_at": datetime.now().isoformat(),
-        }
+        request = build_company_gate_harness_rework_record(
+            source_task=source_task,
+            target_task=target_task,
+            decision=asdict(decision),
+            rework_round=rework_round,
+            requested_at=datetime.now(),
+        )
+        if target_feedback is not None:
+            feedback = str(target_feedback.get("feedback", "") or "").strip()
+            blockers = [
+                str(item).strip()
+                for item in list(target_feedback.get("blockers", []) or [])
+                if str(item).strip()
+            ]
+            request["feedback"] = feedback
+            request["blockers"] = blockers
+            invalidated_by_projection_ids = list(
+                dict.fromkeys(
+                    str(item).strip()
+                    for item in list(
+                        target_feedback.get(
+                            "invalidated_by_projection_ids", []
+                        )
+                        or []
+                    )
+                    if str(item).strip()
+                )
+            )
+            if invalidated_by_projection_ids:
+                request["invalidated_by_projection_ids"] = (
+                    invalidated_by_projection_ids
+                )
+        return request
 
     def _render_gate_harness_rework_summary(self, request: dict[str, Any]) -> str:
         lines = [
@@ -11194,7 +13371,26 @@ class CompanyWorkItemExecutor:
         source_task: Task,
         decision: GateHarnessDecision,
         task_by_projection_id: dict[str, Task],
+        *,
+        expected_pre_delivery_rework_count: int | None = None,
+        max_pre_delivery_reworks: int | None = None,
+        target_feedback_by_projection_id: Mapping[
+            str, Mapping[str, Any]
+        ] | None = None,
     ) -> Task | None:
+        if self._controller_attempt_context_for_task(source_task) is not None:
+            return await self._gate_harness_initiate_rework_for_controller(
+                source_task,
+                decision,
+                task_by_projection_id,
+                expected_pre_delivery_rework_count=(
+                    expected_pre_delivery_rework_count
+                ),
+                max_pre_delivery_reworks=max_pre_delivery_reworks,
+                target_feedback_by_projection_id=(
+                    target_feedback_by_projection_id
+                ),
+            )
         touched_task_ids: set[str] = set()
         target_projection_ids = target_projection_ids_for_decision(decision)
         if not target_projection_ids:
@@ -11212,9 +13408,24 @@ class CompanyWorkItemExecutor:
                 target_task=target_task,
                 decision=decision,
                 rework_round=rework_round,
+                target_feedback=(
+                    dict(target_feedback_by_projection_id or {}).get(
+                        target_projection_id
+                    )
+                ),
             )
             affected_projection_ids = [target_projection_id, *self._collect_downstream_projection_ids(target_projection_id)]
             for affected_projection_id in affected_projection_ids:
+                # Every explicit target must receive the concrete validation
+                # feedback as a primary target.  Defer it to its own outer
+                # iteration instead of consuming it first as another target's
+                # downstream dependent.  This also keeps a shared delivery
+                # lead from being reset twice when two child notes fail.
+                if (
+                    affected_projection_id != target_projection_id
+                    and affected_projection_id in target_projection_ids
+                ):
+                    continue
                 affected_task = task_by_projection_id.get(affected_projection_id)
                 if affected_task is None or affected_task.id in touched_task_ids:
                     continue
@@ -11225,7 +13436,9 @@ class CompanyWorkItemExecutor:
                 self._reset_work_item_outputs_for_rework(affected_task)
                 if affected_projection_id == target_projection_id:
                     affected_task.metadata["gate_harness_rework_count"] = rework_round
-                    affected_task.metadata["gate_harness_rework_feedback"] = decision.summary
+                    affected_task.metadata["gate_harness_rework_feedback"] = str(
+                        request.get("feedback", "") or ""
+                    ).strip()
                     affected_task.metadata["gate_harness_rework_request"] = dict(request)
                     history = list(affected_task.metadata.get("gate_harness_rework_requests", []) or [])
                     history.append(dict(request))
@@ -11242,10 +13455,8 @@ class CompanyWorkItemExecutor:
                         affected_task,
                         f"Reset because upstream work-item projection `{target_projection_id}` entered gate-harness rework.",
                     )
-                await transition_work_item_from_task(
-                    self.store, affected_task,
-                    target_status_or_phase=TaskStatus.PENDING,
-                    reason="gate_harness_rework_reset",
+                await self._reset_task_phase_for_gate_harness_rework(
+                    affected_task,
                 )
                 await self.save_task(affected_task)
                 # Emit work_item_progress event so the UI reverts the work item from
@@ -11255,6 +13466,480 @@ class CompanyWorkItemExecutor:
                     task_id=affected_task.id,
                 )
         return primary_target
+
+    async def _gate_harness_initiate_rework_for_controller(
+        self,
+        source_task: Task,
+        decision: GateHarnessDecision,
+        task_by_projection_id: dict[str, Task],
+        *,
+        expected_pre_delivery_rework_count: int | None = None,
+        max_pre_delivery_reworks: int | None = None,
+        target_feedback_by_projection_id: Mapping[
+            str, Mapping[str, Any]
+        ] | None = None,
+    ) -> Task | None:
+        """Atomically reopen every deterministic-rework card under one fence."""
+
+        source_task_id = str(source_task.id or "").strip()
+        if not source_task_id:
+            raise RuntimeError("controller rework source Task id is missing")
+        target_projection_ids = target_projection_ids_for_decision(decision)
+        if not target_projection_ids:
+            target_projection_ids = [self._projection_id_for_task(source_task)]
+        primary_target: Task | None = None
+        touched_task_ids: set[str] = set()
+        affected_entries: list[tuple[str, Task, bool, int, str]] = []
+        for target_projection_id in target_projection_ids:
+            target_task = task_by_projection_id.get(target_projection_id)
+            if target_task is None:
+                continue
+            if primary_target is None:
+                primary_target = target_task
+            rework_round = (
+                int(target_task.metadata.get("gate_harness_rework_count", 0) or 0)
+                + 1
+            )
+            for affected_projection_id in [
+                target_projection_id,
+                *self._collect_downstream_projection_ids(target_projection_id),
+            ]:
+                if (
+                    affected_projection_id != target_projection_id
+                    and affected_projection_id in target_projection_ids
+                ):
+                    continue
+                affected_task = task_by_projection_id.get(affected_projection_id)
+                if affected_task is None or affected_task.id in touched_task_ids:
+                    continue
+                touched_task_ids.add(affected_task.id)
+                affected_entries.append(
+                    (
+                        affected_projection_id,
+                        affected_task,
+                        affected_projection_id == target_projection_id,
+                        rework_round,
+                        target_projection_id,
+                    )
+                )
+        if primary_target is None or not affected_entries:
+            return None
+
+        mutations: list[CompanyControllerWorkItemMutation] = []
+        snapshots: list[Task] = []
+        task_preimage_hashes: dict[str, str] = {}
+        working_snapshots_by_id: dict[str, Task] = {}
+        progress_messages: list[tuple[str, str, str]] = []
+        source_snapshot: Task | None = None
+        for (
+            affected_projection_id,
+            affected_task,
+            is_primary,
+            rework_round,
+            upstream_target_projection_id,
+        ) in affected_entries:
+            same_task = (
+                str(affected_task.id or "").strip() == source_task_id
+            )
+            durable_task = await self.store.get_task(affected_task.id)
+            if durable_task is None:
+                raise RuntimeError(
+                    f"rework Task `{affected_task.id}` disappeared"
+                )
+            try:
+                rework_round = int(
+                    (durable_task.metadata or {}).get(
+                        "gate_harness_rework_count", 0
+                    )
+                    or 0
+                ) + 1
+            except (TypeError, ValueError):
+                rework_round = 1
+            task_preimage_hashes[affected_task.id] = (
+                company_controller_task_preimage_hash(durable_task)
+            )
+            # Never broad-save a possibly stale in-memory Task.  Apply only
+            # explicit rework deltas to the just-read durable row, preserving
+            # same-attempt Task-only metadata/comments/retry state.
+            working_task = durable_task
+            working_snapshots_by_id[working_task.id] = working_task
+            set_linked_work_item_id(
+                working_task,
+                linked_work_item_id_for_task(affected_task),
+            )
+            working_task.metadata = dict(working_task.metadata)
+            working_task.context_snapshot = dict(working_task.context_snapshot)
+            working_task.result = None
+            self._reset_work_item_outputs_for_rework(working_task)
+            if is_primary:
+                request = self._build_gate_harness_rework_record(
+                    source_task=source_task,
+                    target_task=working_task,
+                    decision=decision,
+                    rework_round=rework_round,
+                    target_feedback=(
+                        dict(target_feedback_by_projection_id or {}).get(
+                            affected_projection_id
+                        )
+                    ),
+                )
+                working_task.metadata["gate_harness_rework_count"] = rework_round
+                working_task.metadata["gate_harness_rework_feedback"] = str(
+                    request.get("feedback", "") or ""
+                ).strip()
+                working_task.metadata["gate_harness_rework_request"] = dict(
+                    request
+                )
+                history = list(
+                    working_task.metadata.get(
+                        "gate_harness_rework_requests",
+                        [],
+                    )
+                    or []
+                )
+                history.append(dict(request))
+                working_task.metadata["gate_harness_rework_requests"] = history[-6:]
+                working_task.context_snapshot["latest_gate_harness_rework"] = dict(
+                    request
+                )
+                progress_message = self._render_gate_harness_rework_summary(request)
+            else:
+                working_task.metadata[
+                    "upstream_gate_harness_rework_source_projection_id"
+                ] = upstream_target_projection_id
+                working_task.context_snapshot[
+                    "upstream_gate_harness_rework_source_projection_id"
+                ] = upstream_target_projection_id
+                adaptive = self._normalize_adaptive_metadata(
+                    working_task.metadata.get("adaptive", {})
+                )
+                adaptive["normalized_state"] = "invalidated"
+                working_task.metadata["adaptive"] = adaptive
+                progress_message = (
+                    "Reset because upstream work-item projection "
+                    f"`{upstream_target_projection_id}` entered gate-harness "
+                    "rework."
+                )
+            working_memory = list(
+                working_task.metadata.get("working_memory", []) or []
+            )
+            working_memory.append(progress_message)
+            working_task.metadata["working_memory"] = working_memory[-12:]
+
+            work_item_id = linked_work_item_id_for_task(working_task)
+            if not work_item_id:
+                raise RuntimeError(
+                    f"rework target `{affected_projection_id}` has no WorkItem"
+                )
+            current = await self.store.get_delegation_work_item(work_item_id)
+            if current is None:
+                raise RuntimeError(
+                    f"rework WorkItem `{work_item_id}` disappeared"
+                )
+            if current.phase == Phase.APPROVED:
+                target_phase = Phase.READY_FOR_REWORK
+                allow_approved_rework = True
+            elif current.phase in {
+                Phase.AWAITING_MANAGER_REVIEW,
+                Phase.AWAITING_HUMAN,
+            }:
+                target_phase = Phase.READY_FOR_REWORK
+                allow_approved_rework = False
+            elif current.phase in {
+                Phase.RUNNING,
+                Phase.WAITING_FOR_PEER,
+                Phase.WAITING_FOR_CHILDREN,
+                Phase.PAUSED,
+                Phase.NEEDS_ATTENTION,
+            }:
+                target_phase = Phase.READY
+                allow_approved_rework = False
+            elif current.phase in {Phase.READY, Phase.READY_FOR_REWORK}:
+                target_phase = current.phase
+                allow_approved_rework = False
+            else:
+                raise RuntimeError(
+                    f"work item `{work_item_id}` cannot enter rework from "
+                    f"{current.phase.value}"
+                )
+            working_task.status = task_status_for_phase(target_phase)
+            metadata_updates: dict[str, Any] = {
+                "claimed_by_role_session_id": "",
+                "claimed_task_id": "",
+            }
+            if same_task:
+                validation_record = copy.deepcopy(
+                    dict(
+                        (source_task.metadata or {}).get(
+                            "pre_delivery_validation", {}
+                        )
+                        or {}
+                    )
+                )
+                for key in (
+                    "pre_delivery_validation",
+                    "pre_delivery_validation_evidence",
+                    "pre_delivery_validation_failure_kind",
+                    "pre_delivery_rework_cap_reached",
+                    "pre_delivery_rework_cap",
+                ):
+                    if key in source_task.metadata:
+                        working_task.metadata[key] = copy.deepcopy(
+                            source_task.metadata[key]
+                        )
+                if validation_record:
+                    durable_history = [
+                        copy.deepcopy(item)
+                        for item in list(
+                            working_task.metadata.get(
+                                "pre_delivery_validation_history", []
+                            )
+                            or []
+                        )
+                        if isinstance(item, dict)
+                    ]
+                    if not durable_history or durable_history[-1] != validation_record:
+                        durable_history.append(validation_record)
+                    working_task.metadata[
+                        "pre_delivery_validation_history"
+                    ] = durable_history[-12:]
+                try:
+                    durable_pre_delivery_count = int(
+                        working_task.metadata.get(
+                            "pre_delivery_rework_count", 0
+                        )
+                        or 0
+                    )
+                except (TypeError, ValueError):
+                    durable_pre_delivery_count = 0
+                working_task.metadata["pre_delivery_rework_count"] = max(
+                    durable_pre_delivery_count,
+                    int(
+                        (source_task.metadata or {}).get(
+                            "pre_delivery_rework_count", 0
+                        )
+                        or 0
+                    ),
+                )
+                metadata_updates.update(
+                    self._pre_delivery_validation_metadata(working_task)
+                )
+                source_snapshot = working_task
+            mutations.append(
+                CompanyControllerWorkItemMutation(
+                    work_item_id=work_item_id,
+                    expected_phases=(current.phase,),
+                    expected_updated_at=current.updated_at,
+                    phase=target_phase,
+                    deliverable_summary="",
+                    blocked_reason="",
+                    clear_claim=True,
+                    metadata_updates=metadata_updates,
+                    metadata_unset=_REWORK_OUTPUT_METADATA_KEYS,
+                    transition_reason="gate_harness_rework_reset",
+                    attempt_outcome="rework",
+                    allow_approved_rework=allow_approved_rework,
+                    required_pre_delivery_rework_count=(
+                        expected_pre_delivery_rework_count
+                        if same_task
+                        else None
+                    ),
+                    pre_delivery_rework_count_limit=(
+                        max_pre_delivery_reworks
+                        if same_task
+                        else None
+                    ),
+                )
+            )
+            if not same_task:
+                snapshots.append(working_task)
+            progress_messages.append(
+                (affected_projection_id, affected_task.id, str(rework_round))
+            )
+        if source_snapshot is None:
+            raise RuntimeError("controller rework did not include delivery source")
+        command_result = await self._execute_authoritative_command(
+            source_task,
+            operation="pre_delivery_validation_rework",
+            mutations=tuple(mutations),
+            task_snapshot=source_snapshot,
+            task_snapshots=tuple(snapshots),
+            task_preimage_hashes=task_preimage_hashes,
+        )
+        if command_result is None or not bool(command_result.applied):
+            durable_counter_changed = False
+            if expected_pre_delivery_rework_count is not None:
+                latest_source = await self.store.get_task(source_task.id)
+                try:
+                    latest_count = int(
+                        dict(
+                            getattr(latest_source, "metadata", {}) or {}
+                        ).get("pre_delivery_rework_count", 0)
+                        or 0
+                    )
+                except (TypeError, ValueError):
+                    latest_count = 0
+                durable_counter_changed = bool(
+                    latest_source is not None
+                    and latest_count
+                    != int(expected_pre_delivery_rework_count)
+                )
+            if (
+                durable_counter_changed
+                or (
+                    command_result is not None
+                    and str(
+                        getattr(command_result, "conflict_reason", "") or ""
+                    )
+                    == "pre_delivery_rework_count_mismatch"
+                )
+            ):
+                raise _PreDeliveryReworkCounterConflict(
+                    "pre-delivery rework counter changed before commit"
+                )
+            raise CompanyRunControllerLeaseLost(
+                "pre-delivery rework lost its claimed controller attempt"
+            )
+        controller_context = self._controller_attempt_context_for_task(
+            source_task
+        )
+        for _projection_id, affected_task, _primary, _round, _upstream in (
+            affected_entries
+        ):
+            committed_snapshot = working_snapshots_by_id.get(affected_task.id)
+            if committed_snapshot is None:
+                continue
+            if controller_context is not None:
+                committed_snapshot.metadata = dict(
+                    committed_snapshot.metadata or {}
+                )
+                committed_snapshot.metadata[
+                    "company_run_controller_owner_token"
+                ] = controller_context.owner_token
+                committed_snapshot.metadata[
+                    "company_run_controller_lease_generation"
+                ] = controller_context.generation
+            affected_task.__dict__.update(
+                copy.deepcopy(committed_snapshot.__dict__)
+            )
+        for affected_projection_id, task_id, rework_round in progress_messages:
+            try:
+                await self._emit_progress(
+                    f"[Company:{affected_projection_id}] reworking "
+                    f"(gate harness rework round {rework_round})",
+                    task_id=task_id,
+                )
+            except CompanyRunControllerLeaseLost:
+                logger.warning(
+                    "pre-delivery rework progress observed controller "
+                    "takeover after authoritative commit task_id={}",
+                    task_id,
+                )
+            except Exception:
+                # Progress is a best-effort projection.  The atomic rework
+                # transaction is already durable; surfacing a notifier error
+                # would make the validator falsely run the infrastructure-
+                # failure closure over a successfully reopened task tree.
+                logger.opt(exception=True).warning(
+                    "pre-delivery rework committed but progress emit failed "
+                    "task_id={}",
+                    task_id,
+                )
+        return primary_target
+
+    async def _reset_task_phase_for_gate_harness_rework(
+        self,
+        task: Task,
+    ) -> None:
+        """Return one affected task to a runnable phase without stale DONE projection.
+
+        Executive/pre-delivery rework commonly invalidates already-approved
+        dependencies.  ``APPROVED`` is deliberately terminal in the ordinary
+        phase graph, so those items must use the Store's named executive
+        reopen operation.  Live review/delivery items use their legal
+        ``READY_FOR_REWORK`` edge.  In both cases the in-memory Task is updated
+        before its snapshot is saved, preventing a stale ``DONE`` write from
+        undoing the Store-side projection.
+        """
+
+        work_item_id = linked_work_item_id_for_task(task)
+        if not work_item_id or self.store is None:
+            task.status = TaskStatus.PENDING
+            return
+        get_work_item = getattr(self.store, "get_delegation_work_item", None)
+        current = await get_work_item(work_item_id) if callable(get_work_item) else None
+        current_phase = getattr(current, "phase", None)
+        if current_phase == Phase.APPROVED:
+            reopen = getattr(
+                self.store,
+                "reopen_approved_delegation_work_item_for_rework",
+                None,
+            )
+            if not callable(reopen):
+                raise RuntimeError(
+                    "company Store cannot reopen an approved work item for rework"
+                )
+            reopened = await reopen(
+                work_item_id,
+                target_phase=Phase.READY_FOR_REWORK,
+                metadata_updates={
+                    "claimed_by_role_session_id": "",
+                    "claimed_task_id": "",
+                },
+                metadata_unset=_REWORK_OUTPUT_METADATA_KEYS,
+                release_claim=True,
+            )
+            if reopened is None:
+                raise RuntimeError(
+                    f"approved work item `{work_item_id}` disappeared during rework"
+                )
+            task.status = task_status_for_phase(reopened.phase)
+            return
+        if current_phase in {
+            Phase.AWAITING_MANAGER_REVIEW,
+            Phase.AWAITING_HUMAN,
+        }:
+            target_phase = Phase.READY_FOR_REWORK
+        elif current_phase in {
+            Phase.RUNNING,
+            Phase.WAITING_FOR_PEER,
+            Phase.WAITING_FOR_CHILDREN,
+            Phase.PAUSED,
+            Phase.NEEDS_ATTENTION,
+        }:
+            target_phase = Phase.READY
+        elif current_phase in {Phase.READY, Phase.READY_FOR_REWORK}:
+            task.status = task_status_for_phase(current_phase)
+            target_phase = current_phase
+        elif current_phase is None:
+            task.status = TaskStatus.PENDING
+            return
+        else:
+            raise RuntimeError(
+                f"work item `{work_item_id}` cannot enter rework from "
+                f"{getattr(current_phase, 'value', current_phase)}"
+            )
+        if current_phase != target_phase:
+            transitioned = await transition_work_item_from_task(
+                self.store,
+                task,
+                target_status_or_phase=target_phase,
+                reason="gate_harness_rework_reset",
+                release_claim=True,
+                attempt_outcome="rework",
+            )
+            if not transitioned or task.status != task_status_for_phase(target_phase):
+                raise RuntimeError(
+                    f"work item `{work_item_id}` did not enter {target_phase.value}"
+                )
+        clear_outputs = getattr(self.store, "update_delegation_work_item", None)
+        if callable(clear_outputs):
+            await clear_outputs(
+                work_item_id,
+                deliverable_summary="",
+                blocked_reason="",
+                metadata_unset=_REWORK_OUTPUT_METADATA_KEYS,
+            )
 
     def _render_gate_harness_checkpoint_prompt(self, task: Task, decision: GateHarnessDecision) -> str:
         action_label = {
@@ -11284,41 +13969,41 @@ class CompanyWorkItemExecutor:
         task: Task,
         decision: GateHarnessDecision,
         *,
-        review_level: str,
-        review_target_role_id: str = "",
         review_chain_role_ids: list[str] | None = None,
     ) -> None:
-        normalized_review_level = str(review_level or "").strip().lower() or "human"
         decision_target_projection_id = target_projection_id_for_decision(decision)
-        task.status = self._review_status_for_level(normalized_review_level)
+        task.status = TaskStatus.AWAITING_HUMAN
         task.metadata = dict(task.metadata)
         task.metadata["gate_harness_pending_decision"] = decision.to_dict()
-        task.metadata["gate_harness_review_level"] = normalized_review_level
-        task.metadata["gate_harness_review_target_role_id"] = str(review_target_role_id or "").strip()
+        task.metadata["gate_harness_review_level"] = "human"
+        task.metadata["gate_harness_review_target_role_id"] = ""
         task.metadata["gate_harness_review_chain_role_ids"] = [
             str(item).strip()
             for item in list(review_chain_role_ids or [])
             if str(item).strip()
         ]
-        await self._append_progress(
-            task,
-            f"Gate harness paused the work item with action `{decision.action}` for {normalized_review_level} review.",
+        progress_messages = (
+            f"Gate harness paused the work item with action `{decision.action}` for human review.",
+            decision.summary,
         )
-        await self._append_progress(task, decision.summary)
-        await self.save_task(task)
+        working_memory = list(task.metadata.get("working_memory", []) or [])
+        task.metadata["working_memory"] = [
+            *working_memory,
+            *(message for message in progress_messages if message),
+        ][-12:]
         gate = WorkItemGatePolicy(
-            gate_type="review" if normalized_review_level == "manager" else "human_confirmation",
+            gate_type="human_confirmation",
             instructions=decision.summary,
-            reviewer_role=str(review_target_role_id or "").strip() or None,
-            requires_human=normalized_review_level != "manager",
+            reviewer_role=None,
+            requires_human=True,
             on_reject="rework" if decision_target_projection_id else "halt",
             rework_projection_id=decision_target_projection_id or None,
             max_retries=1,
             metadata={
                 "source": "gate_harness",
                 "recommended_action": decision.action,
-                "review_level": normalized_review_level,
-                "review_target_role_id": str(review_target_role_id or "").strip(),
+                "review_level": "human",
+                "review_target_role_id": "",
                 "review_chain_role_ids": [
                     str(item).strip()
                     for item in list(review_chain_role_ids or [])
@@ -11335,21 +14020,72 @@ class CompanyWorkItemExecutor:
         )
         if decision_target_projection_id:
             mark_gate_rework_projection(gate, decision_target_projection_id)
-        await self._save_checkpoint(task, gate)
+        await self._save_checkpoint(
+            task,
+            gate,
+            progress_messages=progress_messages,
+        )
 
-    async def _apply_gate_harness(
+    async def _evaluate_and_record_gate_harness(
         self,
         task: Task,
         task_by_projection_id: dict[str, Task],
-    ) -> str:
+    ) -> GateHarnessDecision | None:
+        """Evaluate once while the attempt is open; perform no Store writes."""
+
         harness = self._gate_harness_for_task(task)
         if not harness.policy.enabled:
-            return "pass"
+            return None
         task.metadata = dict(task.metadata)
         packet, decision = await harness.evaluate(task, task_by_projection_id)
         task.metadata["gate_harness_evidence"] = packet.to_dict()
         task.metadata["gate_harness_decision"] = decision.to_dict()
         self._record_gate_harness_history(task, decision)
+        return decision
+
+    async def _commit_pre_done_gate_harness_wait(
+        self,
+        task: Task,
+        decision: GateHarnessDecision | None,
+    ) -> bool:
+        """Commit a cached wait decision exactly once before DONE routing."""
+
+        if decision is None or decision.action not in {
+            "await_user_decision",
+            "replan",
+            "escalate",
+        }:
+            return False
+        task.metadata = dict(task.metadata or {})
+        task.metadata["gate_harness_status"] = "awaiting_decision"
+        await self._pause_for_gate_harness_decision(
+            task,
+            decision,
+            review_chain_role_ids=self._review_chain_for_task(task),
+        )
+        await self._emit_committed_gate_progress_best_effort(
+            f"[Company:{self._projection_id_for_task(task)}] gate harness paused "
+            f"for {decision.action} (human review)",
+            task_id=task.id,
+        )
+        return True
+
+    async def _apply_gate_harness(
+        self,
+        task: Task,
+        task_by_projection_id: dict[str, Task],
+        *,
+        evaluated_decision: GateHarnessDecision | None = None,
+        evaluation_recorded: bool = False,
+    ) -> str:
+        decision = evaluated_decision
+        if not evaluation_recorded:
+            decision = await self._evaluate_and_record_gate_harness(
+                task,
+                task_by_projection_id,
+            )
+        if decision is None:
+            return "pass"
 
         if decision.action == "pass":
             task.metadata["gate_harness_status"] = "passed"
@@ -11372,7 +14108,6 @@ class CompanyWorkItemExecutor:
             else:
                 task.metadata["risks"] = merged_risks
             task.metadata.pop("gate_harness_pending_decision", None)
-            await self._append_progress(task, f"Gate harness allowed the work item to continue with constraints: {decision.summary}")
             await self.save_task(task)
             return "pass_with_constraints"
 
@@ -11414,38 +14149,19 @@ class CompanyWorkItemExecutor:
 
         if decision.action in {"await_user_decision", "replan", "escalate"}:
             task.metadata["gate_harness_status"] = "awaiting_decision"
-            review_chain = self._review_chain_for_task(task)
-            review_level = "human"
-            review_target_role_id = ""
-            if decision.action in {"replan", "escalate"} and review_chain:
-                review_level = "manager"
-                review_target_role_id = review_chain[0]
             await self._pause_for_gate_harness_decision(
                 task,
                 decision,
-                review_level=review_level,
-                review_target_role_id=review_target_role_id,
-                review_chain_role_ids=review_chain,
+                review_chain_role_ids=self._review_chain_for_task(task),
             )
-            await self._emit_progress(
-                f"[Company:{self._projection_id_for_task(task)}] gate harness paused for {decision.action} ({review_level} review)",
+            await self._emit_committed_gate_progress_best_effort(
+                f"[Company:{self._projection_id_for_task(task)}] gate harness paused for {decision.action} (human review)",
                 task_id=task.id,
             )
             return decision.action
 
         task.metadata["gate_harness_status"] = "passed"
         return "pass"
-
-    async def _finalize_work_item_with_gate_harness(
-        self,
-        task: Task,
-        task_by_projection_id: dict[str, Task],
-    ) -> str:
-        action = await self._apply_gate_harness(task, task_by_projection_id)
-        if action not in {"pass", "pass_with_constraints"}:
-            return action
-        await self._finalize_completed_work_item(task)
-        return action
 
     async def _apply_gate(self, task: Task, gate: WorkItemGatePolicy, task_by_projection_id: dict[str, Task]) -> None:
         if gate.gate_type == "automated_verification":
@@ -11455,8 +14171,16 @@ class CompanyWorkItemExecutor:
         metadata = {
             "role_id": task.assigned_to,
             "gate_type": gate.gate_type,
+            "source_event_id": (
+                f"work-item-action-gate:"
+                f"{str(task.metadata.get('delegation_run_id', '') or '')}:"
+                f"{self._projection_id_for_task(task) or task.id}:"
+                f"{gate.gate_type}:"
+                f"{max(int(task.metadata.get('gate_rework_count', 0) or 0), int(task.metadata.get('review_attempt_count', 0) or 0))}"
+            ),
             **work_item_identity_payload_for_task(task),
         }
+        await self.save_task(task)
         approved = True
         decision = None
         if gate.gate_type in {"approval", "human_confirmation"} or gate.requires_human:
@@ -11468,16 +14192,31 @@ class CompanyWorkItemExecutor:
                 force_human=(gate.gate_type == "human_confirmation" or gate.requires_human),
             )
         if decision and decision.action == ApprovalAction.REQUIRE_INPUT:
-            review_level = "manager" if gate.reviewer_role and not gate.requires_human else "human"
-            task.status = self._review_status_for_level(review_level)
-            await self._append_progress(
-                task,
-                "Awaiting manager review." if review_level == "manager" else "Awaiting human confirmation.",
+            checkpoint_gate = gate
+            if gate.reviewer_role and not gate.requires_human:
+                checkpoint_gate = WorkItemGatePolicy.from_dict(
+                    company_work_item_gate_human_fallback_payload(gate)
+                )
+                if checkpoint_gate is None:
+                    raise RuntimeError(
+                        "manager work-item gate has no valid owner fallback"
+                    )
+            task.status = TaskStatus.AWAITING_HUMAN
+            progress_message = "Awaiting human confirmation."
+            working_memory = list(
+                task.metadata.get("working_memory", []) or []
             )
-            await self.save_task(task)
-            await self._save_checkpoint(task, gate)
-            await self._emit_progress(
-                f"[Company:{self._projection_id_for_task(task)}] awaiting {'manager review' if review_level == 'manager' else 'confirmation'}",
+            task.metadata["working_memory"] = [
+                *working_memory,
+                progress_message,
+            ][-12:]
+            await self._save_checkpoint(
+                task,
+                checkpoint_gate,
+                progress_messages=(progress_message,),
+            )
+            await self._emit_committed_gate_progress_best_effort(
+                f"[Company:{self._projection_id_for_task(task)}] awaiting confirmation",
                 task_id=task.id,
             )
             return
@@ -11529,15 +14268,31 @@ class CompanyWorkItemExecutor:
             )
             return
 
+        gate_harness_decision = await self._evaluate_and_record_gate_harness(
+            task,
+            task_by_projection_id,
+        )
+        if await self._commit_pre_done_gate_harness_wait(
+            task,
+            gate_harness_decision,
+        ):
+            return
         await self._append_progress(task, f"Gate {gate.gate_type} passed.")
         await self._apply_done_transition(task)
         await self.save_task(task)
-        completion_action = await self._finalize_work_item_with_gate_harness(task, task_by_projection_id)
+        gate_harness_action = await self._apply_gate_harness(
+            task,
+            task_by_projection_id,
+            evaluated_decision=gate_harness_decision,
+            evaluation_recorded=True,
+        )
+        if gate_harness_action in {"pass", "pass_with_constraints"}:
+            await self._finalize_completed_work_item(task)
         if task.status == TaskStatus.DONE:
             await self._emit_progress(f"[Company:{self._projection_id_for_task(task)}] gate passed", task_id=task.id)
         elif task.status in _REVIEW_WAITING_STATUSES:
             await self._emit_progress(
-                f"[Company:{self._projection_id_for_task(task)}] awaiting {'manager review' if task.status == TaskStatus.AWAITING_MANAGER_REVIEW else 'confirmation'}",
+                f"[Company:{self._projection_id_for_task(task)}] awaiting {'confirmation' if task.status == TaskStatus.AWAITING_HUMAN else 'manager review'}",
                 task_id=task.id,
             )
 
@@ -11565,83 +14320,115 @@ class CompanyWorkItemExecutor:
                 check.get("command", "") for check in checks
                 if isinstance(check, dict) and check.get("command")
             ]
-        if not verification_commands:
-            await self._append_progress(task, "Automated verification gate: no commands to verify, auto-pass.")
-            await self._apply_done_transition(task)
-            await self.save_task(task)
-            await self._finalize_completed_work_item(task)
-            return
-
-        from opc.layer4_tools.shell import bash_exec, powershell_exec
-        exec_fn = powershell_exec if is_windows else bash_exec
-        all_passed = True
-        check_results: list[dict[str, Any]] = []
-        for cmd in verification_commands:
-            cmd_str = str(cmd).strip()
-            if not cmd_str:
-                continue
-            result = await exec_fn(command=cmd_str, timeout=60)
-            passed = result.get("success", False)
-            check_results.append({
-                "command": cmd_str,
-                "passed": passed,
-                "exit_code": result.get("exit_code"),
-                "stdout": str(result.get("stdout", "")),
-                "stderr": str(result.get("stderr", "")),
-                "platform": "windows" if is_windows else ("macos" if _sys.platform == "darwin" else "linux"),
-            })
-            if not passed:
-                all_passed = False
-
-        task.metadata["automated_verification_results"] = check_results
-
-        if all_passed:
+        # Raw gate/manifest commands are untrusted data, not controller policy.
+        # The controller has no ToolCall/checkpoint/result identity with which
+        # to prove that these strings already crossed the normal exact shell
+        # approval boundary.  Never create a second privileged execution path
+        # here.  Rework must run checks through the WorkItem's regular tools
+        # and return durable evidence; the two structured readiness-artifact
+        # gates above remain safe because they inspect data without spawning.
+        platform = (
+            "windows"
+            if is_windows
+            else ("macos" if _sys.platform == "darwin" else "linux")
+        )
+        commands = [
+            str(command or "").strip()
+            for command in verification_commands
+            if str(command or "").strip()
+        ]
+        if not commands:
+            task.metadata["automated_verification_results"] = []
             await self._append_progress(
                 task,
-                f"Automated verification gate passed: {len(check_results)}/{len(check_results)} checks succeeded.",
+                "Automated verification gate passed (no commands configured).",
             )
             await self._apply_done_transition(task)
             await self.save_task(task)
-            await self._finalize_completed_work_item(task)
             await self._emit_progress(
-                f"[Company:{self._projection_id_for_task(task)}] verification passed",
+                f"[Company:{self._projection_id_for_task(task)}] automated verification passed",
                 task_id=task.id,
             )
-        else:
-            failed = [c for c in check_results if not c["passed"]]
-            rework_task = await self.prepare_gate_rework(
+            return
+
+        verify_evidence = getattr(
+            self.store,
+            "company_automated_verification_evidence",
+            None,
+        )
+        evidence = (
+            dict(await verify_evidence(task, commands) or {})
+            if callable(verify_evidence)
+            else {
+                "verified": False,
+                "reason": "durable verification evidence store is unavailable",
+            }
+        )
+        evidence_results = [
+            {**dict(item), "platform": platform}
+            for item in list(evidence.get("results", []) or [])
+            if isinstance(item, dict)
+        ]
+        task.metadata["automated_verification_results"] = evidence_results
+        if evidence.get("verified") is True:
+            await self._append_progress(
                 task,
-                gate,
-                {
-                    task.id: task,
-                    self._projection_id_for_task(task): task,
-                },
-                "",
+                "Automated verification gate passed from exact current-attempt ToolResult evidence.",
             )
-            if rework_task:
-                feedback = "\n".join(
-                    f"FAILED: {c['command']} (exit {c['exit_code']}): {c['stderr']}"
-                    for c in failed
-                )
-                await self._append_progress(task, f"Automated verification gate failed:\n{feedback}")
-                if rework_task is not task:
-                    await self.save_task(rework_task)
-                await self.save_task(task)
-            else:
-                await self._append_progress(
-                    task,
-                    f"Automated verification failed: {len(failed)} check(s) did not pass. No rework remaining.",
-                )
-                await transition_work_item_from_task(
-                    self.store, task,
-                    target_status_or_phase=Phase.FAILED,
-                    reason="automated_verification_no_rework",
-                )
-                await self.save_task(task)
+            await self._apply_done_transition(task)
+            await self.save_task(task)
             await self._emit_progress(
-                f"[Company:{self._projection_id_for_task(task)}] verification failed",
+                f"[Company:{self._projection_id_for_task(task)}] automated verification passed",
                 task_id=task.id,
             )
+            return
+
+        feedback = (
+            "Automated verification requires exact current-attempt ToolCall "
+            "evidence and never executes gate metadata directly. "
+            f"{str(evidence.get('reason', '') or 'Required evidence is missing or stale')}. "
+            "Run each check through the WorkItem's normal shell_exec flow as "
+            "the final mutating action, then retry the gate."
+        )
+        if not evidence_results:
+            task.metadata["automated_verification_results"] = [
+                {
+                    "command": command,
+                    "passed": False,
+                    "exit_code": None,
+                    "stdout": "",
+                    "stderr": feedback,
+                    "platform": platform,
+                    "outcome": "requires_exact_tool_evidence",
+                }
+                for command in commands
+            ]
+        rework_task = await self.prepare_gate_rework(
+            task,
+            gate,
+            {
+                task.id: task,
+                self._projection_id_for_task(task): task,
+            },
+            feedback,
+        )
+        await self._append_progress(task, feedback)
+        if rework_task:
+            if rework_task is not task:
+                await self.save_task(rework_task)
+            await self.save_task(task)
+        else:
+            await transition_work_item_from_task(
+                self.store,
+                task,
+                target_status_or_phase=Phase.FAILED,
+                reason="automated_verification_requires_exact_tool_evidence",
+            )
+            await self.save_task(task)
+        await self._emit_progress(
+            f"[Company:{self._projection_id_for_task(task)}] verification evidence required",
+            task_id=task.id,
+        )
 
     async def _apply_workspace_manifest_gate(self, task: Task, gate: WorkItemGatePolicy) -> None:
         manifest = dict(task.metadata.get("workspace_manifest", {}) or {})
@@ -11923,27 +14710,13 @@ class CompanyWorkItemExecutor:
         reviewer_feedback: str,
         rework_round: int,
     ) -> dict[str, Any]:
-        reviewer_role = str(
-            gate.reviewer_role
-            or review_task.assigned_to
-            or review_task.metadata.get("work_item_role_id", "")
-            or ""
-        ).strip()
-        review_projection_id = self._projection_id_for_task(review_task)
-        rework_projection_id = rework_projection_id_for_gate(gate)
-        return {
-            "review_task_id": review_task.id,
-            **gate_rework_payload(
-                review_projection_id=review_projection_id,
-                target_projection_id=rework_projection_id,
-            ),
-            "review_work_item_title": review_task.title,
-            "reviewer_role": reviewer_role,
-            "feedback": reviewer_feedback,
-            "gate_instructions": gate.instructions,
-            "rework_round": rework_round,
-            "requested_at": datetime.now().isoformat(),
-        }
+        return build_company_gate_rework_record(
+            review_task=review_task,
+            gate=gate,
+            reviewer_feedback=reviewer_feedback,
+            rework_round=rework_round,
+            requested_at=datetime.now(),
+        )
 
     def _render_gate_rework_summary(self, rework_request: dict[str, Any]) -> str:
         review_work_item_title = str(rework_request.get("review_work_item_title", "")).strip() or "Gate review"
@@ -12037,11 +14810,21 @@ class CompanyWorkItemExecutor:
         )
         return rework_task
 
-    async def _save_checkpoint(self, task: Task, gate: WorkItemGatePolicy) -> None:
-        if not self.checkpoint_callback or not self._active_plan:
+    async def _save_checkpoint(
+        self,
+        task: Task,
+        gate: WorkItemGatePolicy,
+        *,
+        progress_messages: tuple[str, ...] = (),
+    ) -> None:
+        if (
+            not self._active_plan
+            or (
+                self.checkpoint_callback is None
+                and self.checkpoint_prepare_callback is None
+            )
+        ):
             return
-        runtime_payload = self._runtime_checkpoint_payload(task)
-        work_item_payload = self._work_item_checkpoint_payload(task)
         prompt_override = str(dict(gate.metadata or {}).get("prompt_override", "") or "").strip()
         gate_metadata = dict(gate.metadata or {})
         gate_rework_projection_id = rework_projection_id_for_gate(gate)
@@ -12051,6 +14834,42 @@ class CompanyWorkItemExecutor:
                     rework_projection_id=gate_rework_projection_id,
                 )
             )
+        gate_payload = {
+            "type": gate.gate_type,
+            "instructions": gate.instructions,
+            "reviewer_role": gate.reviewer_role,
+            "requires_human": gate.requires_human,
+            "on_reject": gate.on_reject,
+            "rework_projection_id": gate_rework_projection_id or None,
+            "max_retries": gate.max_retries,
+            "metadata": gate_metadata,
+        }
+        task_snapshot = copy.deepcopy(task)
+        durable_task = task_snapshot
+        get_task = getattr(self.store, "get_task", None)
+        if callable(get_task):
+            reloaded = await get_task(task.id)
+            if reloaded is None:
+                raise CompanyControllerAttemptSuperseded(
+                    "company gate source Task disappeared before publication"
+                )
+            durable_task = reloaded
+        controller_context = self._controller_attempt_context_for_task(
+            durable_task
+        )
+        if (
+            controller_context is None
+            and getattr(self.store, "project_id", None)
+            and str(
+                (durable_task.metadata or {}).get("delegation_run_id", "") or ""
+            ).strip()
+        ):
+            raise CompanyRunControllerLeaseLost(
+                "production company gate cannot publish without an exact "
+                "controller attempt"
+            )
+        runtime_payload = self._runtime_checkpoint_payload(task_snapshot)
+        work_item_payload = self._work_item_checkpoint_payload(task_snapshot)
         review_level = str(
             gate_metadata.get("review_level")
             or ("manager" if gate.reviewer_role and not gate.requires_human else "human")
@@ -12065,51 +14884,135 @@ class CompanyWorkItemExecutor:
             for item in list(gate_metadata.get("review_chain_role_ids", []) or [])
             if str(item).strip()
         ]
-        await self.checkpoint_callback(
-            {
+        gate_attempt = company_work_item_gate_attempt(
+            task_snapshot,
+            gate_metadata,
+        )
+        try:
+            work_item_attempt_seq = int(
+                task_snapshot.metadata.get(
+                    "claimed_work_item_attempt_seq", 0
+                )
+                or 0
+            )
+        except (TypeError, ValueError):
+            work_item_attempt_seq = 0
+        delegation_run_id = str(
+            task_snapshot.metadata.get("delegation_run_id", "") or ""
+        ).strip()
+        projection_id = (
+            self._projection_id_for_task(task_snapshot) or task_snapshot.id
+        )
+        data = {
                 "checkpoint_type": "company_work_item_gate",
-                "project_id": task.project_id,
-                "session_id": task.session_id,
-                "task_id": task.id,
+                "project_id": task_snapshot.project_id,
+                "session_id": task_snapshot.session_id,
+                "task_id": task_snapshot.id,
                 "payload": {
-                    "waiting_task_id": task.id,
-                    "session_id": task.session_id,
-                    **work_item_identity_payload_for_task(task),
-                    "org_version": task.metadata.get("org_version", 1),
-                    "runtime_topology_version": task.metadata.get("runtime_topology_version", 1),
-                    "reorg_proposal_id": task.metadata.get("reorg_proposal_id", ""),
+                    "waiting_task_id": task_snapshot.id,
+                    "session_id": task_snapshot.session_id,
+                    **work_item_identity_payload_for_task(task_snapshot),
+                    "org_version": task_snapshot.metadata.get("org_version", 1),
+                    "runtime_topology_version": task_snapshot.metadata.get("runtime_topology_version", 1),
+                    "reorg_proposal_id": task_snapshot.metadata.get("reorg_proposal_id", ""),
                     "task_ids": [t.id for t in self._active_tasks],
-                    "gate": {
-                        "type": gate.gate_type,
-                        "instructions": gate.instructions,
-                        "reviewer_role": gate.reviewer_role,
-                        "requires_human": gate.requires_human,
-                        "on_reject": gate.on_reject,
-                        "rework_projection_id": gate_rework_projection_id or None,
-                        "max_retries": gate.max_retries,
-                        "metadata": gate_metadata,
-                    },
+                    "gate": gate_payload,
                     "prompt": prompt_override,
                     "review_level": review_level,
                     "review_target_role_id": review_target_role_id,
                     "review_chain_role_ids": review_chain_role_ids,
-                    "basis_hash": self._checkpoint_basis_hash(task),
+                    "run_id": delegation_run_id,
+                    "waiting_work_item_id": linked_work_item_id_for_task(
+                        task_snapshot
+                    ),
+                    "work_item_attempt_seq": work_item_attempt_seq,
+                    "gate_attempt": gate_attempt,
+                    "source_event_id": (
+                        f"work-item-gate:{delegation_run_id}:{projection_id}:"
+                        f"{gate.gate_type}:{gate_attempt}"
+                    ),
+                    "basis_hash": self._checkpoint_basis_hash(
+                        task_snapshot,
+                        gate_payload,
+                    ),
                     "company_work_item_plan": serialize_company_work_item_runtime_plan(self._active_plan),
                     **work_item_payload,
                     **runtime_payload,
                 },
             }
-        )
-
-    async def _save_feedback_checkpoint(self, task: Task) -> None:
-        if not self.checkpoint_callback:
+        if controller_context is None:
+            if self.checkpoint_callback is None:
+                raise RuntimeError(
+                    "legacy company gate publication callback is unavailable"
+                )
+            await self.checkpoint_callback(data)
             return
+        if self.checkpoint_prepare_callback is None:
+            raise CompanyRunControllerLeaseLost(
+                "controller-owned company gate requires typed checkpoint preparation"
+            )
+        publish = getattr(
+            self.store,
+            "publish_company_work_item_gate_checkpoint_for_controller",
+            None,
+        )
+        if not callable(publish):
+            raise CompanyRunControllerLeaseLost(
+                "company Store lacks typed work-item gate publication"
+            )
+        publication = await self.checkpoint_prepare_callback(data)
+        persisted_checkpoint, _created, persisted_task = await publish(
+            controller_context,
+            publication,
+            task_snapshot=task_snapshot,
+            expected_task_preimage_hash=(
+                company_controller_task_preimage_hash(durable_task)
+            ),
+            progress_messages=tuple(progress_messages or ()),
+        )
+        # The Store returns the exact Task snapshot committed beside the
+        # checkpoint.  Never perform a fallible post-commit reload: an error
+        # after publication must not escape into claimed-task failure cleanup.
+        task.__dict__.update(copy.deepcopy(persisted_task.__dict__))
+        if self.checkpoint_notify_callback is not None:
+            try:
+                await self.checkpoint_notify_callback(persisted_checkpoint)
+            except BaseException as error:
+                if isinstance(error, (KeyboardInterrupt, SystemExit)):
+                    raise
+                logger.opt(exception=True).warning(
+                    "company gate committed but checkpoint notification failed "
+                    "checkpoint_id={}",
+                    persisted_checkpoint.checkpoint_id,
+                )
+
+    async def _emit_committed_gate_progress_best_effort(
+        self,
+        message: str,
+        *,
+        task_id: str,
+    ) -> None:
+        """Emit telemetry after a durable gate commit without reopening it."""
+
+        try:
+            await self._emit_progress(message, task_id=task_id)
+        except BaseException as error:
+            if isinstance(error, (KeyboardInterrupt, SystemExit)):
+                raise
+            logger.opt(exception=True).warning(
+                "company gate committed but progress emission failed task_id={}",
+                task_id,
+            )
+
+    def _feedback_checkpoint_data(self, task: Task) -> dict[str, Any] | None:
+        """Build the delivery feedback input for the Engine's canonical preparer."""
+
         if not self._is_final_human_acceptance_task(task):
             logger.debug(
-                "_save_feedback_checkpoint skipped for non-final work item "
+                "feedback checkpoint skipped for non-final work item "
                 f"task_id={task.id} projection_id={self._projection_id_for_task(task)}"
             )
-            return
+            return None
         active_plan = self._active_plan or CompanyWorkItemRuntimePlan(
             profile=str(task.metadata.get("company_profile", "") or "company"),
             projections=[],
@@ -12136,6 +15039,15 @@ class CompanyWorkItemExecutor:
         linked_work_item_id = linked_work_item_id_for_task(task)
         delivery_revision = task.metadata.get("delivery_revision", "")
         owner_directive_revision = task.metadata.get("owner_directive_revision", "")
+        try:
+            work_item_attempt_seq = int(
+                task.metadata.get("claimed_work_item_attempt_seq", 0) or 0
+            )
+        except (TypeError, ValueError):
+            work_item_attempt_seq = 0
+        validation_record = dict(
+            task.metadata.get("pre_delivery_validation", {}) or {}
+        )
         if followup_message:
             prompt = (
                 f"{followup_message}\n\n"
@@ -12147,13 +15059,12 @@ class CompanyWorkItemExecutor:
                 f"This {feedback_kind} is ready for self-evolution review.\n"
                 "Use this card only to record full agreement, ignore, or feedback that should update employee experience."
             )
-        await self.checkpoint_callback(
-            {
-                "checkpoint_type": "company_delivery_feedback",
-                "project_id": task.project_id,
-                "session_id": task.session_id,
-                "task_id": task.id,
-                "payload": {
+        return {
+            "checkpoint_type": "company_delivery_feedback",
+            "project_id": task.project_id,
+            "session_id": task.session_id,
+            "task_id": task.id,
+            "payload": {
                     "waiting_task_id": task.id,
                     "waiting_work_item_id": linked_work_item_id,
                     "session_id": task.session_id,
@@ -12169,15 +15080,28 @@ class CompanyWorkItemExecutor:
                     "review_chain_role_ids": [],
                     "delivery_revision": delivery_revision,
                     "owner_directive_revision": owner_directive_revision,
+                    "work_item_attempt_seq": work_item_attempt_seq,
+                    "delivery_package_sha256": str(
+                        validation_record.get(
+                            "delivery_package_sha256", ""
+                        )
+                        or ""
+                    ).strip(),
                     "latest_user_directive": str(task.metadata.get("latest_user_directive", "") or "").strip(),
                     "result_content": result_content,
                     "basis_hash": self._checkpoint_basis_hash(task),
                     "company_work_item_plan": serialize_company_work_item_runtime_plan(active_plan),
                     **work_item_payload,
-                    **runtime_payload,
-                },
-            }
-        )
+                **runtime_payload,
+            },
+        }
+
+    async def _save_feedback_checkpoint(self, task: Task) -> None:
+        if not self.checkpoint_callback:
+            return
+        data = self._feedback_checkpoint_data(task)
+        if data is not None:
+            await self.checkpoint_callback(data)
 
     async def _save_peer_checkpoint(self, task: Task) -> None:
         if not self.checkpoint_callback or not self._active_plan:
@@ -12232,7 +15156,13 @@ class CompanyWorkItemExecutor:
         return None
 
     def _capture_work_item_outputs(self, task: Task, result: TaskResult) -> WorkItemOutputBundle:
-        summary = (result.content or "").strip()
+        result_artifacts = dict(result.artifacts or {})
+        opaque_team_result = dict(result_artifacts.get("opaque_external_team_result", {}) or {})
+        summary = str(
+            opaque_team_result.get("summary")
+            or result.content
+            or ""
+        ).strip()
         runtime_state = self._extract_runtime_state(result)
         structured_payload = self._extract_structured_work_item_payload(summary, result.artifacts)
         existing_artifacts = list(task.metadata.get("artifacts", []) or [])
@@ -12248,6 +15178,7 @@ class CompanyWorkItemExecutor:
             "delivery_package",
             "follow_up_actions",
             "downstream_assignments",
+            "opaque_external_team_result",
         ):
             task.metadata.pop(key, None)
         work_item_updates: dict[str, Any] = {}
@@ -12293,6 +15224,31 @@ class CompanyWorkItemExecutor:
         review_verdict = self._normalize_review_verdict(structured_payload.get("review_verdict"))
         if review_verdict:
             work_item_updates["structured_review_verdict"] = review_verdict
+        if opaque_team_result:
+            work_item_updates["opaque_external_team_result"] = copy.deepcopy(opaque_team_result)
+            team_risks = [
+                str(item).strip()
+                for item in list(opaque_team_result.get("risks", []) or [])
+                if str(item or "").strip()
+            ]
+            if team_risks:
+                work_item_updates["risks"] = self._merge_unique_items(
+                    list(work_item_updates.get("risks", [])),
+                    team_risks,
+                )
+            team_questions = [
+                str(item).strip()
+                for item in list(opaque_team_result.get("open_questions", []) or [])
+                if str(item or "").strip()
+            ]
+            if team_questions:
+                work_item_updates["open_questions"] = self._merge_unique_items(
+                    list(work_item_updates.get("open_questions", [])),
+                    team_questions,
+                )
+            handoff = opaque_team_result.get("handoff")
+            if handoff not in (None, "", [], {}):
+                work_item_updates["handoff_context"] = copy.deepcopy(handoff)
         verification = result.artifacts.get("verification", []) if result.artifacts else []
         verification_evidence = dict(result.artifacts.get("verification_evidence", {}) if result.artifacts else {})
         if verification_evidence:
@@ -12379,16 +15335,39 @@ class CompanyWorkItemExecutor:
             "completion_report",
             "handoff_context",
             "context_preview",
+            "opaque_external_team_result",
         )
         updates = {
             key: copy.deepcopy(source.get(key))
             for key in business_keys
             if source.get(key) not in (None, "", [], {})
         }
+        summary = str(
+            source.get("work_item_summary")
+            or source.get("work_item_summary_for_downstream")
+            or ""
+        ).strip()
+        if summary:
+            updates.setdefault("deliverable_summary", summary)
+        controller_context = self._controller_attempt_context_for_task(task)
+        if controller_context is not None:
+            command_result = await self._execute_authoritative_command(
+                task,
+                operation="persist_work_item_owned_output_metadata",
+                mutations=(
+                    CompanyControllerWorkItemMutation(
+                        work_item_id=wid,
+                        deliverable_summary=summary if summary else None,
+                        metadata_updates=updates,
+                    ),
+                ),
+            )
+            if command_result is None or not bool(command_result.applied):
+                raise CompanyRunControllerLeaseLost(
+                    "authoritative output metadata lost its claimed attempt"
+                )
+            return
         try:
-            summary = str(source.get("work_item_summary") or source.get("work_item_summary_for_downstream") or "").strip()
-            if summary:
-                updates.setdefault("deliverable_summary", summary)
             await update_work_item_owned_metadata(self.store, wid, updates)
             if summary and hasattr(self.store, "update_delegation_work_item"):
                 await self.store.update_delegation_work_item(
@@ -12410,6 +15389,7 @@ class CompanyWorkItemExecutor:
         parent_work_item_id = linked_work_item_id_for_task(task)
         if not parent_work_item_id:
             return []
+        controller_context = self._controller_attempt_context_for_task(task)
         output_metadata = self._work_item_output_metadata_for_task(task)
         actions = self._normalize_follow_up_actions(
             list(output_metadata.get("follow_up_actions", []) or task.metadata.get("follow_up_actions", []) or [])
@@ -12429,6 +15409,7 @@ class CompanyWorkItemExecutor:
         existing_work_items = await self.store.list_delegation_work_items(run_id)
         follow_up_dependency_ids: list[str] = []
         created_work_item_ids: list[str] = []
+        pending_follow_up_items: list[DelegationWorkItem] = []
         parent_metadata = dict(parent_work_item.metadata or {})
         parent_dependency_ids = [
             str(item).strip()
@@ -12471,8 +15452,14 @@ class CompanyWorkItemExecutor:
             ]
             work_kind = "review" if action["action"] == "delegate_rereview" else "execute"
             turn_type = self._runtime_work_kind_to_work_item_turn_type(work_kind)
-            follow_up_projection_id = f"followup::{target_role_id}::{uuid.uuid4().hex[:8]}"
+            follow_up_digest = hashlib.sha256(
+                f"{run_id}|{parent_work_item_id}|{dedupe_key}".encode("utf-8")
+            ).hexdigest()[:16]
+            follow_up_projection_id = (
+                f"followup::{target_role_id}::{follow_up_digest}"
+            )
             follow_up_work_item = DelegationWorkItem(
+                work_item_id=follow_up_projection_id,
                 run_id=run_id,
                 cell_id=str(topology_seat.get("team_id", "") or target_role_id).strip(),
                 team_instance_id=str(topology_seat.get("team_instance_id", "") or "").strip(),
@@ -12540,11 +15527,18 @@ class CompanyWorkItemExecutor:
                     turn_type=turn_type,
                 ),
             )
-            await self.store.save_delegation_work_item(follow_up_work_item)
+            if controller_context is not None:
+                pending_follow_up_items.append(follow_up_work_item)
+            else:
+                await self.store.save_delegation_work_item(follow_up_work_item)
             existing_work_items.append(follow_up_work_item)
             follow_up_dependency_ids.append(follow_up_work_item.work_item_id)
-            created_work_item_ids.append(follow_up_work_item.work_item_id)
-            if hasattr(self.store, "save_delegation_event"):
+            if controller_context is None:
+                created_work_item_ids.append(follow_up_work_item.work_item_id)
+            if (
+                controller_context is None
+                and hasattr(self.store, "save_delegation_event")
+            ):
                 try:
                     await self.store.save_delegation_event(
                         DelegationEvent(
@@ -12590,14 +15584,67 @@ class CompanyWorkItemExecutor:
                 )
             )
             parent_work_item.metadata["dependency_pruned_at"] = datetime.now().isoformat()
-        await self.store.save_delegation_work_item(parent_work_item)
-        supersede = getattr(self.store, "supersede_pending_checkpoints", None)
-        if callable(supersede):
-            await supersede(
-                project_id=task.project_id or "default",
-                task_id=task.id,
-                checkpoint_types=["company_work_item_gate", "company_delivery_feedback"],
+        if controller_context is not None:
+            command_result = await self._execute_authoritative_command(
+                task,
+                operation="materialize_follow_up_work_items",
+                mutations=(
+                    CompanyControllerWorkItemMutation(
+                        work_item_id=parent_work_item_id,
+                        metadata_updates={
+                            "follow_up_actions": copy.deepcopy(actions),
+                            **(
+                                {
+                                    "pruned_dependency_work_item_ids": copy.deepcopy(
+                                        parent_work_item.metadata.get(
+                                            "pruned_dependency_work_item_ids", []
+                                        )
+                                    ),
+                                    "dependency_pruned_at": parent_work_item.metadata.get(
+                                        "dependency_pruned_at", ""
+                                    ),
+                                }
+                                if pruned_dependency_ids
+                                else {}
+                            ),
+                        },
+                        metadata_list_appends={
+                            "dependency_work_item_ids": tuple(
+                                follow_up_dependency_ids
+                            )
+                        },
+                        metadata_list_removes={
+                            "dependency_work_item_ids": tuple(
+                                pruned_dependency_ids
+                            )
+                        },
+                    ),
+                ),
+                insert_work_items=tuple(pending_follow_up_items),
             )
+            if command_result is None or not bool(command_result.applied):
+                raise CompanyRunControllerLeaseLost(
+                    "follow-up materialization lost its claimed attempt"
+                )
+            created_work_item_ids = list(
+                command_result.inserted_work_item_ids
+            )
+            persisted_parent = await self.store.get_delegation_work_item(
+                parent_work_item_id
+            )
+            if persisted_parent is not None:
+                merged_dependency_ids = [
+                    str(item).strip()
+                    for item in list(
+                        persisted_parent.metadata.get(
+                            "dependency_work_item_ids", []
+                        )
+                        or []
+                    )
+                    if str(item).strip()
+                ]
+        else:
+            await self.store.save_delegation_work_item(parent_work_item)
         task.metadata = dict(task.metadata)
         task.metadata["delegation_wait_for_work_item_ids"] = merged_dependency_ids
         if linked_work_item_id_for_task(task):
@@ -12606,14 +15653,33 @@ class CompanyWorkItemExecutor:
         else:
             task.metadata["follow_up_actions"] = actions
         try:
-            frontier_changed = await refresh_dependents_for_run(
-                self.store,
-                run_id=run_id,
-                source_work_item_id=parent_work_item_id,
-                source_task_id=task.id,
-                source_role_id=self._role_id_for_task(task),
-                source_cell_id=str(getattr(parent_work_item, "cell_id", "") or "").strip() or None,
-            )
+            if controller_context is not None:
+                frontier_changed = await refresh_dependents_for_controller(
+                    self.store,
+                    run_id=run_id,
+                    project_id=controller_context.project_id,
+                    controller_owner_token=controller_context.owner_token,
+                    controller_lease_generation=controller_context.generation,
+                    source_work_item_id=parent_work_item_id,
+                    source_task_id=task.id,
+                    source_role_id=self._role_id_for_task(task),
+                    source_cell_id=str(
+                        getattr(parent_work_item, "cell_id", "") or ""
+                    ).strip()
+                    or None,
+                )
+            else:
+                frontier_changed = await refresh_dependents_for_run(
+                    self.store,
+                    run_id=run_id,
+                    source_work_item_id=parent_work_item_id,
+                    source_task_id=task.id,
+                    source_role_id=self._role_id_for_task(task),
+                    source_cell_id=str(
+                        getattr(parent_work_item, "cell_id", "") or ""
+                    ).strip()
+                    or None,
+                )
             if frontier_changed:
                 self._signal_dispatcher_wake()
                 await self._notify_kanban_changed()
@@ -13668,7 +16734,22 @@ class CompanyWorkItemExecutor:
     ) -> dict[str, Any]:
         verification_evidence = dict(result.artifacts.get("verification_evidence", {}) if result.artifacts else {})
         if verification_evidence:
-            label = "verified" if str(verification_evidence.get("verdict", "")).strip().lower() == "pass" else "not_verified"
+            evidence_status = str(
+                verification_evidence.get("status", "") or ""
+            ).strip().lower()
+            verdict = str(
+                verification_evidence.get("verdict", "") or ""
+            ).strip().lower()
+            if evidence_status == "unavailable":
+                label = "not_verified"
+            elif evidence_status == "provided":
+                label = {
+                    "pass": "verified",
+                    "fail": "failed",
+                    "partial": "partial",
+                }.get(verdict, "not_verified")
+            else:
+                label = "not_verified"
             return {
                 "label": label,
                 "source": "runtime_verifier_evidence",
@@ -13684,11 +16765,16 @@ class CompanyWorkItemExecutor:
                 status = str(item.get("status", "") or "").strip()
                 summary = str(item.get("summary", "") or item.get("verdict", "") or "").strip()
                 if status:
-                    statuses.append(status)
+                    statuses.append(status.lower())
                 if summary:
                     summaries.append(summary)
-            label = "verified"
-            if any(status in {"issues", "failed", "inconclusive"} for status in statuses):
+            if any(status in {"issues", "fail", "failed"} for status in statuses):
+                label = "failed"
+            elif any(status in {"partial", "inconclusive"} for status in statuses):
+                label = "partial"
+            elif statuses and all(status in {"pass", "passed", "verified"} for status in statuses):
+                label = "verified"
+            else:
                 label = "not_verified"
             return {
                 "label": label,
@@ -13728,6 +16814,37 @@ class CompanyWorkItemExecutor:
     def _projection_id_for_task(task: Task) -> str:
         return projection_id_for_task(task)
 
+    def _tasks_with_current_delivery(
+        self,
+        tasks: list[Task],
+        delivery_task: Task,
+    ) -> list[Task]:
+        """Return one task set whose delivery entry is the current object.
+
+        Finalization can be entered by a freshly reloaded/claimed Task while
+        ``_active_tasks`` still contains an older Python object for the same
+        durable Task (or no delivery projection at all).  Identity checks in
+        deterministic rework must use the object that actually completed.
+        Only an exact durable Task id is replaceable: a second Task id that
+        claims the same projection is retained so validation can fail closed
+        on the identity conflict.
+        """
+
+        delivery_task_id = str(delivery_task.id or "").strip()
+        merged: list[Task] = []
+        inserted = False
+        for candidate in list(tasks or []):
+            candidate_task_id = str(candidate.id or "").strip()
+            if delivery_task_id and candidate_task_id == delivery_task_id:
+                if not inserted:
+                    merged.append(delivery_task)
+                    inserted = True
+                continue
+            merged.append(candidate)
+        if not inserted:
+            merged.append(delivery_task)
+        return merged
+
     @staticmethod
     def _turn_type_for_task(task: Task, *, fallback: str = "") -> str:
         return turn_type_for_task(task, fallback=fallback)
@@ -13759,7 +16876,234 @@ class CompanyWorkItemExecutor:
             return str(task.result.get("content", "")).strip()
         return ""
 
-    def _task_open_issues(self, task: Task) -> list[str]:
+    @staticmethod
+    def _pre_delivery_lineage_cleanup_modes(
+        tasks: list[Task],
+        delivery_task: Task,
+        *,
+        work_item_metadata_by_id: Mapping[str, Mapping[str, Any]] | None = None,
+    ) -> dict[str, str]:
+        """Return active deterministic-rework projections for this delivery.
+
+        A generic gate decision, or a deterministic decision issued by a
+        different delivery projection, is deliberately outside the lineage.
+        Downstream invalidations carry only their upstream projection, so
+        close that relation transitively after identifying exact primary
+        requests.
+        """
+
+        delivery_projection_id = projection_id_for_task(delivery_task)
+        if not delivery_projection_id:
+            return {}
+        modes: dict[str, str] = {}
+        upstream_by_projection: dict[str, str] = {}
+        task_by_projection: dict[str, Task] = {}
+        for candidate in list(tasks or []):
+            metadata = dict(candidate.metadata or {})
+            projection_id = projection_id_for_task(candidate)
+            if projection_id:
+                task_by_projection[projection_id] = candidate
+            work_item_metadata = dict(
+                (work_item_metadata_by_id or {}).get(
+                    linked_work_item_id_for_task(candidate), {}
+                )
+                or {}
+            )
+            task_group_authoritative = any(
+                key in metadata
+                for key in _ACTIVE_GATE_HARNESS_REWORK_TASK_KEYS
+            )
+            active_metadata = (
+                metadata if task_group_authoritative else work_item_metadata
+            )
+            raw_request = active_metadata.get(
+                "gate_harness_rework_request", {}
+            )
+            request = dict(raw_request) if isinstance(raw_request, Mapping) else {}
+            blocker_types = {
+                str(item or "").strip()
+                for item in list(request.get("blocker_types", []) or [])
+                if str(item or "").strip()
+            }
+            if (
+                projection_id
+                and str(request.get("source_projection_id", "") or "").strip()
+                == delivery_projection_id
+                and "pre_delivery_validation" in blocker_types
+            ):
+                modes[projection_id] = "active_group"
+            upstream_projection_id = str(
+                metadata.get(
+                    "upstream_gate_harness_rework_source_projection_id", ""
+                )
+                or dict(candidate.context_snapshot or {}).get(
+                    "upstream_gate_harness_rework_source_projection_id", ""
+                )
+                or (
+                    work_item_metadata.get(
+                        "upstream_gate_harness_rework_source_projection_id",
+                        "",
+                    )
+                    if "upstream_gate_harness_rework_source_projection_id"
+                    not in metadata
+                    and "upstream_gate_harness_rework_source_projection_id"
+                    not in dict(candidate.context_snapshot or {})
+                    else ""
+                )
+                or ""
+            ).strip()
+            if projection_id and upstream_projection_id:
+                upstream_by_projection[projection_id] = upstream_projection_id
+        changed = True
+        while changed:
+            changed = False
+            for projection_id, upstream_projection_id in upstream_by_projection.items():
+                if projection_id not in modes and upstream_projection_id in modes:
+                    candidate = task_by_projection[projection_id]
+                    metadata = dict(candidate.metadata or {})
+                    work_item_metadata = dict(
+                        (work_item_metadata_by_id or {}).get(
+                            linked_work_item_id_for_task(candidate), {}
+                        )
+                        or {}
+                    )
+                    active_metadata = (
+                        metadata
+                        if any(
+                            key in metadata
+                            for key in _ACTIVE_GATE_HARNESS_REWORK_TASK_KEYS
+                        )
+                        else work_item_metadata
+                    )
+                    try:
+                        active_count = int(
+                            active_metadata.get(
+                                "gate_harness_rework_count", 0
+                            )
+                            or 0
+                        )
+                    except (TypeError, ValueError):
+                        active_count = 0
+                    active_group = bool(
+                        str(
+                            active_metadata.get(
+                                "gate_harness_rework_feedback", ""
+                            )
+                            or ""
+                        ).strip()
+                        or isinstance(
+                            active_metadata.get(
+                                "gate_harness_rework_request"
+                            ), Mapping
+                        )
+                        and bool(
+                            active_metadata.get(
+                                "gate_harness_rework_request"
+                            )
+                        )
+                        or active_count > 0
+                    )
+                    modes[projection_id] = (
+                        "upstream_marker_only"
+                        if active_group
+                        else "active_group"
+                    )
+                    changed = True
+        return modes
+
+    @staticmethod
+    def _clear_pre_delivery_lineage_active_gate_metadata(
+        task: Task,
+        *,
+        mode: str = "active_group",
+    ) -> None:
+        """Tombstone Task-owned active state while retaining its audit trail."""
+
+        task.metadata = dict(task.metadata or {})
+        # Presence makes the Task group authoritative over a possibly stale
+        # WorkItem compatibility projection.  Do not pop these tombstones.
+        if mode == "active_group":
+            task.metadata["gate_harness_rework_feedback"] = ""
+            task.metadata["gate_harness_rework_count"] = 0
+            task.metadata["gate_harness_rework_request"] = {}
+        task.metadata.pop(
+            "upstream_gate_harness_rework_source_projection_id", None
+        )
+        task.context_snapshot = dict(task.context_snapshot or {})
+        # A downstream Task may simultaneously own an unrelated generic (or
+        # different-delivery) gate decision.  In that case only sever this
+        # lineage's upstream invalidation marker; its own latest decision and
+        # active group remain authoritative.
+        context_keys = (
+            _ACTIVE_GATE_HARNESS_REWORK_CONTEXT_KEYS
+            if mode == "active_group"
+            else ("upstream_gate_harness_rework_source_projection_id",)
+        )
+        for key in context_keys:
+            task.context_snapshot.pop(key, None)
+        adaptive = dict(task.metadata.get("adaptive", {}) or {})
+        if (
+            mode == "active_group"
+            and str(adaptive.get("normalized_state", "") or "").strip().lower()
+            == "invalidated"
+        ):
+            adaptive["normalized_state"] = {
+                TaskStatus.DONE: "done",
+                TaskStatus.AWAITING_HUMAN: "awaiting_human",
+                TaskStatus.AWAITING_MANAGER_REVIEW: "awaiting_manager_review",
+                TaskStatus.AWAITING_REVIEW: "awaiting_review",
+            }.get(task.status, task.status.value)
+            adaptive["blocked_reason"] = ""
+            task.metadata["adaptive"] = adaptive
+
+    def _pre_delivery_candidate_tasks(
+        self,
+        tasks: list[Task],
+        delivery_task: Task,
+        *,
+        work_item_metadata_by_id: Mapping[str, Mapping[str, Any]] | None = None,
+    ) -> list[Task]:
+        """Project the package that an exact deterministic pass will commit."""
+
+        modes = self._pre_delivery_lineage_cleanup_modes(
+            tasks,
+            delivery_task,
+            work_item_metadata_by_id=work_item_metadata_by_id,
+        )
+        candidates: list[Task] = []
+        for task in tasks:
+            candidate = copy.deepcopy(task)
+            candidate.metadata = dict(candidate.metadata or {})
+            if not any(
+                key in candidate.metadata
+                for key in _ACTIVE_GATE_HARNESS_REWORK_TASK_KEYS
+            ):
+                work_item_metadata = dict(
+                    (work_item_metadata_by_id or {}).get(
+                        linked_work_item_id_for_task(candidate), {}
+                    )
+                    or {}
+                )
+                for key in _ACTIVE_GATE_HARNESS_REWORK_TASK_KEYS:
+                    if key in work_item_metadata:
+                        candidate.metadata[key] = copy.deepcopy(
+                            work_item_metadata[key]
+                        )
+            mode = modes.get(self._projection_id_for_task(candidate), "")
+            if mode:
+                self._clear_pre_delivery_lineage_active_gate_metadata(
+                    candidate,
+                    mode=mode,
+                )
+            candidates.append(candidate)
+        return candidates
+
+    def _task_open_issues(
+        self,
+        task: Task,
+        *,
+        expected_final_delivery_task_id: str = "",
+    ) -> list[str]:
         issues: list[str] = []
         output_metadata = self._work_item_output_metadata_for_task(task)
         review_verdict = self._normalize_review_verdict(
@@ -13769,7 +17113,13 @@ class CompanyWorkItemExecutor:
         if review_verdict.get("label") == "reject":
             summary = str(review_verdict.get("summary", "") or "review rejected").strip()
             issues.append(f"review rejected: {summary}")
-        if task.status in {
+        expected_delivery_wait = bool(
+            expected_final_delivery_task_id
+            and str(task.id or "").strip()
+            == str(expected_final_delivery_task_id or "").strip()
+            and task.status == TaskStatus.AWAITING_HUMAN
+        )
+        if not expected_delivery_wait and task.status in {
             TaskStatus.FAILED,
             TaskStatus.BLOCKED,
             TaskStatus.AWAITING_PEER,
@@ -13794,7 +17144,12 @@ class CompanyWorkItemExecutor:
                 deduped.append(issue)
         return deduped[:8]
 
-    def _build_role_task_map(self, tasks: list[Task]) -> dict[str, dict[str, Any]]:
+    def _build_role_task_map(
+        self,
+        tasks: list[Task],
+        *,
+        expected_final_delivery_task_id: str = "",
+    ) -> dict[str, dict[str, Any]]:
         role_task_map: dict[str, dict[str, Any]] = {}
         for task in tasks:
             role_id = self._role_id_for_task(task)
@@ -13827,7 +17182,12 @@ class CompanyWorkItemExecutor:
                     "title": task.title,
                     "status": getattr(task.status, "value", str(task.status)),
                     "summary": self._task_summary_for_map(task),
-                    "open_issues": self._task_open_issues(task),
+                    "open_issues": self._task_open_issues(
+                        task,
+                        expected_final_delivery_task_id=(
+                            expected_final_delivery_task_id
+                        ),
+                    ),
                     "assigned_to": role_id,
                     "role_name": self._role_name_for_task(task),
                     "employee_assignment": employee_assignment,
@@ -13944,26 +17304,7 @@ class CompanyWorkItemExecutor:
     @staticmethod
     def _reset_work_item_outputs_for_rework(task: Task) -> None:
         task.metadata = dict(task.metadata)
-        for key in (
-            "work_item_summary",
-            "work_item_summary_for_downstream",
-            "work_item_artifact_index",
-            "verification_status",
-            "verification_evidence",
-            "verification",
-            "structured_review_verdict",
-            "delivery_package",
-            "downstream_assignments",
-            "artifacts",
-            "automated_verification_results",
-            "final_feedback_evaluation",
-            "feedback_followup_message",
-            "gate_harness_status",
-            "gate_harness_constraints",
-            "gate_harness_pending_decision",
-            "gate_harness_decision",
-            "gate_harness_evidence",
-        ):
+        for key in _REWORK_OUTPUT_METADATA_KEYS:
             task.metadata.pop(key, None)
         task.context_snapshot = dict(task.context_snapshot)
         for key in (
@@ -14005,9 +17346,10 @@ class CompanyWorkItemExecutor:
     ) -> dict[str, Any]:
         blocking_projection_ids: list[str] = []
         for task in tasks:
-            if task.id == delivery_task.id:
-                continue
-            if self._task_open_issues(task):
+            if self._task_open_issues(
+                task,
+                expected_final_delivery_task_id=delivery_task.id,
+            ):
                 blocking_projection_ids.append(self._projection_id_for_task(task))
         if not blocking_projection_ids:
             return {
@@ -14046,12 +17388,20 @@ class CompanyWorkItemExecutor:
             "assessment_status": "unavailable",
             "assessment_failure_kind": reason,
             "assessment_infrastructure_failure": True,
+            # A failed nested executive turn is never equivalent to an
+            # affirmative delivery decision, even when the deterministic
+            # fallback view itself contains no blockers.
+            "awaiting_human": True,
         }
         if not fallback_deliverable:
-            payload["awaiting_human"] = True
             payload["summary"] = (
                 f"{payload['summary']} Pre-delivery assessment could not produce a "
                 "structured decision, so automatic rework is suspended."
+            )
+        else:
+            payload["summary"] = (
+                f"{payload['summary']} Pre-delivery assessment could not produce a "
+                "structured decision, so final publication requires human review."
             )
         return payload
 
@@ -14138,6 +17488,1087 @@ class CompanyWorkItemExecutor:
             )
         return resolved
 
+    @staticmethod
+    def _normalize_pre_delivery_validation_result(
+        raw: Any,
+    ) -> dict[str, Any]:
+        if not isinstance(raw, Mapping):
+            raise ValueError("pre-delivery validator must return a mapping")
+        missing = {
+            "valid",
+            "evidence",
+            "issues",
+            "rework_target_projection_ids",
+        } - set(raw)
+        if missing:
+            raise ValueError(
+                "pre-delivery validator omitted required fields: "
+                + ", ".join(sorted(missing))
+            )
+        extra = set(raw) - {
+            "valid",
+            "evidence",
+            "issues",
+            "rework_target_projection_ids",
+            "rework_issues_by_projection_id",
+        }
+        if extra:
+            raise ValueError(
+                "pre-delivery validator returned unsupported fields: "
+                + ", ".join(sorted(str(item) for item in extra))
+            )
+        valid = raw.get("valid")
+        evidence = raw.get("evidence")
+        issues = raw.get("issues")
+        target_ids = raw.get("rework_target_projection_ids")
+        raw_issue_mapping = raw.get("rework_issues_by_projection_id")
+        if type(valid) is not bool:
+            raise ValueError("pre-delivery validator valid must be a boolean")
+        if not isinstance(evidence, Mapping):
+            raise ValueError("pre-delivery validator evidence must be a mapping")
+        if not isinstance(issues, list) or any(
+            not isinstance(item, str) or not item.strip() for item in issues
+        ):
+            raise ValueError(
+                "pre-delivery validator issues must be a list of non-empty strings"
+            )
+        if not isinstance(target_ids, list) or any(
+            not isinstance(item, str) or not item.strip() for item in target_ids
+        ):
+            raise ValueError(
+                "pre-delivery validator rework targets must be a list of "
+                "non-empty projection IDs"
+            )
+        if not valid and not issues:
+            raise ValueError("an invalid pre-delivery result must explain its issues")
+        if valid and (issues or target_ids):
+            raise ValueError(
+                "a valid pre-delivery result cannot contain issues or rework targets"
+            )
+        normalized_target_ids = [item.strip() for item in target_ids]
+        if len(set(normalized_target_ids)) != len(normalized_target_ids):
+            raise ValueError(
+                "pre-delivery validator rework targets must be unique"
+            )
+        normalized_issues = [item.strip() for item in issues]
+        if valid:
+            if raw_issue_mapping not in (None, {}):
+                raise ValueError(
+                    "a valid pre-delivery result cannot contain a rework issue mapping"
+                )
+            normalized_issue_mapping: dict[str, list[str]] = {}
+        elif raw_issue_mapping is None:
+            # Backward compatibility for existing injected validators: the
+            # target-specific field is optional.  A legacy result preserves
+            # its prior aggregate-feedback semantics, while validators that
+            # opt in below receive strict shape/coverage checks.
+            normalized_issue_mapping = {
+                target_id: list(normalized_issues)
+                for target_id in normalized_target_ids
+            }
+        else:
+            if not isinstance(raw_issue_mapping, Mapping):
+                raise ValueError(
+                    "pre-delivery validator rework issue mapping must be a mapping"
+                )
+            normalized_issue_mapping = {}
+            for raw_target_id, raw_target_issues in raw_issue_mapping.items():
+                if not isinstance(raw_target_id, str) or not raw_target_id.strip():
+                    raise ValueError(
+                        "pre-delivery validator rework issue mapping keys must be "
+                        "non-empty projection IDs"
+                    )
+                target_id = raw_target_id.strip()
+                if target_id in normalized_issue_mapping:
+                    raise ValueError(
+                        "pre-delivery validator rework issue mapping keys must be unique"
+                    )
+                if not isinstance(raw_target_issues, list) or not raw_target_issues:
+                    raise ValueError(
+                        "each pre-delivery rework target must have at least one issue"
+                    )
+                target_issues = [
+                    item.strip()
+                    for item in raw_target_issues
+                    if isinstance(item, str) and item.strip()
+                ]
+                if len(target_issues) != len(raw_target_issues):
+                    raise ValueError(
+                        "pre-delivery rework issue mapping values must be lists of "
+                        "non-empty strings"
+                    )
+                if any(item not in normalized_issues for item in target_issues):
+                    raise ValueError(
+                        "pre-delivery rework issue mapping may only reference aggregate issues"
+                    )
+                normalized_issue_mapping[target_id] = list(
+                    dict.fromkeys(target_issues)
+                )
+            if set(normalized_issue_mapping) != set(normalized_target_ids):
+                raise ValueError(
+                    "pre-delivery rework issue mapping keys must exactly match "
+                    "the requested target projections"
+                )
+            mapped_issues = {
+                issue
+                for target_issues in normalized_issue_mapping.values()
+                for issue in target_issues
+            }
+            if mapped_issues != set(normalized_issues):
+                raise ValueError(
+                    "pre-delivery rework issue mapping must cover every aggregate issue"
+                )
+            normalized_issue_mapping = {
+                target_id: normalized_issue_mapping[target_id]
+                for target_id in normalized_target_ids
+            }
+        try:
+            durable_evidence = json.loads(
+                json.dumps(dict(evidence), ensure_ascii=False, allow_nan=False)
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "pre-delivery validator evidence must be JSON-serializable"
+            ) from exc
+        return {
+            "valid": valid,
+            "evidence": durable_evidence,
+            "issues": normalized_issues,
+            "rework_target_projection_ids": normalized_target_ids,
+            "rework_issues_by_projection_id": normalized_issue_mapping,
+        }
+
+    @staticmethod
+    def _record_pre_delivery_validation(
+        task: Task,
+        result: Mapping[str, Any],
+        *,
+        status: str,
+        attempt_seq: int = 0,
+        package_hash: str = "",
+    ) -> None:
+        task.metadata = dict(task.metadata or {})
+        record = {
+            "status": str(status or "").strip(),
+            "valid": bool(result.get("valid", False)),
+            "evidence": copy.deepcopy(dict(result.get("evidence", {}) or {})),
+            "issues": list(result.get("issues", []) or []),
+            "rework_target_projection_ids": list(
+                result.get("rework_target_projection_ids", []) or []
+            ),
+            "work_item_attempt_seq": int(attempt_seq or 0),
+            "delivery_package_sha256": str(package_hash or "").strip(),
+            "validated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        issue_mapping = {
+            str(target_id).strip(): [
+                str(issue).strip()
+                for issue in list(target_issues or [])
+                if str(issue).strip()
+            ]
+            for target_id, target_issues in dict(
+                result.get("rework_issues_by_projection_id", {}) or {}
+            ).items()
+            if str(target_id).strip()
+        }
+        if issue_mapping:
+            record["rework_issues_by_projection_id"] = issue_mapping
+        task.metadata["pre_delivery_validation"] = record
+        task.metadata["pre_delivery_validation_evidence"] = copy.deepcopy(
+            record["evidence"]
+        )
+        history = [
+            dict(item)
+            for item in list(
+                task.metadata.get("pre_delivery_validation_history", []) or []
+            )
+            if isinstance(item, dict)
+        ]
+        history.append(copy.deepcopy(record))
+        task.metadata["pre_delivery_validation_history"] = history[-12:]
+
+    async def _pre_delivery_validation_work_item(
+        self,
+        task: Task,
+    ) -> Any | None:
+        work_item_id = linked_work_item_id_for_task(task)
+        getter = getattr(self.store, "get_delegation_work_item", None)
+        return (
+            await getter(work_item_id)
+            if work_item_id and callable(getter)
+            else None
+        )
+
+    @staticmethod
+    def _pre_delivery_validation_metadata(task: Task) -> dict[str, Any]:
+        metadata = dict(task.metadata or {})
+        return {
+            key: copy.deepcopy(metadata[key])
+            for key in (
+                "pre_delivery_validation",
+                "pre_delivery_validation_evidence",
+                "pre_delivery_validation_history",
+                "pre_delivery_validation_failure_kind",
+            )
+            if key in metadata
+        }
+
+    async def _save_pre_delivery_validation_task(
+        self,
+        task: Task,
+        *,
+        tasks: list[Task] | None = None,
+    ) -> None:
+        work_item_id = linked_work_item_id_for_task(task)
+        work_item = None
+        getter = getattr(self.store, "get_delegation_work_item", None)
+        if work_item_id and callable(getter):
+            work_item = await getter(work_item_id)
+        metadata_updates = self._pre_delivery_validation_metadata(task)
+        delivery_package = copy.deepcopy(
+            dict(
+                (task.context_snapshot or {})
+                .get("work_item_owned_outputs", {})
+                .get("delivery_package", {})
+                or (task.context_snapshot or {}).get(
+                    "delivery_package", {}
+                )
+                or {}
+            )
+        )
+        controller_context = self._controller_attempt_context_for_task(task)
+        lineage_work_item_metadata_by_id: dict[str, Mapping[str, Any]] = {}
+        if tasks is not None and callable(getter):
+            for candidate in list(tasks or []):
+                candidate_work_item_id = linked_work_item_id_for_task(
+                    candidate
+                )
+                if not candidate_work_item_id:
+                    continue
+                candidate_work_item = await getter(candidate_work_item_id)
+                if candidate_work_item is not None:
+                    lineage_work_item_metadata_by_id[
+                        candidate_work_item_id
+                    ] = dict(candidate_work_item.metadata or {})
+        lineage_cleanup_modes = (
+            self._pre_delivery_lineage_cleanup_modes(
+                list(tasks or []),
+                task,
+                work_item_metadata_by_id=(
+                    lineage_work_item_metadata_by_id
+                ),
+            )
+            if tasks is not None
+            else {}
+        )
+        lineage_projection_ids = set(lineage_cleanup_modes)
+        lineage_tasks = [
+            candidate
+            for candidate in list(tasks or [])
+            if self._projection_id_for_task(candidate) in lineage_projection_ids
+        ]
+        durable_task = None
+        task_preimage_hashes: dict[str, str] | None = None
+        task_snapshot = task
+        additional_snapshots: list[Task] = []
+        committed_task_by_id: dict[str, Task] = {}
+        if controller_context is not None:
+            snapshot_candidates = list(lineage_tasks)
+            if not any(candidate.id == task.id for candidate in snapshot_candidates):
+                snapshot_candidates.append(task)
+            task_preimage_hashes = {}
+            for candidate in snapshot_candidates:
+                durable_candidate = await self.store.get_task(candidate.id)
+                if durable_candidate is None:
+                    raise CompanyRunControllerLeaseLost(
+                        "pre-delivery validation Task disappeared"
+                    )
+                task_preimage_hashes[candidate.id] = (
+                    company_controller_task_preimage_hash(durable_candidate)
+                )
+                if self._projection_id_for_task(candidate) in lineage_projection_ids:
+                    self._clear_pre_delivery_lineage_active_gate_metadata(
+                        durable_candidate,
+                        mode=lineage_cleanup_modes[
+                            self._projection_id_for_task(candidate)
+                        ],
+                    )
+                committed_task_by_id[candidate.id] = durable_candidate
+            durable_task = committed_task_by_id[task.id]
+            task_snapshot = durable_task
+            task_snapshot.metadata = dict(task_snapshot.metadata or {})
+            task_snapshot.metadata.pop(
+                "pre_delivery_validation_failure_kind", None
+            )
+            validation_record = copy.deepcopy(
+                dict(
+                    metadata_updates.get("pre_delivery_validation", {})
+                    or {}
+                )
+            )
+            if validation_record:
+                durable_history = [
+                    copy.deepcopy(item)
+                    for item in list(
+                        task_snapshot.metadata.get(
+                            "pre_delivery_validation_history", []
+                        )
+                        or []
+                    )
+                    if isinstance(item, dict)
+                ]
+                if not durable_history or durable_history[-1] != validation_record:
+                    durable_history.append(validation_record)
+                metadata_updates[
+                    "pre_delivery_validation_history"
+                ] = durable_history[-12:]
+            task_snapshot.metadata.update(metadata_updates)
+            if delivery_package:
+                task_snapshot.context_snapshot = dict(
+                    task_snapshot.context_snapshot or {}
+                )
+                task_snapshot.context_snapshot["delivery_package"] = (
+                    copy.deepcopy(delivery_package)
+                )
+                owned_outputs = dict(
+                    task_snapshot.context_snapshot.get(
+                        "work_item_owned_outputs", {}
+                    )
+                    or {}
+                )
+                owned_outputs["delivery_package"] = copy.deepcopy(
+                    delivery_package
+                )
+                task_snapshot.context_snapshot[
+                    "work_item_owned_outputs"
+                ] = owned_outputs
+            additional_snapshots = [
+                snapshot
+                for candidate_id, snapshot in committed_task_by_id.items()
+                if candidate_id != task.id
+            ]
+        work_item_metadata_updates = dict(metadata_updates)
+        if delivery_package:
+            work_item_metadata_updates["delivery_package"] = (
+                delivery_package
+            )
+        mutations_list: list[CompanyControllerWorkItemMutation] = []
+        if controller_context is not None and lineage_projection_ids:
+            candidate_by_id = {candidate.id: candidate for candidate in lineage_tasks}
+            candidate_by_id.setdefault(task.id, task)
+            for candidate_id, snapshot in committed_task_by_id.items():
+                candidate = candidate_by_id[candidate_id]
+                candidate_work_item_id = linked_work_item_id_for_task(candidate)
+                candidate_work_item = (
+                    await getter(candidate_work_item_id)
+                    if candidate_work_item_id and callable(getter)
+                    else None
+                )
+                if candidate_work_item is None:
+                    raise CompanyRunControllerLeaseLost(
+                        "pre-delivery pass cleanup WorkItem disappeared"
+                    )
+                is_source = candidate_id == task.id
+                cleanup_mode = lineage_cleanup_modes.get(
+                    self._projection_id_for_task(snapshot)
+                )
+                work_item_unset = (
+                    _ACTIVE_GATE_HARNESS_PASS_WORK_ITEM_UNSET
+                    if cleanup_mode == "active_group"
+                    else (
+                        "upstream_gate_harness_rework_source_projection_id",
+                    )
+                    if cleanup_mode == "upstream_marker_only"
+                    else ()
+                )
+                if is_source:
+                    work_item_unset = (
+                        *work_item_unset,
+                        "pre_delivery_validation_failure_kind",
+                    )
+                mutations_list.append(
+                    CompanyControllerWorkItemMutation(
+                        work_item_id=candidate_work_item_id,
+                        expected_phases=(candidate_work_item.phase,),
+                        expected_updated_at=candidate_work_item.updated_at,
+                        metadata_updates=(
+                            work_item_metadata_updates if is_source else {}
+                        ),
+                        metadata_unset=work_item_unset,
+                    )
+                )
+        elif work_item is not None:
+            mutations_list.append(
+                CompanyControllerWorkItemMutation(
+                    work_item_id=work_item_id,
+                    expected_phases=(work_item.phase,),
+                    expected_updated_at=work_item.updated_at,
+                    metadata_updates=work_item_metadata_updates,
+                    metadata_unset=(
+                        "pre_delivery_validation_failure_kind",
+                    ),
+                )
+            )
+        mutations = tuple(mutations_list)
+        result = await self._execute_authoritative_command(
+            task,
+            operation=(
+                "record_pre_delivery_validation_pass"
+                if controller_context is not None and lineage_projection_ids
+                else "record_pre_delivery_validation"
+            ),
+            mutations=mutations,
+            task_snapshot=task_snapshot,
+            task_snapshots=tuple(additional_snapshots),
+            task_preimage_hashes=task_preimage_hashes,
+        )
+        if result is None:
+            update_work_item = getattr(
+                self.store,
+                "update_delegation_work_item",
+                None,
+            )
+            if work_item_id and callable(update_work_item):
+                await update_work_item(
+                    work_item_id,
+                    metadata_updates=work_item_metadata_updates,
+                    metadata_unset=(
+                        "pre_delivery_validation_failure_kind",
+                    ),
+                )
+            for candidate in lineage_tasks:
+                cleanup_mode = lineage_cleanup_modes[
+                    self._projection_id_for_task(candidate)
+                ]
+                self._clear_pre_delivery_lineage_active_gate_metadata(
+                    candidate,
+                    mode=cleanup_mode,
+                )
+                candidate_work_item_id = linked_work_item_id_for_task(candidate)
+                if candidate_work_item_id and callable(update_work_item):
+                    work_item_unset = (
+                        _ACTIVE_GATE_HARNESS_PASS_WORK_ITEM_UNSET
+                        if cleanup_mode == "active_group"
+                        else (
+                            "upstream_gate_harness_rework_source_projection_id",
+                        )
+                    )
+                    if candidate.id == task.id:
+                        work_item_unset = (
+                            *work_item_unset,
+                            "pre_delivery_validation_failure_kind",
+                        )
+                    await update_work_item(
+                        candidate_work_item_id,
+                        metadata_unset=work_item_unset,
+                    )
+                if candidate.id != task.id:
+                    await self.save_task(candidate)
+            await self.save_task(task)
+            return
+        if not bool(result.applied):
+            raise CompanyRunControllerLeaseLost(
+                "pre-delivery validation lost its claimed controller attempt"
+            )
+        if durable_task is not None:
+            in_memory_by_id = {
+                candidate.id: candidate for candidate in list(tasks or [])
+            }
+            for candidate_id in committed_task_by_id:
+                refreshed = await self.store.get_task(candidate_id)
+                if refreshed is None:
+                    raise CompanyRunControllerLeaseLost(
+                        "pre-delivery pass cleanup Task disappeared after commit"
+                    )
+                target = in_memory_by_id.get(candidate_id)
+                if target is not None:
+                    target.__dict__.update(copy.deepcopy(refreshed.__dict__))
+                if candidate_id == task.id:
+                    task.__dict__.update(copy.deepcopy(refreshed.__dict__))
+
+    async def _fail_pre_delivery_validation_infrastructure(
+        self,
+        task: Task,
+        *,
+        failure_kind: str,
+    ) -> None:
+        existing_validation = copy.deepcopy(
+            dict(
+                (task.metadata or {}).get("pre_delivery_validation", {})
+                or {}
+            )
+        )
+        quality_cap_reached = (
+            str(failure_kind or "").strip()
+            == "quality_rework_cap_reached"
+        )
+        result = {
+            "valid": False,
+            "evidence": (
+                copy.deepcopy(
+                    dict(existing_validation.get("evidence", {}) or {})
+                )
+                if quality_cap_reached
+                else {}
+            ),
+            "issues": [
+                *(
+                    list(existing_validation.get("issues", []) or [])
+                    if quality_cap_reached
+                    else []
+                ),
+                (
+                    "Deterministic pre-delivery validation reached its bounded "
+                    "rework limit; delivery and run were closed without "
+                    "publishing final feedback."
+                    if quality_cap_reached
+                    else "Pre-delivery validation infrastructure failed; "
+                    "delivery was withheld without assigning rework to a child."
+                ),
+            ],
+            "rework_target_projection_ids": [],
+        }
+        self._record_pre_delivery_validation(
+            task,
+            result,
+            status=(
+                "quality_rework_cap_reached"
+                if quality_cap_reached
+                else "infrastructure_failure"
+            ),
+        )
+        task.metadata["pre_delivery_validation_failure_kind"] = str(
+            failure_kind or "validator_failure"
+        ).strip()
+        controller_context = self._controller_attempt_context_for_task(task)
+        run_mutation = None
+        if controller_context is not None:
+            run_mutation = CompanyControllerRunLifecycleMutation(
+                expected_statuses=("running",),
+                expected_lifecycle_statuses=("active", "awaiting_owner"),
+                status="failed",
+                lifecycle_status="closed_failed",
+                metadata_updates={
+                    "run_failure": {
+                        "closed_at": datetime.now(timezone.utc).isoformat(),
+                        "failure_kind": str(failure_kind or "validator_failure"),
+                        "delivery_task_id": task.id,
+                    }
+                },
+            )
+        if controller_context is not None and run_mutation is not None:
+            work_item_id = linked_work_item_id_for_task(task)
+            work_item = await self._pre_delivery_validation_work_item(task)
+            if not work_item_id or work_item is None:
+                raise CompanyRunControllerLeaseLost(
+                    "quality cap closure lost its delivery WorkItem"
+                )
+            durable_task = await self.store.get_task(task.id)
+            if durable_task is None:
+                raise CompanyRunControllerLeaseLost(
+                    "validation failure lost its delivery Task"
+                )
+            durable_preimage = company_controller_task_preimage_hash(
+                durable_task
+            )
+            task_snapshot = durable_task
+            task_snapshot.status = task_status_for_phase(Phase.FAILED)
+            task_snapshot.metadata = dict(task_snapshot.metadata or {})
+            for key in (
+                *self._pre_delivery_validation_metadata(task),
+                "pre_delivery_rework_count",
+                "pre_delivery_rework_cap_reached",
+                "pre_delivery_rework_cap",
+            ):
+                if key in (task.metadata or {}):
+                    task_snapshot.metadata[key] = copy.deepcopy(
+                        task.metadata[key]
+                    )
+            command_result = await self._execute_authoritative_command(
+                task,
+                operation="close_pre_delivery_validation_failure",
+                mutations=(
+                    CompanyControllerWorkItemMutation(
+                        work_item_id=work_item_id,
+                        expected_phases=(work_item.phase,),
+                        expected_updated_at=work_item.updated_at,
+                        phase=Phase.FAILED,
+                        clear_claim=True,
+                        metadata_updates=self._pre_delivery_validation_metadata(
+                            task
+                        ),
+                        transition_reason=(
+                            "pre_delivery_validation_failure"
+                        ),
+                        attempt_outcome=str(
+                            failure_kind or "validator_failure"
+                        ),
+                    ),
+                ),
+                task_snapshot=task_snapshot,
+                task_preimage_hashes={task.id: durable_preimage},
+                run_mutation=run_mutation,
+            )
+            if command_result is None or not bool(command_result.applied):
+                raise CompanyRunControllerLeaseLost(
+                    "validation failure closure lost its claimed controller attempt"
+                )
+            task.__dict__.update(copy.deepcopy(task_snapshot.__dict__))
+        else:
+            await transition_work_item_from_task(
+                self.store,
+                task,
+                target_status_or_phase=Phase.FAILED,
+                reason="pre_delivery_validation_infrastructure_failure",
+                metadata_updates=self._pre_delivery_validation_metadata(task),
+                release_claim=True,
+                attempt_outcome="infrastructure_failure",
+            )
+            if controller_context is None:
+                await self.save_task(task)
+            if quality_cap_reached:
+                run_id = str(
+                    (task.metadata or {}).get("delegation_run_id", "") or ""
+                ).strip()
+                get_run = getattr(self.store, "get_delegation_run", None)
+                save_run = getattr(self.store, "save_delegation_run", None)
+                run = await get_run(run_id) if run_id and callable(get_run) else None
+                if run is not None and callable(save_run):
+                    run.status = "failed"
+                    run.lifecycle_status = "closed_failed"
+                    run.metadata = {
+                        **dict(run.metadata or {}),
+                        "run_failure": {
+                            "closed_at": datetime.now(timezone.utc).isoformat(),
+                            "failure_kind": "quality_rework_cap_reached",
+                            "delivery_task_id": task.id,
+                        },
+                    }
+                    await save_run(run)
+        try:
+            await self._emit_progress(
+                f"[Company:{self._projection_id_for_task(task)}] final delivery "
+                "withheld because deterministic pre-delivery validation failed",
+                task_id=task.id,
+            )
+        except CompanyRunControllerLeaseLost:
+            logger.warning(
+                "validation-failure progress observed controller takeover "
+                "after authoritative closure task_id={}",
+                task.id,
+            )
+        except Exception:
+            logger.opt(exception=True).warning(
+                "validation failure committed but progress emit failed "
+                "task_id={}",
+                task.id,
+            )
+
+    async def _apply_pre_delivery_validator(
+        self,
+        task: Task,
+        plan: CompanyWorkItemRuntimePlan,
+        tasks: list[Task],
+        package: dict[str, Any],
+    ) -> bool:
+        """Return True only when final-delivery processing may continue."""
+
+        validator = getattr(self, "pre_delivery_validator", None)
+        if validator is None:
+            return True
+        tasks = self._tasks_with_current_delivery(tasks, task)
+        delivery_projection_id = self._projection_id_for_task(task)
+        conflicting_delivery_task_ids = sorted(
+            {
+                str(candidate.id or "").strip()
+                for candidate in tasks
+                if delivery_projection_id
+                and self._projection_id_for_task(candidate)
+                == delivery_projection_id
+                and str(candidate.id or "").strip()
+                != str(task.id or "").strip()
+            }
+        )
+        if conflicting_delivery_task_ids:
+            logger.error(
+                "Conflicting delivery projection identity for task {}: {}",
+                task.id,
+                conflicting_delivery_task_ids,
+            )
+            await self._fail_pre_delivery_validation_infrastructure(
+                task,
+                failure_kind="conflicting_delivery_projection_identity",
+            )
+            return False
+        try:
+            validation_package_hash = delivery_package_sha256(package)
+        except (TypeError, ValueError) as exc:
+            await self._fail_pre_delivery_validation_infrastructure(
+                task,
+                failure_kind=f"basis_{type(exc).__name__}",
+            )
+            return False
+        validation_work_item = await self._pre_delivery_validation_work_item(task)
+        try:
+            validation_attempt_seq = int(
+                dict(getattr(validation_work_item, "metadata", {}) or {}).get(
+                    "attempt_seq", 0
+                )
+                or 0
+            )
+            claimed_attempt_seq = int(
+                (task.metadata or {}).get("claimed_work_item_attempt_seq", 0)
+                or 0
+            )
+        except (TypeError, ValueError):
+            validation_attempt_seq = 0
+            claimed_attempt_seq = 0
+        if validation_attempt_seq <= 0 or (
+            self._controller_attempt_context_for_task(task) is not None
+            and claimed_attempt_seq != validation_attempt_seq
+        ):
+            await self._fail_pre_delivery_validation_infrastructure(
+                task,
+                failure_kind="missing_validation_attempt",
+            )
+            return False
+        try:
+            raw_result = await validator(
+                task,
+                plan,
+                list(tasks),
+                copy.deepcopy(package),
+            )
+            result = self._normalize_pre_delivery_validation_result(raw_result)
+        except CompanyRunControllerLeaseLost:
+            raise
+        except Exception as exc:
+            logger.opt(exception=True).error(
+                "Deterministic pre-delivery validator failed for task {}",
+                task.id,
+            )
+            await self._fail_pre_delivery_validation_infrastructure(
+                task,
+                failure_kind=type(exc).__name__,
+            )
+            return False
+
+        if result["valid"]:
+            # A successful exact-attempt pass supersedes any failure recorded
+            # by an earlier validator attempt.
+            task.metadata = dict(task.metadata or {})
+            task.metadata.pop(
+                "pre_delivery_validation_failure_kind", None
+            )
+            self._record_pre_delivery_validation(
+                task,
+                result,
+                status="passed",
+                attempt_seq=validation_attempt_seq,
+                package_hash=validation_package_hash,
+            )
+            try:
+                await self._save_pre_delivery_validation_task(
+                    task,
+                    tasks=tasks,
+                )
+            except CompanyRunControllerLeaseLost:
+                # A multi-Task preimage/phase conflict is an authoritative
+                # contention outcome.  Do not compensate by failing the
+                # delivery/run after the pass transaction wrote nothing.
+                raise
+            except Exception as exc:
+                logger.opt(exception=True).error(
+                    "Passed pre-delivery validation evidence could not be "
+                    "persisted for task {}",
+                    task.id,
+                )
+                await self._fail_pre_delivery_validation_infrastructure(
+                    task,
+                    failure_kind=f"evidence_{type(exc).__name__}",
+                )
+                return False
+            return True
+
+        projection_tasks: dict[str, Task] = {}
+        duplicate_projection_ids: set[str] = set()
+        for candidate in tasks:
+            projection_id = self._projection_id_for_task(candidate)
+            if not projection_id:
+                continue
+            if (
+                projection_id in projection_tasks
+                and projection_tasks[projection_id].id != candidate.id
+            ):
+                duplicate_projection_ids.add(projection_id)
+            projection_tasks[projection_id] = candidate
+        delivery_projection_id = self._projection_id_for_task(task)
+        delivery_projection_matches = bool(
+            delivery_projection_id
+            and projection_tasks.get(delivery_projection_id) is task
+        )
+        requested_targets = list(result["rework_target_projection_ids"])
+        unknown_targets = [
+            item for item in requested_targets if item not in projection_tasks
+        ]
+        if (
+            duplicate_projection_ids
+            or not delivery_projection_matches
+            or not requested_targets
+            or unknown_targets
+        ):
+            logger.error(
+                "Invalid pre-delivery rework target contract for task {}: "
+                "duplicates={} unknown={} empty={} delivery_matches={}",
+                task.id,
+                sorted(duplicate_projection_ids),
+                unknown_targets,
+                not requested_targets,
+                delivery_projection_matches,
+            )
+            await self._fail_pre_delivery_validation_infrastructure(
+                task,
+                failure_kind="invalid_rework_target_contract",
+            )
+            return False
+
+        effective_targets = list(requested_targets)
+        if delivery_projection_id and delivery_projection_id not in effective_targets:
+            effective_targets.append(delivery_projection_id)
+        invalidated_delivery_by_projection_ids = [
+            target_projection_id
+            for target_projection_id in requested_targets
+            if target_projection_id != delivery_projection_id
+        ]
+        upstream_delivery_invalidation_note = ""
+        if invalidated_delivery_by_projection_ids:
+            rendered_projection_ids = ", ".join(
+                f"`{projection_id}`"
+                for projection_id in invalidated_delivery_by_projection_ids
+            )
+            upstream_delivery_invalidation_note = (
+                "Upstream deterministic quality rework invalidated this "
+                "delivery because these dependency projections were reopened: "
+                f"{rendered_projection_ids}. Wait for their corrected outputs "
+                "to be approved, re-read the latest corrected dependency "
+                "outputs, then rebuild and re-verify only the delivery-owned "
+                "output; do not reuse the prior synthesis."
+            )
+        target_feedback_by_projection_id: dict[str, dict[str, Any]] = {}
+        issue_mapping = dict(
+            result.get("rework_issues_by_projection_id", {}) or {}
+        )
+        for target_projection_id in requested_targets:
+            target_issues = [
+                str(issue).strip()
+                for issue in list(issue_mapping.get(target_projection_id, []) or [])
+                if str(issue).strip()
+            ]
+            target_feedback_by_projection_id[target_projection_id] = {
+                "feedback": (
+                    "Deterministic pre-delivery validation failed: "
+                    + "; ".join(target_issues)
+                ),
+                "blockers": target_issues,
+            }
+        if (
+            delivery_projection_id
+            and delivery_projection_id in requested_targets
+            and upstream_delivery_invalidation_note
+        ):
+            delivery_feedback = target_feedback_by_projection_id[
+                delivery_projection_id
+            ]
+            delivery_feedback["feedback"] = "\n\n".join(
+                item
+                for item in (
+                    str(delivery_feedback.get("feedback", "") or "").strip(),
+                    upstream_delivery_invalidation_note,
+                )
+                if item
+            )
+            delivery_feedback["invalidated_by_projection_ids"] = list(
+                invalidated_delivery_by_projection_ids
+            )
+        if (
+            delivery_projection_id
+            and delivery_projection_id not in requested_targets
+        ):
+            target_feedback_by_projection_id[delivery_projection_id] = {
+                "feedback": upstream_delivery_invalidation_note,
+                "blockers": [],
+                "invalidated_by_projection_ids": list(
+                    invalidated_delivery_by_projection_ids
+                ),
+            }
+        self._record_pre_delivery_validation(
+            task,
+            result,
+            status="quality_failed",
+            attempt_seq=validation_attempt_seq,
+            package_hash=validation_package_hash,
+        )
+        counter_task = task
+        if self._controller_attempt_context_for_task(task) is not None:
+            durable_counter_task = await self.store.get_task(task.id)
+            if durable_counter_task is None:
+                await self._fail_pre_delivery_validation_infrastructure(
+                    task,
+                    failure_kind="missing_rework_counter_task",
+                )
+                return False
+            counter_task = durable_counter_task
+        try:
+            prior_pre_delivery_reworks = int(
+                (counter_task.metadata or {}).get(
+                    "pre_delivery_rework_count", 0
+                )
+                or 0
+            )
+        except (TypeError, ValueError):
+            prior_pre_delivery_reworks = 0
+        max_pre_delivery_reworks = self._resolve_max_pre_delivery_reworks(
+            counter_task
+        )
+        if prior_pre_delivery_reworks >= max_pre_delivery_reworks:
+            task.metadata["pre_delivery_rework_cap_reached"] = True
+            task.metadata["pre_delivery_rework_cap"] = max_pre_delivery_reworks
+            await self._fail_pre_delivery_validation_infrastructure(
+                task,
+                failure_kind="quality_rework_cap_reached",
+            )
+            await self._settle_run_lifecycle_on_convergence(tasks)
+            return False
+        task.metadata["pre_delivery_rework_count"] = (
+            prior_pre_delivery_reworks + 1
+        )
+        # A live controller persists this record in the same transaction that
+        # reopens every affected card.  Committing evidence while delivery is
+        # still AWAITING_HUMAN would leave a crash window in which startup
+        # recovery could publish a final feedback card for invalid output.
+        if self._controller_attempt_context_for_task(task) is None:
+            try:
+                await self._save_pre_delivery_validation_task(task)
+            except Exception as exc:
+                logger.opt(exception=True).error(
+                    "Pre-delivery validation evidence could not be persisted "
+                    "for task {}",
+                    task.id,
+                )
+                await self._fail_pre_delivery_validation_infrastructure(
+                    task,
+                    failure_kind=f"evidence_{type(exc).__name__}",
+                )
+                return False
+        summary = "Deterministic pre-delivery validation failed: " + "; ".join(
+            result["issues"]
+        )
+        decision = GateHarnessDecision(
+            action="rework_same_work_item",
+            summary=summary,
+            target_projection_ids=effective_targets,
+            blockers=list(result["issues"]),
+            blocker_types=["pre_delivery_validation"],
+            source="pre_delivery_validator",
+        )
+        rework_task: Task | None = None
+        for _counter_attempt in range(3):
+            try:
+                rework_task = await self._gate_harness_initiate_rework(
+                    task,
+                    decision,
+                    projection_tasks,
+                    expected_pre_delivery_rework_count=(
+                        prior_pre_delivery_reworks
+                    ),
+                    max_pre_delivery_reworks=max_pre_delivery_reworks,
+                    target_feedback_by_projection_id=(
+                        target_feedback_by_projection_id
+                    ),
+                )
+                break
+            except _PreDeliveryReworkCounterConflict:
+                # The exact counter predicate is checked under the same
+                # BEGIN IMMEDIATE transaction as every Task/WorkItem reset.
+                # Reload and either close at the cap or retry from the newly
+                # observed value; never reopen from a stale below-cap intent.
+                fresh_counter_task = await self.store.get_task(task.id)
+                if fresh_counter_task is None:
+                    await self._fail_pre_delivery_validation_infrastructure(
+                        task,
+                        failure_kind="missing_rework_counter_task",
+                    )
+                    return False
+                try:
+                    prior_pre_delivery_reworks = int(
+                        (fresh_counter_task.metadata or {}).get(
+                            "pre_delivery_rework_count", 0
+                        )
+                        or 0
+                    )
+                except (TypeError, ValueError):
+                    prior_pre_delivery_reworks = 0
+                max_pre_delivery_reworks = (
+                    self._resolve_max_pre_delivery_reworks(fresh_counter_task)
+                )
+                task.metadata["pre_delivery_rework_count"] = (
+                    prior_pre_delivery_reworks
+                )
+                if prior_pre_delivery_reworks >= max_pre_delivery_reworks:
+                    task.metadata["pre_delivery_rework_cap_reached"] = True
+                    task.metadata["pre_delivery_rework_cap"] = (
+                        max_pre_delivery_reworks
+                    )
+                    await self._fail_pre_delivery_validation_infrastructure(
+                        task,
+                        failure_kind="quality_rework_cap_reached",
+                    )
+                    return False
+                task.metadata["pre_delivery_rework_count"] = (
+                    prior_pre_delivery_reworks + 1
+                )
+            except Exception as exc:
+                logger.opt(exception=True).error(
+                    "Pre-delivery validation could not apply rework for task {}",
+                    task.id,
+                )
+                await self._fail_pre_delivery_validation_infrastructure(
+                    task,
+                    failure_kind=f"rework_{type(exc).__name__}",
+                )
+                return False
+        else:
+            await self._fail_pre_delivery_validation_infrastructure(
+                task,
+                failure_kind="rework_counter_contention",
+            )
+            return False
+        if rework_task is None:
+            await self._fail_pre_delivery_validation_infrastructure(
+                task,
+                failure_kind="rework_target_unavailable",
+            )
+            return False
+        try:
+            await self._emit_progress(
+                f"[Company:{delivery_projection_id}] final delivery withheld by "
+                "deterministic pre-delivery validation",
+                task_id=task.id,
+            )
+        except CompanyRunControllerLeaseLost:
+            logger.warning(
+                "quality-withheld progress observed controller takeover "
+                "after rework commit task_id={}",
+                task.id,
+            )
+        except Exception:
+            logger.opt(exception=True).warning(
+                "quality rework committed but withheld progress emit failed "
+                "task_id={}",
+                task.id,
+            )
+        return False
+
     async def _ceo_pre_delivery_assessment(
         self,
         delivery_task: Task,
@@ -14161,7 +18592,10 @@ class CompanyWorkItemExecutor:
                     "employee_assignment": dict(task.metadata.get("employee_assignment", {}) or {}),
                     "work_item_assignment": dict(task.metadata.get("work_item_assignment", {}) or {}),
                     "summary": self._task_summary_for_map(task),
-                    "open_issues": self._task_open_issues(task),
+                    "open_issues": self._task_open_issues(
+                        task,
+                        expected_final_delivery_task_id=delivery_task.id,
+                    ),
                     "risks": [str(item).strip() for item in list(output_metadata.get("risks", []) or []) if str(item).strip()],
                     "dependency_projection_ids": list(task.dependencies),
                 }
@@ -14173,7 +18607,17 @@ class CompanyWorkItemExecutor:
             "delivery_projection_title": delivery_task.title,
             "delivery_role_id": self._role_id_for_task(delivery_task),
             "delivery_role_name": self._role_name_for_task(delivery_task),
-            "role_task_map": self._build_role_task_map(tasks),
+            "current_delivery_prepublication_state": {
+                "task_id": delivery_task.id,
+                "status": delivery_task.status.value,
+                "expected": (
+                    delivery_task.status == TaskStatus.AWAITING_HUMAN
+                ),
+            },
+            "role_task_map": self._build_role_task_map(
+                tasks,
+                expected_final_delivery_task_id=delivery_task.id,
+            ),
             "delivery_package": package,
             "work_item_tasks": work_item_tasks,
         }
@@ -14198,20 +18642,56 @@ class CompanyWorkItemExecutor:
                     task_type="quick_tasks",
                     label="ceo_pre_delivery_assessment",
                 )
+            except (CompanyRunControllerLeaseLost, ProviderQuotaExhaustedError):
+                raise
             except LLMRetryError as exc:
                 logger.debug(f"Executive pre-delivery assessment failed after retries: {exc}")
-                return fallback
+                return self._pre_delivery_assessment_unavailable(
+                    fallback,
+                    reason="llm_retry_exhausted",
+                )
             except Exception as exc:
                 logger.debug(f"Executive pre-delivery assessment construction failed: {exc}")
-                return fallback
+                return self._pre_delivery_assessment_unavailable(
+                    fallback,
+                    reason=f"llm_{type(exc).__name__}",
+                )
         if data is None:
             logger.debug("Executive pre-delivery assessment returned non-JSON output")
-            return fallback
-        summary = str(data.get("summary", "") or fallback.get("summary", "")).strip()
+            if self.role_prompt_runner is None and self.llm is None:
+                # A deployment with no nested-assessment backend deliberately
+                # uses the deterministic readiness fallback.  Unavailability
+                # applies only when a configured backend failed to answer.
+                return fallback
+            return self._pre_delivery_assessment_unavailable(
+                fallback,
+                reason="llm_non_json_output",
+            )
+        deliverable = data.get("deliverable")
+        summary_value = data.get("summary", "")
+        rework_targets = data.get("rework_targets", [])
+        schema_valid = bool(
+            type(deliverable) is bool
+            and isinstance(summary_value, str)
+            and isinstance(rework_targets, list)
+            and all(isinstance(item, (str, Mapping)) for item in rework_targets)
+        )
+        if not schema_valid:
+            logger.debug(
+                "Executive pre-delivery assessment returned an invalid schema"
+            )
+            return self._pre_delivery_assessment_unavailable(
+                fallback,
+                reason="role_prompt_invalid_schema",
+            )
+        summary = str(summary_value or fallback.get("summary", "")).strip()
         return {
-            "deliverable": bool(data.get("deliverable", fallback.get("deliverable", True))),
+            "deliverable": deliverable,
             "summary": summary or str(fallback.get("summary", "")).strip(),
-            "rework_targets": list(data.get("rework_targets", []) or []),
+            "rework_targets": list(rework_targets),
+            "assessment_status": "completed",
+            "assessment_failure_kind": "",
+            "assessment_infrastructure_failure": False,
         }
 
     async def _ceo_initiate_rework(
@@ -14223,6 +18703,14 @@ class CompanyWorkItemExecutor:
         source_task: Task,
         source: str,
     ) -> Task | None:
+        if self._controller_attempt_context_for_task(source_task) is not None:
+            return await self._ceo_initiate_rework_for_controller(
+                target_projection_id,
+                feedback,
+                task_by_projection_id,
+                source_task=source_task,
+                source=source,
+            )
         target_task = task_by_projection_id.get(target_projection_id)
         if target_task is None:
             return None
@@ -14287,6 +18775,347 @@ class CompanyWorkItemExecutor:
             )
         return target_task
 
+    async def _ceo_initiate_rework_for_controller(
+        self,
+        target_projection_id: str,
+        feedback: str,
+        task_by_projection_id: dict[str, Task],
+        *,
+        source_task: Task,
+        source: str,
+    ) -> Task | None:
+        """Compatibility wrapper for one atomic executive-rework target."""
+
+        try:
+            expected_count = int(
+                source_task.metadata.get("pre_delivery_rework_count", 0) or 0
+            )
+        except (TypeError, ValueError):
+            expected_count = 0
+        return await self._ceo_initiate_reworks_for_controller(
+            [
+                {
+                    "target_projection_id": target_projection_id,
+                    "feedback": feedback,
+                }
+            ],
+            task_by_projection_id,
+            source_task=source_task,
+            source=source,
+            expected_pre_delivery_rework_count=expected_count,
+            max_pre_delivery_reworks=self._resolve_max_pre_delivery_reworks(
+                source_task
+            ),
+        )
+
+    async def _ceo_initiate_reworks_for_controller(
+        self,
+        rework_targets: list[dict[str, Any]],
+        task_by_projection_id: dict[str, Task],
+        *,
+        source_task: Task,
+        source: str,
+        expected_pre_delivery_rework_count: int,
+        max_pre_delivery_reworks: int,
+    ) -> Task | None:
+        """Atomically reset all executive-directed targets and their closure."""
+
+        explicit_target_ids: list[str] = []
+        feedback_by_target: dict[str, str] = {}
+        for target in rework_targets:
+            target_projection_id = str(
+                target.get("target_projection_id")
+                or target.get("work_item_projection_id")
+                or ""
+            ).strip()
+            if (
+                not target_projection_id
+                or target_projection_id in feedback_by_target
+                or task_by_projection_id.get(target_projection_id) is None
+            ):
+                continue
+            explicit_target_ids.append(target_projection_id)
+            feedback_by_target[target_projection_id] = str(
+                target.get("feedback", "") or ""
+            ).strip()
+        if not explicit_target_ids:
+            return None
+        primary_target = task_by_projection_id[explicit_target_ids[0]]
+        explicit_target_set = set(explicit_target_ids)
+        affected_entries: list[tuple[str, str]] = []
+        touched_task_ids: set[str] = set()
+        for target_projection_id in explicit_target_ids:
+            for affected_projection_id in [
+                target_projection_id,
+                *self._collect_downstream_projection_ids(
+                    target_projection_id
+                ),
+            ]:
+                if (
+                    affected_projection_id != target_projection_id
+                    and affected_projection_id in explicit_target_set
+                ):
+                    continue
+                projected_task = task_by_projection_id.get(
+                    affected_projection_id
+                )
+                if (
+                    projected_task is None
+                    or projected_task.id in touched_task_ids
+                ):
+                    continue
+                touched_task_ids.add(projected_task.id)
+                affected_entries.append(
+                    (affected_projection_id, target_projection_id)
+                )
+        source_projection_id = self._projection_id_for_task(source_task)
+        if source_task.id not in touched_task_ids:
+            touched_task_ids.add(source_task.id)
+            affected_entries.append(
+                (source_projection_id, explicit_target_ids[0])
+            )
+
+        mutations: list[CompanyControllerWorkItemMutation] = []
+        source_snapshot: Task | None = None
+        additional_snapshots: list[Task] = []
+        task_preimage_hashes: dict[str, str] = {}
+        committed_snapshots: dict[str, Task] = {}
+        progress: list[tuple[str, str, int]] = []
+        source_task_id = str(source_task.id or "").strip()
+        rework_round_by_target: dict[str, int] = {}
+
+        for affected_projection_id, upstream_target_projection_id in affected_entries:
+            projected_task = task_by_projection_id.get(affected_projection_id)
+            if projected_task is None and affected_projection_id == source_projection_id:
+                projected_task = source_task
+            if projected_task is None:
+                raise CompanyRunControllerLeaseLost(
+                    f"executive rework projection `{affected_projection_id}` disappeared"
+                )
+            durable_task = await self.store.get_task(projected_task.id)
+            if durable_task is None:
+                raise CompanyRunControllerLeaseLost(
+                    f"executive rework Task `{projected_task.id}` disappeared"
+                )
+            work_item_id = linked_work_item_id_for_task(durable_task)
+            durable_item = (
+                await self.store.get_delegation_work_item(work_item_id)
+                if work_item_id
+                else None
+            )
+            if durable_item is None:
+                raise CompanyRunControllerLeaseLost(
+                    f"executive rework WorkItem `{work_item_id}` disappeared"
+                )
+            task_preimage_hashes[durable_task.id] = (
+                company_controller_task_preimage_hash(durable_task)
+            )
+            working_task = copy.deepcopy(durable_task)
+            working_task.metadata = dict(working_task.metadata or {})
+            working_task.context_snapshot = dict(
+                working_task.context_snapshot or {}
+            )
+            working_task.result = None
+            self._reset_work_item_outputs_for_rework(working_task)
+            is_primary = affected_projection_id == upstream_target_projection_id
+            if is_primary:
+                try:
+                    rework_round = int(
+                        working_task.metadata.get("ceo_rework_count", 0) or 0
+                    ) + 1
+                except (TypeError, ValueError):
+                    rework_round = 1
+                rework_round_by_target[
+                    upstream_target_projection_id
+                ] = rework_round
+            else:
+                rework_round = rework_round_by_target.get(
+                    upstream_target_projection_id,
+                    1,
+                )
+            normalized_feedback = self._normalize_gate_feedback(
+                feedback_by_target.get(upstream_target_projection_id, ""),
+                fallback=(
+                    f"{source_task.title} cannot move forward yet. "
+                    "Review the executive feedback, address the blocking "
+                    "issues, and resubmit."
+                ),
+            )
+            if is_primary:
+                rework_request = self._build_ceo_rework_record(
+                    source_task=source_task,
+                    target_task=working_task,
+                    feedback=normalized_feedback,
+                    rework_round=rework_round,
+                    source=source,
+                )
+                working_task.metadata["ceo_rework_count"] = rework_round
+                working_task.metadata[
+                    "ceo_rework_feedback"
+                ] = normalized_feedback
+                working_task.metadata[
+                    "ceo_rework_feedback_full"
+                ] = feedback_by_target.get(
+                    upstream_target_projection_id,
+                    "",
+                )
+                working_task.metadata["ceo_rework_request"] = copy.deepcopy(
+                    rework_request
+                )
+                history = list(
+                    working_task.metadata.get("ceo_rework_requests", []) or []
+                )
+                history.append(copy.deepcopy(rework_request))
+                working_task.metadata["ceo_rework_requests"] = history[-6:]
+                working_task.context_snapshot[
+                    "ceo_rework_feedback"
+                ] = normalized_feedback
+                working_task.context_snapshot[
+                    "latest_ceo_rework"
+                ] = copy.deepcopy(rework_request)
+                progress_message = self._render_ceo_rework_summary(
+                    rework_request
+                )
+            else:
+                working_task.metadata[
+                    "upstream_ceo_rework_source_projection_id"
+                ] = upstream_target_projection_id
+                working_task.context_snapshot[
+                    "upstream_ceo_rework_source_projection_id"
+                ] = upstream_target_projection_id
+                adaptive = self._normalize_adaptive_metadata(
+                    working_task.metadata.get("adaptive", {})
+                )
+                adaptive["normalized_state"] = "invalidated"
+                working_task.metadata["adaptive"] = adaptive
+                progress_message = (
+                    "Reset because upstream work-item projection "
+                    f"`{upstream_target_projection_id}` entered "
+                    "executive-directed rework."
+                )
+            same_source = working_task.id == source_task_id
+            if same_source:
+                for key in (
+                    "pre_delivery_validation",
+                    "pre_delivery_validation_evidence",
+                    "pre_delivery_validation_failure_kind",
+                    "pre_delivery_rework_cap_reached",
+                    "pre_delivery_rework_cap",
+                ):
+                    if key in source_task.metadata:
+                        working_task.metadata[key] = copy.deepcopy(
+                            source_task.metadata[key]
+                        )
+                working_task.metadata[
+                    "pre_delivery_rework_count"
+                ] = int(expected_pre_delivery_rework_count) + 1
+            working_memory = list(
+                working_task.metadata.get("working_memory", []) or []
+            )
+            working_memory.append(progress_message)
+            working_task.metadata["working_memory"] = working_memory[-12:]
+
+            if durable_item.phase == Phase.APPROVED:
+                target_phase = Phase.READY_FOR_REWORK
+                allow_approved_rework = True
+            elif durable_item.phase in {
+                Phase.AWAITING_MANAGER_REVIEW,
+                Phase.AWAITING_HUMAN,
+            }:
+                target_phase = Phase.READY_FOR_REWORK
+                allow_approved_rework = False
+            elif durable_item.phase in {
+                Phase.RUNNING,
+                Phase.WAITING_FOR_PEER,
+                Phase.WAITING_FOR_CHILDREN,
+                Phase.PAUSED,
+                Phase.NEEDS_ATTENTION,
+            }:
+                target_phase = Phase.READY
+                allow_approved_rework = False
+            elif durable_item.phase in {Phase.READY, Phase.READY_FOR_REWORK}:
+                target_phase = durable_item.phase
+                allow_approved_rework = False
+            else:
+                raise CompanyRunControllerLeaseLost(
+                    f"work item `{work_item_id}` cannot enter executive rework "
+                    f"from {durable_item.phase.value}"
+                )
+            working_task.status = task_status_for_phase(target_phase)
+            mutations.append(
+                CompanyControllerWorkItemMutation(
+                    work_item_id=work_item_id,
+                    expected_phases=(durable_item.phase,),
+                    expected_updated_at=durable_item.updated_at,
+                    phase=target_phase,
+                    deliverable_summary="",
+                    blocked_reason="",
+                    clear_claim=True,
+                    metadata_updates={
+                        "claimed_by_role_session_id": "",
+                        "claimed_task_id": "",
+                    },
+                    metadata_unset=_REWORK_OUTPUT_METADATA_KEYS,
+                    transition_reason="ceo_rework_reset",
+                    attempt_outcome="rework",
+                    allow_approved_rework=allow_approved_rework,
+                    required_pre_delivery_rework_count=(
+                        int(expected_pre_delivery_rework_count)
+                        if same_source
+                        else None
+                    ),
+                    pre_delivery_rework_count_limit=(
+                        int(max_pre_delivery_reworks)
+                        if same_source
+                        else None
+                    ),
+                )
+            )
+            committed_snapshots[working_task.id] = working_task
+            if working_task.id == source_task_id:
+                source_snapshot = working_task
+            else:
+                additional_snapshots.append(working_task)
+            progress.append(
+                (affected_projection_id, working_task.id, rework_round)
+            )
+
+        if not mutations:
+            return None
+        result = await self._execute_authoritative_command(
+            source_task,
+            operation="executive_delivery_rework",
+            mutations=tuple(mutations),
+            task_snapshot=source_snapshot,
+            task_snapshots=tuple(additional_snapshots),
+            task_preimage_hashes=task_preimage_hashes,
+        )
+        if result is None or not bool(result.applied):
+            raise CompanyRunControllerLeaseLost(
+                "executive rework lost its atomic controller fence"
+            )
+        context = self._controller_attempt_context_for_task(source_task)
+        for projected_task in task_by_projection_id.values():
+            snapshot = committed_snapshots.get(projected_task.id)
+            if snapshot is None:
+                continue
+            if context is not None:
+                snapshot.metadata = dict(snapshot.metadata or {})
+                snapshot.metadata[
+                    "company_run_controller_owner_token"
+                ] = context.owner_token
+                snapshot.metadata[
+                    "company_run_controller_lease_generation"
+                ] = context.generation
+            projected_task.__dict__.update(copy.deepcopy(snapshot.__dict__))
+        for projection_id, task_id, rework_round in progress:
+            await self._emit_progress_after_authoritative_commit(
+                f"[Company:{projection_id}] reworking "
+                f"({source} rework round {rework_round})",
+                task_id=task_id,
+            )
+        return primary_target
+
     async def _mark_run_awaiting_owner_from_delivery(
         self,
         task: Task,
@@ -14320,6 +19149,214 @@ class CompanyWorkItemExecutor:
         except Exception:
             logger.opt(exception=True).debug("Failed to save delegation run owner review lifecycle update")
 
+    async def _commit_final_delivery_owner_handoff(
+        self,
+        task: Task,
+        *,
+        summary: str,
+        progress_message: str,
+    ) -> bool:
+        """Atomically publish final delivery state for a live controller.
+
+        Legacy fixtures without a durable controller credential return False
+        and retain the historical transition/save/callback path.  A live
+        native attempt must have the Engine's canonical prepare callback and
+        Coordinator notification callback; it may never degrade to the
+        unfenced path.
+        """
+
+        controller_context = self._controller_attempt_context_for_task(task)
+        if controller_context is None:
+            return False
+        if not callable(self.checkpoint_prepare_callback) or not callable(
+            self.checkpoint_notify_callback
+        ):
+            raise CompanyRunControllerLeaseLost(
+                "final delivery lacks canonical checkpoint prepare/notify callbacks"
+            )
+        work_item_id = linked_work_item_id_for_task(task)
+        if not work_item_id:
+            raise CompanyRunControllerLeaseLost(
+                "final delivery has no authoritative WorkItem"
+            )
+        validation_work_item = await self._pre_delivery_validation_work_item(
+            task
+        )
+        durable_task = await self.store.get_task(task.id)
+        if validation_work_item is None or durable_task is None:
+            raise CompanyRunControllerLeaseLost(
+                "final delivery Task/WorkItem disappeared before publication"
+            )
+        durable_preimage = company_controller_task_preimage_hash(durable_task)
+        local_package = copy.deepcopy(
+            dict(
+                (task.context_snapshot or {})
+                .get("work_item_owned_outputs", {})
+                .get("delivery_package", {})
+                or (task.context_snapshot or {}).get("delivery_package", {})
+                or {}
+            )
+        )
+        durable_package = copy.deepcopy(
+            dict(
+                (durable_task.context_snapshot or {})
+                .get("work_item_owned_outputs", {})
+                .get("delivery_package", {})
+                or (durable_task.context_snapshot or {}).get(
+                    "delivery_package", {}
+                )
+                or (validation_work_item.metadata or {}).get(
+                    "delivery_package", {}
+                )
+                or {}
+            )
+        )
+        pre_delivery_validator = getattr(self, "pre_delivery_validator", None)
+        package = durable_package if pre_delivery_validator is not None else (
+            local_package or durable_package
+        )
+        required_validation_attempt: int | None = None
+        required_package_hash: str | None = None
+        if pre_delivery_validator is not None:
+            if not validation_record_matches_current_delivery(
+                durable_task,
+                validation_work_item,
+                package,
+            ):
+                raise CompanyRunControllerLeaseLost(
+                    "final delivery lacks validation for its exact attempt and package"
+                )
+            validation_record = dict(
+                (durable_task.metadata or {}).get(
+                    "pre_delivery_validation", {}
+                )
+                or {}
+            )
+            required_validation_attempt = int(
+                validation_record.get("work_item_attempt_seq", 0) or 0
+            )
+            required_package_hash = str(
+                validation_record.get("delivery_package_sha256", "") or ""
+            ).strip()
+
+        publication_task = durable_task
+        publication_task.status = TaskStatus.AWAITING_HUMAN
+        publication_task.metadata = dict(publication_task.metadata or {})
+        for key in (
+            "ceo_pre_delivery_assessment",
+            "pre_delivery_assessment_status",
+            "pre_delivery_assessment_failure_kind",
+            "pre_delivery_rework_count",
+            "pre_delivery_rework_cap_reached",
+            "pre_delivery_rework_cap",
+        ):
+            if key in (task.metadata or {}):
+                publication_task.metadata[key] = copy.deepcopy(
+                    task.metadata[key]
+                )
+        if package:
+            publication_task.context_snapshot = dict(
+                publication_task.context_snapshot or {}
+            )
+            publication_task.context_snapshot["delivery_package"] = (
+                copy.deepcopy(package)
+            )
+            owned_outputs = dict(
+                publication_task.context_snapshot.get(
+                    "work_item_owned_outputs", {}
+                )
+                or {}
+            )
+            owned_outputs["delivery_package"] = copy.deepcopy(package)
+            publication_task.context_snapshot[
+                "work_item_owned_outputs"
+            ] = owned_outputs
+        checkpoint_data = self._feedback_checkpoint_data(publication_task)
+        if checkpoint_data is None:
+            raise CompanyRunControllerLeaseLost(
+                "final delivery is not eligible for owner feedback"
+            )
+        prepared = await self.checkpoint_prepare_callback(checkpoint_data)
+        if not isinstance(prepared, PreparedOwnerInteractionPublication):
+            raise CompanyRunControllerLeaseLost(
+                "Engine returned an invalid prepared owner checkpoint"
+            )
+        now_text = datetime.now().isoformat()
+        origin_owner_interaction = OriginOwnerInteractionLease.from_payload(
+            dict(publication_task.metadata or {}).get(
+                "origin_owner_interaction"
+            )
+        )
+        command_result = await self._execute_authoritative_command(
+            task,
+            operation="publish_final_delivery_owner_handoff",
+            mutations=(
+                CompanyControllerWorkItemMutation(
+                    work_item_id=work_item_id,
+                    expected_phases=(Phase.AWAITING_HUMAN,),
+                    expected_updated_at=validation_work_item.updated_at,
+                    deliverable_summary=str(summary or "").strip() or None,
+                    metadata_updates={"delivery_package": package},
+                    metadata_list_appends={
+                        "progress_log": (str(progress_message or "").strip(),)
+                        if str(progress_message or "").strip()
+                        else (),
+                    },
+                    required_pre_delivery_validation_attempt_seq=(
+                        required_validation_attempt
+                    ),
+                    required_delivery_package_sha256=(
+                        required_package_hash
+                    ),
+                ),
+            ),
+            task_snapshot=publication_task,
+            task_preimage_hashes={task.id: durable_preimage},
+            run_mutation=CompanyControllerRunLifecycleMutation(
+                expected_statuses=("running",),
+                expected_lifecycle_statuses=("active", "awaiting_owner"),
+                status="running",
+                lifecycle_status="awaiting_owner",
+                latest_deliverable_summary=str(summary or "").strip() or None,
+                metadata_updates={
+                    "awaiting_owner_review": True,
+                    "awaiting_owner_review_task_id": task.id,
+                    "awaiting_owner_review_at": now_text,
+                },
+            ),
+            owner_publication=prepared,
+            origin_owner_interaction=origin_owner_interaction,
+        )
+        if command_result is None or not bool(command_result.applied):
+            raise CompanyRunControllerLeaseLost(
+                "final delivery owner handoff lost its claimed attempt"
+            )
+        checkpoint = command_result.owner_checkpoint
+        if checkpoint is None:
+            raise RuntimeError(
+                "final delivery authoritative commit returned no owner checkpoint"
+            )
+        task.__dict__.update(copy.deepcopy(publication_task.__dict__))
+        try:
+            await self.checkpoint_notify_callback(checkpoint)
+        except CompanyRunControllerLeaseLost:
+            # Publication and run lifecycle already committed together.  A
+            # takeover observed by the low-latency notification cannot make
+            # the caller reinterpret that durable success as a failed final
+            # commit (which could otherwise trigger rework/failure writes).
+            logger.warning(
+                "final delivery notification observed controller takeover "
+                "after authoritative commit task_id={}",
+                task.id,
+            )
+        except Exception:
+            # The durable row is already committed. Consumers poll the Store;
+            # this callback is only the Coordinator's low-latency refresh hint.
+            logger.opt(exception=True).warning(
+                "final delivery committed but owner checkpoint notify failed"
+            )
+        return True
+
     async def _settle_run_lifecycle_on_convergence(self, tasks: list[Task]) -> None:
         """Close the delegation run when its tree converged in terminal failure.
 
@@ -14352,13 +19389,30 @@ class CompanyWorkItemExecutor:
             return
         if any(getattr(item, "phase", None) not in DONE_PHASES for item in work_items):
             return
+        gate_halt_failures = [
+            item
+            for item in work_items
+            if getattr(item, "phase", None) in {Phase.FAILED, Phase.CANCELLED}
+            and str(
+                dict(getattr(item, "metadata", {}) or {}).get(
+                    "last_transition_reason", ""
+                )
+                or ""
+            ).strip()
+            in {
+                "company_work_item_gate_denied_halt",
+                "company_work_item_gate_invalidated",
+                "company_work_item_gate_orphaned",
+            }
+        ]
         failed_core = [
             item
             for item in work_items
-            if str(getattr(item, "kind", "") or "").strip().lower() in {"intake", "delivery"}
+            if str(getattr(item, "kind", "") or "").strip().lower()
+            in {"intake", "deliver", "delivery"}
             and getattr(item, "phase", None) in {Phase.FAILED, Phase.CANCELLED}
         ]
-        if not failed_core:
+        if not failed_core and not gate_halt_failures:
             return
         try:
             run = await self.store.get_delegation_run(run_id)
@@ -14368,7 +19422,7 @@ class CompanyWorkItemExecutor:
         if run is None:
             return
         lifecycle = str(getattr(run, "lifecycle_status", "") or "").strip()
-        if lifecycle in {"closed_failed", "awaiting_owner"}:
+        if lifecycle == "awaiting_owner":
             return
         failed_items = [
             {
@@ -14381,22 +19435,68 @@ class CompanyWorkItemExecutor:
             for item in work_items
             if getattr(item, "phase", None) in {Phase.FAILED, Phase.CANCELLED}
         ]
-        closed_at = datetime.now().isoformat()
-        run.status = (
+        existing_run_failure = dict(
+            dict(getattr(run, "metadata", {}) or {}).get("run_failure", {})
+            or {}
+        )
+        closed_at = str(existing_run_failure.get("closed_at", "") or "").strip()
+        if not closed_at:
+            closed_at = datetime.now().isoformat()
+        target_run_status = (
             "failed"
             if any(item["phase"] == Phase.FAILED.value for item in failed_items)
             else "cancelled"
         )
-        run.lifecycle_status = "closed_failed"
-        run.metadata = {
-            **dict(run.metadata or {}),
-            "run_failure": {
-                "closed_at": closed_at,
-                "failed_items": failed_items,
-            },
+        run_failure = {
+            "closed_at": closed_at,
+            "failed_items": failed_items,
         }
         try:
-            await self.store.save_delegation_run(run)
+            state = self._run_state()
+            if lifecycle == "closed_failed":
+                # A prior controller may have committed run closure and then
+                # crashed before publishing the owner failure card.  Closure
+                # is therefore not the terminal acknowledgement for this
+                # continuation; keep going and idempotently repair the card.
+                pass
+            elif state.controller_owner_token:
+                transition_run = getattr(
+                    self.store,
+                    "transition_delegation_run_lifecycle_for_controller",
+                    None,
+                )
+                if not callable(transition_run):
+                    raise CompanyRunControllerLeaseLost(
+                        "Store lacks typed run lifecycle transition"
+                    )
+                run_result = await transition_run(
+                    run_id,
+                    project_id=state.controller_project_id,
+                    root_session_id=state.controller_root_session_id,
+                    owner_token=state.controller_owner_token,
+                    generation=state.controller_lease_generation,
+                    mutation=CompanyControllerRunLifecycleMutation(
+                        expected_statuses=(str(run.status or ""),),
+                        expected_lifecycle_statuses=(lifecycle,),
+                        expected_current_revision=int(run.current_revision or 1),
+                        expected_updated_at=run.updated_at,
+                        status=target_run_status,
+                        lifecycle_status="closed_failed",
+                        metadata_updates={"run_failure": run_failure},
+                    ),
+                    operation="settle_run_failure_convergence",
+                )
+                if not run_result.applied or run_result.run is None:
+                    return
+                run = run_result.run
+            else:
+                run.status = target_run_status
+                run.lifecycle_status = "closed_failed"
+                run.metadata = {
+                    **dict(run.metadata or {}),
+                    "run_failure": run_failure,
+                }
+                await self.store.save_delegation_run(run)
         except Exception:
             logger.opt(exception=True).debug("run failure settlement: run save failed")
             return
@@ -14406,12 +19506,59 @@ class CompanyWorkItemExecutor:
             + (f" — {item['blocked_reason']}" if item["blocked_reason"] else "")
             for item in failed_items
         )
-        await self._emit_progress(
+        await self._emit_progress_after_authoritative_commit(
             f"[Company] run closed after terminal failure — {len(failed_items)} "
             f"failed/cancelled work item(s). Send a new request to start a fresh run.",
             task_id=origin_task.id if origin_task else "",
         )
-        if self.checkpoint_callback and origin_task is not None:
+        failure_source_event_id = f"company-run-failure:{run_id}"
+        process_publications = getattr(
+            self,
+            "_published_failure_review_source_events",
+            None,
+        )
+        if process_publications is None:
+            process_publications = set()
+            self._published_failure_review_source_events = process_publications
+        failure_review_exists = failure_source_event_id in process_publications
+        list_checkpoints = getattr(self.store, "get_execution_checkpoints", None)
+        if callable(list_checkpoints):
+            try:
+                failure_reviews = await list_checkpoints(
+                    project_id=str(origin_task.project_id or "default").strip()
+                    if origin_task is not None
+                    else str(getattr(run, "project_id", "default") or "default").strip(),
+                    checkpoint_types=["company_run_failure_review"],
+                )
+                failure_review_exists = failure_review_exists or any(
+                    str(dict(item.payload or {}).get("run_id", "") or "").strip()
+                    == run_id
+                    and str(
+                        dict(item.payload or {}).get("source_event_id", "") or ""
+                    ).strip()
+                    == failure_source_event_id
+                    and str(item.status or "").strip().lower()
+                    not in {
+                        "invalid",
+                        "stale",
+                        "superseded",
+                        "failed",
+                        "cancelled",
+                        "canceled",
+                        "outcome_unknown",
+                    }
+                    for item in failure_reviews
+                )
+            except Exception:
+                logger.opt(exception=True).debug(
+                    "run failure settlement: failure-review lookup failed"
+                )
+        publication_succeeded = failure_review_exists
+        if (
+            self.checkpoint_callback
+            and origin_task is not None
+            and not failure_review_exists
+        ):
             original_request = str(
                 (origin_task.metadata or {}).get("original_request", "")
                 or origin_task.description
@@ -14427,6 +19574,20 @@ class CompanyWorkItemExecutor:
                         "task_id": origin_task.id,
                         "payload": {
                             "run_id": run_id,
+                            "source_event_id": failure_source_event_id,
+                            "revision": 1,
+                            "conversation_turn_id": str(
+                                (origin_task.metadata or {}).get(
+                                    "conversation_turn_id", ""
+                                )
+                                or ""
+                            ).strip(),
+                            "conversation_turn_sequence": int(
+                                (origin_task.metadata or {}).get(
+                                    "conversation_turn_sequence", 0
+                                )
+                                or 0
+                            ),
                             "waiting_task_id": origin_task.id,
                             "session_id": origin_task.session_id,
                             "task_ids": [t.id for t in tasks],
@@ -14444,35 +19605,200 @@ class CompanyWorkItemExecutor:
                         },
                     }
                 )
+                publication_succeeded = True
+                process_publications.add(failure_source_event_id)
             except Exception:
                 logger.opt(exception=True).debug("run failure settlement: checkpoint save failed")
+        if publication_succeeded and not str(
+            dict(getattr(run, "metadata", {}) or {}).get(
+                "failure_review_published_at", ""
+            )
+            or ""
+        ).strip():
+            published_at = datetime.now().isoformat()
+            try:
+                current_run = await self.store.get_delegation_run(run_id)
+                if current_run is not None:
+                    state = self._run_state()
+                    if state.controller_owner_token:
+                        stamp_result = await self.store.transition_delegation_run_lifecycle_for_controller(
+                            run_id,
+                            project_id=state.controller_project_id,
+                            root_session_id=state.controller_root_session_id,
+                            owner_token=state.controller_owner_token,
+                            generation=state.controller_lease_generation,
+                            mutation=CompanyControllerRunLifecycleMutation(
+                                expected_statuses=(str(current_run.status or ""),),
+                                expected_lifecycle_statuses=("closed_failed",),
+                                expected_current_revision=int(
+                                    current_run.current_revision or 1
+                                ),
+                                expected_updated_at=current_run.updated_at,
+                                metadata_updates={
+                                    "failure_review_published_at": published_at,
+                                    "failure_review_source_event_id": (
+                                        failure_source_event_id
+                                    ),
+                                },
+                            ),
+                            operation="stamp_run_failure_review_publication",
+                        )
+                        if stamp_result.applied and stamp_result.run is not None:
+                            run = stamp_result.run
+                    else:
+                        current_run.metadata = {
+                            **dict(current_run.metadata or {}),
+                            "failure_review_published_at": published_at,
+                            "failure_review_source_event_id": failure_source_event_id,
+                        }
+                        await self.store.save_delegation_run(current_run)
+            except Exception:
+                # The checkpoint itself is the durable acknowledgement.  A
+                # missing audit stamp only causes a safe deduplicated lookup
+                # on the next reconciliation pass.
+                logger.opt(exception=True).debug(
+                    "run failure settlement: publication audit stamp failed"
+                )
+
+    async def _emit_progress_after_authoritative_commit(
+        self,
+        message: str,
+        *,
+        task_id: str,
+    ) -> None:
+        """Best-effort UI notification after an irreversible business commit."""
+
+        try:
+            await self._emit_progress(message, task_id=task_id)
+        except CompanyRunControllerLeaseLost:
+            logger.warning(
+                "post-commit progress observed controller takeover task_id={}",
+                task_id,
+            )
+        except Exception:
+            logger.opt(exception=True).warning(
+                "authoritative delivery committed but progress emit failed "
+                "task_id={}",
+                task_id,
+            )
 
     async def _finalize_completed_work_item(self, task: Task) -> None:
         if self._is_authoritative_delivery_work_item(task):
             plan = self._active_plan or CompanyWorkItemRuntimePlan(
                 profile=str(task.metadata.get("company_profile", "") or "company"),
             )
-            tasks = list(self._active_tasks) or [task]
-            package = self._build_authoritative_delivery_package(plan, tasks, task)
+            tasks = self._tasks_with_current_delivery(
+                list(self._active_tasks),
+                task,
+            )
+            # Keep the dispatcher-facing run state on the same canonical
+            # instance used by validation/rework; a stale delivery object must
+            # not be observed again after this finalization turn.
+            self._active_tasks = tasks
+            candidate_work_item_metadata_by_id: dict[
+                str, Mapping[str, Any]
+            ] = {}
+            get_work_item = getattr(
+                self.store,
+                "get_delegation_work_item",
+                None,
+            )
+            if callable(get_work_item):
+                for candidate_task in tasks:
+                    candidate_work_item_id = linked_work_item_id_for_task(
+                        candidate_task
+                    )
+                    if not candidate_work_item_id:
+                        continue
+                    candidate_work_item = await get_work_item(
+                        candidate_work_item_id
+                    )
+                    if candidate_work_item is not None:
+                        candidate_work_item_metadata_by_id[
+                            candidate_work_item_id
+                        ] = dict(candidate_work_item.metadata or {})
+            candidate_tasks = self._pre_delivery_candidate_tasks(
+                tasks,
+                task,
+                work_item_metadata_by_id=(
+                    candidate_work_item_metadata_by_id
+                ),
+            )
+            candidate_delivery = next(
+                candidate
+                for candidate in candidate_tasks
+                if str(candidate.id or "").strip() == str(task.id or "").strip()
+            )
+            # The validator, durable evidence hash, executive assessment and
+            # publication all consume this same candidate package.  It omits
+            # only active deterministic-rework markers from this delivery's
+            # lineage; the pass transaction below materializes that exact
+            # projection without changing the package after validation.
+            package = self._build_authoritative_delivery_package(
+                plan,
+                candidate_tasks,
+                candidate_delivery,
+            )
             task.metadata = dict(task.metadata)
             task.context_snapshot = dict(task.context_snapshot)
             task.context_snapshot["delivery_package"] = package
             self._set_work_item_output_context(task, {"delivery_package": package})
             linked_work_item_id = linked_work_item_id_for_task(task)
             if linked_work_item_id:
-                await update_work_item_owned_metadata(self.store, linked_work_item_id, {"delivery_package": package})
+                if self._controller_attempt_context_for_task(task) is None:
+                    await update_work_item_owned_metadata(
+                        self.store,
+                        linked_work_item_id,
+                        {"delivery_package": package},
+                    )
                 task.metadata.pop("delivery_package", None)
             else:
                 task.metadata["delivery_package"] = package
+            if not await self._apply_pre_delivery_validator(
+                task,
+                plan,
+                tasks,
+                package,
+            ):
+                return
             assessment = await self._ceo_pre_delivery_assessment(task, plan, tasks, package)
             task.metadata["ceo_pre_delivery_assessment"] = dict(assessment)
+            assessment_status = str(
+                assessment.get("assessment_status", "completed") or "completed"
+            ).strip()
+            assessment_failure_kind = str(
+                assessment.get("assessment_failure_kind", "") or ""
+            ).strip()
+            if assessment_status == "unavailable" or assessment_failure_kind:
+                task.metadata["pre_delivery_assessment_status"] = (
+                    assessment_status or "unavailable"
+                )
+                task.metadata["pre_delivery_assessment_failure_kind"] = (
+                    assessment_failure_kind or "assessment_unavailable"
+                )
+            else:
+                # Publication starts from the durable Task and copies only
+                # keys present locally.  Explicit completion tombstones clear
+                # an unavailable/failure result left by an earlier attempt.
+                task.metadata["pre_delivery_assessment_status"] = "completed"
+                task.metadata[
+                    "pre_delivery_assessment_failure_kind"
+                ] = ""
             if bool(assessment.get("awaiting_human")):
-                task.metadata["pre_delivery_assessment_status"] = str(
-                    assessment.get("assessment_status", "awaiting_human") or "awaiting_human"
+                assessment_summary = str(
+                    assessment.get("summary", "")
+                    or "Final delivery is awaiting human review."
                 )
-                task.metadata["pre_delivery_assessment_failure_kind"] = str(
-                    assessment.get("assessment_failure_kind", "") or ""
-                )
+                if await self._commit_final_delivery_owner_handoff(
+                    task,
+                    summary=assessment_summary,
+                    progress_message=assessment_summary,
+                ):
+                    await self._emit_progress_after_authoritative_commit(
+                        f"[Company:{self._projection_id_for_task(task)}] final delivery awaiting human review",
+                        task_id=task.id,
+                    )
+                    return
                 await transition_work_item_from_task(
                     self.store, task,
                     target_status_or_phase=Phase.AWAITING_HUMAN,
@@ -14518,6 +19844,23 @@ class CompanyWorkItemExecutor:
                     if prior_pre_delivery_reworks >= max_pre_delivery_reworks:
                         task.metadata["pre_delivery_rework_cap_reached"] = True
                         task.metadata["pre_delivery_rework_cap"] = max_pre_delivery_reworks
+                        cap_summary = (
+                            "Final delivery reached the pre-delivery rework cap; "
+                            "awaiting human review."
+                        )
+                        if await self._commit_final_delivery_owner_handoff(
+                            task,
+                            summary=cap_summary,
+                            progress_message=(
+                                "Final delivery reached the pre-delivery rework cap "
+                                f"({max_pre_delivery_reworks}); awaiting human review."
+                            ),
+                        ):
+                            await self._emit_progress_after_authoritative_commit(
+                                f"[Company:{self._projection_id_for_task(task)}] pre-delivery rework cap reached",
+                                task_id=task.id,
+                            )
+                            return
                         await transition_work_item_from_task(
                             self.store, task,
                             target_status_or_phase=Phase.AWAITING_HUMAN,
@@ -14541,7 +19884,42 @@ class CompanyWorkItemExecutor:
                             task_id=task.id,
                         )
                         return
-                    task.metadata["pre_delivery_rework_count"] = prior_pre_delivery_reworks + 1
+                    controller_context = self._controller_attempt_context_for_task(
+                        task
+                    )
+                    if controller_context is not None:
+                        normalized_rework_targets = [
+                            {
+                                **dict(item),
+                                "feedback": str(
+                                    item.get("feedback", "")
+                                    or assessment.get("summary", "")
+                                    or ""
+                                ),
+                            }
+                            for item in rework_targets
+                        ]
+                        await self._ceo_initiate_reworks_for_controller(
+                            normalized_rework_targets,
+                            task_by_projection_id,
+                            source_task=task,
+                            source="pre_delivery",
+                            expected_pre_delivery_rework_count=(
+                                prior_pre_delivery_reworks
+                            ),
+                            max_pre_delivery_reworks=(
+                                max_pre_delivery_reworks
+                            ),
+                        )
+                        await self._emit_progress_after_authoritative_commit(
+                            f"[Company:{self._projection_id_for_task(task)}] "
+                            "executive withheld delivery for rework",
+                            task_id=task.id,
+                        )
+                        return
+                    task.metadata[
+                        "pre_delivery_rework_count"
+                    ] = prior_pre_delivery_reworks + 1
                     for item in rework_targets:
                         target_projection_id = str(
                             item.get("target_projection_id")
@@ -14552,7 +19930,8 @@ class CompanyWorkItemExecutor:
                             continue
                         await self._ceo_initiate_rework(
                             target_projection_id,
-                            item.get("feedback", "") or str(assessment.get("summary", "") or ""),
+                            item.get("feedback", "")
+                            or str(assessment.get("summary", "") or ""),
                             task_by_projection_id,
                             source_task=task,
                             source="pre_delivery",
@@ -14573,6 +19952,23 @@ class CompanyWorkItemExecutor:
                     )
                     return
         if self._requires_user_feedback(task):
+            delivery_summary = str(
+                task.result.get("content", "")
+                if isinstance(task.result, dict)
+                else task.result or ""
+            ).strip()
+            if await self._commit_final_delivery_owner_handoff(
+                task,
+                summary=delivery_summary,
+                progress_message=(
+                    "Awaiting user feedback before learning from this delivery."
+                ),
+            ):
+                await self._emit_progress_after_authoritative_commit(
+                    f"[Company:{self._projection_id_for_task(task)}] awaiting user feedback",
+                    task_id=task.id,
+                )
+                return
             await self._append_progress(task, "Awaiting user feedback before learning from this delivery.")
             await transition_work_item_from_task(
                 self.store, task,
@@ -14581,7 +19977,7 @@ class CompanyWorkItemExecutor:
             )
             await self._mark_run_awaiting_owner_from_delivery(
                 task,
-                summary=str(task.result.get("content", "") if isinstance(task.result, dict) else task.result or "").strip(),
+                summary=delivery_summary,
             )
             await self.save_task(task)
             await self._save_feedback_checkpoint(task)
@@ -14796,10 +20192,23 @@ class CompanyWorkItemExecutor:
         package.setdefault("artifact_manifest", [])
         package.setdefault("constraints", [])
         package.setdefault("risks", [])
-        package.setdefault("open_issues", [])
+        # Open issues are a runtime projection, never trusted carry-over from
+        # an agent-authored or previous-attempt package.
+        package["open_issues"] = []
         package.setdefault("next_steps", [])
-        package.setdefault("source_projection_refs", [])
-        package["role_task_map"] = self._build_role_task_map(tasks)
+        # Runtime provenance is rebuilt from the exact candidate view every
+        # time.  Reusing an agent-supplied/earlier attempt list could retain
+        # stale deterministic rework markers after those artifacts were fixed.
+        package["source_projection_refs"] = []
+        package["role_task_map"] = self._build_role_task_map(
+            tasks,
+            expected_final_delivery_task_id=delivery_task.id,
+        )
+        package["current_delivery_prepublication_state"] = {
+            "task_id": delivery_task.id,
+            "status": delivery_task.status.value,
+            "expected": delivery_task.status == TaskStatus.AWAITING_HUMAN,
+        }
 
         for task in tasks:
             projection_id = self._projection_id_for_task(task)
@@ -14814,7 +20223,10 @@ class CompanyWorkItemExecutor:
                     "role_name": self._role_name_for_task(task),
                     "employee_assignment": dict(task.metadata.get("employee_assignment", {}) or {}),
                     "summary": self._task_summary_for_map(task),
-                    "open_issues": self._task_open_issues(task),
+                    "open_issues": self._task_open_issues(
+                        task,
+                        expected_final_delivery_task_id=delivery_task.id,
+                    ),
                     "gate_harness_status": str(task.metadata.get("gate_harness_status", "") or "").strip(),
                     "constraints": list(task.metadata.get("gate_harness_constraints", []) or []),
                 }
@@ -14854,7 +20266,11 @@ class CompanyWorkItemExecutor:
                 package["open_issues"].append(
                     f"{task.title}: {str(review_verdict.get('summary', '') or 'review rejected').strip()}"
                 )
-            if task.status in {
+            expected_delivery_wait = bool(
+                task.id == delivery_task.id
+                and task.status == TaskStatus.AWAITING_HUMAN
+            )
+            if not expected_delivery_wait and task.status in {
                 TaskStatus.FAILED,
                 TaskStatus.BLOCKED,
                 TaskStatus.AWAITING_PEER,

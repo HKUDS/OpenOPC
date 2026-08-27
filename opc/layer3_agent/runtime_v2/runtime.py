@@ -9,24 +9,32 @@ import re
 import time
 import uuid
 from dataclasses import dataclass
-from typing import Any, Awaitable, Callable, Optional
+from datetime import datetime
+from typing import Any, Awaitable, Callable
 
 from loguru import logger
 
+from opc.core.company_controller import CompanyRunControllerLeaseLost
 from opc.core.config import OPCConfig
 from opc.core.events import EventBus
 from opc.core.models import OPCEvent, PermissionResolution, Task, TaskResult, TaskStatus, VerificationEvidence
+from opc.layer0_interaction.coordinator import InteractionCoordinator
 from opc.layer2_organization.collaboration_policy import ownership_guard_violation
+from opc.layer2_organization.company_runtime_identity import is_company_runtime_task
 from opc.layer2_organization.work_item_identity import (
-    projection_id_for_task,
     result_delivery_identity_payload_for_task,
     turn_type_for_task,
     work_item_identity_payload_for_task,
 )
+from opc.layer2_organization.work_item_links import linked_work_item_id_for_task
 from opc.layer3_agent.runtime_v2.permissions import RuntimePermissionAdapter
 from opc.layer3_agent.runtime_v2.streaming_tool_executor import StreamingToolExecutor
 from opc.layer3_agent.runtime_v2.subagents import ChildAgentFactory, SubagentManager
-from opc.layer3_agent.runtime_v2.tool_hooks import RuntimeToolHookBus, RuntimeToolHookContext
+from opc.layer3_agent.runtime_v2.tool_hooks import (
+    RuntimeCompanyControllerToolFence,
+    RuntimeToolHookBus,
+    RuntimeToolHookContext,
+)
 from opc.layer3_agent.runtime_v2.tool_planner import ToolPlanner
 from opc.layer3_agent.prompt_harness import (
     render_runtime_artifact_messages,
@@ -35,14 +43,19 @@ from opc.layer3_agent.prompt_harness import (
 from opc.layer3_agent.prompt_harness.artifacts import build_runtime_artifact_record
 from opc.layer3_agent.prompt_harness.types import RuntimeArtifact
 from opc.layer4_tools.execution_context import ensure_task_execution_context
+from opc.layer4_tools.opaque_execution import (
+    build_company_opaque_execution_plan,
+    company_opaque_execution_identity,
+    exact_tool_call_fingerprint,
+    opaque_execution_envelope_digest,
+)
 from opc.layer4_tools.output_budget import clip_text
-from opc.layer4_tools.registry import ToolDefinition
 from opc.layer4_tools.registry import ToolRegistry
 from opc.layer6_observability.cost_tracker import CostEntry
 from opc.llm.provider import LLMProvider, ProviderQuotaExhaustedError
 
 
-ApprovalCallback = Callable[[ToolDefinition, dict[str, Any], Optional[Task], Any], Awaitable[tuple[bool, Any]]]
+ApprovalCallback = Callable[..., Awaitable[tuple[bool, Any]]]
 PrefetchProvider = Callable[[Task, str, list[dict[str, Any]]], Awaitable[dict[str, str]]]
 
 
@@ -72,6 +85,7 @@ class NativeRuntimeV2:
         approval_callback: ApprovalCallback | None = None,
         permission_policy: Any | None = None,
         prefetch_provider: PrefetchProvider | None = None,
+        interaction_coordinator: InteractionCoordinator | None = None,
     ) -> None:
         self.llm = llm
         self.tools = tool_registry
@@ -88,6 +102,9 @@ class NativeRuntimeV2:
         # gates every tool call; ASK routes into approval_callback.
         self.permission_policy = permission_policy
         self.prefetch_provider = prefetch_provider
+        self.interaction_coordinator = interaction_coordinator or getattr(
+            permission_policy, "interaction_coordinator", None
+        )
         self._pre_tool_hooks: list[tuple[str, Any]] = []
         self._post_tool_hooks: list[tuple[str, Any]] = []
         self._failure_tool_hooks: list[tuple[str, Any]] = []
@@ -112,10 +129,81 @@ class NativeRuntimeV2:
         on_progress: Any = None,
         inbox_interrupt_provider: Any = None,
     ) -> TaskResult:
+        """Run one native turn with a durable permission failure boundary."""
+
+        try:
+            return await self._run_impl(
+                system_prompt,
+                user_message,
+                context_messages=context_messages,
+                attachment_refs=attachment_refs,
+                task=task,
+                allowed_tools=allowed_tools,
+                on_progress=on_progress,
+                inbox_interrupt_provider=inbox_interrupt_provider,
+            )
+        except BaseException as exc:
+            if task is not None:
+                cleanup = asyncio.create_task(
+                    self._settle_aborted_runtime(
+                        task=task,
+                        error=exc,
+                    )
+                )
+                # Runtime owners are cancelled during ordered Engine
+                # shutdown.  Keep the Store-backed cleanup joined even if a
+                # second cancel arrives; shutdown must be able to prove there
+                # is no live runtime projection before it closes the Store.
+                while not cleanup.done():
+                    try:
+                        await asyncio.shield(cleanup)
+                    except asyncio.CancelledError:
+                        continue
+                await cleanup
+            raise
+
+    async def _run_impl(
+        self,
+        system_prompt: str,
+        user_message: str,
+        context_messages: list[dict[str, Any]] | None = None,
+        attachment_refs: list[dict[str, Any]] | None = None,
+        task: Task | None = None,
+        allowed_tools: list[str] | None = None,
+        on_progress: Any = None,
+        inbox_interrupt_provider: Any = None,
+    ) -> TaskResult:
         if task is not None:
             ensure_task_execution_context(task, self.config)
+            await self._refresh_durable_tool_permits(task)
+            self._assert_durable_tool_permits_resumable(task)
         runtime_session_id = self._runtime_session_id(task)
         conversation_turn_id = self._conversation_turn_id(task, runtime_session_id)
+        continue_after_tool_result = bool(
+            self._runtime_resume_payload(task).get("continue_after_tool_result")
+        )
+        attempt_user_seed_required = bool(
+            task is not None
+            and (task.metadata or {}).get(
+                "_runtime_v2_attempt_user_seed_required", False
+            )
+        )
+        attempt_user_seed_receipt: dict[str, Any] = {}
+        if (
+            attempt_user_seed_required
+            and task is not None
+            and not self._approved_resume_tool_call(task)
+            and not continue_after_tool_result
+        ):
+            attempt_user_seed_receipt = await self._ensure_attempt_user_turn_seed(
+                task,
+                user_message,
+                runtime_session_id=runtime_session_id,
+                conversation_turn_id=conversation_turn_id,
+            )
+            user_message = str(
+                attempt_user_seed_receipt.get("content", "") or user_message
+            )
         user_content = self.llm.prepare_user_message_content(
             user_message,
             attachment_refs=attachment_refs,
@@ -126,7 +214,26 @@ class NativeRuntimeV2:
             user_message=user_message,
             context_messages=context_messages,
             task=task,
+            suppress_resume_user_append=(
+                attempt_user_seed_required or bool(attempt_user_seed_receipt)
+            ),
         )
+        if continue_after_tool_result and task is not None:
+            store = getattr(self.memory_manager, "store", None)
+            clear_marker = getattr(
+                store, "set_task_runtime_continuation_marker", None
+            )
+            if not callable(clear_marker):
+                raise RuntimeError(
+                    "durable runtime continuation marker store is unavailable"
+                )
+            persisted = await clear_marker(
+                task.id,
+                runtime_session_id=runtime_session_id,
+                enabled=False,
+            )
+            task.context_snapshot = dict(persisted.context_snapshot or {})
+            task.metadata = dict(persisted.metadata or {})
         tool_schemas = self.llm.get_tool_definitions(self.tools.get_schemas(allowed=allowed_tools))
         planner = ToolPlanner(
             self.tools,
@@ -137,7 +244,6 @@ class NativeRuntimeV2:
             guardian=self.config.autonomy.permissions_v2.guardian,
         )
         todo_state: list[dict[str, Any]] = self._restore_task_ledger(task)
-        current_runtime_messages: list[dict[str, Any]] = []
         runtime_status: dict[str, Any] = {
             "current_tool": None,
             "queue_depth": 0,
@@ -250,6 +356,9 @@ class NativeRuntimeV2:
             planner=planner,
             permission_resolver=permission_resolver,
             hook_bus=hook_bus,
+            controller_tool_fence=RuntimeCompanyControllerToolFence(
+                store=self._controller_tool_fence_store()
+            ),
             runtime_tool_handler=lambda tool_name, arguments: self._handle_runtime_tool(
                 subagents=subagents,
                 tool_name=tool_name,
@@ -291,12 +400,17 @@ class NativeRuntimeV2:
                 "artifact_manifest": list(runtime_notes.get("artifact_manifest", []) or []),
             },
         )
-        await self._seed_user_turn(
-            task,
-            user_message,
-            runtime_session_id=runtime_session_id,
-            conversation_turn_id=conversation_turn_id,
-        )
+        if (
+            not attempt_user_seed_required
+            and not self._approved_resume_tool_call(task)
+            and not continue_after_tool_result
+        ):
+            await self._seed_user_turn(
+                task,
+                user_message,
+                runtime_session_id=runtime_session_id,
+                conversation_turn_id=conversation_turn_id,
+            )
         await self._emit_prompt_prefix_state(
             runtime_session_id=runtime_session_id,
             task=task,
@@ -305,8 +419,146 @@ class NativeRuntimeV2:
             base_prefix_len=base_prefix_len,
         )
         await self._emit_status_snapshot(runtime_session_id, task, runtime_status)
-
         for iteration in range(self.max_iterations):
+            await self._refresh_durable_tool_permits(task)
+            self._assert_durable_tool_permits_resumable(task)
+            approved_resume_tool_call = self._approved_resume_tool_call(
+                task,
+                state="ready",
+            )
+            if approved_resume_tool_call:
+                resume_call = {
+                    "id": str(approved_resume_tool_call.get("id", "") or ""),
+                    "function": str(approved_resume_tool_call.get("function", "") or ""),
+                    "arguments": dict(approved_resume_tool_call.get("arguments", {}) or {}),
+                    "_approval_permit": dict(approved_resume_tool_call),
+                }
+                if bool(approved_resume_tool_call.get("approved")):
+                    effect_started = await self._begin_durable_tool_permission_effect(
+                        task,
+                        approved_resume_tool_call,
+                    )
+                    if not effect_started:
+                        raise RuntimeError(
+                            "durable ToolCall permission lease was lost before execution"
+                        )
+                    # The atomic begin command persisted both the checkpoint
+                    # effect fence and Task permit state. Refresh that fact;
+                    # never follow it with a stale second ledger write.
+                    await self._refresh_durable_tool_permits(task)
+                    executing_permit = self._approved_resume_tool_call(
+                        task,
+                        tool_call_id=str(resume_call.get("id", "") or ""),
+                        state="executing",
+                    )
+                    if not executing_permit:
+                        raise RuntimeError(
+                            "durable ToolCall permit did not enter executing state"
+                        )
+                    resume_call["_approval_permit"] = executing_permit
+                    resumed_results = await executor.execute(
+                        [resume_call],
+                        task=task,
+                        on_progress=on_progress,
+                    )
+                    if not resumed_results:
+                        raise RuntimeError("approved ToolCall produced no execution result")
+                    resumed_item = resumed_results[0]
+                else:
+                    denied_result = self._canonical_exact_tool_call_denial_result(
+                        permit=approved_resume_tool_call,
+                    )
+                    denied_decision = permission_resolver.decision_from_result(
+                        resume_call["function"],
+                        resume_call["arguments"],
+                        denied_result,
+                    )
+                    resumed_item = {
+                        "tool_call": resume_call,
+                        "result": denied_result,
+                        "permission_decision": denied_decision,
+                        "stop_batch_on_failure": False,
+                        "hook_metadata": {"durable_tool_permission": True},
+                    }
+                self._update_runtime_notes(runtime_notes, [resumed_item])
+                resumed_result = dict(resumed_item.get("result", {}) or {})
+                clipped_resume_result = self._clip_tool_result_for_history(
+                    resume_call["function"],
+                    resumed_result,
+                )
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": resume_call["id"],
+                    "content": json.dumps(
+                        clipped_resume_result,
+                        ensure_ascii=False,
+                        default=str,
+                    ),
+                })
+                result_payload = resumed_result.get("result", {})
+                if isinstance(result_payload, dict):
+                    aggregated_artifacts = self._merge_artifacts(
+                        aggregated_artifacts,
+                        result_payload,
+                    )
+                permission_finished = await self._persist_tool_result(
+                    task,
+                    resume_call,
+                    clipped_resume_result,
+                    resumed_item.get("permission_decision"),
+                    runtime_session_id=runtime_session_id,
+                    hook_metadata={
+                        **dict(resumed_item.get("hook_metadata", {}) or {}),
+                        "durable_tool_permission": True,
+                        "approval_checkpoint_id": str(
+                            approved_resume_tool_call.get("checkpoint_id", "") or ""
+                        ),
+                    },
+                )
+                if not permission_finished:
+                    await self._set_approved_resume_tool_call_state(
+                        task,
+                        {
+                            **approved_resume_tool_call,
+                            "state": "result_persisted",
+                        },
+                    )
+                    await self._complete_durable_tool_permission(
+                        task=task,
+                        item=resumed_item,
+                        runtime_session_id=runtime_session_id,
+                    )
+                await self._emit_runtime_event(
+                    runtime_session_id,
+                    task,
+                    "approved_tool_call_resumed",
+                    {
+                        "tool_call_id": resume_call["id"],
+                        "tool_name": resume_call["function"],
+                        "approval_checkpoint_id": str(
+                            approved_resume_tool_call.get("checkpoint_id", "") or ""
+                        ),
+                    },
+                )
+                await self._refresh_durable_tool_permits(task)
+                self._assert_durable_tool_permits_resumable(task)
+                approved_resume_tool_call = self._approved_resume_tool_call(
+                    task,
+                    state="ready",
+                )
+                if approved_resume_tool_call:
+                    # A task can own several independently approved calls.  The
+                    # keyed permit ledger preserves all of them; drain each
+                    # exact call before asking the LLM for another command.
+                    continue
+            # A second controller can durably append another approved call
+            # while this runner is finishing the first one.  Refresh at the
+            # model boundary so the original assistant command is always
+            # drained before a new LLM turn can be generated.
+            await self._refresh_durable_tool_permits(task)
+            self._assert_durable_tool_permits_resumable(task)
+            if self._approved_resume_tool_call(task, state="ready"):
+                continue
             await self._emit_runtime_event(
                 runtime_session_id,
                 task,
@@ -537,23 +789,22 @@ class NativeRuntimeV2:
                             },
                         )
             except Exception as exc:
-                rate_limit_checker = getattr(self.llm, "is_rate_limit_error", None)
-                if callable(rate_limit_checker) and rate_limit_checker(exc):
+                quota_error = self._provider_quota_error(exc)
+                if quota_error is not None:
                     # Quota/rate-limit rejections never reach the model, so
                     # conversation-feedback retries cannot help — surface a
                     # typed error for the dispatcher to park on instead of
                     # burning retries and failing the work item (OBS-6).
                     await self._cancel_early_tool_runs(early_tool_runs)
-                    await self._emit_runtime_event(
-                        runtime_session_id,
-                        task,
-                        "provider_quota_exhausted",
-                        {
-                            "iteration": iteration + 1,
-                            "message": str(exc)[:600],
-                        },
+                    await self._emit_provider_quota_exhausted(
+                        runtime_session_id=runtime_session_id,
+                        task=task,
+                        iteration=iteration,
+                        error=exc,
                     )
-                    raise ProviderQuotaExhaustedError(str(exc)) from exc
+                    if quota_error is exc:
+                        raise
+                    raise quota_error from exc
                 if self.llm.is_context_overflow_error(exc) and overflow_retries < max_overflow_retries:
                     overflow_retries += 1
                     messages = await self._apply_context_pipeline(
@@ -692,7 +943,6 @@ class NativeRuntimeV2:
                     for item in tool_calls
                 ]
             messages.append(assistant_message)
-            current_runtime_messages = [dict(message) for message in messages]
             await self._persist_assistant_turn(
                 task,
                 assistant_text,
@@ -717,7 +967,7 @@ class NativeRuntimeV2:
                 if on_progress and assistant_text:
                     await self._emit_progress(on_progress, assistant_text, task)
                 active_subagents = subagents.list_agents().get("agents", [])
-                verification_gate = await self._run_verification_gate(
+                await self._run_verification_audit(
                     runtime_session_id=runtime_session_id,
                     task=task,
                     subagents=subagents,
@@ -725,23 +975,6 @@ class NativeRuntimeV2:
                     todo_state=todo_state,
                     runtime_notes=runtime_notes,
                 )
-                if verification_gate is not None:
-                    verification_gate.artifacts = {
-                        **dict(verification_gate.artifacts or {}),
-                        "runtime_session_id": runtime_session_id,
-                        **result_delivery_identity_payload_for_task(
-                            task,
-                            canonical_turn_id=conversation_turn_id,
-                        ),
-                    }
-                    await self._save_runtime_session(
-                        runtime_session_id,
-                        task,
-                        verification_gate.status.value,
-                        dict(verification_gate.artifacts or {}),
-                    )
-                    self._cancel_prefetch(pending_prefetch)
-                    return verification_gate
                 extraction_artifacts = await self._extract_durable_memory(
                     task=task,
                     user_message=user_message,
@@ -869,7 +1102,7 @@ class NativeRuntimeV2:
                 result_payload = result.get("result", {})
                 if isinstance(result_payload, dict):
                     aggregated_artifacts = self._merge_artifacts(aggregated_artifacts, result_payload)
-                await self._persist_tool_result(
+                permission_finished = await self._persist_tool_result(
                     task,
                     call,
                     clipped_result,
@@ -877,6 +1110,21 @@ class NativeRuntimeV2:
                     runtime_session_id=runtime_session_id,
                     hook_metadata=item.get("hook_metadata", {}),
                 )
+                if not permission_finished:
+                    durable_permit = self._approved_resume_tool_call(
+                        task,
+                        tool_call_id=str(call.get("id", "") or ""),
+                    )
+                    if durable_permit:
+                        await self._set_approved_resume_tool_call_state(
+                            task,
+                            {**durable_permit, "state": "result_persisted"},
+                        )
+                    await self._complete_durable_tool_permission(
+                        task=task,
+                        item=item,
+                        runtime_session_id=runtime_session_id,
+                    )
 
         await self._save_runtime_session(runtime_session_id, task, "failed", {"reason": "max_iterations"})
         self._cancel_prefetch(pending_prefetch)
@@ -887,6 +1135,20 @@ class NativeRuntimeV2:
             cost=total_cost,
             token_usage=total_usage,
         )
+
+    def _controller_tool_fence_store(self) -> Any:
+        """Resolve the canonical Store without coupling the executor to memory."""
+
+        candidates = (
+            getattr(self.memory_manager, "store", None),
+            getattr(self.interaction_coordinator, "store", None),
+        )
+        for store in candidates:
+            if callable(
+                getattr(store, "delegation_run_controller_lease_is_current", None)
+            ):
+                return store
+        return next((store for store in candidates if store is not None), None)
 
     async def _handle_runtime_tool(
         self,
@@ -958,9 +1220,7 @@ class NativeRuntimeV2:
         if task:
             runtime_resume = self._runtime_resume_payload(task)
             runtime_session_id = str(
-                runtime_resume.get("runtime_session_id")
-                or (task.metadata.get("runtime_v2", {}) or {}).get("runtime_session_id")
-                or ""
+                runtime_resume.get("runtime_session_id") or ""
             ).strip()
             if runtime_session_id:
                 return runtime_session_id
@@ -975,6 +1235,269 @@ class NativeRuntimeV2:
             return {}
         raw_resume = context_snapshot.get("runtime_resume", {})
         return dict(raw_resume) if isinstance(raw_resume, dict) else {}
+
+    def _approved_resume_tool_calls(self, task: Task | None) -> dict[str, dict[str, Any]]:
+        if task is None:
+            return {}
+        runtime_resume = self._runtime_resume_payload(task)
+        raw_calls = runtime_resume.get("approved_tool_calls")
+        if raw_calls is None:
+            return {}
+        if not isinstance(raw_calls, dict):
+            raise RuntimeError("canonical approved_tool_calls is not a mapping")
+        records = {
+            str(fingerprint): dict(record)
+            for fingerprint, record in dict(raw_calls or {}).items()
+            if isinstance(record, dict)
+        }
+        if len(records) != len(raw_calls):
+            raise RuntimeError("canonical approved_tool_calls contains an invalid permit")
+        required = (
+            "id",
+            "function",
+            "fingerprint",
+            "runtime_session_id",
+            "checkpoint_id",
+            "task_id",
+        )
+        for fingerprint, record in records.items():
+            if (
+                not fingerprint
+                or not all(
+                    str(record.get(key, "") or "").strip() for key in required
+                )
+                or not isinstance(record.get("arguments"), dict)
+            ):
+                raise RuntimeError(
+                    "canonical exact ToolCall permit has incomplete ownership"
+                )
+        return records
+
+    def _approved_resume_tool_call(
+        self,
+        task: Task | None,
+        *,
+        tool_call_id: str = "",
+        fingerprint: str = "",
+        state: str = "",
+    ) -> dict[str, Any]:
+        records = self._approved_resume_tool_calls(task)
+        if state:
+            records = {
+                key: record
+                for key, record in records.items()
+                if str(record.get("state", "") or "") == str(state)
+            }
+        if fingerprint:
+            return dict(records.get(str(fingerprint), {}) or {})
+        if tool_call_id:
+            return next(
+                (
+                    dict(record)
+                    for record in records.values()
+                    if str(record.get("id", "") or "") == str(tool_call_id)
+                ),
+                {},
+            )
+        return dict(next(iter(records.values()), {}) or {})
+
+    @staticmethod
+    def _canonical_exact_tool_call_denial_result(
+        *,
+        approval: dict[str, Any] | None = None,
+        permit: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Build the one canonical ToolResult for a durable owner denial.
+
+        A live callback has the richest structured approval payload, while a
+        restart begins with only the persisted exact-call permit.  Merge the
+        two representations without replacing live policy evidence, then
+        force the two decision fields whose meaning is fixed by this result.
+        """
+
+        canonical_approval = dict(approval or {})
+        durable_permit = dict(permit or {})
+        permit_approval = {
+            "approval_checkpoint_id": durable_permit.get("checkpoint_id"),
+            "approved_tool_call_id": durable_permit.get("id"),
+            "approved_tool_call_fingerprint": durable_permit.get("fingerprint"),
+            "approval_claim_id": durable_permit.get("claim_id"),
+            "approval_consumer_id": durable_permit.get("consumer_id"),
+            "approval_checkpoint_type": durable_permit.get("checkpoint_type"),
+            "approval_checkpoint_project_id": durable_permit.get(
+                "checkpoint_project_id"
+            ),
+        }
+        for key, value in permit_approval.items():
+            if value not in (None, "") and not canonical_approval.get(key):
+                canonical_approval[key] = value
+        canonical_approval.setdefault(
+            "policy_source",
+            "durable_tool_permission",
+        )
+        canonical_approval.setdefault(
+            "rationale",
+            "The owner denied this exact ToolCall.",
+        )
+        canonical_approval.setdefault("risk_level", "high")
+        canonical_approval.setdefault("confidence", 1.0)
+        canonical_approval.update({"action": "reject", "human_reply": "deny"})
+        return {
+            "error": "The owner denied this exact ToolCall.",
+            "success": False,
+            "approval": canonical_approval,
+        }
+
+    def _assert_durable_tool_permits_resumable(self, task: Task | None) -> None:
+        """Keep every LLM/effect boundary behind a ready-only permit queue.
+
+        A retained ``executing`` permit may already have crossed an external
+        effect, while ``result_persisted`` needs checkpoint reconciliation.
+        Neither can be treated as an empty queue and followed by a new model
+        turn.  Raising here routes the whole canonical queue through the joined
+        abort settlement path, which terminalizes or releases each permit with
+        its exact state semantics.
+        """
+
+        for permit in self._approved_resume_tool_calls(task).values():
+            state = str(permit.get("state", "") or "").strip()
+            if state == "ready":
+                continue
+            if state not in {"denied", "executing", "result_persisted"}:
+                raise RuntimeError(
+                    f"durable ToolCall permit has unknown state {state!r}"
+                )
+            raise RuntimeError(
+                "durable ToolCall permit requires exact recovery before a new "
+                f"runtime turn (state={state})"
+            )
+
+    async def _set_approved_resume_tool_call_state(
+        self,
+        task: Task | None,
+        record: dict[str, Any] | None,
+        *,
+        remove_fingerprint: str = "",
+    ) -> None:
+        if task is None:
+            return
+        approved_calls = self._approved_resume_tool_calls(task)
+        fingerprint = str(remove_fingerprint or "").strip()
+        if record is None:
+            if not fingerprint:
+                if len(approved_calls) != 1:
+                    raise ValueError(
+                        "removing a durable ToolCall permit requires its fingerprint"
+                    )
+                fingerprint = next(iter(approved_calls))
+            existing = dict(approved_calls.get(fingerprint, {}) or {})
+            runtime_session_id = str(
+                existing.get("runtime_session_id", "") or ""
+            ).strip()
+        else:
+            fingerprint = str(record.get("fingerprint", "") or "").strip()
+            if not fingerprint:
+                raise ValueError("approved ToolCall record requires fingerprint")
+            runtime_session_id = str(
+                record.get("runtime_session_id", "") or ""
+            ).strip()
+        store = getattr(self.memory_manager, "store", None)
+        update = getattr(store, "update_task_runtime_tool_permit", None)
+        if not callable(update):
+            raise RuntimeError(
+                "durable ToolCall permit store is unavailable"
+            )
+        persisted = await update(
+            task.id,
+            runtime_session_id=runtime_session_id,
+            fingerprint=fingerprint,
+            permit=dict(record) if record is not None else None,
+            expected_permit=(existing if record is None else None),
+        )
+        task.context_snapshot = dict(persisted.context_snapshot or {})
+        task.metadata = dict(persisted.metadata or {})
+
+    async def _refresh_durable_tool_permits(self, task: Task | None) -> None:
+        """Refresh only the Store-owned exact-permit ledger on ``task``.
+
+        Several checkpoint consumers may approve independent ToolCalls for the
+        same persisted assistant turn.  Their atomic Store merges must be
+        visible to the single elected runtime before it crosses the next LLM
+        boundary; a controller-local Task object is not an ownership source.
+        """
+
+        if task is None:
+            return
+        store = getattr(self.memory_manager, "store", None)
+        get_ledger = getattr(store, "get_task_runtime_tool_ledger", None)
+        if not callable(get_ledger):
+            return
+        ledger = await get_ledger(
+            task.id,
+            project_id=str(getattr(task, "project_id", "") or "default"),
+        )
+        if ledger is None:
+            raise RuntimeError(
+                f"task {task.id} disappeared while draining durable ToolCalls"
+            )
+        apply_to_task = getattr(ledger, "apply_to_task", None)
+        if not callable(apply_to_task):
+            raise RuntimeError("canonical durable ToolCall ledger snapshot is invalid")
+        apply_to_task(task)
+
+    async def _durable_tool_permit_matches_context(
+        self,
+        *,
+        permit: dict[str, Any],
+        task: Task | None,
+        runtime_session_id: str,
+    ) -> bool:
+        """Verify that a one-shot permit is still owned by its durable row."""
+
+        if task is None:
+            return False
+        store = getattr(self.memory_manager, "store", None)
+        getter = getattr(store, "get_execution_checkpoint", None)
+        if not callable(getter):
+            return False
+        checkpoint_id = str(permit.get("checkpoint_id", "") or "").strip()
+        checkpoint_type = str(
+            permit.get("checkpoint_type", "") or "tool_permission"
+        ).strip()
+        project_id = str(
+            permit.get("checkpoint_project_id")
+            or getattr(task, "project_id", "")
+            or "default"
+        ).strip() or "default"
+        checkpoint = await getter(
+            checkpoint_id,
+            project_id=project_id,
+            checkpoint_type=checkpoint_type,
+        )
+        if checkpoint is None or str(checkpoint.status or "") != "consuming":
+            return False
+        payload = dict(checkpoint.payload or {})
+        interaction = dict(payload.get("interaction", {}) or {})
+        ownership = dict(interaction.get("ownership", {}) or {})
+        tool_call = dict(payload.get("tool_call", {}) or {})
+        claim = dict(interaction.get("claim", {}) or {})
+        task_id = str(getattr(task, "id", "") or "").strip()
+        return bool(
+            checkpoint_type == "tool_permission"
+            and str(checkpoint.task_id or ownership.get("waiting_task_id") or "").strip()
+            == task_id
+            and str(ownership.get("waiting_task_id", "") or "").strip() == task_id
+            and str(tool_call.get("id", "") or "").strip()
+            == str(permit.get("id", "") or "").strip()
+            and str(tool_call.get("runtime_session_id", "") or "").strip()
+            == str(runtime_session_id or "").strip()
+            and str(tool_call.get("fingerprint", "") or "").strip()
+            == str(permit.get("fingerprint", "") or "").strip()
+            and str(claim.get("claim_id", "") or "").strip()
+            == str(permit.get("claim_id", "") or "").strip()
+            and str(claim.get("consumer_id", "") or "").strip()
+            == str(permit.get("consumer_id", "") or "").strip()
+        )
 
     def _conversation_turn_id(self, task: Task | None, runtime_session_id: str) -> str:
         if task:
@@ -1023,6 +1546,7 @@ class NativeRuntimeV2:
                     context,
                     permission_resolver=permission_resolver,
                     on_progress=on_progress,
+                    runtime_session_id=runtime_session_id,
                 ),
             )
             hook_bus.register_post_hook("approval_metadata", self._approval_post_hook)
@@ -1042,6 +1566,7 @@ class NativeRuntimeV2:
         *,
         permission_resolver: RuntimePermissionAdapter,
         on_progress: Any = None,
+        runtime_session_id: str = "",
     ) -> dict[str, Any] | None:
         predicted = context.predicted_permission
         if predicted is not None and getattr(predicted, "resolution", None) == PermissionResolution.DENY:
@@ -1076,6 +1601,73 @@ class NativeRuntimeV2:
                 "stop_execution": True,
                 "stop_batch_on_failure": True,
             }
+        permit = context.call.get("_approval_permit")
+        if isinstance(permit, dict) and bool(permit.get("approved")):
+            permit_call_id = str(permit.get("id", "") or "").strip()
+            permit_runtime_id = str(permit.get("runtime_session_id", "") or "").strip()
+            permit_task_id = str(permit.get("task_id", "") or "").strip()
+            permit_fingerprint = str(permit.get("fingerprint", "") or "").strip()
+            execution_envelope: dict[str, Any] = {}
+            execution_identity: dict[str, Any] = {}
+            if (
+                context.tool_name in {"shell_exec", "python_exec"}
+                and is_company_runtime_task(context.task)
+            ):
+                execution_envelope = build_company_opaque_execution_plan(
+                    context.task,
+                    context.tool_name,
+                    context.arguments,
+                ).envelope
+                execution_identity = company_opaque_execution_identity(
+                    context.task
+                )
+            actual_fingerprint = exact_tool_call_fingerprint(
+                tool_call_id=str(context.call.get("id", "") or ""),
+                tool_name=context.tool_name,
+                arguments=dict(context.arguments or {}),
+                runtime_session_id=permit_runtime_id,
+                execution_envelope=execution_envelope,
+                execution_identity=execution_identity,
+            )
+            durable_owner_matches = await self._durable_tool_permit_matches_context(
+                permit=permit,
+                task=context.task,
+                runtime_session_id=runtime_session_id,
+            )
+            if (
+                durable_owner_matches
+                and
+                permit_call_id
+                and permit_call_id == str(context.call.get("id", "") or "")
+                and permit_runtime_id == str(runtime_session_id or "")
+                and permit_task_id
+                and permit_task_id == str(getattr(context.task, "id", "") or "")
+                and permit_fingerprint
+                and permit_fingerprint == actual_fingerprint
+                and dict(permit.get("execution_envelope", {}) or {})
+                == execution_envelope
+                and dict(permit.get("execution_identity", {}) or {})
+                == execution_identity
+            ):
+                canonical_permit = self._approved_resume_tool_call(
+                    context.task,
+                    tool_call_id=permit_call_id,
+                )
+                if canonical_permit:
+                    context.call["_approval_permit"] = canonical_permit
+                return {
+                    "approval": {
+                        "action": "auto_approve",
+                        "risk_level": "low",
+                        "confidence": 1.0,
+                        "policy_source": "durable_tool_permission",
+                        "rationale": "Exact persisted ToolCall approved by the owner.",
+                        "human_reply": str(permit.get("decision", "") or "approve_once"),
+                        "approval_checkpoint_id": str(permit.get("checkpoint_id", "") or ""),
+                        "approved_tool_call_id": permit_call_id,
+                        "approved_tool_call_fingerprint": permit_fingerprint,
+                    }
+                }
         if self.approval_callback is None or context.tool is None or getattr(context.tool, "runtime_managed", False):
             return None
         requires_prompt = (
@@ -1084,7 +1676,33 @@ class NativeRuntimeV2:
         ) or bool(getattr(context.tool, "requires_confirmation", False))
         if not requires_prompt:
             return None
-        allowed, decision = await self.approval_callback(context.tool, context.arguments, context.task, on_progress)
+        call_context = {
+            "id": str(context.call.get("id", "") or ""),
+            "tool_call_id": str(context.call.get("id", "") or ""),
+            "runtime_session_id": str(runtime_session_id or ""),
+            "batch_id": str(context.call.get("batch_id", "") or ""),
+            "arguments_raw": str(context.call.get("arguments_raw", "") or ""),
+        }
+        try:
+            allowed, decision = await self.approval_callback(
+                context.tool,
+                context.arguments,
+                context.task,
+                on_progress,
+                call_context=call_context,
+            )
+        except TypeError as exc:
+            # Third-party callback adapters may still implement the original
+            # four-argument protocol.  Only fall back for a signature mismatch;
+            # a TypeError raised inside a modern callback must remain visible.
+            if "call_context" not in str(exc):
+                raise
+            allowed, decision = await self.approval_callback(
+                context.tool,
+                context.arguments,
+                context.task,
+                on_progress,
+            )
         approval_payload = {
             "action": getattr(getattr(decision, "action", None), "value", ""),
             "risk_level": getattr(getattr(decision, "risk_level", None), "value", ""),
@@ -1093,8 +1711,113 @@ class NativeRuntimeV2:
             "rationale": str(getattr(decision, "rationale", "") or ""),
             **dict(getattr(decision, "metadata", {}) or {}),
         }
+        approval_checkpoint_id = str(
+            approval_payload.get("approval_checkpoint_id", "") or ""
+        ).strip()
+        durable_denial_permit: dict[str, Any] = {}
+        if approval_checkpoint_id and context.task is not None:
+            permit = self._approved_resume_tool_call(
+                context.task,
+                tool_call_id=str(context.call.get("id", "") or ""),
+            )
+            if (
+                str(permit.get("checkpoint_id", "") or "") == approval_checkpoint_id
+                and str(permit.get("id", "") or "")
+                == str(context.call.get("id", "") or "")
+                and str(permit.get("task_id", "") or "")
+                == str(getattr(context.task, "id", "") or "")
+                and str(permit.get("runtime_session_id", "") or "")
+                == str(runtime_session_id or "")
+            ):
+                if allowed and not await self._begin_durable_tool_permission_effect(
+                    context.task,
+                    permit,
+                ):
+                    return {
+                        "result": {
+                            "error": (
+                                "Tool execution blocked because its durable approval "
+                                "lease is no longer owned by this runtime."
+                            ),
+                            "success": False,
+                        },
+                        "stop_execution": True,
+                        "stop_batch_on_failure": True,
+                    }
+                if allowed:
+                    # Exact begin already advanced both checkpoint and permit
+                    # atomically. Pull the canonical state into this Task.
+                    await self._refresh_durable_tool_permits(context.task)
+                    executing_permit = self._approved_resume_tool_call(
+                        context.task,
+                        tool_call_id=str(context.call.get("id", "") or ""),
+                    )
+                    if executing_permit:
+                        context.call["_approval_permit"] = executing_permit
+                else:
+                    permit_is_exact_denial = bool(
+                        str(permit.get("checkpoint_type", "") or "")
+                        == "tool_permission"
+                        and permit.get("approved") is False
+                        and str(permit.get("decision", "") or "") == "deny"
+                        and str(permit.get("state", "") or "") == "ready"
+                        and str(permit.get("function", "") or "")
+                        == context.tool_name
+                        and dict(permit.get("arguments", {}) or {})
+                        == dict(context.arguments or {})
+                        and str(permit.get("fingerprint", "") or "")
+                        == str(
+                            approval_payload.get(
+                                "approved_tool_call_fingerprint",
+                                "",
+                            )
+                            or ""
+                        )
+                        and str(permit.get("id", "") or "")
+                        == str(
+                            approval_payload.get("approved_tool_call_id", "")
+                            or ""
+                        )
+                        and str(permit.get("claim_id", "") or "").strip()
+                        and str(permit.get("consumer_id", "") or "").strip()
+                        and await self._durable_tool_permit_matches_context(
+                            permit=permit,
+                            task=context.task,
+                            runtime_session_id=runtime_session_id,
+                        )
+                    )
+                    if permit_is_exact_denial:
+                        durable_denial_permit = permit
+                        await self._set_approved_resume_tool_call_state(
+                            context.task,
+                            {**permit, "state": "denied"},
+                        )
         if not allowed:
-            permission_resolver.record_denial(context.tool_name, context.arguments)
+            permission_resolver.record_denial(
+                context.tool_name,
+                context.arguments,
+                task=context.task,
+                denial_id=str(context.call.get("id", "") or ""),
+            )
+            durable_human_denial = bool(
+                durable_denial_permit
+                and approval_checkpoint_id
+                and str(approval_payload.get("human_reply", "") or "")
+                .strip()
+                .lower()
+                == "deny"
+            )
+            if durable_human_denial:
+                denial_result = self._canonical_exact_tool_call_denial_result(
+                    approval=approval_payload,
+                    permit=durable_denial_permit,
+                )
+                return {
+                    "approval": dict(denial_result["approval"]),
+                    "result": denial_result,
+                    "stop_execution": True,
+                    "stop_batch_on_failure": True,
+                }
             return {
                 "approval": approval_payload,
                 "result": {
@@ -1154,19 +1877,52 @@ class NativeRuntimeV2:
         user_message: str,
         context_messages: list[dict[str, Any]] | None,
         task: Task | None,
+        suppress_resume_user_append: bool = False,
     ) -> tuple[list[dict[str, Any]], int]:
         runtime_resume = self._runtime_resume_payload(task)
+        ready_permit = self._approved_resume_tool_call(task, state="ready")
+        if ready_permit and (
+            task is None
+            or not task.session_id
+            or not getattr(self.memory_manager, "store", None)
+        ):
+            raise RuntimeError(
+                "approved ToolCall cannot resume without its durable session store"
+            )
         if runtime_resume and task and getattr(self.memory_manager, "store", None) and task.session_id:
             restored = await self._restore_transcript_messages(task)
+            if ready_permit and not restored:
+                raise RuntimeError(
+                    "approved ToolCall has no durable transcript to resume"
+                )
             if restored:
                 sanitizer = getattr(self.llm, "sanitize_tool_call_history", None)
-                if callable(sanitizer):
+                if ready_permit:
+                    restored = self._sanitize_restored_history_for_resume(
+                        restored,
+                        task=task,
+                        sanitizer=(
+                            sanitizer
+                            if callable(sanitizer)
+                            else lambda messages: list(messages)
+                        ),
+                    )
+                elif callable(sanitizer):
                     restored = sanitizer(restored)
                 prefix_messages: list[dict[str, Any]] = [{"role": "system", "content": system_prompt}]
                 if context_messages:
                     prefix_messages.extend(context_messages)
                 messages = [*prefix_messages, *restored]
-                if self._should_append_resume_user_turn(restored, user_message):
+                # An approved restart resumes at the exact unresolved ToolCall
+                # boundary.  Appending a new user turn here would place it
+                # between the assistant tool_call and its tool result and would
+                # force the model to regenerate the command.
+                if (
+                    not self._approved_resume_tool_call(task)
+                    and not bool(runtime_resume.get("continue_after_tool_result"))
+                    and not suppress_resume_user_append
+                    and self._should_append_resume_user_turn(restored, user_message)
+                ):
                     messages.append({"role": "user", "content": user_content})
                 return messages, len(prefix_messages)
         messages: list[dict[str, Any]] = [{"role": "system", "content": system_prompt}]
@@ -1174,6 +1930,132 @@ class NativeRuntimeV2:
             messages.extend(context_messages)
         messages.append({"role": "user", "content": user_content})
         return messages, len(messages)
+
+    def _sanitize_restored_history_for_resume(
+        self,
+        restored: list[dict[str, Any]],
+        *,
+        task: Task,
+        sanitizer: Callable[[list[dict[str, Any]]], list[dict[str, Any]]],
+    ) -> list[dict[str, Any]]:
+        """Sanitize history without deleting an approved pending ToolCall.
+
+        The generic provider sanitizer intentionally drops an unterminated
+        assistant tool-call block.  That is correct for ordinary recovery,
+        but an approved exact ToolCall resumes precisely at that boundary: the
+        runtime must execute it and append its ToolResult before another model
+        turn.  Preserve the one durable pending block while still sanitizing
+        all earlier history.  Any ambiguous or non-adjacent tail fails closed.
+        """
+
+        permits = self._approved_resume_tool_calls(task)
+        ready_records = [
+            dict(record)
+            for record in permits.values()
+            if str(record.get("state", "") or "").strip() == "ready"
+        ]
+        ready_ids = {
+            str(record.get("id", "") or "").strip()
+            for record in ready_records
+        }
+        ready_ids.discard("")
+        if len(ready_ids) != len(ready_records):
+            raise RuntimeError(
+                "approved ToolCall permits have duplicate or empty call ids"
+            )
+        if not ready_ids:
+            return list(sanitizer(restored))
+
+        block_index = -1
+        block_ids: set[str] = set()
+        block_calls: dict[str, dict[str, Any]] = {}
+        for index, message in enumerate(restored):
+            if str(message.get("role", "") or "").strip() != "assistant":
+                continue
+            calls = message.get("tool_calls")
+            if not isinstance(calls, list):
+                continue
+            candidate_calls = {
+                str(call.get("id", "") or "").strip(): dict(call)
+                for call in calls
+                if isinstance(call, dict)
+                and str(call.get("id", "") or "").strip()
+            }
+            if len(candidate_calls) != len(calls):
+                raise RuntimeError(
+                    "approved ToolCall transcript has duplicate or empty call ids"
+                )
+            candidate_ids = set(candidate_calls)
+            if ready_ids & candidate_ids:
+                if block_index >= 0:
+                    raise RuntimeError(
+                        "approved ToolCall permits span multiple transcript blocks"
+                    )
+                block_index = index
+                block_ids = candidate_ids
+                block_calls = candidate_calls
+        if block_index < 0 or not ready_ids.issubset(block_ids):
+            raise RuntimeError(
+                "approved ToolCall has no exact durable assistant transcript block"
+            )
+
+        preserved_tail: list[dict[str, Any]] = []
+        completed_ids: set[str] = set()
+        for message in restored[block_index + 1 :]:
+            role = str(message.get("role", "") or "").strip()
+            tool_call_id = str(message.get("tool_call_id", "") or "").strip()
+            if role != "tool" or tool_call_id not in block_ids:
+                raise RuntimeError(
+                    "approved ToolCall transcript has a non-adjacent recovery tail"
+                )
+            if tool_call_id in completed_ids:
+                raise RuntimeError(
+                    "approved ToolCall transcript has duplicate ToolResults"
+                )
+            completed_ids.add(tool_call_id)
+            preserved_tail.append(dict(message))
+        if completed_ids & ready_ids:
+            raise RuntimeError(
+                "approved ToolCall already has a durable transcript result"
+            )
+        if ready_ids != block_ids - completed_ids:
+            raise RuntimeError(
+                "approved ToolCall transcript contains an unowned pending call"
+            )
+
+        for permit in permits.values():
+            call_id = str(permit.get("id", "") or "").strip()
+            if call_id not in ready_ids:
+                continue
+            call = block_calls.get(call_id, {})
+            function = dict(call.get("function", {}) or {})
+            if str(call.get("type", "function") or "").strip() != "function":
+                raise RuntimeError(
+                    "approved ToolCall transcript has a non-function call type"
+                )
+            name = str(function.get("name", "") or "").strip()
+            if name != str(permit.get("function", "") or "").strip():
+                raise RuntimeError(
+                    "approved ToolCall transcript function does not match permit"
+                )
+            raw_arguments = function.get("arguments", "{}")
+            try:
+                arguments = (
+                    json.loads(raw_arguments)
+                    if isinstance(raw_arguments, str)
+                    else dict(raw_arguments or {})
+                )
+            except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise RuntimeError(
+                    "approved ToolCall transcript arguments are not canonical JSON"
+                ) from exc
+            if arguments != dict(permit.get("arguments", {}) or {}):
+                raise RuntimeError(
+                    "approved ToolCall transcript arguments do not match permit"
+                )
+
+        prefix = list(sanitizer(restored[:block_index]))
+        return [*prefix, dict(restored[block_index]), *preserved_tail]
 
     async def _restore_transcript_messages(self, task: Task) -> list[dict[str, Any]]:
         store = getattr(self.memory_manager, "store", None)
@@ -1759,10 +2641,82 @@ class NativeRuntimeV2:
                     "strategy": strategy,
                 }
             except Exception as retry_exc:
+                quota_error = self._provider_quota_error(retry_exc)
+                if quota_error is not None:
+                    await self._emit_provider_quota_exhausted(
+                        runtime_session_id=runtime_session_id,
+                        task=task,
+                        iteration=iteration,
+                        error=retry_exc,
+                    )
+                    if quota_error is retry_exc:
+                        raise
+                    raise quota_error from retry_exc
                 last_error = retry_exc
                 if not self.llm.is_tool_protocol_error(retry_exc):
                     break
         return None
+
+    def _provider_quota_error(
+        self,
+        error: Exception,
+    ) -> ProviderQuotaExhaustedError | None:
+        chain: list[Exception] = []
+        pending: list[BaseException] = [error]
+        seen: set[int] = set()
+        while pending:
+            current = pending.pop(0)
+            if id(current) in seen:
+                continue
+            seen.add(id(current))
+            if isinstance(current, Exception):
+                chain.append(current)
+            if current.__cause__ is not None:
+                pending.append(current.__cause__)
+            if current.__context__ is not None:
+                pending.append(current.__context__)
+
+        for current in chain:
+            if isinstance(current, ProviderQuotaExhaustedError):
+                if current is error:
+                    return current
+                # Do not re-raise the nested instance from its wrapper: that
+                # would mutate nested.__cause__ back to the wrapper and form
+                # an exception-chain cycle (wrapper -> nested -> wrapper).
+                return ProviderQuotaExhaustedError(str(current))
+
+        rate_limit_checker = getattr(self.llm, "is_rate_limit_error", None)
+        if callable(rate_limit_checker):
+            for current in chain:
+                if rate_limit_checker(current):
+                    return ProviderQuotaExhaustedError(str(current))
+        return None
+
+    async def _emit_provider_quota_exhausted(
+        self,
+        *,
+        runtime_session_id: str,
+        task: Task | None,
+        iteration: int,
+        error: Exception,
+    ) -> None:
+        try:
+            await self._emit_runtime_event(
+                runtime_session_id,
+                task,
+                "provider_quota_exhausted",
+                {
+                    "iteration": iteration + 1,
+                    "message": str(error)[:600],
+                },
+            )
+        except Exception:
+            # Telemetry is best-effort at this recovery boundary. The
+            # dispatcher needs the typed exception to return the claimed
+            # WorkItem to READY; an event sink outage must not replace it.
+            logger.opt(exception=True).warning(
+                "Failed to emit provider_quota_exhausted runtime event"
+            )
 
     @staticmethod
     def _provider_error_feedback_message(
@@ -2883,6 +3837,109 @@ class NativeRuntimeV2:
             final_text = verdict
         return final_text, verdict
 
+    async def _ensure_attempt_user_turn_seed(
+        self,
+        task: Task,
+        user_message: str,
+        *,
+        runtime_session_id: str,
+        conversation_turn_id: str,
+    ) -> dict[str, Any]:
+        """Persist exactly one explicit user correction per WorkItem attempt."""
+
+        revision = str(
+            (task.metadata or {}).get(
+                "_runtime_v2_attempt_user_seed_revision", ""
+            )
+            or ""
+        ).strip()
+        work_item_id = linked_work_item_id_for_task(task)
+        try:
+            attempt_seq = int(
+                (task.metadata or {}).get(
+                    "claimed_work_item_attempt_seq", 0
+                )
+                or 0
+            )
+        except (TypeError, ValueError):
+            attempt_seq = 0
+        if not revision or not work_item_id or attempt_seq <= 0:
+            raise RuntimeError(
+                "attempt user-turn seed lacks a durable WorkItem revision"
+            )
+        seed_payload = {
+            "task_id": str(task.id or "").strip(),
+            "work_item_id": work_item_id,
+            "attempt_seq": attempt_seq,
+        }
+        seed_key = "runtime-v2-attempt-user:" + hashlib.sha256(
+            json.dumps(
+                seed_payload,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        store = getattr(self.memory_manager, "store", None)
+        ensure_seed = getattr(store, "ensure_runtime_user_turn_seed", None)
+        if not callable(ensure_seed):
+            raise RuntimeError(
+                "durable runtime user-turn seed store is unavailable"
+            )
+        receipt = dict(
+            await ensure_seed(
+            task=task,
+            runtime_session_id=runtime_session_id,
+            seed_key=seed_key,
+            prompt_revision=revision,
+            content=user_message,
+            metadata={
+                "conversation_turn_id": str(conversation_turn_id or "").strip(),
+                "canonical_turn_id": str(conversation_turn_id or "").strip(),
+                "turn_id": str(conversation_turn_id or "").strip(),
+                "work_item_id": work_item_id,
+                "claimed_work_item_attempt_seq": attempt_seq,
+                "runtime_user_turn_kind": "work_item_attempt_correction",
+            },
+            )
+            or {}
+        )
+        canonical_revision = str(
+            receipt.get("prompt_revision", "") or revision
+        ).strip()
+        canonical_content = str(receipt.get("content", "") or user_message)
+        task.metadata["_runtime_v2_attempt_user_seed_key"] = seed_key
+        task.metadata["_runtime_v2_user_seeded"] = True
+        task.metadata["_runtime_v2_attempt_user_seed_revision"] = canonical_revision
+        try:
+            await self._emit_runtime_event(
+                runtime_session_id,
+                task,
+                "attempt_user_turn_seeded",
+                {
+                    "seed_key": seed_key,
+                    "created": bool(dict(receipt or {}).get("created", False)),
+                    "work_item_id": work_item_id,
+                    "claimed_work_item_attempt_seq": attempt_seq,
+                    "prompt_revision": canonical_revision,
+                    "canonical_reused": bool(
+                        receipt.get("canonical_reused", False)
+                    ),
+                    "inferred_turn_mode": "rework",
+                },
+            )
+        except CompanyRunControllerLeaseLost:
+            raise
+        except Exception:
+            logger.opt(exception=True).warning(
+                "Failed to publish attempt user-turn seed telemetry"
+            )
+        return {
+            **receipt,
+            "content": canonical_content,
+            "prompt_revision": canonical_revision,
+        }
+
     async def _seed_user_turn(
         self,
         task: Task | None,
@@ -3051,18 +4108,76 @@ class NativeRuntimeV2:
                 },
             )
             if store and hasattr(store, "save_runtime_tool_call"):
+                tool_name = str(tool_call.get("function", "") or "")
+                tool_arguments = dict(tool_call.get("arguments", {}) or {})
+                tool_call_metadata = {
+                    "arguments_raw": str(tool_call.get("arguments_raw", "") or ""),
+                    "arguments_parse_error": str(tool_call.get("arguments_parse_error", "") or ""),
+                    "project_id": str(task.project_id or "default").strip()
+                    or "default",
+                    "delegation_run_id": str(
+                        task.metadata.get("delegation_run_id", "") or ""
+                    ).strip(),
+                    "work_item_id": (
+                        linked_work_item_id_for_task(task)
+                        or str(
+                            task.metadata.get(
+                                "_company_parent_work_item_id", ""
+                            )
+                            or ""
+                        ).strip()
+                    ),
+                    "runtime_task_id": str(task.id or "").strip(),
+                    "claimed_work_item_attempt_seq": task.metadata.get(
+                        "claimed_work_item_attempt_seq", 0
+                    )
+                    or 0,
+                }
+                if (
+                    is_company_runtime_task(task)
+                    and tool_name in {"shell_exec", "python_exec"}
+                ):
+                    try:
+                        plan = build_company_opaque_execution_plan(
+                            task,
+                            tool_name,
+                            tool_arguments,
+                        )
+                        execution_identity = company_opaque_execution_identity(
+                            task
+                        )
+                        fingerprint = exact_tool_call_fingerprint(
+                            tool_call_id=str(tool_call.get("id", "") or ""),
+                            tool_name=tool_name,
+                            arguments=tool_arguments,
+                            runtime_session_id=runtime_session_id,
+                            execution_envelope=plan.envelope,
+                            execution_identity=execution_identity,
+                        )
+                        tool_call_metadata.update(
+                            {
+                                "company_opaque_fingerprint": fingerprint,
+                                "company_opaque_execution_envelope_digest": (
+                                    opaque_execution_envelope_digest(
+                                        plan.envelope
+                                    )
+                                ),
+                            }
+                        )
+                    except Exception:
+                        # Approval will fail closed on the same canonical
+                        # builder.  Keep the malformed call for diagnostics,
+                        # but it can never qualify as verification evidence.
+                        pass
                 await store.save_runtime_tool_call(
                     runtime_session_id=runtime_session_id,
                     task_id=task.id,
                     session_id=task.session_id,
                     message_id=message.message_id,
                     tool_call_id=str(tool_call.get("id", "") or ""),
-                    tool_name=str(tool_call.get("function", "") or ""),
-                    arguments=dict(tool_call.get("arguments", {}) or {}),
-                    metadata={
-                        "arguments_raw": str(tool_call.get("arguments_raw", "") or ""),
-                        "arguments_parse_error": str(tool_call.get("arguments_parse_error", "") or ""),
-                    },
+                    tool_name=tool_name,
+                    arguments=tool_arguments,
+                    metadata=tool_call_metadata,
                 )
 
     async def _persist_tool_result(
@@ -3074,9 +4189,9 @@ class NativeRuntimeV2:
         *,
         runtime_session_id: str,
         hook_metadata: dict[str, Any] | None = None,
-    ) -> None:
+    ) -> bool:
         if not task or not self.memory_manager or not task.session_id:
-            return
+            return False
         message = await self.memory_manager.append_session_message(
             session_id=task.session_id,
             role="assistant",
@@ -3093,7 +4208,7 @@ class NativeRuntimeV2:
             },
         )
         if not message:
-            return
+            return False
         store = getattr(self.memory_manager, "store", None)
         await self.memory_manager.append_session_part(
             task.session_id,
@@ -3122,6 +4237,90 @@ class NativeRuntimeV2:
                 content=json.dumps(result, ensure_ascii=False, default=str),
                 metadata={"tool_name": str(call.get("function", "") or "")},
             )
+        result_metadata = {
+            "hook_metadata": dict(hook_metadata or {}),
+            "project_id": str(task.project_id or "default").strip()
+            or "default",
+            "delegation_run_id": str(
+                task.metadata.get("delegation_run_id", "") or ""
+            ).strip(),
+            "work_item_id": (
+                linked_work_item_id_for_task(task)
+                or str(
+                    task.metadata.get("_company_parent_work_item_id", "")
+                    or ""
+                ).strip()
+            ),
+            "runtime_task_id": str(task.id or "").strip(),
+            "claimed_work_item_attempt_seq": task.metadata.get(
+                "claimed_work_item_attempt_seq", 0
+            )
+            or 0,
+            "permission_decision": {
+                "resolution": getattr(getattr(decision, "resolution", None), "value", ""),
+                "scope": getattr(getattr(decision, "scope", None), "value", ""),
+                "risk_level": getattr(getattr(decision, "risk_level", None), "value", ""),
+                "rationale": str(getattr(decision, "rationale", "") or ""),
+                "source": str(getattr(decision, "source", "") or ""),
+            },
+        }
+        permit = self._approved_resume_tool_call(
+            task,
+            tool_call_id=str(call.get("id", "") or ""),
+        )
+        if permit:
+            result_metadata.update(
+                {
+                    "company_opaque_fingerprint": str(
+                        permit.get("fingerprint", "") or ""
+                    ).strip(),
+                    "company_opaque_execution_envelope_digest": (
+                        opaque_execution_envelope_digest(
+                            dict(permit.get("execution_envelope", {}) or {})
+                        )
+                    ),
+                }
+            )
+            coordinator = self.interaction_coordinator
+            if coordinator is None:
+                raise RuntimeError(
+                    "durable ToolResult completion requires InteractionCoordinator"
+                )
+            receipt = await coordinator.persist_exact_tool_result(
+                permit,
+                runtime_session_id=runtime_session_id,
+                task_id=task.id,
+                session_id=task.session_id,
+                message_id=message.message_id,
+                tool_call_id=str(call.get("id", "") or ""),
+                tool_name=str(call.get("function", "") or ""),
+                payload=dict(result),
+                metadata=result_metadata,
+                checkpoint_payload_patch={
+                    "approval_result": {
+                        "reply": str(permit.get("decision", "") or ""),
+                        "approved": bool(permit.get("approved")),
+                        "scope": (
+                            "once"
+                            if str(permit.get("decision", "") or "")
+                            == "approve_once"
+                            else str(permit.get("decision", "") or "")
+                        ),
+                        "tool_call_id": str(permit.get("id", "") or ""),
+                        "tool_call_fingerprint": str(
+                            permit.get("fingerprint", "") or ""
+                        ),
+                        "tool_result_persisted": True,
+                    }
+                },
+            )
+            if not receipt.applied:
+                raise RuntimeError(
+                    "durable ToolResult completion lost its interaction claim: "
+                    f"{receipt.outcome}"
+                )
+            await self._refresh_durable_tool_permits(task)
+            return True
         if store and hasattr(store, "save_runtime_tool_result"):
             await store.save_runtime_tool_result(
                 runtime_session_id=runtime_session_id,
@@ -3131,17 +4330,290 @@ class NativeRuntimeV2:
                 tool_call_id=str(call.get("id", "") or ""),
                 tool_name=str(call.get("function", "") or ""),
                 payload=dict(result),
-                metadata={
-                    "hook_metadata": dict(hook_metadata or {}),
-                    "permission_decision": {
-                        "resolution": getattr(getattr(decision, "resolution", None), "value", ""),
-                        "scope": getattr(getattr(decision, "scope", None), "value", ""),
-                        "risk_level": getattr(getattr(decision, "risk_level", None), "value", ""),
-                        "rationale": str(getattr(decision, "rationale", "") or ""),
-                        "source": str(getattr(decision, "source", "") or ""),
-                    }
-                },
+                metadata=result_metadata,
             )
+        return False
+
+    async def _begin_durable_tool_permission_effect(
+        self,
+        task: Task | None,
+        permit: dict[str, Any],
+    ) -> bool:
+        """Fence an exact ToolCall immediately before invoking its executor."""
+
+        if task is None:
+            return False
+        coordinator = self.interaction_coordinator
+        if coordinator is None:
+            return False
+        checkpoint_id = str(permit.get("checkpoint_id", "") or "").strip()
+        claim_id = str(permit.get("claim_id", "") or "").strip()
+        consumer_id = str(permit.get("consumer_id", "") or "").strip()
+        if not checkpoint_id or not claim_id or not consumer_id:
+            return False
+        receipt = await coordinator.begin_exact_tool_effect(permit)
+        return bool(receipt.acquired)
+
+    async def _settle_aborted_runtime(
+        self,
+        *,
+        task: Task,
+        error: BaseException,
+    ) -> None:
+        """Join durable abort cleanup before the runtime owner exits.
+
+        Tool-permission settlement and runtime-session convergence are
+        independent durable facts.  Attempt both and propagate the first
+        cleanup failure so the Engine's ordered shutdown remains fail-closed
+        with its Store open.
+        """
+
+        cleanup_errors: list[BaseException] = []
+        try:
+            await self._settle_interrupted_durable_tool_permissions(
+                task=task,
+                error=error,
+            )
+        except BaseException as exc:
+            cleanup_errors.append(exc)
+        try:
+            await self._terminalize_aborted_runtime_session(
+                task,
+                error=error,
+            )
+        except BaseException as exc:
+            cleanup_errors.append(exc)
+        if cleanup_errors:
+            raise cleanup_errors[0]
+
+    async def _terminalize_aborted_runtime_session(
+        self,
+        task: Task,
+        *,
+        error: BaseException,
+    ) -> None:
+        """Terminalize every aborted native runtime without data loss.
+
+        Controller shutdown normally changes the row to ``suspended`` inside
+        the atomic WorkItem/checkpoint transaction before cancelling this
+        coroutine.  This handler is the complementary boundary for an
+        independent runtime abort.  It never creates a row for a turn which
+        did not reach its initial ``running`` write and it merges the
+        persisted resume/artifact envelope rather than replacing it.  A
+        cancellation is resumable (``suspended``); every other escaping error
+        is terminal (``failed``).
+        """
+
+        runtime_state = dict((task.metadata or {}).get("runtime_v2", {}) or {})
+        runtime_session_id = str(
+            runtime_state.get("runtime_session_id")
+            or self._runtime_resume_payload(task).get("runtime_session_id")
+            or ""
+        ).strip()
+        if not runtime_session_id:
+            return
+        store = getattr(self.memory_manager, "store", None)
+        get_runtime_session = getattr(store, "get_runtime_session", None)
+        if not callable(get_runtime_session):
+            return
+        persisted = await get_runtime_session(runtime_session_id)
+        if persisted is None:
+            return
+        live_statuses = {"running", "starting", "working"}
+        persisted_status = str(persisted.get("status", "") or "").strip().lower()
+        if persisted_status not in live_statuses:
+            runtime_state["status"] = persisted_status
+            task.metadata = dict(task.metadata or {})
+            task.metadata["runtime_v2"] = runtime_state
+            return
+
+        cancelled = isinstance(error, asyncio.CancelledError)
+        terminal_status = "suspended" if cancelled else "failed"
+        interrupted_at = datetime.now().isoformat()
+        terminal_metadata = {
+            **dict(persisted.get("metadata", {}) or {}),
+            "status": terminal_status,
+            "runtime_interrupted_at": interrupted_at,
+            "runtime_interruption_kind": type(error).__name__,
+            "runtime_interruption_error": str(error)[:1000],
+            "runtime_interrupt_reason": (
+                "runtime_owner_cancelled" if cancelled else "runtime_owner_failed"
+            ),
+        }
+        if cancelled:
+            terminal_metadata["runtime_suspend_reason"] = "runtime_owner_cancelled"
+        try:
+            await self._save_runtime_session(
+                runtime_session_id,
+                task,
+                terminal_status,
+                terminal_metadata,
+            )
+        except CompanyRunControllerLeaseLost:
+            # The atomic controller terminal write can win after our initial read.
+            # Its dispatch hold correctly rejects this tail write; accept the
+            # race only when the authoritative transaction already made the
+            # runtime row non-live.
+            current = await get_runtime_session(runtime_session_id)
+            current_status = str(
+                dict(current or {}).get("status", "") or ""
+            ).strip().lower()
+            if current is None or current_status in live_statuses:
+                raise
+            task_runtime_state = dict(
+                (task.metadata or {}).get("runtime_v2", {}) or {}
+            )
+            task_runtime_state["status"] = current_status
+            task.metadata = dict(task.metadata or {})
+            task.metadata["runtime_v2"] = task_runtime_state
+
+    async def _settle_interrupted_durable_tool_permissions(
+        self,
+        *,
+        task: Task,
+        error: BaseException,
+    ) -> None:
+        """Close or release every claimed permit when its runtime aborts.
+
+        Once a call reached ``executing`` its external outcome is uncertain and
+        must never be replayed.  A ``ready`` call has not crossed that boundary,
+        so its claim is released to ``answered`` for exact recovery.
+        """
+
+        coordinator = self.interaction_coordinator
+        if coordinator is None:
+            return
+        await self._refresh_durable_tool_permits(task)
+        permits = list(self._approved_resume_tool_calls(task).values())
+        first_cleanup_error: BaseException | None = None
+        for permit in permits:
+            state = str(permit.get("state", "") or "").strip()
+            if state not in {"ready", "denied", "executing", "result_persisted"}:
+                continue
+            checkpoint_id = str(permit.get("checkpoint_id", "") or "").strip()
+            claim_id = str(permit.get("claim_id", "") or "").strip()
+            consumer_id = str(permit.get("consumer_id", "") or "").strip()
+            if not checkpoint_id or not claim_id or not consumer_id:
+                continue
+            error_patch = {
+                "approval_result": {
+                    "tool_call_id": str(permit.get("id", "") or ""),
+                    "tool_call_fingerprint": str(
+                        permit.get("fingerprint", "") or ""
+                    ),
+                    "error_kind": type(error).__name__,
+                    "error": str(error)[:1000],
+                    "tool_result_persisted": state == "result_persisted",
+                    "outcome_unknown": state == "executing",
+                }
+            }
+            try:
+                receipt = await coordinator.settle_interrupted_exact_tool(
+                    permit,
+                    state=state,
+                    error_kind=type(error).__name__,
+                    payload_patch=error_patch,
+                )
+                checkpoint_status = str(
+                    getattr(receipt.checkpoint, "status", "") or ""
+                ).strip()
+                if receipt.applied or checkpoint_status not in {
+                    "pending",
+                    "answered",
+                    "consuming",
+                    "resuming",
+                }:
+                    await self._set_approved_resume_tool_call_state(
+                        task,
+                        None,
+                        remove_fingerprint=str(
+                            permit.get("fingerprint", "") or ""
+                        ),
+                    )
+            except BaseException as exc:
+                logger.opt(exception=True).warning(
+                    "Could not settle interrupted durable permission {}",
+                    checkpoint_id,
+                )
+                if (
+                    not isinstance(exc, asyncio.CancelledError)
+                    and first_cleanup_error is None
+                ):
+                    first_cleanup_error = exc
+        if first_cleanup_error is not None:
+            raise first_cleanup_error
+
+    async def _complete_durable_tool_permission(
+        self,
+        *,
+        task: Task | None,
+        item: dict[str, Any],
+        runtime_session_id: str,
+    ) -> None:
+        """Resolve a tool-permission lease only after its result is durable."""
+
+        if task is None:
+            return
+        call = dict(item.get("tool_call", {}) or {})
+        permit = self._approved_resume_tool_call(
+            task,
+            tool_call_id=str(call.get("id", "") or ""),
+        )
+        if not permit or str(permit.get("id", "") or "") != str(call.get("id", "") or ""):
+            return
+        checkpoint_id = str(permit.get("checkpoint_id", "") or "").strip()
+        claim_id = str(permit.get("claim_id", "") or "").strip()
+        consumer_id = str(permit.get("consumer_id", "") or "").strip()
+        if not checkpoint_id or not claim_id or not consumer_id:
+            return
+        coordinator = self.interaction_coordinator
+        if coordinator is None:
+            return
+        receipt = await coordinator.finish_exact_tool_permission(
+            permit,
+            payload_patch={
+                "approval_result": {
+                    "reply": str(permit.get("decision", "") or ""),
+                    "approved": bool(permit.get("approved")),
+                    "scope": (
+                        "once"
+                        if str(permit.get("decision", "") or "") == "approve_once"
+                        else str(permit.get("decision", "") or "")
+                    ),
+                    "tool_call_id": str(permit.get("id", "") or ""),
+                    "tool_call_fingerprint": str(permit.get("fingerprint", "") or ""),
+                    "tool_result_persisted": True,
+                }
+            },
+        )
+        if not receipt.applied:
+            logger.warning(
+                "Could not finish durable tool permission {} after result persistence: {}",
+                checkpoint_id,
+                receipt.outcome,
+            )
+            checkpoint_status = str(
+                getattr(receipt.checkpoint, "status", "") or ""
+            ).strip()
+            if checkpoint_status not in {
+                "pending",
+                "answered",
+                "consuming",
+                "resuming",
+            }:
+                await self._set_approved_resume_tool_call_state(
+                    task,
+                    None,
+                    remove_fingerprint=str(
+                        permit.get("fingerprint", "") or ""
+                    ),
+                )
+            return
+        await self._set_approved_resume_tool_call_state(
+            task,
+            None,
+            remove_fingerprint=str(permit.get("fingerprint", "") or ""),
+        )
 
     async def _persist_compaction_boundary(
         self,
@@ -3327,6 +4799,33 @@ class NativeRuntimeV2:
                 project_id=task.project_id if task else "default",
                 status=status,
                 metadata=metadata,
+                controller_run_id=(
+                    str((task.metadata or {}).get("delegation_run_id", "") or "").strip()
+                    if task
+                    else ""
+                ),
+                controller_owner_token=(
+                    str(
+                        (task.metadata or {}).get(
+                            "company_run_controller_owner_token",
+                            "",
+                        )
+                        or ""
+                    ).strip()
+                    if task
+                    else ""
+                ),
+                controller_lease_generation=(
+                    int(
+                        (task.metadata or {}).get(
+                            "company_run_controller_lease_generation",
+                            0,
+                        )
+                        or 0
+                    )
+                    if task
+                    else 0
+                ),
             )
 
     async def _emit_prompt_prefix_state(
@@ -3478,37 +4977,7 @@ class NativeRuntimeV2:
             return True
         return False
 
-    def _verification_block_would_deadlock(self, task: Task | None) -> bool:
-        """Whether parking ``task`` on AWAITING_HUMAN after a failed
-        verification would deadlock the company workflow.
-
-        A failed verification gate normally parks the turn on AWAITING_HUMAN so
-        a human can intervene. That is correct only for user-facing company
-        cards (chiefly the final delivery card routed to a human reviewer): they
-        surface an approval card in the UI. Non-user-visible turns — worker
-        execute, the hidden worker report/handoff card, internal review cards —
-        have no UI surface, so blocking on a human is a guaranteed deadlock: the
-        hidden card stalls, the manager-review work item never spawns, and the
-        parent stays ``waiting_for_children`` with its claim unreleased. For
-        those, the turn should complete (DONE) and flow into the normal
-        manager-review gate, which is the real quality check for worker output.
-
-        Conservative by design: returns True only for cards that demonstrably
-        cannot surface a human approval card. Anything user-visible keeps the
-        existing AWAITING_HUMAN behavior unchanged.
-        """
-        if task is None:
-            return False
-        meta = dict(getattr(task, "metadata", {}) or {})
-        if meta.get("user_visible") is False:
-            return True
-        if meta.get("report_execution_work_item") or meta.get("review_execution_work_item"):
-            return True
-        if meta.get("hidden_from_company_kanban"):
-            return True
-        return False
-
-    async def _run_verification_gate(
+    async def _run_verification_audit(
         self,
         *,
         runtime_session_id: str,
@@ -3517,9 +4986,17 @@ class NativeRuntimeV2:
         messages: list[dict[str, Any]],
         todo_state: list[dict[str, Any]],
         runtime_notes: dict[str, Any],
-    ) -> TaskResult | None:
+    ) -> None:
+        """Record verifier evidence without owning workflow disposition.
+
+        Verification is an advisory runtime audit. Company-mode quality
+        failures are handled by the company contract, manager-review, rework,
+        and final-delivery state machines; task-mode callers receive the same
+        evidence in their result artifacts. Only an explicit interaction such
+        as ``request_user_input`` may create an owner wait.
+        """
         if not self._verification_required(task=task, todo_state=todo_state, runtime_notes=runtime_notes):
-            return None
+            return
         policy = self.config.system.native_runtime.verification_policy
         summary = self._build_verification_prompt(task)
         if task is not None and str(task.metadata.get("execution_mode", "") or "").strip() == "company_mode":
@@ -3638,61 +5115,6 @@ class NativeRuntimeV2:
             task,
             "verification_completed",
             verification_state,
-        )
-        if passed:
-            return None
-        if self._is_task_mode_runtime_task(task):
-            return None
-        if self._verification_block_would_deadlock(task):
-            # The task's company card is not user-visible (worker execute,
-            # hidden report/handoff, internal review). Parking it on
-            # AWAITING_HUMAN can never surface an approval card, so the whole
-            # company run deadlocks: the hidden report turn stalls → the manager
-            # review work item never spawns → the parent stays
-            # waiting_for_children with its claim unreleased. Complete the turn
-            # instead and let the company manager-review gate be the quality
-            # check. The failed verdict is already persisted in runtime_v2
-            # metadata and emitted as verification_completed for audit.
-            logger.warning(
-                "Native verification failed on a non-user-visible company turn; "
-                "completing instead of parking on AWAITING_HUMAN to avoid a "
-                "hidden-card deadlock. task_id=%s work_kind=%s",
-                getattr(task, "id", ""),
-                (dict(getattr(task, "metadata", {}) or {})).get("work_kind"),
-            )
-            return None
-        active_subagents = subagents.list_agents().get("agents", [])
-        failure_reason = verdict_text or "Verification found blocking issues."
-        if verification_evidence.status == "unavailable":
-            return None
-        return TaskResult(
-            status=TaskStatus.AWAITING_HUMAN,
-            content=failure_reason,
-            artifacts={
-                "runtime_session_id": runtime_session_id,
-                "verification": verification_state,
-                "verification_evidence": verification_evidence.__dict__,
-                "permission_requests": list(runtime_notes.get("permission_details", []) or []),
-                "task_ledger": list(todo_state or []),
-                "prefetch_hits": list(runtime_notes.get("prefetch_hits", []) or []),
-                "compaction_records": [],
-                "active_subagents": active_subagents,
-                "artifact_manifest": list(self._compose_runtime_artifact_manifest(
-                    task=task,
-                    messages=messages,
-                    todo_state=todo_state,
-                    runtime_notes=runtime_notes,
-                    compaction_boundaries=[],
-                    active_subagents=active_subagents,
-                )),
-                "resume_state": self._build_resume_state(
-                    messages=messages,
-                    todo_state=todo_state,
-                    runtime_notes=runtime_notes,
-                    compaction_boundaries=[],
-                    active_subagents=active_subagents,
-                ),
-            },
         )
 
     async def _maybe_update_background_session_memory(

@@ -24,6 +24,10 @@ ACTIVE_COMPANY_RUNTIME_CHECKPOINT_STATUSES: frozenset[str] = frozenset({
     "pending",
     "resuming",
 })
+RUNTIME_AUXILIARY_KINDS: frozenset[str] = frozenset({
+    "meeting_turn",
+    "role_prompt",
+})
 
 
 def _text(value: Any) -> str:
@@ -60,6 +64,10 @@ def _has_company_runtime_marker(task: Any) -> bool:
         return True
     if execution_mode in {"company", "company_mode", "multi_team_org"}:
         return True
+
+    # Canonical work-item/runtime links are stronger than a stale mode field.
+    # They identify actual company-owned execution and must retain its native
+    # isolation boundary unless the external workspace fence is enabled.
     if is_work_item_runtime_metadata(metadata):
         return True
     if linked_work_item_id_for_task(task):
@@ -72,26 +80,75 @@ def _has_company_runtime_marker(task: Any) -> bool:
             "delegation_run_id",
             "work_item_projection_id",
             "work_item_projection_ref",
-            "work_item_role_id",
             "shared_role_session",
         )
     ):
         return True
-    # Old company records may predate exec_mode.  An explicit task-mode marker
-    # wins over the legacy profile hint.
+
+    # ``work_item_role_id`` is also used by Task mode for its single
+    # ``task_generalist`` execution identity.  It is only a legacy company
+    # hint, not a canonical work-item link, so an explicit Task marker must
+    # win over it.  Previously this check happened too late and every Task-mode
+    # external agent was rejected at the company isolation fence, causing an
+    # invisible fallback to Native Runtime.
     explicitly_task_mode = (
         exec_mode in {"task", "project", "single"}
         or mode == "task"
         or execution_mode in {"task", "task_mode", "project"}
         or _text(metadata.get("task_mode_contract")) == "single_full_capability_main_agent"
     )
-    return not explicitly_task_mode and bool(_text(metadata.get("company_profile")))
+    if explicitly_task_mode:
+        return False
+    return bool(
+        _text(metadata.get("work_item_role_id"))
+        or _text(metadata.get("company_profile"))
+    )
 
 
 def is_company_runtime_task(task: Any) -> bool:
     """Return whether durable Task metadata identifies company-owned work."""
 
     return _has_company_runtime_marker(task)
+
+
+def requires_native_company_execution(task: Any) -> bool:
+    """Whether an unisolated external process is forbidden for this Task."""
+
+    metadata = _metadata(task)
+    assigned_external_agent = _text(getattr(task, "assigned_external_agent", ""))
+    external_fence = _text(metadata.get("external_company_execution_fence"))
+    if (
+        is_company_runtime_task(task)
+        and assigned_external_agent
+        and metadata.get("external_company_execution_allowed") is True
+        and external_fence == "validated_workspace"
+    ):
+        return False
+    return bool(
+        is_company_runtime_task(task)
+        or metadata.get("recruitment_planning") is True
+        or metadata.get("company_runtime_auxiliary_task") is True
+    )
+
+
+def is_runtime_auxiliary_task(task: Any) -> bool:
+    """Return whether *task* is an internal, non-user-visible runtime turn.
+
+    Auxiliary Tasks are durable execution envelopes needed by RuntimeV2's
+    exact ledger.  They deliberately are not WorkItems, chat sessions, or
+    kanban cards.  The generic marker covers non-company meeting turns while
+    the company marker additionally selects Store's controller/source fence.
+    """
+
+    metadata = _metadata(task)
+    kind = _text(metadata.get("runtime_auxiliary_kind"))
+    return bool(
+        kind in RUNTIME_AUXILIARY_KINDS
+        and (
+            metadata.get("runtime_auxiliary_task") is True
+            or metadata.get("company_runtime_auxiliary_task") is True
+        )
+    )
 
 
 def is_pure_company_ui_anchor(task: Any, runtime_session_id: str) -> bool:
@@ -187,7 +244,9 @@ class CompanyRuntimeIdentityIndex:
     """Session-first index over preloaded Tasks and checkpoints."""
 
     def __init__(self, tasks: Iterable[Any], checkpoints: Iterable[Any] = ()) -> None:
-        self.tasks = tuple(tasks or ())
+        self.tasks = tuple(
+            task for task in (tasks or ()) if not is_runtime_auxiliary_task(task)
+        )
         self.checkpoints = tuple(checkpoints or ())
         self.tasks_by_id = {
             _task_id(task): task
@@ -389,3 +448,110 @@ async def load_company_runtime_identity_index(
             checkpoint_types=sorted(COMPANY_RUNTIME_CHECKPOINT_TYPES),
         ) if callable(checkpoint_getter) else []
     return build_company_runtime_identity_index(tasks, checkpoints)
+
+
+async def resolve_company_interaction_ownership(
+    store: Any,
+    project_id: str,
+    *,
+    waiting_task_id: str = "",
+    waiting_session_id: str = "",
+    execution_parent_task_id: str = "",
+    execution_parent_session_id: str = "",
+    origin_task_id: str = "",
+    root_session_id_hint: str = "",
+    existing_ownership: dict[str, Any] | None = None,
+    require_company_identity: bool = False,
+) -> dict[str, str]:
+    """Resolve the durable actor for one owner interaction.
+
+    The waiting Task remains the execution identity.  Company owner
+    visibility is projected from :class:`CompanyRuntimeIdentity` and its pure
+    UI anchor; an empty canonical anchor is meaningful and therefore remains
+    empty (the root session is then the actor).  A company-owned Task that is
+    present in the Store but cannot be mapped to a runtime fails closed.
+
+    Taskless preflight interactions are still valid.  They are session-owned
+    until company runtime Tasks exist and deliberately do not claim a company
+    runtime identity.
+    """
+
+    project = _text(project_id) or "default"
+    waiting_id = _text(waiting_task_id)
+    waiting_session = _text(waiting_session_id)
+    parent_id = _text(execution_parent_task_id)
+    parent_session = _text(execution_parent_session_id)
+    origin_id = _text(origin_task_id)
+    root_hint = _text(root_session_id_hint)
+    existing = dict(existing_ownership or {})
+
+    identity_index = await load_company_runtime_identity_index(store, project)
+    waiting_task = identity_index.task(waiting_id) if waiting_id else None
+    if waiting_task is not None:
+        waiting_session = waiting_session or _task_session_id(waiting_task)
+        parent_id = parent_id or _text(getattr(waiting_task, "parent_id", ""))
+        parent_session = parent_session or _task_parent_session_id(waiting_task)
+        metadata = _metadata(waiting_task)
+        origin_id = origin_id or _text(metadata.get("origin_task_id"))
+        root_hint = root_hint or _text(
+            metadata.get("company_runtime_root_session_id")
+        )
+
+    identity: CompanyRuntimeIdentity | None = None
+    # A native child may have a process-local role session.  Its durable parent
+    # and origin are the authoritative route to the company runtime, while the
+    # child itself remains ``waiting_task_id`` below.
+    for candidate_task_id in (parent_id, origin_id, waiting_id):
+        if not candidate_task_id:
+            continue
+        identity = identity_index.resolve(task_id=candidate_task_id)
+        if identity is not None:
+            break
+    if identity is None and root_hint:
+        identity = identity_index.resolve(runtime_session_id=root_hint)
+
+    company_owned = bool(
+        require_company_identity
+        or (waiting_task is not None and is_company_runtime_task(waiting_task))
+    )
+    if company_owned and identity is None:
+        raise RuntimeError(
+            f"company owner interaction task {waiting_id!r} has no canonical runtime identity"
+        )
+    if identity is not None and identity.project_id != project:
+        raise RuntimeError("company owner interaction resolved to another project")
+
+    if identity is not None:
+        root_session_id = identity.runtime_session_id
+        ui_anchor_task_id = identity.ui_anchor_task_id
+        company_runtime_session_id = identity.runtime_session_id
+    else:
+        root_session_id = root_hint or parent_session or waiting_session
+        # Only durable, locally addressable Tasks may become a fallback anchor.
+        # Missing/taskless records remain explicitly session-owned.
+        fallback_candidates = (origin_id, parent_id, waiting_id)
+        ui_anchor_task_id = next(
+            (
+                candidate
+                for candidate in fallback_candidates
+                if candidate and identity_index.task(candidate) is not None
+            ),
+            "",
+        )
+        company_runtime_session_id = ""
+
+    return {
+        **{
+            str(key): str(value or "").strip()
+            for key, value in existing.items()
+            if str(key).strip()
+        },
+        "ui_anchor_task_id": _text(ui_anchor_task_id),
+        "ui_anchor_session_id": _text(root_session_id),
+        "waiting_task_id": waiting_id,
+        "waiting_session_id": waiting_session,
+        "execution_parent_task_id": parent_id,
+        "execution_parent_session_id": parent_session,
+        "root_session_id": _text(root_session_id),
+        "company_runtime_session_id": _text(company_runtime_session_id),
+    }

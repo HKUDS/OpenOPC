@@ -39,6 +39,12 @@ MANAGER_DISPATCH_TURN_METADATA_KEYS: tuple[str, ...] = (
     "manager_dispatch_guard_unresolved",
 )
 
+GATE_HARNESS_REWORK_METADATA_KEYS: tuple[str, ...] = (
+    "gate_harness_rework_feedback",
+    "gate_harness_rework_count",
+    "gate_harness_rework_request",
+)
+
 
 def reset_manager_dispatch_turn_metadata(metadata: Mapping[str, Any] | None) -> dict[str, Any]:
     """Return mutable metadata with prior manager-turn outcomes removed.
@@ -79,10 +85,60 @@ def _as_mapping(value: Any) -> dict[str, Any]:
     return {}
 
 
+def safe_rework_count(value: Any) -> int:
+    """Return one non-negative rework count without trusting durable JSON."""
+
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError, OverflowError):
+        return 0
+
+
+def authoritative_gate_harness_rework_metadata(
+    *,
+    task_metadata: Mapping[str, Any] | None,
+    work_item_metadata: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    """Select the sole authority for one deterministic rework attempt.
+
+    Controller-mode gate state is Task-owned.  Presence of *any* Task gate
+    field therefore selects the Task group as a whole, including explicit
+    empty/zero values that clear stale WorkItem projections.  A WorkItem is a
+    compatibility fallback only when the Task has no gate fields at all.
+    """
+
+    task = _as_mapping(task_metadata)
+    work_item = _as_mapping(work_item_metadata)
+    if any(key in task for key in GATE_HARNESS_REWORK_METADATA_KEYS):
+        return {
+            key: task[key]
+            for key in GATE_HARNESS_REWORK_METADATA_KEYS
+            if key in task
+        }
+    return {
+        key: work_item[key]
+        for key in GATE_HARNESS_REWORK_METADATA_KEYS
+        if key in work_item
+    }
+
+
+def has_gate_harness_rework(metadata: Mapping[str, Any] | None) -> bool:
+    """Return whether normalized gate metadata represents a rework turn."""
+
+    normalized = _as_mapping(metadata)
+    feedback = str(
+        normalized.get("gate_harness_rework_feedback", "") or ""
+    ).strip()
+    request = _as_mapping(normalized.get("gate_harness_rework_request", {}))
+    count = safe_rework_count(normalized.get("gate_harness_rework_count", 0))
+    return bool(feedback or request or count > 0)
+
+
 def infer_turn_mode(
     work_item: Any,
     *,
     is_review_entry: bool = False,
+    supplemental_metadata: Mapping[str, Any] | None = None,
 ) -> TurnMode:
     """Classify the turn the agent is about to run.
 
@@ -91,8 +147,24 @@ def infer_turn_mode(
     ``is_review_entry`` should be True when the dispatcher popped a
     ``review-work-item::`` queue entry — those are always reviews,
     even if the underlying work_item metadata is ambiguous.
+    ``supplemental_metadata`` is a narrow Task-side projection used for
+    controller-owned gate-harness rework fields that are not mirrored onto
+    the claimed WorkItem.
     """
     metadata = _as_mapping(getattr(work_item, "metadata", None))
+    # Deterministic gate rework is recorded on the durable Task because the
+    # Task owns the validator/result envelope.  The dispatcher claims the
+    # linked WorkItem (and flips it to RUNNING) before prompt assembly, while
+    # the WorkItem itself may therefore have neither a rework phase nor these
+    # Task-owned fields.  Accept the narrow supplemental projection so the
+    # stateless classifier can still recover the actual turn semantics without
+    # letting unrelated Task metadata override WorkItem identity or priority.
+    # Task presence is authoritative even when its current value is empty/zero;
+    # otherwise a stale WorkItem projection can resurrect an older rework.
+    gate_metadata = authoritative_gate_harness_rework_metadata(
+        task_metadata=supplemental_metadata,
+        work_item_metadata=metadata,
+    )
     kind = str(getattr(work_item, "kind", "") or "").strip().lower()
     phase = _as_phase(getattr(work_item, "phase", None))
 
@@ -122,13 +194,14 @@ def infer_turn_mode(
     # may only see RUNNING. Fall back to the metadata trail the
     # reviewer leaves: ``rework_feedback`` is set on rejection and
     # cleared on approval, and ``review_rework_count`` increments
-    # on each rejection. Either signal means "the previous turn
-    # was rejected", so render this as REWORK.
+    # on each rejection.  Deterministic gate rework uses the parallel
+    # ``gate_harness_rework_*`` trail.  Any of those signals means the
+    # previous output must be corrected, so render this as REWORK.
     if phase == Phase.READY_FOR_REWORK:
         return TurnMode.REWORK
     rework_feedback = str(metadata.get("rework_feedback", "") or "").strip()
-    rework_count = int(metadata.get("review_rework_count", 0) or 0)
-    if rework_feedback or rework_count > 0:
+    rework_count = safe_rework_count(metadata.get("review_rework_count", 0))
+    if rework_feedback or rework_count > 0 or has_gate_harness_rework(gate_metadata):
         return TurnMode.REWORK
 
     # Priority 3: integrate. The parent has dependency_work_item_ids

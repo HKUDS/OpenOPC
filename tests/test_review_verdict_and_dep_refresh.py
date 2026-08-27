@@ -23,7 +23,6 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import MagicMock
 
 from opc.core.models import (
     DelegationWorkItem,
@@ -346,6 +345,175 @@ class RefreshDependentsForRunTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(after.metadata.get("work_item_turn_type"), "deliver")
         self.assertEqual(after.metadata.get("current_turn_mode"), "deliver_required")
         self.assertEqual(after.metadata.get("waiting_on_work_item_ids"), [])
+
+    async def test_final_delivery_absorbs_late_intake_children_before_running(self) -> None:
+        """A delivery card must mirror children added after it was spawned."""
+
+        intake = _make_work_item(
+            work_item_id="intake",
+            run_id="run-late-delivery-deps",
+            phase=Phase.WAITING_FOR_CHILDREN,
+            role_id="ceo",
+            dependency_ids=["coo", "cto", "cmo"],
+        )
+        delivery = _make_work_item(
+            work_item_id="delivery",
+            run_id="run-late-delivery-deps",
+            phase=Phase.RUNNING,
+            role_id="ceo",
+            dependency_ids=["coo"],
+            claimed_by="role-runtime::run-late-delivery-deps::ceo",
+            parent_work_item_id="intake",
+            metadata={
+                "work_kind": "delivery",
+                "delegation_turn_kind": "delivery",
+                "intake_work_item_id": "intake",
+            },
+        )
+        coo = _make_work_item(
+            work_item_id="coo",
+            run_id="run-late-delivery-deps",
+            phase=Phase.APPROVED,
+            role_id="coo",
+            parent_work_item_id="intake",
+        )
+        cto = _make_work_item(
+            work_item_id="cto",
+            run_id="run-late-delivery-deps",
+            phase=Phase.AWAITING_MANAGER_REVIEW,
+            role_id="cto",
+            parent_work_item_id="intake",
+        )
+        cmo = _make_work_item(
+            work_item_id="cmo",
+            run_id="run-late-delivery-deps",
+            phase=Phase.RUNNING,
+            role_id="cmo",
+            parent_work_item_id="intake",
+        )
+        await self._save(intake, delivery, coo, cto, cmo)
+
+        changed = await refresh_dependents_for_run(
+            self.store,
+            run_id="run-late-delivery-deps",
+        )
+
+        self.assertTrue(changed)
+        after = await self.store.get_delegation_work_item("delivery")
+        assert after is not None
+        self.assertEqual(
+            list(after.metadata.get("dependency_work_item_ids", [])),
+            ["coo", "cto", "cmo"],
+        )
+        self.assertEqual(after.phase, Phase.WAITING_FOR_CHILDREN)
+
+    async def test_final_delivery_dependency_closure_ignores_hidden_attention_child(self) -> None:
+        intake = _make_work_item(
+            work_item_id="intake-hidden",
+            run_id="run-hidden-delivery-deps",
+            phase=Phase.WAITING_FOR_CHILDREN,
+            role_id="ceo",
+            dependency_ids=["coo-hidden"],
+        )
+        delivery = _make_work_item(
+            work_item_id="delivery-hidden",
+            run_id="run-hidden-delivery-deps",
+            phase=Phase.WAITING_DEPENDENCIES,
+            role_id="ceo",
+            dependency_ids=["coo-hidden"],
+            parent_work_item_id="intake-hidden",
+            metadata={
+                "work_kind": "delivery",
+                "intake_work_item_id": "intake-hidden",
+            },
+        )
+        coo = _make_work_item(
+            work_item_id="coo-hidden",
+            run_id="run-hidden-delivery-deps",
+            phase=Phase.RUNNING,
+            parent_work_item_id="intake-hidden",
+        )
+        attention = _make_work_item(
+            work_item_id="attention-hidden",
+            run_id="run-hidden-delivery-deps",
+            phase=Phase.AWAITING_HUMAN,
+            parent_work_item_id="intake-hidden",
+            metadata={
+                "hidden_from_company_kanban": True,
+                "upstream_visibility": "hidden",
+            },
+        )
+        await self._save(intake, delivery, coo, attention)
+
+        await refresh_dependents_for_run(
+            self.store,
+            run_id="run-hidden-delivery-deps",
+        )
+
+        after = await self.store.get_delegation_work_item("delivery-hidden")
+        assert after is not None
+        self.assertEqual(
+            list(after.metadata.get("dependency_work_item_ids", [])),
+            ["coo-hidden"],
+        )
+
+    async def test_late_dependency_reopens_closed_approved_final_delivery(self) -> None:
+        intake = _make_work_item(
+            work_item_id="intake-closed",
+            run_id="run-closed-delivery-deps",
+            phase=Phase.WAITING_FOR_CHILDREN,
+            role_id="ceo",
+            dependency_ids=["coo-closed", "cto-late"],
+        )
+        delivery = _make_work_item(
+            work_item_id="delivery-closed",
+            run_id="run-closed-delivery-deps",
+            phase=Phase.APPROVED,
+            role_id="ceo",
+            dependency_ids=["coo-closed"],
+            parent_work_item_id="intake-closed",
+            metadata={
+                "work_kind": "delivery",
+                "intake_work_item_id": "intake-closed",
+                "allowed_delegate_role_ids": ["cto", "cmo"],
+                "requires_user_feedback": False,
+                "feedback_closed": True,
+                "human_review_closed": True,
+                "delivery_package": {"content": "obsolete"},
+            },
+        )
+        coo = _make_work_item(
+            work_item_id="coo-closed",
+            run_id="run-closed-delivery-deps",
+            phase=Phase.APPROVED,
+            parent_work_item_id="intake-closed",
+        )
+        cto = _make_work_item(
+            work_item_id="cto-late",
+            run_id="run-closed-delivery-deps",
+            phase=Phase.RUNNING,
+            parent_work_item_id="intake-closed",
+        )
+        await self._save(intake, delivery, coo, cto)
+
+        changed = await refresh_dependents_for_run(
+            self.store,
+            run_id="run-closed-delivery-deps",
+        )
+
+        self.assertTrue(changed)
+        after = await self.store.get_delegation_work_item("delivery-closed")
+        assert after is not None
+        self.assertEqual(after.phase, Phase.WAITING_DEPENDENCIES)
+        self.assertEqual(
+            list(after.metadata.get("dependency_work_item_ids", [])),
+            ["coo-closed", "cto-late"],
+        )
+        self.assertTrue(after.metadata.get("requires_user_feedback"))
+        self.assertFalse(after.metadata.get("feedback_closed"))
+        self.assertFalse(after.metadata.get("human_review_closed"))
+        self.assertTrue(after.metadata.get("delivery_inputs_invalidated_at"))
+        self.assertEqual(after.metadata.get("allowed_delegate_role_ids"), [])
 
     async def test_child_cancelled_triggers_parent_refresh(self) -> None:
         """Fix 3 core + failure-triage release: a non-APPROVED terminal
@@ -763,7 +931,7 @@ class RefreshDependentsForRunTests(unittest.IsolatedAsyncioTestCase):
         doomed = compute_doomed_work_item_ids(by_id)
         self.assertNotIn("alive-triage", doomed)
 
-        changed = await refresh_dependents_for_run(self.store, run_id="run-alive")
+        await refresh_dependents_for_run(self.store, run_id="run-alive")
         after_upper = await self.store.get_delegation_work_item("alive-upper")
         # The upper parent keeps waiting for the live triage card — no
         # premature settlement over it.
@@ -959,11 +1127,8 @@ class RefreshDependentsForRunTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(after.metadata.get("waiting_on_work_item_ids"), [])
         self.assertIn("deleted-child", after.metadata.get("pruned_dependency_work_item_ids", []))
 
-    async def test_child_awaiting_human_triggers_refresh(self) -> None:
-        """Fix 3 regression: when max_review_reworks escalates a child to
-        AWAITING_HUMAN, the hook must fire so the parent's dep metadata
-        is updated. Previously this transition was silent and the parent
-        drifted into a zombie state."""
+    async def test_final_delivery_child_awaiting_human_triggers_refresh(self) -> None:
+        """A genuine final-delivery human wait still participates in dependency refresh."""
         parent = _make_work_item(
             work_item_id="parent-h",
             run_id="run-c",
@@ -979,15 +1144,15 @@ class RefreshDependentsForRunTests(unittest.IsolatedAsyncioTestCase):
         child_h2 = _make_work_item(
             work_item_id="child-h2",
             run_id="run-c",
-            phase=Phase.AWAITING_MANAGER_REVIEW,
+            phase=Phase.RUNNING,
         )
         await self._save(parent, child_h1, child_h2)
 
         await self.store.update_delegation_work_item(
             "child-h2", phase=Phase.AWAITING_HUMAN
         )
-        # Parent stays waiting (AWAITING_HUMAN is not APPROVED), but the
-        # hook ran. Next step: a human approves → parent should unblock.
+        # Parent stays waiting (AWAITING_HUMAN is not APPROVED). Once the
+        # final delivery is accepted, the dependency hook unblocks it.
         await self.store.update_delegation_work_item(
             "child-h2", phase=Phase.APPROVED
         )

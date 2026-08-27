@@ -6,6 +6,7 @@ import type {
   ChannelStatusInfo,
   ReorgProposalInfo,
 } from '../types/visual'
+import type { InteractionReplyReceipt } from '../types/chat'
 import { PackageCard } from './PackageCard'
 import { CollapsibleSection } from './CollapsibleSection'
 
@@ -44,7 +45,11 @@ interface ArchitectureMarketplaceProps {
   channels: ChannelStatusInfo[]
   reorgProposals: ReorgProposalInfo[]
   isCustomMode: boolean
-  onReorgDecide: (proposalId: string, approved: boolean, notes?: string) => void
+  onReorgDecide: (
+    proposal: ReorgProposalInfo,
+    approved: boolean,
+    notes?: string,
+  ) => Promise<InteractionReplyReceipt>
   onMarketInstall: (path: string, strategy: string) => void
   onMarketUninstall: (packageId: string) => void
 }
@@ -61,6 +66,11 @@ export function ArchitectureMarketplace({
   const [showImportForm, setShowImportForm] = useState(false)
   const [importPath, setImportPath] = useState('')
   const [uninstallingId, setUninstallingId] = useState<string | null>(null)
+  const [submittingReorgId, setSubmittingReorgId] = useState<string | null>(null)
+  const [acceptedReorgIds, setAcceptedReorgIds] = useState<Set<string>>(
+    () => new Set(),
+  )
+  const [reorgError, setReorgError] = useState<Record<string, string>>({})
 
   const categories = useMemo(() => {
     const cats = new Set<string>()
@@ -102,6 +112,40 @@ export function ArchitectureMarketplace({
     setUninstallingId(pkgId)
     onMarketUninstall(pkgId)
     setTimeout(() => setUninstallingId(null), 3000)
+  }
+
+  const handleReorgDecision = async (
+    proposal: ReorgProposalInfo,
+    approved: boolean,
+  ) => {
+    if (!proposal.checkpoint_id || proposal.checkpoint_status !== 'pending') return
+    setSubmittingReorgId(proposal.proposal_id)
+    setReorgError(current => ({ ...current, [proposal.proposal_id]: '' }))
+    try {
+      const receipt = await onReorgDecide(proposal, approved)
+      if (!receipt.accepted) {
+        setReorgError(current => ({
+          ...current,
+          [proposal.proposal_id]: receipt.reason || receipt.error || 'Decision was not accepted.',
+        }))
+        return
+      }
+      // The local control changes only after the durable interaction ACK.
+      setAcceptedReorgIds(current => {
+        const next = new Set(current)
+        next.add(proposal.proposal_id)
+        return next
+      })
+    } catch (error) {
+      setReorgError(current => ({
+        ...current,
+        [proposal.proposal_id]: error instanceof Error ? error.message : 'Decision failed.',
+      }))
+    } finally {
+      setSubmittingReorgId(current => (
+        current === proposal.proposal_id ? null : current
+      ))
+    }
   }
 
   return (
@@ -232,6 +276,15 @@ export function ArchitectureMarketplace({
           <div className="org-reorg-list">
             {reorgProposals.map(p => {
               const isPending = p.status === 'proposed'
+              const isSubmitting = submittingReorgId === p.proposal_id
+              const wasAccepted = acceptedReorgIds.has(p.proposal_id)
+              const canDecide = (
+                isPending
+                && isCustomMode
+                && p.checkpoint_status === 'pending'
+                && Boolean(p.checkpoint_id)
+                && !wasAccepted
+              )
               return (
                 <div key={p.proposal_id} className={`org-reorg-card org-reorg-${p.status}`}>
                   <div className="org-reorg-header">
@@ -239,11 +292,31 @@ export function ArchitectureMarketplace({
                     <span className="org-reorg-status">{p.status}</span>
                   </div>
                   {p.summary && <div className="org-reorg-summary">{p.summary}</div>}
-                  {isPending && isCustomMode && (
+                  {canDecide && (
                     <div className="org-reorg-actions">
-                      <button className="org-reorg-approve" onClick={() => onReorgDecide(p.proposal_id, true)}>Approve</button>
-                      <button className="org-reorg-deny" onClick={() => onReorgDecide(p.proposal_id, false)}>Deny</button>
+                      <button
+                        className="org-reorg-approve"
+                        disabled={isSubmitting}
+                        onClick={() => void handleReorgDecision(p, true)}
+                      >{isSubmitting ? 'Submitting…' : 'Approve'}</button>
+                      <button
+                        className="org-reorg-deny"
+                        disabled={isSubmitting}
+                        onClick={() => void handleReorgDecision(p, false)}
+                      >Deny</button>
                     </div>
+                  )}
+                  {isPending && isCustomMode && wasAccepted && (
+                    <div className="org-reorg-status">Decision submitted</div>
+                  )}
+                  {isPending && isCustomMode && p.user_confirmation_required
+                    && !p.checkpoint_id && !wasAccepted && (
+                    <div className="org-reorg-status">
+                      Approval is unavailable until its review checkpoint is restored.
+                    </div>
+                  )}
+                  {reorgError[p.proposal_id] && (
+                    <div className="org-reorg-status">{reorgError[p.proposal_id]}</div>
                   )}
                 </div>
               )

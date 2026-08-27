@@ -11,6 +11,7 @@ import type {
   ArchitecturePresetDetail,
   HireTalentHandler,
 } from '../types/visual'
+import type { InteractionReplyReceipt } from '../types/chat'
 import { TeamView } from './TeamView'
 import { DelegationStrategyPanel } from './DelegationStrategyPanel'
 import { ArchitectureMarketplace } from './ArchitectureMarketplace'
@@ -71,7 +72,11 @@ interface OrgTabProps {
   hiringTemplateId?: string | null
   onImportEmployee?: (employeeId: string) => void
   onRequestReorgList: () => void
-  onReorgDecide: (proposalId: string, approved: boolean, notes?: string) => void
+  onReorgDecide: (
+    proposal: ReorgProposalInfo,
+    approved: boolean,
+    notes?: string,
+  ) => Promise<InteractionReplyReceipt>
   // Market
   onMarketExport?: (data: { package_id: string; name: string; description: string; version: string }) => void
   onMarketInstall?: (path: string, strategy: string) => void
@@ -106,6 +111,8 @@ interface OrgTabProps {
   onBulkAddRoles?: (roles: Array<{ role_id: string; name: string; responsibility: string; reports_to: string }>) => void
   onUpdateRole?: (roleId: string, updates: { name?: string; responsibility?: string; reports_to?: string; can_spawn?: string[]; icon?: string | null; execution_strategy?: string; preferred_external_agent?: string | null; prompt_refs?: string[] }) => void
   onDeleteRole?: (roleId: string) => void
+  onBindExternalTeam?: (data: { boundary_role_id: string; organization_id?: string; scope: 'subtree' }) => void
+  onUnbindExternalTeam?: (data: { binding_id?: string; boundary_role_id?: string; organization_id?: string }) => void
   onUpdateOrgStrategy?: (data: { final_decider_role_id?: string | null }) => void
   onUpdateRuntimePolicy?: (policy: Record<string, any>) => void
   onResetArchitecture?: () => void
@@ -117,7 +124,7 @@ export function OrgTab({
   onHireTalent, hiringTemplateId, onImportEmployee, onRequestReorgList, onReorgDecide,
   onMarketExport, onMarketInstall, onMarketUninstall,
   marketPresets, marketPreviewData, onMarketBrowse, onMarketPreview, onMarketApplyPreset, onMarketClearPreview,
-  onAddRole, onBulkAddRoles, onUpdateRole, onDeleteRole, onUpdateOrgStrategy,
+  onAddRole, onBulkAddRoles, onUpdateRole, onDeleteRole, onBindExternalTeam, onUnbindExternalTeam, onUpdateOrgStrategy,
   onUpdateRuntimePolicy, onResetArchitecture,
   onConfigExport, onConfigImport, configExportYaml, configImportPreview, configImportError,
   onSavedOrgsList, onSavedOrgSaveAs, onSavedOrgCreate, onSavedOrgLoad, onSavedOrgDelete, savedOrgsList,
@@ -346,10 +353,13 @@ export function OrgTab({
             employees={displayEmployees}
             sessionRecruitmentByRole={sessionRecruitmentByRole}
             isCustomMode={isCustomMode}
+            organizationId={data.organization_id}
             onAddRole={onAddRole ?? (() => {})}
             onBulkAddRoles={onBulkAddRoles}
             onUpdateRole={onUpdateRole ?? (() => {})}
             onDeleteRole={onDeleteRole ?? (() => {})}
+            onBindExternalTeam={onBindExternalTeam}
+            onUnbindExternalTeam={onUnbindExternalTeam}
             onExport={onMarketExport ?? (() => {})}
             onImportEmployee={onImportEmployee}
             onResetArchitecture={onResetArchitecture}

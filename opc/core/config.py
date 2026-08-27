@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 import yaml
-from pydantic import AliasChoices, BaseModel, Field, field_validator
+from pydantic import AliasChoices, BaseModel, Field, PrivateAttr, field_validator
 
 from opc.core.company_tools import COMPANY_APPROVAL_EXEMPT_TOOL_NAMES
 
@@ -56,6 +56,17 @@ def get_project_config_dir(project_path: Path | None = None) -> Path:
     if project_path:
         return project_path / ".opc"
     return get_opc_home()
+
+
+def get_project_config_workspace(config_dir: Path) -> Path | None:
+    """Return the workspace owning a project-local config directory, if any."""
+
+    from opc.core.workspace_trust import project_workspace_for_config
+
+    return project_workspace_for_config(
+        config_dir,
+        active_project_root=_find_project_root(),
+    )
 
 
 def _atomic_write_text(path: Path, content: str) -> None:
@@ -107,6 +118,7 @@ _ORG_RUNTIME_KEYS = (
     "talent_templates",
     "teams",
     "team_runtime",
+    "external_team_bindings",
     "installed_packages",
     "role_serial_queue_enabled",
 )
@@ -362,10 +374,19 @@ class ExternalAgentConfig(BaseModel):
     status_heartbeat_seconds: int = 30
     approval_mode: ExternalAgentApprovalMode = "auto"
     show_thinking: bool = False
+    # Optional provider-specific transport/runtime settings.  They are kept
+    # on the shared external-agent model so project-local YAML can configure
+    # Jiuwen without importing Jiuwen/OpenJiuwen into the OpenOPC process.
+    transport: Literal["cli", "gateway"] = "cli"
+    gateway_url: str = ""
+    provider_mode: str = ""
+    project_dir: str = ""
+    trusted_dirs: list[str] = Field(default_factory=list)
+    agent_group_name: str = ""
 
 
 class AgentsConfig(BaseModel):
-    preferred_order: list[str] = Field(default_factory=lambda: ["claude_code", "cursor", "codex", "opencode"])
+    preferred_order: list[str] = Field(default_factory=lambda: ["claude_code", "cursor", "codex", "opencode", "jiuwen", "jiuwenswarm"])
     agents: dict[str, ExternalAgentConfig] = Field(default_factory=lambda: {
         "claude_code": ExternalAgentConfig(command="claude", run_mode="interactive", approval_mode="full-auto"),
         "cursor": ExternalAgentConfig(command="cursor-agent", run_mode="interactive", approval_mode="full-auto"),
@@ -376,6 +397,25 @@ class AgentsConfig(BaseModel):
             run_mode="interactive",
             approval_mode="full-auto",
             show_thinking=True,
+        ),
+        # ``jiuwen`` is a normal single external agent. ``jiuwenswarm`` is an
+        # opaque execution team: OpenOPC owns one Task/WorkItem while Jiuwen
+        # owns every internal teammate and subtask.
+        "jiuwen": ExternalAgentConfig(
+            command="jiuwenswarm",
+            run_mode="interactive",
+            transport="gateway",
+            gateway_url="ws://127.0.0.1:19001/tui",
+            provider_mode="code.normal",
+            interactive_timeout_seconds=21600,
+        ),
+        "jiuwenswarm": ExternalAgentConfig(
+            command="jiuwenswarm",
+            run_mode="interactive",
+            transport="gateway",
+            gateway_url="ws://127.0.0.1:19001/tui",
+            provider_mode="team",
+            interactive_timeout_seconds=21600,
         ),
     })
     native_subagents: dict[str, "NativeSubagentProfileConfig"] = Field(default_factory=dict)
@@ -530,7 +570,10 @@ class ContextUsageReportingConfig(BaseModel):
 
 
 class VerificationPolicyConfig(BaseModel):
-    enabled: bool = True
+    # Company mode already has its own manager-review/rework state machine.
+    # Keep the optional extra verifier opt-in so a freshly-created config has
+    # the same behaviour as the shipped system_config.yaml template.
+    enabled: bool = False
     min_todos_for_verification: int = 3
     require_on_code_edits: bool = True
     require_on_risky_tools: bool = True
@@ -854,6 +897,48 @@ class TeamRuntimeConfig(BaseModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
+class ExternalTeamBindingConfig(BaseModel):
+    """Bind one organization boundary (optionally its subtree) to one opaque team."""
+
+    binding_id: str = ""
+    boundary_role_id: str
+    external_agent: str = "jiuwenswarm"
+    scope: Literal["role", "subtree"] = "subtree"
+    enabled: bool = True
+    collapse_subtree: bool = True
+    session_scope: Literal["work_item", "company_run"] = "company_run"
+    max_inflight: int = Field(default=1, ge=1)
+    failure_policy: Literal["fail_closed", "fallback_native"] = "fail_closed"
+    review_owner_role_id: str = ""
+    artifact_isolation: Literal["validated_workspace"] = "validated_workspace"
+    provider_mode: str = "team"
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("boundary_role_id")
+    @classmethod
+    def _validate_external_team_boundary(cls, value: str) -> str:
+        normalized = str(value or "").strip()
+        if not normalized:
+            raise ValueError("external team boundary_role_id must not be empty")
+        return normalized
+
+    @field_validator("external_agent")
+    @classmethod
+    def _validate_external_team_agent(cls, value: str) -> str:
+        normalized = str(value or "").strip().lower()
+        if normalized != "jiuwenswarm":
+            raise ValueError("opaque external team bindings require external_agent=jiuwenswarm")
+        return normalized
+
+    @field_validator("provider_mode")
+    @classmethod
+    def _validate_external_team_provider_mode(cls, value: str) -> str:
+        normalized = str(value or "team").strip().lower() or "team"
+        if "team" not in normalized.split("."):
+            raise ValueError("opaque external team bindings require a Jiuwen team provider_mode")
+        return normalized
+
+
 class OrgConfig(BaseModel):
     organization_id: str = DEFAULT_ORGANIZATION_ID
     organization_name: str = "My One-Person Company"
@@ -871,6 +956,7 @@ class OrgConfig(BaseModel):
     employees: list[EmployeeConfig] = Field(default_factory=list)
     teams: list[TeamConfig] = Field(default_factory=list)
     team_runtime: TeamRuntimeConfig = Field(default_factory=TeamRuntimeConfig)
+    external_team_bindings: list[ExternalTeamBindingConfig] = Field(default_factory=list)
     escalation_rules: list[EscalationRule] = Field(default_factory=list)
     installed_packages: list[Any] = Field(default_factory=list)
     # Fix 5 PR3 feature flag. When ON, runnable work items for a role
@@ -906,7 +992,6 @@ class SystemConfig(BaseModel):
     log_level: str = "INFO"
     max_agent_iterations: int = 50
     context_compression_threshold: float = 0.85
-    escalation_timeout_seconds: int = 3600
     auto_approve_below_cost: float = 10.0
     require_confirmation: list[str] = Field(
         default_factory=lambda: ["deploy to production", "send external emails", "modify database schema"]
@@ -950,8 +1035,8 @@ class AutonomyConfig(BaseModel):
     safe_command_prefixes: list[str] = Field(default_factory=lambda: [
         "ls", "pwd", "echo", "rg", "find", "git status", "git diff", "python -V",
         "python3 -V", "node -v", "npm -v", "curl", "wget", "yt-dlp", "aria2c", "ffmpeg",
-        # Read-only commands agents chain constantly; each segment of a compound
-        # command must match one of these for the whole command to stay LOW risk.
+        # Standalone read-only commands. Shell control structures always route
+        # through an explicit permission checkpoint, regardless of prefix.
         "cd", "cat", "head", "tail", "grep", "wc", "sort", "uniq", "cut", "tr",
         "stat", "file", "which", "date", "du", "df", "tree", "basename", "dirname",
         "realpath", "readlink", "uname", "nproc", "whoami", "hostname", "git log",
@@ -1280,6 +1365,7 @@ def build_company_org_payload_from_config(
         "talent_templates": [],
         "teams": [team.model_dump() for team in org.teams],
         "team_runtime": org.team_runtime.model_dump(),
+        "external_team_bindings": [binding.model_dump() for binding in org.external_team_bindings],
         "installed_packages": _dump_config_list(org.installed_packages),
         "role_serial_queue_enabled": bool(org.role_serial_queue_enabled),
         "metadata": {
@@ -1418,6 +1504,7 @@ def _legacy_company_org_payload(config_dir: Path) -> dict[str, Any]:
         "talent_templates": [],
         "teams": org_runtime_data.get("teams") or [],
         "team_runtime": org_runtime_data.get("team_runtime") or {},
+        "external_team_bindings": org_runtime_data.get("external_team_bindings") or [],
         "installed_packages": org_runtime_data.get("installed_packages") or [],
         "role_serial_queue_enabled": bool(org_runtime_data.get("role_serial_queue_enabled", True)),
         "metadata": {"source": "legacy_migration"},
@@ -1455,6 +1542,7 @@ def _normalize_corporate_company_org_payload(data: dict[str, Any]) -> dict[str, 
     payload["talent_templates"] = []
     payload.setdefault("teams", [])
     payload.setdefault("team_runtime", {})
+    payload.setdefault("external_team_bindings", [])
     payload.setdefault("installed_packages", [])
     payload.setdefault("role_serial_queue_enabled", True)
     payload.setdefault("metadata", {})
@@ -1661,11 +1749,58 @@ class OPCConfig(BaseModel):
     channels: ChannelsConfig = Field(default_factory=ChannelsConfig)
     autonomy: AutonomyConfig = Field(default_factory=AutonomyConfig)
     capabilities: CapabilityConfig = Field(default_factory=CapabilityConfig)
+    _trusted_workspace: Path | None = PrivateAttr(default=None)
+    _trusted_config_dir: Path | None = PrivateAttr(default=None)
+
+    def bind_workspace_trust(self, workspace: Path, config_dir: Path) -> None:
+        """Attach the project trust provenance used for pre-sink rechecks."""
+
+        self._trusted_workspace = Path(workspace).resolve(strict=False)
+        self._trusted_config_dir = Path(config_dir).resolve(strict=False)
+
+    def require_workspace_trust(self, *, include_effective: bool = False) -> None:
+        """Revalidate bound project authority immediately before runtime use.
+
+        Normal runtime checks bind the source files while allowing explicit
+        host-side CLI overrides such as ``--model`` and ``--debug``.  Loading
+        and trust-grant flows additionally validate the normalized declaration.
+        """
+
+        if self._trusted_workspace is None or self._trusted_config_dir is None:
+            return
+        from opc.core.workspace_trust import WorkspaceTrustStore
+
+        WorkspaceTrustStore().require(
+            self._trusted_workspace,
+            self._trusted_config_dir,
+            self if include_effective else None,
+        )
 
     @classmethod
-    def load(cls, config_dir: Path | None = None) -> "OPCConfig":
+    def load(
+        cls,
+        config_dir: Path | None = None,
+        *,
+        trusted_source: bool = False,
+    ) -> "OPCConfig":
         if config_dir is None:
             config_dir = get_opc_home() / "config"
+        config_dir = Path(config_dir)
+        trusted_workspace: Path | None = None
+        trust_store: Any | None = None
+
+        # Project-local configuration can select executables, endpoints, and
+        # credential sources.  Check its user-owned trust record before any
+        # parsing or migration: several legacy migrations intentionally write
+        # normalized config back to disk during load.
+        if not trusted_source and config_dir.exists():
+            workspace = get_project_config_workspace(config_dir)
+            if workspace is not None:
+                from opc.core.workspace_trust import WorkspaceTrustStore
+
+                trust_store = WorkspaceTrustStore()
+                trust_store.require(workspace, config_dir)
+                trusted_workspace = workspace
 
         merged: dict[str, Any] = {}
         for name in ("system_config", "llm_config", "agent_config", "channel_config"):
@@ -1731,6 +1866,12 @@ class OPCConfig(BaseModel):
             )
         except Exception:
             pass
+        if trust_store is not None and trusted_workspace is not None:
+            # Recheck both the source bytes and normalized effective authority
+            # after parsing.  This catches migrations and concurrent changes
+            # before the config can reach an engine sink.
+            trust_store.require(trusted_workspace, config_dir, config)
+            config.bind_workspace_trust(trusted_workspace, config_dir)
         return config
 
     def save(self, config_dir: Path | None = None) -> None:
@@ -1777,7 +1918,9 @@ class OPCConfig(BaseModel):
                         existing = yaml.safe_load(f) or {}
                     existing_roles = existing.get("roles") or []
                     if existing_roles:
-                        import logging, os as _os
+                        import logging
+                        import os as _os
+
                         logging.getLogger(__name__).error(
                             "OPCConfig.save(): REFUSED to wipe %d existing roles with "
                             "empty list in custom mode. pid=%d, path=%s. "

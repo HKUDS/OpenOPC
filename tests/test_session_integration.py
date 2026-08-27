@@ -213,61 +213,6 @@ async def _make_chat_store() -> ChatStore:
     return cs
 
 
-class TestEscalationEngineIds(unittest.IsolatedAsyncioTestCase):
-    """Escalation ids should be unique per prompt."""
-
-    async def test_escalation_ids_are_unique_for_same_task(self) -> None:
-        from opc.layer2_organization.escalation import EscalationEngine
-
-        event_bus = StubEventBus()
-
-        async def _reply(_message: str, _options: list[dict[str, str]]) -> str:
-            return "approve_once"
-
-        engine = EscalationEngine(event_bus, user_reply_callback=_reply)
-        task = Task(id="task-1", title="Approval target", project_id="test-project")
-
-        await engine.escalate_decision(
-            task,
-            "Approve tool 'file_read'?",
-            [{"id": "approve_once", "label": "Approve once"}],
-        )
-        await engine.escalate_decision(
-            task,
-            "Approve tool 'file_write'?",
-            [{"id": "approve_once", "label": "Approve once"}],
-        )
-
-        created = [evt for evt in event_bus.published if evt.event_type == "escalation_created"]
-        self.assertEqual(len(created), 2)
-        escalation_ids = [str(evt.payload.get("escalation_id", "")) for evt in created]
-        self.assertEqual(len(set(escalation_ids)), 2)
-        self.assertTrue(all(escalation_id.startswith("esc_task-1_") for escalation_id in escalation_ids))
-
-    async def test_escalation_decision_timeout_has_no_implicit_approval_default(self) -> None:
-        from opc.layer2_organization.escalation import EscalationEngine
-
-        event_bus = StubEventBus()
-
-        async def _reply(_message: str, _options: list[dict[str, str]]) -> str:
-            await asyncio.sleep(1)
-            return "approve_once"
-
-        engine = EscalationEngine(event_bus, timeout_seconds=0, user_reply_callback=_reply)
-        task = Task(id="task-timeout", title="Approval target", project_id="test-project")
-
-        reply = await engine.escalate_decision(
-            task,
-            "Approve tool 'file_read'?",
-            [{"id": "approve_once", "label": "Approve once"}],
-        )
-
-        self.assertIsNone(reply)
-        timeout_events = [evt for evt in event_bus.published if evt.event_type == "escalation_timeout"]
-        self.assertEqual(len(timeout_events), 1)
-        self.assertIsNone(timeout_events[0].payload.get("default_action"))
-
-
 # ═══════════════════════════════════════════════════════════════════════
 # Test 1: EventAdapter — display counter & child_session_created
 # ═══════════════════════════════════════════════════════════════════════
@@ -605,7 +550,7 @@ class TestWSHandlerSessionSend(unittest.IsolatedAsyncioTestCase):
         await self.chat_store._db.close()
         shutil.rmtree(self.test_root, ignore_errors=True)
 
-    async def test_extract_checkpoint_metadata_uses_engine_session_lookup(self) -> None:
+    async def test_delivery_feedback_metadata_is_built_from_durable_checkpoint(self) -> None:
         checkpoint = SimpleNamespace(
             checkpoint_type="company_delivery_feedback",
             checkpoint_id="cp-delivery-1",
@@ -623,14 +568,12 @@ class TestWSHandlerSessionSend(unittest.IsolatedAsyncioTestCase):
                 "result_content": "Generated the requested website.",
             },
         )
-        self.engine.get_latest_pending_checkpoint_for_session = AsyncMock(return_value=checkpoint)
-
-        metadata = await self.handler._extract_checkpoint_metadata(
-            self.task_id,
-            session_id=self.session_id,
+        metadata = await self.handler._build_owner_interaction_meta(
+            checkpoint,
+            engine=self.engine,
         )
 
-        self.engine.get_latest_pending_checkpoint_for_session.assert_awaited_once_with(self.session_id)
+        assert metadata is not None
         self.assertEqual(metadata["checkpoint_type"], "company_delivery_feedback")
         self.assertEqual(metadata["checkpoint_id"], "cp-delivery-1")
         self.assertEqual(metadata["waiting_task_id"], "delivery-task-1")
@@ -645,7 +588,7 @@ class TestWSHandlerSessionSend(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(metadata["summary"], "Final site is ready.")
 
-    async def test_extract_checkpoint_metadata_maps_staffing_selection_checkpoint(self) -> None:
+    async def test_staffing_metadata_is_built_from_durable_checkpoint(self) -> None:
         checkpoint = SimpleNamespace(
             checkpoint_type="company_staffing_selection",
             checkpoint_id="cp-staffing-1",
@@ -678,13 +621,12 @@ class TestWSHandlerSessionSend(unittest.IsolatedAsyncioTestCase):
                 },
             },
         )
-        self.engine.get_latest_pending_checkpoint_for_session = AsyncMock(return_value=checkpoint)
-
-        metadata = await self.handler._extract_checkpoint_metadata(
-            self.task_id,
-            session_id=self.session_id,
+        metadata = await self.handler._build_owner_interaction_meta(
+            checkpoint,
+            engine=self.engine,
         )
 
+        assert metadata is not None
         self.assertEqual(metadata["checkpoint_type"], "company_staffing_selection")
         self.assertEqual(metadata["checkpoint_id"], "cp-staffing-1")
         self.assertEqual(metadata["staffing_roles"][0]["role_id"], "senior_engineer")
@@ -693,7 +635,7 @@ class TestWSHandlerSessionSend(unittest.IsolatedAsyncioTestCase):
             "engineering-frontend-developer",
         )
 
-    async def test_extract_checkpoint_metadata_maps_task_user_input_checkpoint(self) -> None:
+    async def test_task_user_input_metadata_is_built_from_durable_checkpoint(self) -> None:
         checkpoint = SimpleNamespace(
             checkpoint_type="task_user_input",
             checkpoint_id="cp-user-input-1",
@@ -715,13 +657,12 @@ class TestWSHandlerSessionSend(unittest.IsolatedAsyncioTestCase):
         }
         task.title = "Engineering Execution"
         await self.store.save_task(task)
-        self.engine.get_latest_pending_checkpoint_for_session = AsyncMock(return_value=checkpoint)
-
-        metadata = await self.handler._extract_checkpoint_metadata(
-            self.task_id,
-            session_id=self.session_id,
+        metadata = await self.handler._build_owner_interaction_meta(
+            checkpoint,
+            engine=self.engine,
         )
 
+        assert metadata is not None
         self.assertEqual(metadata["checkpoint_type"], "task_user_input")
         self.assertEqual(metadata["checkpoint_id"], "cp-user-input-1")
         self.assertEqual(metadata["work_item_projection_id"], "engineering_execution")
@@ -732,6 +673,29 @@ class TestWSHandlerSessionSend(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(metadata["input_questions"][0]["allow_freeform"])
         self.assertEqual(metadata["required_fields"], ["deployment_region"])
         self.assertEqual(metadata["resume_hint"], "Reply with a region like us-east-1.")
+
+    async def test_task_user_input_does_not_infer_a_tool_card_from_error_text(self) -> None:
+        checkpoint = SimpleNamespace(
+            checkpoint_type="task_user_input",
+            checkpoint_id="cp-user-input-policy-error",
+            payload={
+                "task_id": self.task_id,
+                "prompt": "Tool execution blocked by autonomy policy.",
+                "pause_request": {
+                    "reason": "Choose a different implementation approach.",
+                    "questions": ["How should the task continue?"],
+                },
+            },
+        )
+
+        metadata = await self.handler._build_owner_interaction_meta(
+            checkpoint,
+            engine=self.engine,
+        )
+
+        assert metadata is not None
+        self.assertEqual(metadata["checkpoint_type"], "task_user_input")
+        self.assertEqual(metadata["resume_hint"], "")
 
     async def test_snapshot_checkpoint_meta_restores_delivery_feedback_checkpoint(self) -> None:
         from opc.plugins.office_ui.snapshot_builder import _build_snapshot_checkpoint_meta
@@ -749,7 +713,17 @@ class TestWSHandlerSessionSend(unittest.IsolatedAsyncioTestCase):
                 "runtime_session_id": "runtime-1",
             },
         )
-        self.engine.get_latest_pending_checkpoint_for_session = AsyncMock(return_value=checkpoint)
+        migration_persistence: list[bool] = []
+
+        async def get_checkpoint(
+            _session_id: str,
+            *,
+            persist_runtime_v2_migration: bool = True,
+        ) -> Any:
+            migration_persistence.append(persist_runtime_v2_migration)
+            return checkpoint
+
+        self.engine.get_latest_pending_checkpoint_for_session = get_checkpoint
         task = await self.store.get_task(self.task_id)
         assert task is not None
         task.status = TaskStatus.AWAITING_HUMAN
@@ -763,6 +737,30 @@ class TestWSHandlerSessionSend(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(metadata["work_item_turn_type"], "deliver")
         self.assertEqual(metadata["summary"], "Ready for review.")
         self.assertEqual(metadata["runtime_session_id"], "runtime-1")
+        self.assertEqual(migration_persistence, [False])
+
+    async def test_company_lease_loss_rejects_request_without_cancelling_websocket(self) -> None:
+        from opc.core.company_controller import CompanyRunControllerLeaseLost
+
+        ws = type("FakeWS", (), {"closed": False, "closing": False})()
+        ws.send_json = AsyncMock()
+        with patch(
+            "opc.plugins.office_ui.ws_handler.build_collab_sync",
+            new=AsyncMock(
+                side_effect=CompanyRunControllerLeaseLost("stale company controller")
+            ),
+        ):
+            await self.handler._route_message(
+                ws,
+                json.dumps({"type": "collab_sync", "project_id": "test-project"}),
+            )
+
+        self.handler._send_ack.assert_awaited_once_with(
+            ws,
+            ok=False,
+            error="stale company controller",
+            action="collab_sync",
+        )
 
     async def test_session_send_inserts_user_message(self) -> None:
         """User message should be inserted into chat_store and broadcast."""
@@ -933,8 +931,6 @@ class TestWSHandlerSessionSend(unittest.IsolatedAsyncioTestCase):
 
     async def test_session_send_passes_session_id_to_engine(self) -> None:
         """_process_session_message should pass session_id to engine.process_message."""
-        ws = MagicMock()
-
         # Instead of mocking _track, let _process_session_message run directly
         await self.handler._process_session_message(
             self.task_id, "test content", session_id=self.session_id
@@ -981,7 +977,7 @@ class TestWSHandlerSessionSend(unittest.IsolatedAsyncioTestCase):
         call_kwargs = self.engine.process_message.call_args.kwargs
         self.assertEqual(call_kwargs["mode"], "company")
         self.assertEqual(call_kwargs["company_profile"], "corporate")
-        self.assertIsNone(call_kwargs["preferred_agent"])
+        self.assertEqual(call_kwargs["preferred_agent"], "codex")
 
     async def test_company_session_message_broadcasts_runtime_control_running_then_idle(self) -> None:
         task = await self.store.get_task(self.task_id)
@@ -1047,7 +1043,7 @@ class TestWSHandlerSessionSend(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(call.kwargs["run_engine"], self.engine)
         self.assertEqual(call.kwargs["run_project_id"], "test-project")
 
-    async def test_company_plain_input_supersedes_unanswered_delivery_review_card(self) -> None:
+    async def test_company_plain_input_defers_delivery_supersede_to_engine_domain(self) -> None:
         ws = MagicMock()
         parent_task = await self.store.get_task(self.task_id)
         assert parent_task is not None
@@ -1086,21 +1082,9 @@ class TestWSHandlerSessionSend(unittest.IsolatedAsyncioTestCase):
         )
         await self.store.save_execution_checkpoint(checkpoint)
 
-        checkpoint_message = await self.chat_store.insert_message(
-            channel_id=f"session:{self.task_id}",
-            sender="assistant",
-            sender_name="OPC",
-            content="Please review the previous delivery.",
-            project_id="test-project",
-            metadata={
-                "checkpoint_id": checkpoint.checkpoint_id,
-                "checkpoint_type": "company_delivery_feedback",
-                "summary": "Previous delivery is ready.",
-            },
-        )
         self.engine.get_active_company_runtime_suspend_checkpoint = AsyncMock(return_value=None)
+        self.engine.submit_checkpoint_decision = AsyncMock()
         self.handler._process_session_message = AsyncMock()
-        self.handler._process_company_delivery_feedback_reply = AsyncMock()
 
         def _close_coro(_task_id: str, coro: Any, **_kwargs: Any) -> None:
             coro.close()
@@ -1113,24 +1097,15 @@ class TestWSHandlerSessionSend(unittest.IsolatedAsyncioTestCase):
             "content": "第二个需求：重新做一个更简洁的版本",
         })
 
-        self.handler._process_company_delivery_feedback_reply.assert_not_called()
         self.handler._process_session_message.assert_called_once()
-        self.assertEqual(self.store._checkpoints[checkpoint.checkpoint_id].status, "superseded")
-        refreshed_waiting_task = await self.store.get_task(waiting_task.id)
-        self.assertEqual(refreshed_waiting_task.status, TaskStatus.DONE)
-        self.assertFalse(refreshed_waiting_task.metadata["requires_user_feedback"])
-        self.assertTrue(refreshed_waiting_task.metadata["feedback_superseded"])
-        cursor = await self.chat_store._db.execute(
-            "SELECT metadata FROM messages WHERE message_id = ?",
-            (checkpoint_message["message_id"],),
-        )
-        row = await cursor.fetchone()
-        self.assertIsNotNone(row)
-        metadata = json.loads(row[0])
-        self.assertEqual(metadata.get("checkpoint_status"), "superseded")
-        self.assertEqual(metadata.get("checkpoint_resolution_reason"), "new_company_turn_started")
+        self.engine.submit_checkpoint_decision.assert_not_awaited()
+        # This test deliberately mocks the engine turn, so the checkpoint is
+        # still pending at the Office boundary.  The company-domain CAS,
+        # waiting-task close, and interaction_checkpoint_changed event are
+        # covered by test_durable_interactions.py.
+        self.assertEqual(self.store._checkpoints[checkpoint.checkpoint_id].status, "pending")
 
-    async def test_superseded_delivery_feedback_card_reply_is_consumed(self) -> None:
+    async def test_superseded_delivery_feedback_interaction_is_rejected(self) -> None:
         ws = MagicMock()
         parent_task = await self.store.get_task(self.task_id)
         assert parent_task is not None
@@ -1154,52 +1129,37 @@ class TestWSHandlerSessionSend(unittest.IsolatedAsyncioTestCase):
             },
         )
         await self.store.save_execution_checkpoint(checkpoint)
-        checkpoint_message = await self.chat_store.insert_message(
-            channel_id=f"session:{self.task_id}",
-            sender="assistant",
-            sender_name="OPC",
-            content="Please review the previous delivery.",
-            project_id="test-project",
-            metadata={
-                "checkpoint_id": checkpoint.checkpoint_id,
-                "checkpoint_type": "company_delivery_feedback",
-                "summary": "Previous delivery is ready.",
-            },
-        )
         self.engine.get_active_company_runtime_suspend_checkpoint = AsyncMock(return_value=None)
         self.handler._process_session_message = AsyncMock()
-        self.handler._process_company_delivery_feedback_reply = AsyncMock()
+        self.handler._project_accepted_interaction_reply = AsyncMock()
+        self.engine.submit_checkpoint_decision = AsyncMock(return_value={
+            "accepted": False,
+            "status": "superseded",
+            "reason": "invalid_state",
+        })
 
-        await self.handler._handle_session_send(ws, {
+        await self.handler._handle_interaction_reply(ws, {
             "project_id": "test-project",
-            "task_id": self.task_id,
-            "content": "I fully agree with this delivery.",
-            "metadata": {
-                "response_to_checkpoint_id": "cp-delivery-superseded",
-                "response_to_checkpoint_type": "company_delivery_feedback",
+            "checkpoint_id": "cp-delivery-superseded",
+            "checkpoint_type": "company_delivery_feedback",
+            "client_request_id": "interaction-superseded",
+            "requester_task_id": self.task_id,
+            "requester_session_id": self.session_id,
+            "decision": {
+                "text": "I fully agree with this delivery.",
                 "checkpoint_reply_kind": "approve",
                 "self_evolution_trigger": True,
             },
         })
 
-        self.handler._process_company_delivery_feedback_reply.assert_not_called()
         self.handler._process_session_message.assert_not_called()
-        cursor = await self.chat_store._db.execute(
-            "SELECT metadata FROM messages WHERE message_id = ?",
-            (checkpoint_message["message_id"],),
-        )
-        row = await cursor.fetchone()
-        self.assertIsNotNone(row)
-        metadata = json.loads(row[0])
-        self.assertEqual(metadata.get("checkpoint_status"), "superseded")
-        cursor = await self.chat_store._db.execute(
-            "SELECT content FROM messages WHERE sender = 'assistant' ORDER BY timestamp DESC LIMIT 1",
-        )
-        helper_row = await cursor.fetchone()
-        self.assertIsNotNone(helper_row)
-        self.assertIn("superseded by a newer company turn", helper_row[0])
+        self.handler._project_accepted_interaction_reply.assert_not_awaited()
+        ack = self.handler._send_ack.await_args.kwargs
+        self.assertFalse(ack["ok"])
+        self.assertEqual(ack["error"], "invalid_state")
+        self.assertEqual(ack["status"], "superseded")
 
-    async def test_ignore_delivery_feedback_card_terminalizes_without_self_evolution(self) -> None:
+    async def test_ignore_delivery_feedback_uses_interaction_control_plane(self) -> None:
         ws = MagicMock()
         parent_task = await self.store.get_task(self.task_id)
         assert parent_task is not None
@@ -1240,120 +1200,43 @@ class TestWSHandlerSessionSend(unittest.IsolatedAsyncioTestCase):
         )
         await self.store.save_execution_checkpoint(checkpoint)
 
-        async def _ignore_checkpoint(cp: ExecutionCheckpoint, *, reply_metadata: dict[str, Any] | None = None) -> str:
-            cp.status = "ignored"
-            cp.payload = {
-                **dict(cp.payload or {}),
-                "feedback_ignored": True,
-                "feedback_reply_metadata": dict(reply_metadata or {}),
-            }
-            await self.store.save_execution_checkpoint(cp)
-            task = await self.store.get_task(waiting_task.id)
-            assert task is not None
-            task.status = TaskStatus.DONE
-            task.metadata = {
-                **dict(task.metadata or {}),
-                "requires_user_feedback": False,
-                "human_review_closed": True,
-                "feedback_closed": True,
-                "feedback_resolved": True,
-                "feedback_resolution": "self_evolution_review_ignored",
-                "self_evolution_review_ignored": True,
-            }
-            await self.store.save_task(task)
-            return "Self-evolution review ignored."
-
-        checkpoint_message = await self.chat_store.insert_message(
-            channel_id=f"session:{self.task_id}",
-            sender="assistant",
-            sender_name="OPC",
-            content="Please review the previous delivery.",
-            project_id="test-project",
-            metadata={
-                "checkpoint_id": checkpoint.checkpoint_id,
-                "checkpoint_type": "company_delivery_feedback",
-                "summary": "Previous delivery is ready.",
-            },
-        )
         self.engine.get_active_company_runtime_suspend_checkpoint = AsyncMock(return_value=None)
-        self.engine.ignore_company_delivery_feedback_checkpoint = AsyncMock(side_effect=_ignore_checkpoint)
-        self.engine.run_company_delivery_self_evolution_checkpoint = AsyncMock()
         self.handler._process_session_message = AsyncMock()
-        self.handler._process_company_delivery_feedback_reply = AsyncMock()
+        self.handler._project_accepted_interaction_reply = AsyncMock()
+        self.engine.submit_checkpoint_decision = AsyncMock(return_value={
+            "accepted": True,
+            "status": "answered",
+        })
 
-        await self.handler._handle_session_send(ws, {
+        await self.handler._handle_interaction_reply(ws, {
             "project_id": "test-project",
-            "task_id": self.task_id,
-            "content": "Ignore this self-evolution review.",
-            "metadata": {
-                "response_to_checkpoint_id": "cp-delivery-ignore",
-                "response_to_checkpoint_type": "company_delivery_feedback",
+            "checkpoint_id": "cp-delivery-ignore",
+            "checkpoint_type": "company_delivery_feedback",
+            "client_request_id": "interaction-ignore",
+            "requester_task_id": self.task_id,
+            "requester_session_id": self.session_id,
+            "decision": {
+                "text": "Ignore this self-evolution review.",
                 "checkpoint_reply_kind": "ignore",
             },
         })
 
-        self.engine.run_company_delivery_self_evolution_checkpoint.assert_not_called()
-        self.engine.ignore_company_delivery_feedback_checkpoint.assert_awaited_once()
-        self.handler._process_company_delivery_feedback_reply.assert_not_called()
         self.handler._process_session_message.assert_not_called()
-        self.assertEqual(self.store._checkpoints[checkpoint.checkpoint_id].status, "ignored")
-        refreshed_waiting_task = await self.store.get_task(waiting_task.id)
-        assert refreshed_waiting_task is not None
-        self.assertEqual(refreshed_waiting_task.status, TaskStatus.DONE)
-        self.assertFalse(refreshed_waiting_task.metadata["requires_user_feedback"])
-        self.assertTrue(refreshed_waiting_task.metadata["feedback_closed"])
-        self.assertTrue(refreshed_waiting_task.metadata["self_evolution_review_ignored"])
-        cursor = await self.chat_store._db.execute(
-            "SELECT metadata FROM messages WHERE message_id = ?",
-            (checkpoint_message["message_id"],),
-        )
-        row = await cursor.fetchone()
-        self.assertIsNotNone(row)
-        metadata = json.loads(row[0])
-        self.assertEqual(metadata.get("checkpoint_status"), "ignored")
-        self.assertEqual(metadata.get("checkpoint_reply_kind"), "ignore")
-        self.assertEqual(metadata.get("checkpoint_resolution_reason"), "ignored_by_user")
-        cursor = await self.chat_store._db.execute(
-            "SELECT COUNT(*) FROM messages WHERE sender = 'user' AND content = ?",
-            ("Ignore this self-evolution review.",),
-        )
-        user_ignore_count = await cursor.fetchone()
-        self.assertEqual(user_ignore_count[0], 0)
-        cursor = await self.chat_store._db.execute(
-            "SELECT COUNT(*) FROM messages WHERE json_extract(metadata, '$.kind') = 'company_self_evolution_result'",
-        )
-        result_count = await cursor.fetchone()
-        self.assertEqual(result_count[0], 0)
-
-        await self.handler._handle_session_send(ws, {
-            "project_id": "test-project",
-            "task_id": self.task_id,
-            "content": "Ignore this self-evolution review.",
-            "metadata": {
-                "response_to_checkpoint_id": "cp-delivery-ignore",
-                "response_to_checkpoint_type": "company_delivery_feedback",
+        self.engine.submit_checkpoint_decision.assert_awaited_once_with(
+            checkpoint_id="cp-delivery-ignore",
+            checkpoint_type="company_delivery_feedback",
+            decision={
+                "text": "Ignore this self-evolution review.",
                 "checkpoint_reply_kind": "ignore",
             },
-        })
-
-        self.engine.ignore_company_delivery_feedback_checkpoint.assert_awaited_once()
-        self.handler._process_company_delivery_feedback_reply.assert_not_called()
-        self.handler._process_session_message.assert_not_called()
-        cursor = await self.chat_store._db.execute(
-            "SELECT COUNT(*) FROM messages WHERE sender = 'user' AND content = ?",
-            ("Ignore this self-evolution review.",),
+            client_request_id="interaction-ignore",
+            requester_task_id=self.task_id,
+            requester_session_id=self.session_id,
         )
-        user_ignore_count = await cursor.fetchone()
-        self.assertEqual(user_ignore_count[0], 0)
-        cursor = await self.chat_store._db.execute(
-            "SELECT COUNT(*) FROM messages WHERE sender = 'assistant' AND content LIKE ?",
-            ("This delivery self-evolution review is no longer active.%",),
-        )
-        stale_helper_count = await cursor.fetchone()
-        self.assertEqual(stale_helper_count[0], 0)
+        self.handler._project_accepted_interaction_reply.assert_awaited_once()
+        self.assertTrue(self.handler._send_ack.await_args.kwargs["ok"])
 
-    async def test_ignore_delivery_feedback_synthetic_only_card_persists_terminal_card(self) -> None:
-        ws = MagicMock()
+    async def test_terminal_delivery_event_projects_synthetic_card_without_chat_truth(self) -> None:
         parent_task = await self.store.get_task(self.task_id)
         assert parent_task is not None
         parent_task.metadata = {
@@ -1395,95 +1278,52 @@ class TestWSHandlerSessionSend(unittest.IsolatedAsyncioTestCase):
         )
         await self.store.save_execution_checkpoint(checkpoint)
 
-        async def _ignore_checkpoint(cp: ExecutionCheckpoint, *, reply_metadata: dict[str, Any] | None = None) -> str:
-            cp.status = "ignored"
-            cp.payload = {
-                **dict(cp.payload or {}),
-                "feedback_ignored": True,
-                "feedback_reply_metadata": dict(reply_metadata or {}),
-            }
-            await self.store.save_execution_checkpoint(cp)
-            task = await self.store.get_task(waiting_task.id)
-            assert task is not None
-            task.status = TaskStatus.DONE
-            task.metadata = {
-                **dict(task.metadata or {}),
-                "requires_user_feedback": False,
-                "human_review_closed": True,
-                "feedback_closed": True,
-                "feedback_resolved": True,
-                "feedback_resolution": "self_evolution_review_ignored",
-                "self_evolution_review_ignored": True,
-            }
-            await self.store.save_task(task)
-            return "Self-evolution review ignored."
-
-        self.engine.get_active_company_runtime_suspend_checkpoint = AsyncMock(return_value=None)
-        self.engine.ignore_company_delivery_feedback_checkpoint = AsyncMock(side_effect=_ignore_checkpoint)
-        self.engine.run_company_delivery_self_evolution_checkpoint = AsyncMock()
-        self.handler._process_session_message = AsyncMock()
-        self.handler._process_company_delivery_feedback_reply = AsyncMock()
-
-        await self.handler._handle_session_send(ws, {
-            "project_id": "test-project",
-            "task_id": self.task_id,
-            "content": "Ignore this self-evolution review.",
-            "metadata": {
-                "response_to_checkpoint_id": checkpoint.checkpoint_id,
-                "response_to_checkpoint_type": "company_delivery_feedback",
-                "checkpoint_reply_kind": "ignore",
+        checkpoint.status = "ignored"
+        checkpoint.payload["interaction"] = {
+            "kind": "company_delivery_feedback",
+            "ownership": {
+                "ui_anchor_task_id": self.task_id,
+                "ui_anchor_session_id": self.session_id,
+                "waiting_task_id": waiting_task.id,
+                "waiting_session_id": waiting_task.session_id,
             },
-        })
+        }
+        await self.store.save_execution_checkpoint(checkpoint)
+        self.engine.can_answer_checkpoint = AsyncMock(return_value=True)
+        self.handler._load_execution_checkpoint_for_reply = AsyncMock(return_value=checkpoint)
 
-        self.engine.run_company_delivery_self_evolution_checkpoint.assert_not_called()
-        self.engine.ignore_company_delivery_feedback_checkpoint.assert_awaited_once()
-        self.handler._process_company_delivery_feedback_reply.assert_not_called()
-        self.handler._process_session_message.assert_not_called()
+        await self.handler._handle_runtime_event_progress({
+            "type": "interaction_checkpoint_changed",
+            "checkpoint_id": checkpoint.checkpoint_id,
+            "checkpoint_type": checkpoint.checkpoint_type,
+            "task_id": waiting_task.id,
+            "ui_anchor_task_id": self.task_id,
+            "ui_anchor_session_id": self.session_id,
+            "status": "ignored",
+        }, engine=self.engine, project_id="test-project")
+
+        self.engine.can_answer_checkpoint.assert_awaited_once_with(
+            checkpoint,
+            requester_task_id=self.task_id,
+            requester_session_id=self.session_id,
+        )
+        card = next(
+            envelope["payload"]
+            for envelope in self.broadcasts
+            if envelope.get("type") == "session_message"
+            and envelope.get("payload", {}).get("message_id") == f"checkpoint::{checkpoint.checkpoint_id}"
+        )
+        self.assertEqual(card["channel_id"], f"session:{self.task_id}")
+        self.assertEqual(card["metadata"]["checkpoint_status"], "ignored")
+        self.assertEqual(card["metadata"]["source"], "execution_checkpoint")
         cursor = await self.chat_store._db.execute(
-            "SELECT channel_id, sender, sender_name, content, timestamp, metadata "
-            "FROM messages WHERE message_id = ? AND project_id = ?",
+            "SELECT message_id FROM messages WHERE message_id = ? AND project_id = ?",
             (f"checkpoint::{checkpoint.checkpoint_id}", "test-project"),
         )
         row = await cursor.fetchone()
-        self.assertIsNotNone(row)
-        assert row is not None
-        self.assertEqual(row[0], f"session:{self.task_id}")
-        self.assertEqual(row[1], "assistant")
-        self.assertEqual(row[2], "Final delivery")
-        self.assertLess(abs(float(row[4]) - checkpoint.created_at.timestamp()), 1.0)
-        metadata = json.loads(row[5])
-        self.assertEqual(metadata.get("checkpoint_id"), checkpoint.checkpoint_id)
-        self.assertEqual(metadata.get("checkpoint_type"), "company_delivery_feedback")
-        self.assertEqual(metadata.get("checkpoint_status"), "ignored")
-        self.assertEqual(metadata.get("checkpoint_reply_kind"), "ignore")
-        self.assertEqual(metadata.get("checkpoint_resolution_reason"), "ignored_by_user")
-        self.assertEqual(metadata.get("waiting_task_id"), waiting_task.id)
-        cursor = await self.chat_store._db.execute(
-            "SELECT COUNT(*) FROM messages WHERE sender = 'user' AND content = ?",
-            ("Ignore this self-evolution review.",),
-        )
-        user_ignore_count = await cursor.fetchone()
-        self.assertEqual(user_ignore_count[0], 0)
+        self.assertIsNone(row)
 
-        await self.handler._handle_session_send(ws, {
-            "project_id": "test-project",
-            "task_id": self.task_id,
-            "content": "Ignore this self-evolution review.",
-            "metadata": {
-                "response_to_checkpoint_id": checkpoint.checkpoint_id,
-                "response_to_checkpoint_type": "company_delivery_feedback",
-                "checkpoint_reply_kind": "ignore",
-            },
-        })
-        cursor = await self.chat_store._db.execute(
-            "SELECT COUNT(*) FROM messages WHERE message_id = ? AND project_id = ?",
-            (f"checkpoint::{checkpoint.checkpoint_id}", "test-project"),
-        )
-        terminal_count = await cursor.fetchone()
-        self.assertEqual(terminal_count[0], 1)
-        self.engine.ignore_company_delivery_feedback_checkpoint.assert_awaited_once()
-
-    async def test_new_company_turn_supersedes_synthetic_only_delivery_feedback_card(self) -> None:
+    async def test_new_company_turn_with_synthetic_feedback_card_enters_engine_domain(self) -> None:
         ws = MagicMock()
         parent_task = await self.store.get_task(self.task_id)
         assert parent_task is not None
@@ -1526,8 +1366,8 @@ class TestWSHandlerSessionSend(unittest.IsolatedAsyncioTestCase):
         )
         await self.store.save_execution_checkpoint(checkpoint)
         self.engine.get_active_company_runtime_suspend_checkpoint = AsyncMock(return_value=None)
+        self.engine.submit_checkpoint_decision = AsyncMock()
         self.handler._process_session_message = AsyncMock()
-        self.handler._process_company_delivery_feedback_reply = AsyncMock()
 
         def _close_coro(_task_id: str, coro: Any, **_kwargs: Any) -> None:
             coro.close()
@@ -1540,23 +1380,20 @@ class TestWSHandlerSessionSend(unittest.IsolatedAsyncioTestCase):
             "content": "第二个需求：继续看黄金价格",
         })
 
-        self.handler._process_company_delivery_feedback_reply.assert_not_called()
         self.handler._process_session_message.assert_called_once()
-        self.assertEqual(self.store._checkpoints[checkpoint.checkpoint_id].status, "superseded")
+        self.engine.submit_checkpoint_decision.assert_not_awaited()
+        # Synthetic cards are projections, so Office does not create a
+        # terminal row before the engine has atomically superseded the durable
+        # checkpoint and emitted interaction_checkpoint_changed.
+        self.assertEqual(self.store._checkpoints[checkpoint.checkpoint_id].status, "pending")
         cursor = await self.chat_store._db.execute(
             "SELECT channel_id, timestamp, metadata FROM messages WHERE message_id = ? AND project_id = ?",
             (f"checkpoint::{checkpoint.checkpoint_id}", "test-project"),
         )
         row = await cursor.fetchone()
-        self.assertIsNotNone(row)
-        assert row is not None
-        self.assertEqual(row[0], f"session:{self.task_id}")
-        self.assertLess(abs(float(row[1]) - checkpoint.created_at.timestamp()), 1.0)
-        metadata = json.loads(row[2])
-        self.assertEqual(metadata.get("checkpoint_status"), "superseded")
-        self.assertEqual(metadata.get("checkpoint_resolution_reason"), "new_company_turn_started")
+        self.assertIsNone(row)
 
-    async def test_company_delivery_feedback_reply_routes_to_checkpoint_parent_runtime(self) -> None:
+    async def test_delivery_feedback_interaction_forwards_owner_identity_to_engine(self) -> None:
         ws = MagicMock()
         parent_task = await self.store.get_task(self.task_id)
         assert parent_task is not None
@@ -1601,37 +1438,39 @@ class TestWSHandlerSessionSend(unittest.IsolatedAsyncioTestCase):
         )
         await self.store.save_execution_checkpoint(checkpoint)
         self.handler._process_session_message = AsyncMock()
-        self.handler._process_company_delivery_feedback_reply = AsyncMock()
+        self.handler._project_accepted_interaction_reply = AsyncMock()
+        self.engine.submit_checkpoint_decision = AsyncMock(return_value={
+            "accepted": True,
+            "status": "answered",
+        })
 
-        def _close_coro(_task_id: str, coro: Any, **_kwargs: Any) -> None:
-            coro.close()
-
-        self.handler._track_session = MagicMock(side_effect=_close_coro)
-
-        await self.handler._handle_session_send(ws, {
+        await self.handler._handle_interaction_reply(ws, {
             "project_id": "test-project",
-            "task_id": self.task_id,
-            "content": "没有ppt介绍。生成一个ppt来说明，用codex的image2",
-            "metadata": {
-                "response_to_checkpoint_id": "cp-delivery-route",
-                "response_to_checkpoint_type": "company_delivery_feedback",
+            "checkpoint_id": "cp-delivery-route",
+            "checkpoint_type": "company_delivery_feedback",
+            "client_request_id": "interaction-delivery-route",
+            "requester_task_id": self.task_id,
+            "requester_session_id": self.session_id,
+            "decision": {
+                "text": "没有ppt介绍。生成一个ppt来说明，用codex的image2",
+                "checkpoint_reply_kind": "feedback",
             },
         })
 
         self.handler._process_session_message.assert_not_called()
-        self.handler._process_company_delivery_feedback_reply.assert_called_once()
-        call = self.handler._process_company_delivery_feedback_reply.call_args.kwargs
-        self.assertEqual(call["parent_task_id"], self.task_id)
-        self.assertEqual(call["parent_session_id"], self.session_id)
-        self.assertEqual(call["reply_channel_id"], f"session:{self.task_id}")
-        self.assertEqual(call["waiting_task_id"], waiting_task.id)
-        self.assertEqual(call["checkpoint"].checkpoint_id, "cp-delivery-route")
-        self.assertEqual(
-            call["message_metadata"]["response_to_checkpoint_id"],
-            "cp-delivery-route",
+        self.engine.submit_checkpoint_decision.assert_awaited_once_with(
+            checkpoint_id="cp-delivery-route",
+            checkpoint_type="company_delivery_feedback",
+            decision={
+                "text": "没有ppt介绍。生成一个ppt来说明，用codex的image2",
+                "checkpoint_reply_kind": "feedback",
+            },
+            client_request_id="interaction-delivery-route",
+            requester_task_id=self.task_id,
+            requester_session_id=self.session_id,
         )
 
-    async def test_company_delivery_feedback_reply_records_self_evolution_result_without_resync(self) -> None:
+    async def test_delivery_reply_projection_is_transcript_only(self) -> None:
         parent_task = await self.store.get_task(self.task_id)
         assert parent_task is not None
         parent_task.metadata = {
@@ -1670,57 +1509,41 @@ class TestWSHandlerSessionSend(unittest.IsolatedAsyncioTestCase):
                 "waiting_task_id": waiting_task.id,
                 "task_ids": [waiting_task.id],
                 "feedback_scope": "final",
+                "interaction": {
+                    "kind": "company_delivery_feedback",
+                    "ownership": {
+                        "ui_anchor_task_id": self.task_id,
+                        "ui_anchor_session_id": self.session_id,
+                        "waiting_task_id": waiting_task.id,
+                        "waiting_session_id": waiting_task.session_id,
+                    },
+                },
             },
         )
-        self.handler._mark_checkpoint_card_after_engine_response = AsyncMock(return_value=None)
-        self.handler._extract_checkpoint_metadata = AsyncMock(return_value=None)
-        self.handler._sync_task_transcript_messages = AsyncMock(return_value=0)
-        self.handler._flush_progress = AsyncMock()
-        self.engine.run_company_delivery_self_evolution_checkpoint = AsyncMock(return_value="Self-evolution completed.")
-
-        await self.handler._process_company_delivery_feedback_reply(
-            parent_task_id=self.task_id,
-            parent_session_id=self.session_id,
-            reply_channel_id=f"session:{self.task_id}",
-            content="继续做图片版 PPT",
-            attachment_refs=None,
-            message_metadata={
-                "response_to_checkpoint_id": "cp-delivery-sync",
-                "response_to_checkpoint_type": "company_delivery_feedback",
+        checkpoint.status = "answered"
+        self.handler._load_execution_checkpoint_for_reply = AsyncMock(return_value=checkpoint)
+        await self.handler._project_accepted_interaction_reply(
+            engine=self.engine,
+            project_id="test-project",
+            requester_task_id=self.task_id,
+            requester_session_id=self.session_id,
+            checkpoint_id="cp-delivery-sync",
+            checkpoint_type="company_delivery_feedback",
+            client_request_id="user-msg-sync",
+            decision={
+                "text": "继续做图片版 PPT",
+                "checkpoint_reply_kind": "feedback",
             },
-            user_message_id="user-msg-sync",
-            user_message_created_at=123.0,
-            run_engine=self.engine,
-            run_project_id="test-project",
-            checkpoint=checkpoint,
-            waiting_task_id=waiting_task.id,
-            lock=asyncio.Lock(),
         )
 
         self.engine.process_message.assert_not_awaited()
-        self.engine.run_company_delivery_self_evolution_checkpoint.assert_awaited_once()
-        self.handler._sync_task_transcript_messages.assert_not_awaited()
-        self.handler._extract_checkpoint_metadata.assert_not_awaited()
         messages = await self.chat_store.get_channel_messages(f"session:{self.task_id}", project_id="test-project")
-        result_message = next(message for message in messages if message["content"] == "Self-evolution completed.")
-        self.assertEqual(result_message["metadata"]["kind"], "company_self_evolution_result")
-        self.assertEqual(result_message["metadata"]["response_to_checkpoint_id"], "cp-delivery-sync")
-        self.assertNotIn("checkpoint_type", result_message["metadata"])
-        self.assertNotIn("checkpoint_id", result_message["metadata"])
+        response_message = next(message for message in messages if message["content"] == "继续做图片版 PPT")
+        self.assertEqual(response_message["message_id"], "interaction::user-msg-sync")
+        self.assertEqual(response_message["metadata"]["response_to_checkpoint_id"], "cp-delivery-sync")
+        self.assertEqual(response_message["metadata"]["checkpoint_reply_kind"], "feedback")
 
-    async def test_checkpoint_card_update_falls_back_across_channels(self) -> None:
-        other_channel_id = "session:delivery-task"
-        await self.chat_store.insert_message(
-            channel_id=other_channel_id,
-            sender="assistant",
-            sender_name="OPC",
-            content="Please review the delivery.",
-            project_id="test-project",
-            metadata={
-                "checkpoint_type": "company_delivery_feedback",
-                "checkpoint_id": "cp-delivery-global",
-            },
-        )
+    async def test_terminal_checkpoint_card_rebuilds_from_durable_row(self) -> None:
         checkpoint = ExecutionCheckpoint(
             checkpoint_id="cp-delivery-global",
             project_id="test-project",
@@ -1728,26 +1551,31 @@ class TestWSHandlerSessionSend(unittest.IsolatedAsyncioTestCase):
             task_id="delivery-task",
             checkpoint_type="company_delivery_feedback",
             status="resolved",
-            payload={"waiting_task_id": "delivery-task"},
-        )
-        self.engine._load_execution_checkpoint_by_id = AsyncMock(return_value=checkpoint)
-
-        updated = await self.handler._mark_checkpoint_card_after_engine_response(
-            channel_id=f"session:{self.task_id}",
-            project_id="test-project",
-            engine=self.engine,
-            message_metadata={
-                "response_to_checkpoint_id": "cp-delivery-global",
-                "response_to_checkpoint_type": "company_delivery_feedback",
+            payload={
+                "waiting_task_id": "delivery-task",
+                "interaction": {
+                    "kind": "company_delivery_feedback",
+                    "ownership": {
+                        "ui_anchor_task_id": self.task_id,
+                        "ui_anchor_session_id": self.session_id,
+                        "waiting_task_id": "delivery-task",
+                    },
+                },
             },
-            response_message_id="user-msg-1",
         )
 
-        self.assertIsNotNone(updated)
-        assert updated is not None
-        self.assertEqual(updated["channel_id"], other_channel_id)
-        self.assertEqual(updated["metadata"]["checkpoint_status"], "responded")
-        self.assertEqual(updated["metadata"]["checkpoint_response_message_id"], "user-msg-1")
+        card = await self.handler._interaction_checkpoint_ui_message(
+            checkpoint,
+            engine=self.engine,
+            project_id="test-project",
+        )
+
+        self.assertIsNotNone(card)
+        assert card is not None
+        self.assertEqual(card["message_id"], "checkpoint::cp-delivery-global")
+        self.assertEqual(card["channel_id"], f"session:{self.task_id}")
+        self.assertEqual(card["metadata"]["checkpoint_status"], "resolved")
+        self.assertEqual(card["metadata"]["source"], "execution_checkpoint")
 
     async def test_task_session_send_still_uses_dispatcher(self) -> None:
         """Task-mode sessions keep the existing Dispatcher path."""
@@ -2138,7 +1966,7 @@ class TestWSHandlerSessionSend(unittest.IsolatedAsyncioTestCase):
             errors,
         )
 
-    async def test_lock_free_process_session_message_uses_durable_org_for_role_task(self) -> None:
+    async def test_process_session_message_uses_durable_org_with_pending_gate(self) -> None:
         runtime_session_id = "runtime-org-lock-free-session"
         anchor = await self.store.get_task(self.task_id)
         assert anchor is not None
@@ -2186,26 +2014,18 @@ class TestWSHandlerSessionSend(unittest.IsolatedAsyncioTestCase):
             return_value="wrong-active-org"
         )
 
-        lock = self.handler._get_task_lock(role_task.id)
-        await lock.acquire()
-        try:
-            await self.handler._process_session_message(
-                role_task.id,
-                "approve",
-                session_id=role_task.session_id,
-                message_metadata={
-                    "response_to_checkpoint_id": checkpoint.checkpoint_id,
-                    "response_to_checkpoint_type": checkpoint.checkpoint_type,
-                },
-            )
-        finally:
-            lock.release()
+        await self.handler._process_session_message(
+            role_task.id,
+            "ordinary follow-up",
+            session_id=role_task.session_id,
+        )
 
         self.engine.process_message.assert_called_once()
         call_kwargs = self.engine.process_message.call_args.kwargs
         self.assertEqual(call_kwargs["mode"], "org")
         self.assertEqual(call_kwargs["company_profile"], "custom")
         self.assertEqual(call_kwargs["org_id"], "vc-investment-firm")
+        self.assertEqual(self.store._checkpoints[checkpoint.checkpoint_id].status, "pending")
 
     async def test_session_send_reuses_task_session_without_is_ready_flag(self) -> None:
         """Session replies should reuse the task session even for simple stub stores."""
@@ -2237,15 +2057,15 @@ class TestWSHandlerSessionSend(unittest.IsolatedAsyncioTestCase):
             run_project_id="test-project",
         )
 
-    async def test_checkpoint_reply_metadata_forwarded_for_non_escalation_cards(self) -> None:
-        """Non-escalation checkpoint replies must keep the selected card id/type."""
+    async def test_structured_checkpoint_decisions_use_interaction_reply(self) -> None:
+        """Every owner card keeps its checkpoint identity off session_send."""
         ws = MagicMock()
         self.handler._dispatch_session_message = AsyncMock()
-
-        def _close_coro(_task_id: str, coro: Any, **_kwargs: Any) -> None:
-            coro.close()
-
-        self.handler._track_session = MagicMock(side_effect=_close_coro)
+        self.handler._project_accepted_interaction_reply = AsyncMock()
+        self.engine.submit_checkpoint_decision = AsyncMock(return_value={
+            "accepted": True,
+            "status": "answered",
+        })
 
         user_input_answers = {
             "deployment_region": {
@@ -2261,40 +2081,32 @@ class TestWSHandlerSessionSend(unittest.IsolatedAsyncioTestCase):
             ("company_work_item_gate", "cp-work-item-gate", {}),
             ("company_recruitment_confirmation", "cp-recruitment", {"checkpoint_reply_kind": "feedback"}),
         ]
-        for checkpoint_type, checkpoint_id, extra_metadata in cases:
+        for index, (checkpoint_type, checkpoint_id, extra_metadata) in enumerate(cases):
             with self.subTest(checkpoint_type=checkpoint_type):
                 content = f"reply to {checkpoint_type}"
-                metadata = {
-                    "response_to_checkpoint_id": checkpoint_id,
-                    "response_to_checkpoint_type": checkpoint_type,
+                decision = {
+                    "text": content,
                     **extra_metadata,
                 }
-                await self.handler._handle_session_send(ws, {
+                await self.handler._handle_interaction_reply(ws, {
                     "project_id": "test-project",
-                    "task_id": self.task_id,
-                    "content": content,
-                    "metadata": metadata,
+                    "checkpoint_id": checkpoint_id,
+                    "checkpoint_type": checkpoint_type,
+                    "client_request_id": f"interaction-structured-{index}",
+                    "requester_task_id": self.task_id,
+                    "requester_session_id": self.session_id,
+                    "decision": decision,
                 })
 
-                call_kwargs = self.handler._dispatch_session_message.call_args.kwargs
-                self.assertEqual(call_kwargs["message_metadata"], metadata)
-
-                cursor = await self.chat_store._db.execute(
-                    "SELECT metadata FROM messages WHERE sender = 'user' AND content = ? ORDER BY timestamp DESC LIMIT 1",
-                    (content,),
+                self.engine.submit_checkpoint_decision.assert_awaited_with(
+                    checkpoint_id=checkpoint_id,
+                    checkpoint_type=checkpoint_type,
+                    decision=decision,
+                    client_request_id=f"interaction-structured-{index}",
+                    requester_task_id=self.task_id,
+                    requester_session_id=self.session_id,
                 )
-                row = await cursor.fetchone()
-                self.assertIsNotNone(row)
-                stored_metadata = json.loads(row[0]) if row and row[0] else {}
-                self.assertEqual(stored_metadata.get("response_to_checkpoint_id"), checkpoint_id)
-                self.assertEqual(stored_metadata.get("response_to_checkpoint_type"), checkpoint_type)
-                if checkpoint_type == "company_recruitment_confirmation":
-                    self.assertEqual(stored_metadata.get("checkpoint_reply_kind"), "feedback")
-                if checkpoint_type == "task_user_input":
-                    self.assertEqual(
-                        stored_metadata.get("user_input_answers"),
-                        user_input_answers,
-                    )
+        self.handler._dispatch_session_message.assert_not_called()
 
     async def test_session_send_after_company_stop_bypasses_parent_dispatch_lock(self) -> None:
         """Plain text after Stop should go straight to the suspend checkpoint path."""
@@ -2606,8 +2418,8 @@ class TestWSHandlerProjectSwitch(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(kwargs["ok"])
         self.assertIn("already exists", kwargs["error"])
 
-    async def test_stale_human_escalation_reply_does_not_dispatch(self) -> None:
-        """Expired approval clicks should not be re-routed as ordinary chat messages."""
+    async def test_legacy_checkpoint_reply_metadata_is_rejected(self) -> None:
+        """Legacy approval clicks never fall through to ordinary chat."""
         ws = MagicMock()
         self.handler._dispatch_session_message = AsyncMock()
         self.handler._track_session = MagicMock(side_effect=self._discard_session_dispatch)
@@ -2625,17 +2437,17 @@ class TestWSHandlerProjectSwitch(unittest.IsolatedAsyncioTestCase):
 
         self.handler._dispatch_session_message.assert_not_called()
         self.handler._track_session.assert_not_called()
-
-        cursor = await self.chat_store._db.execute(
-            "SELECT sender, content FROM messages ORDER BY timestamp DESC LIMIT 1"
+        self.handler._send_ack.assert_awaited_with(
+            ws,
+            ok=False,
+            action="session_send",
+            error="checkpoint_reply_requires_interaction_reply",
+            project_id="alpha",
+            task_id=self.task_id,
         )
-        row = await cursor.fetchone()
-        self.assertIsNotNone(row)
-        self.assertEqual(row[0], "assistant")
-        self.assertIn("no longer active", row[1])
 
-    async def test_stale_human_escalation_metadata_stripped_for_normal_message(self) -> None:
-        """If stale approval metadata lingers, normal chat should still go through cleanly."""
+    async def test_plain_session_metadata_cannot_carry_checkpoint_fields(self) -> None:
+        """Ordinary composer metadata is restricted to its idempotency key."""
         ws = MagicMock()
         self.handler._dispatch_session_message = AsyncMock()
 
@@ -2648,11 +2460,7 @@ class TestWSHandlerProjectSwitch(unittest.IsolatedAsyncioTestCase):
             "project_id": "alpha",
             "task_id": self.task_id,
             "content": "Please continue with a status update",
-            "metadata": {
-                "response_to_checkpoint_id": "esc-stale",
-                "response_to_checkpoint_type": "human_escalation",
-                "response_to_escalation_id": "esc-stale",
-            },
+            "metadata": {"ui_message_id": "ui-normal-message"},
         })
 
         self.handler._dispatch_session_message.assert_called_once_with(
@@ -2660,8 +2468,8 @@ class TestWSHandlerProjectSwitch(unittest.IsolatedAsyncioTestCase):
             "Please continue with a status update",
             session_id=self.session_id,
             attachment_refs=None,
-            message_metadata=None,
-            user_message_id=ANY,
+            message_metadata={"ui_message_id": "ui-normal-message"},
+            user_message_id="ui-normal-message",
             user_message_created_at=ANY,
             run_engine=self.engine,
             run_project_id="alpha",
@@ -2673,173 +2481,111 @@ class TestWSHandlerProjectSwitch(unittest.IsolatedAsyncioTestCase):
         row = await cursor.fetchone()
         self.assertIsNotNone(row)
         metadata = json.loads(row[0]) if row and row[0] else {}
-        self.assertEqual(metadata, {})
+        self.assertEqual(metadata, {"ui_message_id": "ui-normal-message"})
 
-    async def test_session_send_targets_exact_pending_escalation_by_id(self) -> None:
-        """Explicit escalation metadata should resolve only the selected approval card."""
-        first = self.handler._remember_pending_escalation({
-            "escalation_id": "esc-first",
-            "task_id": self.task_id,
-            "source_task_id": self.task_id,
-            "message": "Approve tool 'file_read'?",
-            "options": [{"id": "approve_once", "label": "Approve once"}],
-            "default_action": "approve_once",
-            "escalation_type": "decision_needed",
+    async def test_interaction_reply_targets_exact_checkpoint_id(self) -> None:
+        """The explicit control message forwards exactly one durable checkpoint."""
+        self.engine.submit_checkpoint_decision = AsyncMock(return_value={
+            "accepted": True,
+            "status": "answered",
         })
-        second = self.handler._remember_pending_escalation({
-            "escalation_id": "esc-second",
-            "task_id": self.task_id,
-            "source_task_id": self.task_id,
-            "message": "Approve tool 'file_search'?",
-            "options": [{"id": "approve_once", "label": "Approve once"}],
-            "default_action": "approve_once",
-            "escalation_type": "decision_needed",
-        })
+        self.handler._project_accepted_interaction_reply = AsyncMock()
 
-        try:
-            ws = MagicMock()
-            await self.handler._handle_session_send(ws, {
-                "project_id": "alpha",
-                "task_id": self.task_id,
-                "content": "Approve once",
-                "metadata": {
-                    "response_to_checkpoint_id": "esc-first",
-                    "response_to_checkpoint_type": "human_escalation",
-                    "response_to_escalation_id": "esc-first",
-                },
-            })
-
-            self.assertTrue(first["future"].done())
-            self.assertEqual(first["future"].result(), "approve_once")
-            self.assertFalse(second["future"].done())
-
-            cursor = await self.chat_store._db.execute(
-                "SELECT metadata FROM messages WHERE sender = 'user' ORDER BY timestamp DESC LIMIT 1"
-            )
-            row = await cursor.fetchone()
-            self.assertIsNotNone(row)
-            metadata = json.loads(row[0]) if row[0] else {}
-            self.assertEqual(metadata.get("response_to_checkpoint_id"), "esc-first")
-            self.assertEqual(metadata.get("response_to_escalation_id"), "esc-first")
-        finally:
-            if not second["future"].done():
-                second["future"].cancel()
-            self.handler._pending_escalations.clear()
-            self.handler._pending_escalation_order.clear()
-
-    async def test_reused_escalation_id_gets_fresh_future(self) -> None:
-        """If an escalation id is ever reused, the handler should reopen the pending state."""
-        first = self.handler._remember_pending_escalation({
-            "escalation_id": "esc-reused",
-            "task_id": self.task_id,
-            "source_task_id": self.task_id,
-            "message": "Approve tool 'file_read'?",
-            "options": [{"id": "approve_once", "label": "Approve once"}],
-            "default_action": "approve_once",
-            "escalation_type": "decision_needed",
-        })
-        first["future"].set_result("approve_once")
-
-        refreshed = self.handler._remember_pending_escalation({
-            "escalation_id": "esc-reused",
-            "task_id": self.task_id,
-            "source_task_id": self.task_id,
-            "message": "Approve tool 'file_write'?",
-            "options": [{"id": "approve_once", "label": "Approve once"}],
-            "default_action": "approve_once",
-            "escalation_type": "decision_needed",
+        ws = MagicMock()
+        await self.handler._handle_interaction_reply(ws, {
+            "project_id": "alpha",
+            "checkpoint_id": "cp-first",
+            "checkpoint_type": "tool_permission",
+            "client_request_id": "interaction-first",
+            "requester_task_id": self.task_id,
+            "requester_session_id": self.session_id,
+            "decision": {
+                "text": "Approve once",
+                "option_id": "approve_once",
+            },
         })
 
-        try:
-            self.assertEqual(self.handler._pending_escalation_order.count("esc-reused"), 1)
-            self.assertIsNot(first["future"], refreshed["future"])
-            self.assertFalse(refreshed["future"].done())
-            self.assertEqual(refreshed["message"], "Approve tool 'file_write'?")
-        finally:
-            refreshed_future = refreshed.get("future")
-            if refreshed_future and not refreshed_future.done():
-                refreshed_future.cancel()
-            self.handler._pending_escalations.clear()
-            self.handler._pending_escalation_order.clear()
+        self.engine.submit_checkpoint_decision.assert_awaited_once_with(
+            checkpoint_id="cp-first",
+            checkpoint_type="tool_permission",
+            decision={"text": "Approve once", "option_id": "approve_once"},
+            client_request_id="interaction-first",
+            requester_task_id=self.task_id,
+            requester_session_id=self.session_id,
+        )
+        self.handler._project_accepted_interaction_reply.assert_awaited_once()
 
-    async def test_explicit_non_escalation_checkpoint_reply_bypasses_pending_escalation(self) -> None:
-        """Recruitment/reorg replies should not be swallowed by an unrelated pending escalation."""
-        pending = self.handler._remember_pending_escalation({
-            "escalation_id": "esc-tool-approval",
-            "task_id": self.task_id,
-            "source_task_id": self.task_id,
-            "message": "Approve tool 'file_read'?",
-            "options": [{"id": "approve_once", "label": "Approve once"}],
-            "default_action": "approve_once",
-            "escalation_type": "decision_needed",
+    async def test_duplicate_interaction_receipt_is_acknowledged_idempotently(self) -> None:
+        """Duplicate delivery is reported from the durable engine receipt."""
+        self.engine.submit_checkpoint_decision = AsyncMock(side_effect=[
+            {"accepted": True, "status": "answered"},
+            {"accepted": True, "deduplicated": True, "status": "answered"},
+        ])
+        self.handler._project_accepted_interaction_reply = AsyncMock()
+        payload = {
+            "project_id": "alpha",
+            "checkpoint_id": "cp-reused",
+            "checkpoint_type": "tool_permission",
+            "client_request_id": "interaction-reused",
+            "requester_task_id": self.task_id,
+            "requester_session_id": self.session_id,
+            "decision": {"text": "Approve once", "option_id": "approve_once"},
+        }
+
+        await self.handler._handle_interaction_reply(MagicMock(), payload)
+        await self.handler._handle_interaction_reply(MagicMock(), payload)
+
+        self.assertEqual(self.engine.submit_checkpoint_decision.await_count, 2)
+        self.assertEqual(self.handler._project_accepted_interaction_reply.await_count, 2)
+        self.assertTrue(self.handler._send_ack.await_args_list[-1].kwargs["deduplicated"])
+
+    async def test_recruitment_decision_uses_same_interaction_endpoint(self) -> None:
+        """Recruitment choices share the single durable control plane."""
+        self.engine.submit_checkpoint_decision = AsyncMock(return_value={
+            "accepted": True,
+            "status": "answered",
         })
+        self.handler._project_accepted_interaction_reply = AsyncMock()
 
-        try:
-            ws = MagicMock()
-            self.handler._dispatch_session_message = AsyncMock()
-            self.handler._track_session = MagicMock(side_effect=self._discard_session_dispatch)
+        ws = MagicMock()
+        self.handler._dispatch_session_message = AsyncMock()
 
-            await self.handler._handle_session_send(ws, {
-                "project_id": "alpha",
-                "task_id": self.task_id,
-                "content": "approve",
-                "metadata": {
-                    "response_to_checkpoint_id": "recruitment-1",
-                    "response_to_checkpoint_type": "company_recruitment_confirmation",
-                    "checkpoint_reply_kind": "approve",
-                    "recruitment_role_agents": {
-                        "executor": "codex",
-                        "reviewer": "native",
-                    },
-                },
-            })
-
-            self.assertFalse(pending["future"].done())
-            self.handler._dispatch_session_message.assert_called_once_with(
-                self.task_id,
-                "approve",
-                session_id=self.session_id,
-                attachment_refs=None,
-                message_metadata={
-                    "response_to_checkpoint_id": "recruitment-1",
-                    "response_to_checkpoint_type": "company_recruitment_confirmation",
-                    "checkpoint_reply_kind": "approve",
-                    "recruitment_role_agents": {
-                        "executor": "codex",
-                        "reviewer": "native",
-                    },
-                },
-                user_message_id=ANY,
-                user_message_created_at=ANY,
-                run_engine=self.engine,
-                run_project_id="alpha",
-            )
-
-            cursor = await self.chat_store._db.execute(
-                "SELECT metadata FROM messages WHERE sender = 'user' ORDER BY timestamp DESC LIMIT 1"
-            )
-            row = await cursor.fetchone()
-            self.assertIsNotNone(row)
-            metadata = json.loads(row[0]) if row[0] else {}
-            self.assertEqual(metadata.get("response_to_checkpoint_id"), "recruitment-1")
-            self.assertEqual(metadata.get("response_to_checkpoint_type"), "company_recruitment_confirmation")
-            self.assertEqual(metadata.get("checkpoint_reply_kind"), "approve")
-            self.assertEqual(
-                metadata.get("recruitment_role_agents"),
-                {
+        await self.handler._handle_interaction_reply(ws, {
+            "project_id": "alpha",
+            "checkpoint_id": "recruitment-1",
+            "checkpoint_type": "company_recruitment_confirmation",
+            "client_request_id": "interaction-recruitment",
+            "requester_task_id": self.task_id,
+            "requester_session_id": self.session_id,
+            "decision": {
+                "text": "approve",
+                "checkpoint_reply_kind": "approve",
+                "recruitment_role_agents": {
                     "executor": "codex",
                     "reviewer": "native",
                 },
-            )
-            self.assertIsNone(metadata.get("response_to_escalation_id"))
-        finally:
-            if not pending["future"].done():
-                pending["future"].cancel()
-            self.handler._pending_escalations.clear()
-            self.handler._pending_escalation_order.clear()
+            },
+        })
 
-    async def test_checkpoint_reply_marks_original_card_with_submitted_metadata(self) -> None:
-        """Checkpoint cards reflect explicit card choices as soon as the reply is sent."""
+        self.handler._dispatch_session_message.assert_not_called()
+        self.engine.submit_checkpoint_decision.assert_awaited_once_with(
+            checkpoint_id="recruitment-1",
+            checkpoint_type="company_recruitment_confirmation",
+            decision={
+                "text": "approve",
+                "checkpoint_reply_kind": "approve",
+                "recruitment_role_agents": {
+                    "executor": "codex",
+                    "reviewer": "native",
+                },
+            },
+            client_request_id="interaction-recruitment",
+            requester_task_id=self.task_id,
+            requester_session_id=self.session_id,
+        )
+
+    async def test_checkpoint_reply_does_not_mutate_chat_card_truth(self) -> None:
+        """The durable checkpoint, not a ChatStore row, owns interaction state."""
         checkpoint_message = await self.chat_store.insert_message(
             channel_id=f"session:{self.task_id}",
             sender="assistant",
@@ -2873,15 +2619,21 @@ class TestWSHandlerProjectSwitch(unittest.IsolatedAsyncioTestCase):
 
         ws = MagicMock()
         self.handler._dispatch_session_message = AsyncMock()
-        self.handler._track_session = MagicMock(side_effect=self._discard_session_dispatch)
+        self.handler._project_accepted_interaction_reply = AsyncMock()
+        self.engine.submit_checkpoint_decision = AsyncMock(return_value={
+            "accepted": True,
+            "status": "answered",
+        })
 
-        await self.handler._handle_session_send(ws, {
+        await self.handler._handle_interaction_reply(ws, {
             "project_id": "alpha",
-            "task_id": self.task_id,
-            "content": "approve",
-            "metadata": {
-                "response_to_checkpoint_id": "recruitment-2",
-                "response_to_checkpoint_type": "company_recruitment_confirmation",
+            "checkpoint_id": "recruitment-2",
+            "checkpoint_type": "company_recruitment_confirmation",
+            "client_request_id": "interaction-recruitment-2",
+            "requester_task_id": self.task_id,
+            "requester_session_id": self.session_id,
+            "decision": {
+                "text": "approve",
                 "checkpoint_reply_kind": "approve",
                 "recruitment_role_agents": {
                     "executor": "codex",
@@ -2896,52 +2648,16 @@ class TestWSHandlerProjectSwitch(unittest.IsolatedAsyncioTestCase):
         row = await cursor.fetchone()
         self.assertIsNotNone(row)
         metadata = json.loads(row[0]) if row and row[0] else {}
-        self.assertEqual(metadata.get("checkpoint_status"), "responded")
-        self.assertTrue(metadata.get("checkpoint_response_message_id"))
+        self.assertIsNone(metadata.get("checkpoint_status"))
+        self.assertIsNone(metadata.get("checkpoint_response_message_id"))
         self.assertEqual(metadata.get("checkpoint_id"), "recruitment-2")
-        self.assertEqual(metadata.get("checkpoint_reply_kind"), "approve")
-        self.assertEqual(metadata.get("recruitment_role_agents"), {"executor": "codex"})
-        self.assertEqual(metadata.get("proposals", [{}])[0].get("selected_agent"), "codex")
-        self.assertEqual(metadata.get("staffing_roles", [{}])[0].get("selected_agent"), "codex")
+        self.assertIsNone(metadata.get("checkpoint_reply_kind"))
+        self.assertEqual(metadata.get("proposals", [{}])[0].get("selected_agent"), "native")
+        self.assertEqual(metadata.get("staffing_roles", [{}])[0].get("selected_agent"), "native")
 
-        session_id = self.session_id
-
-        class ResolvedCheckpointStore:
-            async def get_execution_checkpoints(self, project_id: str = "default") -> list[ExecutionCheckpoint]:
-                return [
-                    ExecutionCheckpoint(
-                        checkpoint_id="recruitment-2",
-                        project_id=project_id,
-                        session_id=session_id,
-                        checkpoint_type="company_recruitment_confirmation",
-                        status="resolved",
-                    )
-                ]
-
-        updated = await self.handler._mark_checkpoint_card_after_engine_response(
-            channel_id=f"session:{self.task_id}",
-            project_id="alpha",
-            engine=SimpleNamespace(store=ResolvedCheckpointStore()),
-            message_metadata={
-                "response_to_checkpoint_id": "recruitment-2",
-                "response_to_checkpoint_type": "company_recruitment_confirmation",
-                "checkpoint_reply_kind": "approve",
-                "recruitment_role_agents": {
-                    "executor": "codex",
-                },
-            },
-            response_message_id="user-response-1",
-        )
-        self.assertIsNotNone(updated)
-        assert updated is not None
-        updated_metadata = updated["metadata"]
-        self.assertEqual(updated_metadata.get("checkpoint_status"), "responded")
-        self.assertEqual(updated_metadata.get("checkpoint_response_message_id"), "user-response-1")
-        self.assertIn("checkpoint_responded_at", updated_metadata)
-        self.assertEqual(updated_metadata.get("checkpoint_reply_kind"), "approve")
-        self.assertEqual(updated_metadata.get("recruitment_role_agents"), {"executor": "codex"})
-        self.assertEqual(updated_metadata.get("proposals", [{}])[0].get("selected_agent"), "codex")
-        self.assertEqual(updated_metadata.get("staffing_roles", [{}])[0].get("selected_agent"), "codex")
+        self.handler._dispatch_session_message.assert_not_called()
+        self.handler._project_accepted_interaction_reply.assert_awaited_once()
+        self.assertTrue(self.handler._send_ack.await_args.kwargs["ok"])
 
     async def test_superseded_checkpoint_status_is_terminal_in_chat_store(self) -> None:
         checkpoint_message = await self.chat_store.insert_message(
@@ -3238,6 +2954,32 @@ class TestWSHandlerSessionUpdateConfig(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(ack_kwargs["exec_mode"], "company")
         self.assertEqual(ack_kwargs["company_profile"], "corporate")
         self.assertEqual(ack_kwargs["preferred_agent"], "codex")
+
+    async def test_task_mode_update_preserves_jiuwen_agent_selection(self) -> None:
+        for agent in ("jiuwen", "jiuwenswarm"):
+            with self.subTest(agent=agent):
+                self.broadcasts.clear()
+                self.handler._send_ack.reset_mock()
+                ws = MagicMock()
+                await self.handler._handle_session_update_config(ws, {
+                    "project_id": "test-project",
+                    "task_id": self.task_id,
+                    "exec_mode": "task",
+                    "preferred_agent": agent,
+                })
+
+                task = await self.store.get_task(self.task_id)
+                self.assertEqual(task.metadata.get("preferred_agent"), agent)
+                self.assertEqual(task.metadata.get("selected_execution_agent"), agent)
+
+                updates = [b for b in self.broadcasts if b["type"] == "session_updated"]
+                self.assertEqual(len(updates), 1)
+                self.assertEqual(updates[0]["payload"]["preferred_agent"], agent)
+                self.assertEqual(updates[0]["payload"]["selected_execution_agent"], agent)
+
+                ack_kwargs = self.handler._send_ack.call_args.kwargs
+                self.assertTrue(ack_kwargs["ok"])
+                self.assertEqual(ack_kwargs["preferred_agent"], agent)
 
     async def test_update_config_persists_custom_org_id(self) -> None:
         ws = MagicMock()
@@ -3986,7 +3728,7 @@ class TestWSHandlerSessionDetail(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["messages"][0]["content"], "## Global Intent Summary\n\nBuild the feature")
         self.assertEqual(payload["messages"][1]["sender"], "agent-reviewer")
 
-    async def test_session_detail_reconciles_legacy_inactive_approval_card(self) -> None:
+    async def test_session_detail_reconciles_retired_legacy_escalation_card(self) -> None:
         ws = MagicMock()
         ws.send_json = AsyncMock()
         task = Task(
@@ -4005,20 +3747,26 @@ class TestWSHandlerSessionDetail(unittest.IsolatedAsyncioTestCase):
             channel_id="session:legacy-approval-task",
             sender="assistant",
             sender_name="OPC",
-            content="Approve external_agent 'opencode'?",
+            content="Legacy action required",
             metadata={
                 "checkpoint_type": "human_escalation",
                 "checkpoint_id": "esc-legacy-stuck",
-                "escalation_id": "esc-legacy-stuck",
                 "escalation_type": "decision_needed",
-                "prompt": "Approve external_agent 'opencode'?",
-                "summary": "Approve external_agent 'opencode'?",
-                "options": [{"id": "approve_once", "label": "Approve once"}],
-                "default_action": "approve_once",
+                "prompt": "Legacy action required",
+                "summary": "Legacy action required",
             },
-            message_id="escalation::esc-legacy-stuck",
+            message_id="checkpoint::esc-legacy-stuck",
             project_id="test-project",
         )
+        await self.store.save_execution_checkpoint(ExecutionCheckpoint(
+            checkpoint_id="esc-legacy-stuck",
+            project_id="test-project",
+            session_id="legacy-approval-session",
+            task_id="legacy-approval-task",
+            checkpoint_type="human_escalation",
+            status="stale",
+            payload={},
+        ))
 
         await self.handler._handle_session_detail(
             ws,
@@ -4034,8 +3782,8 @@ class TestWSHandlerSessionDetail(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(card["metadata"].get("checkpoint_status"), "stale")
         self.assertEqual(
-            card["metadata"].get("checkpoint_resolution_reason"),
-            "session_detail_reconcile_inactive_escalation",
+            card["metadata"].get("checkpoint_resolution_source"),
+            "execution_checkpoint_lifecycle",
         )
 
     async def test_session_detail_reconciles_resolved_staffing_card(self) -> None:
@@ -5729,7 +5477,7 @@ class TestOfficeServiceExecutionIdentity(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(call_kwargs["mode"], "org")
         self.assertEqual(call_kwargs["company_profile"], "custom")
         self.assertEqual(call_kwargs["org_id"], "quantum_harbor")
-        self.assertIsNone(call_kwargs["preferred_agent"])
+        self.assertEqual(call_kwargs["preferred_agent"], "codex")
         updated = await self.store.get_task(task.id)
         self.assertEqual(updated.metadata.get("exec_mode"), "org")
         self.assertEqual(updated.metadata.get("company_profile"), "custom")
@@ -5759,7 +5507,7 @@ class TestOfficeServiceExecutionIdentity(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(call_kwargs["mode"], "company")
         self.assertEqual(call_kwargs["company_profile"], "corporate")
         self.assertIsNone(call_kwargs["org_id"])
-        self.assertIsNone(call_kwargs["preferred_agent"])
+        self.assertEqual(call_kwargs["preferred_agent"], "codex")
         updated = await self.store.get_task(task.id)
         self.assertEqual(updated.metadata.get("exec_mode"), "company")
         self.assertEqual(updated.metadata.get("company_profile"), "corporate")
@@ -6424,7 +6172,7 @@ class TestWSHandlerTranscriptSync(unittest.IsolatedAsyncioTestCase):
 
 
 class TestWSHandlerEscalationRouting(unittest.IsolatedAsyncioTestCase):
-    """Escalations should surface on the user-visible session task."""
+    """Durable owner interactions surface on the user-visible session task."""
 
     async def asyncSetUp(self) -> None:
         from opc.plugins.office_ui.ws_handler import WSHandler
@@ -6441,7 +6189,7 @@ class TestWSHandlerEscalationRouting(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self) -> None:
         await self.chat_store._db.close()
 
-    async def test_escalation_routes_to_origin_session_task(self) -> None:
+    async def test_permission_checkpoint_event_routes_to_owner_anchor(self) -> None:
         origin_task_id = "session-task-1"
         exec_task_id = "exec-task-1"
         session_id = "sess-1"
@@ -6462,33 +6210,49 @@ class TestWSHandlerEscalationRouting(unittest.IsolatedAsyncioTestCase):
         await self.chat_store.create_session_channel(origin_task_id, "Session Task", project_id="test-project")
         self.handler._session_to_task[session_id] = origin_task_id
 
-        event = MagicMock()
-        event.payload = {
-            "escalation_id": "esc-1",
-            "task_id": exec_task_id,
-            "type": "decision_needed",
-            "message": "Approve tool 'file_read'?",
-            "options": [{"id": "approve_once", "label": "Approve once"}],
-            "default_action": "approve_once",
-        }
-
-        await self.handler._mirror_escalation(event)
-
-        cursor = await self.chat_store._db.execute(
-            "SELECT channel_id, metadata FROM messages WHERE message_id = (SELECT message_id FROM messages ORDER BY timestamp DESC LIMIT 1)"
+        checkpoint = ExecutionCheckpoint(
+            checkpoint_id="cp-tool-1",
+            project_id="test-project",
+            task_id=exec_task_id,
+            session_id=session_id,
+            checkpoint_type="tool_permission",
+            status="pending",
+            payload={
+                "interaction": {
+                    "kind": "tool_permission",
+                    "prompt": "Approve tool 'file_read'?",
+                    "options": [{"id": "approve_once", "label": "Approve once"}],
+                    "ownership": {
+                        "ui_anchor_task_id": origin_task_id,
+                        "ui_anchor_session_id": session_id,
+                        "waiting_task_id": exec_task_id,
+                        "waiting_session_id": session_id,
+                    },
+                },
+                "tool_call": {"id": "call-1", "name": "file_read"},
+                "approval": {},
+            },
         )
-        row = await cursor.fetchone()
-        self.assertIsNotNone(row)
-        self.assertEqual(row[0], f"session:{origin_task_id}")
-        metadata = json.loads(row[1]) if row[1] else {}
-        self.assertEqual(metadata.get("task_id"), origin_task_id)
-        self.assertEqual(metadata.get("source_task_id"), exec_task_id)
+        await self.store.save_execution_checkpoint(checkpoint)
+        self.engine.can_answer_checkpoint = AsyncMock(return_value=True)
+        self.handler._load_execution_checkpoint_for_reply = AsyncMock(return_value=checkpoint)
 
-        pending_from_origin = self.handler._find_pending_escalation(task_id=origin_task_id)
-        pending_from_exec = self.handler._find_pending_escalation(task_id=exec_task_id)
-        self.assertIsNotNone(pending_from_origin)
-        self.assertIsNotNone(pending_from_exec)
-        self.assertEqual(pending_from_origin, pending_from_exec)
+        await self.handler._handle_runtime_event_progress({
+            "type": "interaction_checkpoint_changed",
+            "checkpoint_id": checkpoint.checkpoint_id,
+            "checkpoint_type": checkpoint.checkpoint_type,
+            "task_id": exec_task_id,
+            "ui_anchor_task_id": origin_task_id,
+            "ui_anchor_session_id": session_id,
+        }, engine=self.engine, project_id="test-project")
+
+        card = next(
+            item["payload"] for item in self.broadcasts
+            if item.get("type") == "session_message"
+        )
+        self.assertEqual(card["channel_id"], f"session:{origin_task_id}")
+        self.assertEqual(card["metadata"]["checkpoint_id"], "cp-tool-1")
+        self.assertEqual(card["metadata"]["checkpoint_type"], "tool_permission")
 
     async def test_origin_session_plain_approval_requires_card_click(self) -> None:
         origin_task_id = "session-task-2"
@@ -6511,20 +6275,21 @@ class TestWSHandlerEscalationRouting(unittest.IsolatedAsyncioTestCase):
         await self.chat_store.create_session_channel(origin_task_id, "Session Task", project_id="test-project")
         self.handler._session_to_task[session_id] = origin_task_id
 
-        event = MagicMock()
-        event.payload = {
-            "escalation_id": "esc-2",
-            "task_id": exec_task_id,
-            "type": "decision_needed",
-            "message": "Approve tool 'file_search'?",
-            "options": [{"id": "approve_once", "label": "Approve once"}],
-            "default_action": "approve_once",
-        }
-        await self.handler._mirror_escalation(event)
-
-        pending = self.handler._find_pending_escalation(task_id=origin_task_id)
-        self.assertIsNotNone(pending)
-        future = pending["future"]
+        checkpoint = ExecutionCheckpoint(
+            checkpoint_id="cp-tool-2",
+            project_id="test-project",
+            task_id=exec_task_id,
+            session_id=session_id,
+            checkpoint_type="tool_permission",
+            status="pending",
+            payload={},
+        )
+        await self.store.save_execution_checkpoint(checkpoint)
+        self.engine.submit_checkpoint_decision = AsyncMock()
+        self.handler._dispatch_session_message = AsyncMock()
+        self.handler._track_session = MagicMock(
+            side_effect=lambda _task_id, coro, **_kwargs: coro.close()
+        )
 
         ws = MagicMock()
         await self.handler._handle_session_send(ws, {
@@ -6533,21 +6298,11 @@ class TestWSHandlerEscalationRouting(unittest.IsolatedAsyncioTestCase):
             "content": "approve",
         })
 
-        self.assertFalse(future.done())
-        self.assertIsNotNone(self.handler._find_pending_escalation(task_id=origin_task_id))
-        cursor = await self.chat_store._db.execute(
-            "SELECT sender, content FROM messages ORDER BY timestamp DESC LIMIT 1"
-        )
-        row = await cursor.fetchone()
-        self.assertIsNotNone(row)
-        self.assertEqual(row[0], "assistant")
-        self.assertIn("approval card buttons", row[1])
-        if not future.done():
-            future.cancel()
-        self.handler._pending_escalations.clear()
-        self.handler._pending_escalation_order.clear()
+        self.handler._dispatch_session_message.assert_called_once()
+        self.engine.submit_checkpoint_decision.assert_not_awaited()
+        self.assertEqual(self.store._checkpoints[checkpoint.checkpoint_id].status, "pending")
 
-    async def test_origin_session_card_reply_resolves_pending_escalation(self) -> None:
+    async def test_origin_session_card_reply_submits_durable_checkpoint(self) -> None:
         origin_task_id = "session-task-2-card"
         exec_task_id = "exec-task-2-card"
         session_id = "sess-2-card"
@@ -6568,40 +6323,35 @@ class TestWSHandlerEscalationRouting(unittest.IsolatedAsyncioTestCase):
         await self.chat_store.create_session_channel(origin_task_id, "Session Task", project_id="test-project")
         self.handler._session_to_task[session_id] = origin_task_id
 
-        event = MagicMock()
-        event.payload = {
-            "escalation_id": "esc-2-card",
-            "task_id": exec_task_id,
-            "type": "decision_needed",
-            "message": "Approve tool 'file_search'?",
-            "options": [{"id": "approve_once", "label": "Approve once"}],
-            "default_action": "approve_once",
-        }
-        await self.handler._mirror_escalation(event)
-
-        pending = self.handler._find_pending_escalation(task_id=origin_task_id)
-        self.assertIsNotNone(pending)
-        future = pending["future"]
+        self.engine.submit_checkpoint_decision = AsyncMock(return_value={
+            "accepted": True,
+            "status": "answered",
+        })
+        self.handler._project_accepted_interaction_reply = AsyncMock()
+        self.handler._send_ack = AsyncMock()
 
         ws = MagicMock()
-        await self.handler._handle_session_send(ws, {
+        await self.handler._handle_interaction_reply(ws, {
             "project_id": "test-project",
-            "task_id": origin_task_id,
-            "content": "Approve once",
-            "metadata": {
-                "response_to_checkpoint_id": "esc-2-card",
-                "response_to_checkpoint_type": "human_escalation",
-                "response_to_escalation_id": "esc-2-card",
-            },
+            "checkpoint_id": "cp-tool-2-card",
+            "checkpoint_type": "tool_permission",
+            "client_request_id": "interaction-tool-2-card",
+            "requester_task_id": origin_task_id,
+            "requester_session_id": session_id,
+            "decision": {"text": "Approve once", "option_id": "approve_once"},
         })
 
-        self.assertTrue(future.done())
-        self.assertEqual(future.result(), "approve_once")
-        self.assertIsNone(self.handler._find_pending_escalation(task_id=origin_task_id))
-        self.handler._pending_escalations.clear()
-        self.handler._pending_escalation_order.clear()
+        self.engine.submit_checkpoint_decision.assert_awaited_once_with(
+            checkpoint_id="cp-tool-2-card",
+            checkpoint_type="tool_permission",
+            decision={"text": "Approve once", "option_id": "approve_once"},
+            client_request_id="interaction-tool-2-card",
+            requester_task_id=origin_task_id,
+            requester_session_id=session_id,
+        )
+        self.assertTrue(self.handler._send_ack.await_args.kwargs["ok"])
 
-    async def test_escalation_timeout_marks_original_card_terminal(self) -> None:
+    async def test_permission_timeout_event_projects_terminal_checkpoint(self) -> None:
         origin_task_id = "session-task-timeout"
         exec_task_id = "exec-task-timeout"
         session_id = "sess-timeout"
@@ -6622,42 +6372,49 @@ class TestWSHandlerEscalationRouting(unittest.IsolatedAsyncioTestCase):
         await self.chat_store.create_session_channel(origin_task_id, "Session Task", project_id="test-project")
         self.handler._session_to_task[session_id] = origin_task_id
 
-        created_event = MagicMock()
-        created_event.payload = {
-            "escalation_id": "esc-timeout",
-            "task_id": exec_task_id,
-            "type": "decision_needed",
-            "message": "Approve external_agent 'opencode'?",
-            "options": [{"id": "approve_once", "label": "Approve once"}],
-            "default_action": "approve_once",
-        }
-        await self.handler._mirror_escalation(created_event)
-
-        timeout_event = MagicMock()
-        timeout_event.event_type = "escalation_timeout"
-        timeout_event.payload = {
-            "escalation_id": "esc-timeout",
-            "default_action": "approve_once",
-        }
-        await self.handler.on_opc_event(timeout_event)
-
-        cursor = await self.chat_store._db.execute(
-            "SELECT metadata FROM messages WHERE message_id = ?",
-            ("escalation::esc-timeout",),
+        checkpoint = ExecutionCheckpoint(
+            checkpoint_id="cp-timeout",
+            project_id="test-project",
+            task_id=exec_task_id,
+            session_id=session_id,
+            checkpoint_type="action_permission",
+            status="timeout",
+            payload={
+                "interaction": {
+                    "kind": "action_permission",
+                    "prompt": "Approve external_agent 'opencode'?",
+                    "options": [{"id": "approve_once", "label": "Approve once"}],
+                    "ownership": {
+                        "ui_anchor_task_id": origin_task_id,
+                        "ui_anchor_session_id": session_id,
+                        "waiting_task_id": exec_task_id,
+                    },
+                },
+                "approval": {"action_name": "external_agent"},
+                "tool_call": {"id": "call-timeout", "name": "external_agent"},
+            },
         )
-        row = await cursor.fetchone()
-        self.assertIsNotNone(row)
-        metadata = json.loads(row[0]) if row and row[0] else {}
-        self.assertEqual(metadata.get("checkpoint_status"), "timeout")
-        self.assertEqual(metadata.get("checkpoint_timeout_default_action"), "approve_once")
-        self.assertIn("checkpoint_resolved_at", metadata)
+        await self.store.save_execution_checkpoint(checkpoint)
+        self.engine.can_answer_checkpoint = AsyncMock(return_value=True)
+        self.handler._load_execution_checkpoint_for_reply = AsyncMock(return_value=checkpoint)
+
+        await self.handler._handle_runtime_event_progress({
+            "type": "interaction_checkpoint_changed",
+            "checkpoint_id": checkpoint.checkpoint_id,
+            "checkpoint_type": checkpoint.checkpoint_type,
+            "task_id": exec_task_id,
+            "ui_anchor_task_id": origin_task_id,
+            "ui_anchor_session_id": session_id,
+            "status": "timeout",
+        }, engine=self.engine, project_id="test-project")
+
         self.assertTrue(any(
             item.get("type") == "session_message"
             and (item.get("payload") or {}).get("metadata", {}).get("checkpoint_status") == "timeout"
             for item in self.broadcasts
         ))
 
-    async def test_stale_escalation_reply_marks_card_inactive_without_dispatch(self) -> None:
+    async def test_stale_permission_reply_is_rejected_without_dispatch(self) -> None:
         origin_task_id = "session-task-stale"
         session_id = "sess-stale"
 
@@ -6668,55 +6425,31 @@ class TestWSHandlerEscalationRouting(unittest.IsolatedAsyncioTestCase):
             session_id=session_id,
         ))
         await self.chat_store.create_session_channel(origin_task_id, "Session Task", project_id="test-project")
-        await self.chat_store.insert_message(
-            channel_id=f"session:{origin_task_id}",
-            sender="assistant",
-            sender_name="OPC",
-            content="Approve external_agent 'opencode'?",
-            metadata={
-                "checkpoint_type": "human_escalation",
-                "checkpoint_id": "esc-stale",
-                "escalation_id": "esc-stale",
-                "escalation_type": "decision_needed",
-                "prompt": "Approve external_agent 'opencode'?",
-                "summary": "Approve external_agent 'opencode'?",
-                "options": [{"id": "approve_once", "label": "Approve once"}],
-                "default_action": "approve_once",
-            },
-            message_id="escalation::esc-stale",
-            project_id="test-project",
-        )
-
         self.handler._dispatch_session_message = AsyncMock()
         self.handler._track_session = MagicMock()
+        self.handler._project_accepted_interaction_reply = AsyncMock()
+        self.handler._send_ack = AsyncMock()
+        self.engine.submit_checkpoint_decision = AsyncMock(return_value={
+            "accepted": False,
+            "status": "stale",
+            "reason": "stale",
+        })
         ws = MagicMock()
-        await self.handler._handle_session_send(ws, {
+        await self.handler._handle_interaction_reply(ws, {
             "project_id": "test-project",
-            "task_id": origin_task_id,
-            "content": "Approve once",
-            "metadata": {
-                "response_to_checkpoint_id": "esc-stale",
-                "response_to_checkpoint_type": "human_escalation",
-                "response_to_escalation_id": "esc-stale",
-            },
+            "checkpoint_id": "cp-stale",
+            "checkpoint_type": "action_permission",
+            "client_request_id": "interaction-stale",
+            "requester_task_id": origin_task_id,
+            "requester_session_id": session_id,
+            "decision": {"text": "Approve once", "option_id": "approve_once"},
         })
 
         self.handler._dispatch_session_message.assert_not_called()
         self.handler._track_session.assert_not_called()
-        cursor = await self.chat_store._db.execute(
-            "SELECT metadata FROM messages WHERE message_id = ?",
-            ("escalation::esc-stale",),
-        )
-        row = await cursor.fetchone()
-        self.assertIsNotNone(row)
-        metadata = json.loads(row[0]) if row and row[0] else {}
-        self.assertEqual(metadata.get("checkpoint_status"), "stale")
-        self.assertEqual(metadata.get("checkpoint_resolution_reason"), "reply_to_inactive_escalation")
-        self.assertTrue(any(
-            item.get("type") == "session_message"
-            and (item.get("payload") or {}).get("metadata", {}).get("checkpoint_status") == "stale"
-            for item in self.broadcasts
-        ))
+        self.handler._project_accepted_interaction_reply.assert_not_awaited()
+        self.assertFalse(self.handler._send_ack.await_args.kwargs["ok"])
+        self.assertEqual(self.handler._send_ack.await_args.kwargs["error"], "stale")
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -6776,6 +6509,120 @@ class TestSnapshotBuilderSessionData(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(session["task_id"], "t1")
             self.assertEqual(result["boards"][0]["board_id"], "p1")
             self.assertEqual([task["task_id"] for task in result["tasks"]], ["t1"])
+        finally:
+            await chat_store._db.close()
+
+    async def test_runtime_auxiliary_task_is_hidden_and_stale_channel_is_pruned(
+        self,
+    ) -> None:
+        from opc.plugins.office_ui.snapshot_builder import (
+            build_collab_sync,
+            build_project_index_sync,
+        )
+
+        store = StubStore()
+        root_task = Task(
+            id="source",
+            title="Customer-visible delivery",
+            session_id="source-session",
+            project_id="p1",
+            status=TaskStatus.DONE,
+        )
+        await store.save_task(root_task)
+        auxiliary = Task(
+            id="source::ceo_pre_delivery_assessment::aux-1",
+            title="CEO Pre Delivery Assessment",
+            session_id="source-session:aux:ceo_pre_delivery_assessment:aux-1",
+            parent_session_id="source-session",
+            parent_id="source",
+            project_id="p1",
+            assigned_to="ceo",
+            status=TaskStatus.DONE,
+            metadata={
+                "runtime_auxiliary_task": True,
+                "company_runtime_auxiliary_task": True,
+                "runtime_auxiliary_kind": "role_prompt",
+                "runtime_auxiliary_source_task_id": "source",
+            },
+        )
+        await store.save_task(auxiliary)
+        chat_store = await _make_chat_store()
+        await chat_store.create_session_channel(
+            root_task.id,
+            root_task.title,
+            project_id="p1",
+        )
+        await chat_store.create_session_channel(
+            auxiliary.id,
+            auxiliary.title,
+            project_id="p1",
+        )
+        await chat_store.insert_message(
+            channel_id=f"session:{auxiliary.id}",
+            sender="ceo",
+            sender_name="CEO",
+            content="Internal assessment",
+            project_id="p1",
+        )
+        await chat_store.append_progress(
+            auxiliary.id,
+            [{"type": "status_change", "summary": "Internal", "timestamp": time.time()}],
+            project_id="p1",
+        )
+        try:
+            engine = MagicMock()
+            engine.store = store
+            engine.project_id = "p1"
+
+            result = await build_collab_sync(
+                engine,
+                MagicMock(),
+                chat_store,
+            )
+            self.assertEqual(
+                {item["task_id"] for item in result["tasks"]},
+                {root_task.id},
+            )
+            self.assertNotIn(auxiliary.id, {item["task_id"] for item in result["sessions"]})
+            self.assertEqual(
+                {item["task_id"] for item in result["sessions"]},
+                {root_task.id},
+            )
+            self.assertNotIn(
+                f"session:{auxiliary.id}",
+                {item["channel_id"] for item in result["channels"]},
+            )
+            self.assertFalse(
+                any(
+                    channel["channel_id"] == f"session:{auxiliary.id}"
+                    for channel in await chat_store.get_session_channels("p1")
+                )
+            )
+
+            # The lightweight project index independently enforces the same
+            # invariant and removes a channel recreated by an older process.
+            await chat_store.create_session_channel(
+                auxiliary.id,
+                auxiliary.title,
+                project_id="p1",
+            )
+            index = await build_project_index_sync(
+                engine,
+                MagicMock(),
+                chat_store,
+            )
+            self.assertNotIn(
+                f"session:{auxiliary.id}",
+                {item["channel_id"] for item in index["channels"]},
+            )
+            self.assertEqual(
+                {item["task_id"] for item in index["sessions"]},
+                {root_task.id},
+            )
+            self.assertEqual(
+                {item["task_id"] for item in index["tasks"]},
+                {root_task.id},
+            )
         finally:
             await chat_store._db.close()
 
@@ -7567,6 +7414,122 @@ class TestSnapshotBuilderSessionData(unittest.IsolatedAsyncioTestCase):
 
 
 class TestWSHandlerCommsState(unittest.IsolatedAsyncioTestCase):
+    async def test_comms_read_is_bound_to_durable_task_layout(self) -> None:
+        from opc.plugins.office_ui.services.comms import CommsService
+        from opc.plugins.office_ui.services.context import OfficeServiceContext
+
+        store = StubStore()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            workspace = root / "workspace-a"
+            other_workspace = root / "workspace-b"
+            workspace.mkdir()
+            other_workspace.mkdir()
+            task = Task(
+                id="comms-reader-task",
+                title="Authorized comms reader",
+                session_id="session-a",
+                project_id="project-a",
+                metadata={
+                    "comms_workspace_root": str(workspace),
+                    "target_output_dir": str(workspace),
+                },
+            )
+            foreign_task = Task(
+                id="foreign-comms-task",
+                title="Foreign comms reader",
+                session_id="session-a",
+                project_id="project-b",
+                metadata={
+                    "comms_workspace_root": str(workspace),
+                    "target_output_dir": str(workspace),
+                },
+            )
+            await store.save_task(task)
+            await store.save_task(foreign_task)
+
+            authorized = file_comms.resolve_layout(
+                workspace,
+                "project-a",
+                "session-a",
+            )
+            wrong_session = file_comms.resolve_layout(
+                workspace,
+                "project-a",
+                "session-b",
+            )
+            wrong_workspace = file_comms.resolve_layout(
+                other_workspace,
+                "project-a",
+                "session-a",
+            )
+            wrong_project = file_comms.resolve_layout(
+                workspace,
+                "project-b",
+                "session-a",
+            )
+            messages: dict[str, Path] = {}
+            for label, layout in (
+                ("authorized", authorized),
+                ("session", wrong_session),
+                ("workspace", wrong_workspace),
+                ("project", wrong_project),
+            ):
+                file_comms.ensure_layout(layout, ["sender", "reader"])
+                messages[label] = file_comms.send_message(
+                    layout,
+                    from_role="sender",
+                    to_role="reader",
+                    subject=f"{label} message",
+                    body=f"body:{label}",
+                )
+
+            engine = _make_engine(store=store)
+            engine.project_id = "project-a"
+            context = OfficeServiceContext(
+                engine=engine,
+                agent_store=MagicMock(),
+                chat_store=MagicMock(),
+                event_adapter=MagicMock(),
+            )
+            service = CommsService(context)
+
+            result = await service.read(
+                project_id="project-a",
+                task_id=task.id,
+                path=str(messages["authorized"]),
+            )
+            self.assertEqual(result.payload["body"], "body:authorized\n")
+            self.assertEqual(result.payload["project_id"], "project-a")
+            self.assertEqual(result.payload["task_id"], task.id)
+
+            for label in ("session", "workspace", "project"):
+                with self.subTest(label=label):
+                    with self.assertRaises(ServiceError) as denied:
+                        await service.read(
+                            project_id="project-a",
+                            task_id=task.id,
+                            path=str(messages[label]),
+                        )
+                    self.assertEqual(denied.exception.code, "path_outside_comms")
+
+            with self.assertRaises(ServiceError) as mismatched_task:
+                await service.read(
+                    project_id="project-a",
+                    task_id=foreign_task.id,
+                    path=str(messages["project"]),
+                )
+            self.assertEqual(
+                mismatched_task.exception.code,
+                "task_project_mismatch",
+            )
+            with self.assertRaises(ServiceError) as missing_task:
+                await service.read(
+                    project_id="project-a",
+                    path=str(messages["authorized"]),
+                )
+            self.assertEqual(missing_task.exception.code, "task_required")
+
     async def test_comms_state_resolves_session_scope_from_root_anchor_task(self) -> None:
         from opc.plugins.office_ui.ws_handler import WSHandler
 
@@ -7626,9 +7589,73 @@ class TestWSHandlerCommsState(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(payload.get("empty", False))
             self.assertEqual(payload["session_id"], "root-session")
             self.assertEqual(payload["project_id"], "test-project")
+            self.assertEqual(payload["task_id"], "child-task")
             roles = {role["role_id"]: role for role in payload.get("roles", [])}
             self.assertIn("executor", roles)
             self.assertEqual(roles["executor"]["unread_count"], 1)
+
+    async def test_comms_state_does_not_follow_runtime_namespace_symlink(self) -> None:
+        from opc.plugins.office_ui.ws_handler import WSHandler
+
+        store = StubStore()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            workspace = root / "workspace"
+            external = root / "external"
+            workspace.mkdir()
+            external.mkdir()
+            escaped_role = (
+                external
+                / "test-project"
+                / "root-session"
+                / "inbox"
+                / "escaped-role"
+                / "new"
+            )
+            escaped_role.mkdir(parents=True)
+            (escaped_role / "secret.md").write_text(
+                "external secret",
+                encoding="utf-8",
+            )
+            (workspace / ".opc-comms").symlink_to(
+                external,
+                target_is_directory=True,
+            )
+            task = Task(
+                id="symlink-comms-task",
+                title="Symlink comms",
+                session_id="root-session",
+                project_id="test-project",
+                metadata={
+                    "comms_workspace_root": str(workspace),
+                    "target_output_dir": str(workspace),
+                },
+            )
+            await store.save_task(task)
+            engine = _make_engine(store=store)
+            engine.project_id = "test-project"
+            handler = WSHandler(
+                engine,
+                MagicMock(),
+                MagicMock(),
+                MagicMock(),
+            )
+            ws = MagicMock()
+            ws.send_json = AsyncMock()
+
+            await handler._handle_comms_state(
+                ws,
+                {
+                    "project_id": "test-project",
+                    "task_id": task.id,
+                },
+            )
+
+            payload = ws.send_json.await_args.args[0]["payload"]
+            self.assertTrue(payload["available"])
+            self.assertTrue(payload["empty"])
+            self.assertEqual(payload["roles"], [])
+            self.assertNotIn("external secret", str(payload))
 
 
 if __name__ == "__main__":

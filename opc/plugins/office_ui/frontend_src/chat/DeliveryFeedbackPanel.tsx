@@ -4,8 +4,9 @@ import { MarkdownBody } from './MarkdownBody'
 
 interface DeliveryFeedbackPanelProps {
   meta: ChatMessageMeta
-  onReply: (text: string, metadata?: CheckpointReplyMetadata) => void
+  onReply: (text: string, metadata?: CheckpointReplyMetadata) => Promise<boolean>
   responded: boolean
+  submitting?: boolean
 }
 
 function firstLine(text: string): string {
@@ -36,11 +37,10 @@ function checkpointStatusLabel(status: string): string {
 }
 
 export const DeliveryFeedbackPanel = React.memo(function DeliveryFeedbackPanel({
-  meta, onReply, responded,
+  meta, onReply, responded, submitting = false,
 }: DeliveryFeedbackPanelProps) {
   const isResponded = responded
   const [feedback, setFeedback] = useState('')
-  const [submittingAction, setSubmittingAction] = useState<CheckpointReplyMetadata['checkpoint_reply_kind'] | null>(null)
   const checkpointStatus = String(meta.checkpoint_status ?? '').trim().toLowerCase()
   const resolvedLabel = checkpointStatusLabel(checkpointStatus)
   const prompt = String(meta.prompt ?? meta.summary ?? '').trim()
@@ -57,7 +57,7 @@ export const DeliveryFeedbackPanel = React.memo(function DeliveryFeedbackPanel({
   )
   const worktreePath = String(meta.worktree_path ?? '').trim()
   const hasRuntimeState = activeSubagents.length > 0 || permissionRequests.length > 0 || !!worktreePath
-  const actionsDisabled = isResponded || submittingAction !== null
+  const actionsDisabled = isResponded || submitting
 
   const buildReplyMetadata = useCallback((kind: NonNullable<CheckpointReplyMetadata['checkpoint_reply_kind']>, text = ''): CheckpointReplyMetadata => {
     const checkpointId = String(meta.checkpoint_id ?? '').trim()
@@ -76,27 +76,24 @@ export const DeliveryFeedbackPanel = React.memo(function DeliveryFeedbackPanel({
     return metadata
   }, [meta.checkpoint_id])
 
-  const handleApprove = useCallback(() => {
+  const handleApprove = useCallback(async () => {
     if (actionsDisabled) return
     const metadata = buildReplyMetadata('approve')
-    setSubmittingAction('approve')
-    onReply('I fully agree with this delivery.', metadata)
+    await onReply('I fully agree with this delivery.', metadata)
   }, [actionsDisabled, buildReplyMetadata, onReply])
 
-  const handleFeedback = useCallback(() => {
+  const handleFeedback = useCallback(async () => {
     const text = feedback.trim()
     if (actionsDisabled || !text) return
     const metadata = buildReplyMetadata('feedback', text)
-    setSubmittingAction('feedback')
-    onReply(text, metadata)
-    setFeedback('')
+    const accepted = await onReply(text, metadata)
+    if (accepted) setFeedback('')
   }, [actionsDisabled, buildReplyMetadata, feedback, onReply])
 
-  const handleIgnore = useCallback(() => {
+  const handleIgnore = useCallback(async () => {
     if (actionsDisabled) return
     const metadata = buildReplyMetadata('ignore')
-    setSubmittingAction('ignore')
-    onReply('Ignore this self-evolution review.', metadata)
+    await onReply('Ignore this self-evolution review.', metadata)
   }, [actionsDisabled, buildReplyMetadata, onReply])
 
   return (
