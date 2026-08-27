@@ -4,11 +4,17 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import litellm
+import yaml
+
 from opc.core.config import LLMConfig, OPCConfig
 from opc.llm.provider import LLMProvider, _is_local_endpoint, _normalize_litellm_model
+from opc.plugins.office_ui.llm_config_service import (
+    get_llm_config_service,
+    update_llm_config_service,
+)
 
 
 class TestLocalLLMProvider(unittest.IsolatedAsyncioTestCase):
@@ -92,6 +98,40 @@ class TestLocalLLMProvider(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(provider_b.resolve_api_base(config_b.default_model))
         self.assertEqual(provider_b.resolve_api_base("ollama/qwen2.5-coder"), "http://localhost:11434")
 
+    @patch("opc.llm.provider.litellm.acompletion")
+    async def test_acompletion_kwargs_mixed_routing_isolation(
+        self, mock_acompletion: AsyncMock
+    ) -> None:
+        """Verify LiteLLM acompletion kwargs isolate cloud routed calls from local default endpoint."""
+        mock_response = AsyncMock()
+        mock_response.choices = [
+            AsyncMock(
+                message=AsyncMock(content="Planning result", tool_calls=None),
+                finish_reason="stop",
+            )
+        ]
+        mock_response.usage = None
+        mock_acompletion.return_value = mock_response
+
+        # Config: Ollama default with local base + Anthropic routed planning model
+        config = LLMConfig(
+            default_model="ollama/llama3.3",
+            api_base="http://localhost:11434",
+            is_local=True,
+            routing={"planning": "anthropic/claude-sonnet-4-20250514"},
+            api_key="",
+        )
+        provider = LLMProvider(config)
+
+        env = {"ANTHROPIC_API_KEY": "sk-ant-test-key-123"}
+        with patch.dict(os.environ, env):
+            await provider.chat(task_type="planning", messages=[{"role": "user", "content": "Plan project"}])
+
+        kwargs = mock_acompletion.call_args.kwargs
+        self.assertEqual(kwargs["model"], "anthropic/claude-sonnet-4-20250514")
+        self.assertNotIn("api_base", kwargs)
+        self.assertEqual(kwargs["api_key"], "sk-ant-test-key-123")
+
     def test_has_credentials_for_ollama(self) -> None:
         """Ollama model without API key evaluates to has_credentials() == True."""
         provider = LLMProvider(LLMConfig(default_model="ollama/llama3.3", api_key=""))
@@ -159,30 +199,107 @@ class TestLocalLLMProvider(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(kwargs["api_key"], "local")
         self.assertEqual(kwargs["api_base"], "http://localhost:8000/v1")
 
-    def test_backend_config_persistence_and_provider_reinitialization(self) -> None:
-        """Test saving LLM config updates .opc/config/llm_config.yaml and reinitializes LLMProvider."""
+    def test_canonical_config_dir_file_persistence(self) -> None:
+        """Test update_llm_config_service updates canonical opc_home/config/llm_config.yaml."""
         with tempfile.TemporaryDirectory() as tmpdir:
             opc_home = Path(tmpdir)
-            config = OPCConfig.load(opc_home)
+            config_dir = opc_home / "config"
+            config_dir.mkdir(parents=True)
 
-            # Initial state: default model configured
-            self.assertTrue(bool(config.llm.default_model))
+            # Create existing config
+            initial_config = OPCConfig()
+            initial_config.save(config_dir)
 
-            # Update to local Ollama model
-            config.llm.default_model = "ollama/llama3.3"
-            config.llm.api_base = "http://localhost:11434"
-            config.llm.provider = "ollama"
-            config.llm.is_local = True
-            config.save(opc_home)
+            payload = {
+                "default_model": "ollama/llama3.3",
+                "api_base": "http://localhost:11434",
+                "provider": "ollama",
+                "is_local": True,
+                "context_window": 128000,
+            }
 
-            # Reload and reinitialize LLMProvider
-            reloaded_config = OPCConfig.load(opc_home)
-            self.assertEqual(reloaded_config.llm.default_model, "ollama/llama3.3")
-            self.assertTrue(reloaded_config.llm.is_local)
+            res = update_llm_config_service(opc_home, payload)
+            self.assertTrue(res["ok"])
 
-            provider = LLMProvider(reloaded_config.llm, opc_home=opc_home)
-            self.assertEqual(provider.resolve_api_base("ollama/llama3.3"), "http://localhost:11434")
-            self.assertTrue(provider.has_credentials())
+            # Verify ONLY opc_home/config/llm_config.yaml was updated
+            llm_yaml = config_dir / "llm_config.yaml"
+            self.assertTrue(llm_yaml.exists())
+
+            with open(llm_yaml, encoding="utf-8") as f:
+                data = yaml.safe_load(f)
+
+            self.assertEqual(data["llm"]["default_model"], "ollama/llama3.3")
+            self.assertEqual(data["llm"]["api_base"], "http://localhost:11434")
+            self.assertTrue(data["llm"]["is_local"])
+
+            # Verify root opc_home has no leaked yaml files
+            self.assertFalse((opc_home / "llm_config.yaml").exists())
+
+    def test_explicit_key_clearing_semantics(self) -> None:
+        """Test API key clearing semantics: '' clears key, '***' preserves key."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            opc_home = Path(tmpdir)
+            config_dir = opc_home / "config"
+            config_dir.mkdir(parents=True)
+
+            # 1. Set initial key
+            update_llm_config_service(opc_home, {
+                "default_model": "openai/gpt-4o",
+                "api_key": "sk-secret-key-123",
+            })
+            info1 = get_llm_config_service(opc_home)
+            self.assertTrue(info1["has_api_key"])
+
+            # 2. Update with '***' -> key remains preserved
+            update_llm_config_service(opc_home, {
+                "default_model": "openai/gpt-4o",
+                "api_key": "***",
+            })
+            info2 = get_llm_config_service(opc_home)
+            self.assertTrue(info2["has_api_key"])
+
+            # 3. Update with '' -> key is explicitly cleared
+            update_llm_config_service(opc_home, {
+                "default_model": "ollama/llama3.3",
+                "api_key": "",
+            })
+            info3 = get_llm_config_service(opc_home)
+            self.assertFalse(info3["has_api_key"])
+
+    def test_engine_reconfigure_llm_hot_apply(self) -> None:
+        """Test OPCEngine.reconfigure_llm updates LLMProvider across all sub-components."""
+        mock_engine = MagicMock()
+        mock_engine.opc_home = Path("/tmp/fake_opc_home")
+        mock_engine.config = OPCConfig()
+
+        mock_history = MagicMock()
+        mock_comms = MagicMock()
+        mock_approval = MagicMock()
+        mock_secretary = MagicMock()
+        mock_executor = MagicMock()
+        mock_router = MagicMock()
+
+        mock_engine.history_compactor = mock_history
+        mock_engine.communication = mock_comms
+        mock_engine.approval_engine = mock_approval
+        mock_engine.secretary = mock_secretary
+        mock_engine.company_executor = mock_executor
+        mock_engine.task_router = mock_router
+
+        # Bind real reconfigure_llm method
+        from opc.engine import OPCEngine
+        mock_engine.reconfigure_llm = OPCEngine.reconfigure_llm.__get__(mock_engine, OPCEngine)
+
+        new_cfg = LLMConfig(default_model="ollama/qwen2.5-coder", api_base="http://localhost:11434")
+        new_provider = mock_engine.reconfigure_llm(new_cfg)
+
+        self.assertEqual(mock_engine.llm, new_provider)
+        self.assertEqual(mock_history.llm, new_provider)
+        self.assertEqual(mock_comms.llm, new_provider)
+        self.assertEqual(mock_approval.llm, new_provider)
+        self.assertEqual(mock_secretary.llm, new_provider)
+        self.assertEqual(mock_executor.llm, new_provider)
+        self.assertEqual(mock_router.llm, new_provider)
 
 
 if __name__ == "__main__":

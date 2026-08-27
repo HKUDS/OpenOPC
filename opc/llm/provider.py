@@ -294,6 +294,24 @@ class ProviderQuotaExhaustedError(RuntimeError):
     """The provider rejected the request for quota/rate-limit reasons."""
 
 
+_CLOUD_MODEL_PREFIXES = (
+    "anthropic/",
+    "openrouter/",
+    "gemini/",
+    "google/",
+    "azure/",
+    "groq/",
+    "deepseek/",
+    "together_ai/",
+    "mistral/",
+)
+
+
+def _is_cloud_model(model: str) -> bool:
+    m = (model or "").strip().lower()
+    return any(m.startswith(prefix) for prefix in _CLOUD_MODEL_PREFIXES)
+
+
 class LLMProvider:
     """Unified LLM interface via LiteLLM supporting tool calls."""
 
@@ -329,13 +347,19 @@ class LLMProvider:
 
     def resolve_api_base(self, model: str | None = None) -> str | None:
         """Resolve effective API base URL for a specific model or default model."""
-        # 1. Explicit config.api_base takes precedence if set
+        target_model = (model or self.config.default_model or "").strip().lower()
+
+        # Cloud models must NOT inherit local loopback config.api_base or local env vars
+        if _is_cloud_model(target_model):
+            if self.config.api_base and not _is_local_endpoint(self.config.api_base, target_model):
+                return self.config.api_base
+            return None
+
+        # Explicit config.api_base takes precedence for local/custom models if set
         if self.config.api_base:
             return self.config.api_base
 
-        target_model = (model or self.config.default_model or "").strip().lower()
-
-        # 2. Check provider-scoped environment variables and default local endpoints
+        # Check provider-scoped environment variables and default local endpoints
         if target_model.startswith("ollama/") or target_model.startswith("ollama_chat/"):
             return (
                 os.environ.get("OLLAMA_API_BASE")
@@ -374,16 +398,58 @@ class LLMProvider:
 
         return None
 
+    def resolve_credentials(self, model: str | None = None) -> tuple[str | None, bool]:
+        """Resolve effective (api_key, is_local) scoped to the target model."""
+        target_model = (model or self.config.default_model or "").strip().lower()
+        api_base = self.resolve_api_base(target_model)
+        is_cloud = _is_cloud_model(target_model)
+
+        is_local = _is_local_endpoint(api_base, target_model) or (
+            target_model == (self.config.default_model or "").strip().lower()
+            and getattr(self.config, "is_local", False)
+            and not is_cloud
+        )
+
+        if is_local:
+            # Prevent leaking cloud keys to local loopback servers
+            if self._api_key and getattr(self.config, "is_local", False) and not is_cloud:
+                return self._api_key, True
+            return "local", True
+
+        if is_cloud:
+            if target_model.startswith("anthropic/"):
+                env_key = os.environ.get("ANTHROPIC_API_KEY")
+                if env_key:
+                    return env_key, False
+                if self._api_key and not getattr(self.config, "is_local", False):
+                    return self._api_key, False
+                return None, False
+            if target_model.startswith("openrouter/"):
+                env_key = os.environ.get("OPENROUTER_API_KEY")
+                if env_key:
+                    return env_key, False
+                return self._api_key, False
+            if target_model.startswith("gemini/") or target_model.startswith("google/"):
+                env_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+                if env_key:
+                    return env_key, False
+                return self._api_key, False
+            if target_model.startswith("azure/"):
+                env_key = os.environ.get("AZURE_API_KEY") or os.environ.get("AZURE_OPENAI_API_KEY")
+                if env_key:
+                    return env_key, False
+                return self._api_key, False
+
+        api_key = self._api_key or (
+            os.environ.get(self.config.api_key_env) if self.config.api_key_env else None
+        )
+        return api_key, False
+
     def has_credentials(self, model: str | None = None) -> bool:
         """Whether an LLM call can plausibly authenticate for a given model."""
         target_model = model or self.config.default_model
-        api_base = self.resolve_api_base(target_model)
-
-        if self._api_key:
-            return True
-        if getattr(self.config, "is_local", False):
-            return True
-        if _is_local_endpoint(api_base, target_model):
+        api_key, is_local = self.resolve_credentials(target_model)
+        if is_local or api_key:
             return True
         return any(os.environ.get(var) for var in self._CREDENTIAL_ENV_VARS)
 
@@ -695,6 +761,7 @@ class LLMProvider:
     ) -> dict[str, Any]:
         model = self._select_model(task_type)
         api_base = self.resolve_api_base(model)
+        api_key, _ = self.resolve_credentials(model)
         litellm_model = _normalize_litellm_model(model, api_base)
         temp = temperature if temperature is not None else self.config.temperature
         max_tok = _clamp_max_tokens(model, max_tokens if max_tokens is not None else self.config.max_tokens)
@@ -710,10 +777,8 @@ class LLMProvider:
             call_kwargs["reasoning_effort"] = self.config.reasoning_effort
         if api_base:
             call_kwargs["api_base"] = api_base
-        if self._api_key:
-            call_kwargs["api_key"] = self._api_key
-        elif _is_local_endpoint(api_base, model) or getattr(self.config, "is_local", False):
-            call_kwargs["api_key"] = "local"
+        if api_key:
+            call_kwargs["api_key"] = api_key
         if tools:
             call_kwargs["tools"] = tools
             call_kwargs["tool_choice"] = "auto"
@@ -846,6 +911,7 @@ class LLMProvider:
     ) -> AsyncIterator[RuntimeLLMEvent]:
         model = self._select_model(task_type)
         api_base = self.resolve_api_base(model)
+        api_key, _ = self.resolve_credentials(model)
         litellm_model = _normalize_litellm_model(model, api_base)
         temp = temperature if temperature is not None else self.config.temperature
         max_tok = _clamp_max_tokens(model, max_tokens if max_tokens is not None else self.config.max_tokens)
@@ -862,10 +928,8 @@ class LLMProvider:
             call_kwargs["reasoning_effort"] = self.config.reasoning_effort
         if api_base:
             call_kwargs["api_base"] = api_base
-        if self._api_key:
-            call_kwargs["api_key"] = self._api_key
-        elif _is_local_endpoint(api_base, model) or getattr(self.config, "is_local", False):
-            call_kwargs["api_key"] = "local"
+        if api_key:
+            call_kwargs["api_key"] = api_key
         if tools:
             call_kwargs["tools"] = tools
             call_kwargs["tool_choice"] = "auto"

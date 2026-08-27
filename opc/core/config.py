@@ -1776,6 +1776,55 @@ class OPCConfig(BaseModel):
             self if include_effective else None,
         )
 
+def resolve_config_dir(path: Path | None = None) -> Path:
+    """Resolve target config directory (canonical: opc_home / 'config')."""
+    if path is None:
+        return get_opc_home() / "config"
+    p = Path(path)
+    if p.name == "config":
+        return p
+    if (p / "config").is_dir():
+        return p / "config"
+    if not (p / "llm_config.yaml").exists() and not (p / "system_config.yaml").exists():
+        return p / "config"
+    return p
+
+
+class OPCConfig(BaseModel):
+    system: SystemConfig = Field(default_factory=SystemConfig)
+    llm: LLMConfig = Field(default_factory=LLMConfig)
+    agents: AgentsConfig = Field(default_factory=AgentsConfig)
+    org: OrgConfig = Field(default_factory=OrgConfig)
+    channels: ChannelsConfig = Field(default_factory=ChannelsConfig)
+    autonomy: AutonomyConfig = Field(default_factory=AutonomyConfig)
+    capabilities: CapabilityConfig = Field(default_factory=CapabilityConfig)
+    _trusted_workspace: Path | None = PrivateAttr(default=None)
+    _trusted_config_dir: Path | None = PrivateAttr(default=None)
+
+    def bind_workspace_trust(self, workspace: Path, config_dir: Path) -> None:
+        """Attach the project trust provenance used for pre-sink rechecks."""
+
+        self._trusted_workspace = Path(workspace).resolve(strict=False)
+        self._trusted_config_dir = Path(config_dir).resolve(strict=False)
+
+    def require_workspace_trust(self, *, include_effective: bool = False) -> None:
+        """Revalidate bound project authority immediately before runtime use.
+
+        Normal runtime checks bind the source files while allowing explicit
+        host-side CLI overrides such as ``--model`` and ``--debug``.  Loading
+        and trust-grant flows additionally validate the normalized declaration.
+        """
+
+        if self._trusted_workspace is None or self._trusted_config_dir is None:
+            return
+        from opc.core.workspace_trust import WorkspaceTrustStore
+
+        WorkspaceTrustStore().require(
+            self._trusted_workspace,
+            self._trusted_config_dir,
+            self if include_effective else None,
+        )
+
     @classmethod
     def load(
         cls,
@@ -1783,9 +1832,7 @@ class OPCConfig(BaseModel):
         *,
         trusted_source: bool = False,
     ) -> "OPCConfig":
-        if config_dir is None:
-            config_dir = get_opc_home() / "config"
-        config_dir = Path(config_dir)
+        config_dir = resolve_config_dir(config_dir)
         trusted_workspace: Path | None = None
         trust_store: Any | None = None
 
@@ -1874,9 +1921,16 @@ class OPCConfig(BaseModel):
             config.bind_workspace_trust(trusted_workspace, config_dir)
         return config
 
+    def save_llm_config(self, config_dir: Path | None = None) -> Path:
+        """Atomically save ONLY llm_config.yaml under canonical config_dir."""
+        target_dir = resolve_config_dir(config_dir)
+        target_dir.mkdir(parents=True, exist_ok=True)
+        llm_path = target_dir / "llm_config.yaml"
+        _atomic_write_yaml(llm_path, {"llm": self.llm.model_dump()})
+        return llm_path
+
     def save(self, config_dir: Path | None = None) -> None:
-        if config_dir is None:
-            config_dir = get_opc_home() / "config"
+        config_dir = resolve_config_dir(config_dir)
         config_dir.mkdir(parents=True, exist_ok=True)
 
         system_path = config_dir / "system_config.yaml"

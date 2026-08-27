@@ -162,6 +162,8 @@ async def create_app(
     app["db"] = db
     app["ws_handler"] = ws_handler
     app["instance_lock"] = instance_lock
+    app["opc_home"] = opc_home
+    app["config"] = config
 
     # ── Routes ────────────────────────────────────────────────────────
     app.router.add_get("/ws", ws_handler.handle_ws)
@@ -224,22 +226,10 @@ async def _serve_spa_fallback(request: aiohttp.web.Request) -> aiohttp.web.Respo
 
 async def _handle_get_llm_config_api(request: aiohttp.web.Request) -> aiohttp.web.Response:
     try:
+        from opc.plugins.office_ui.llm_config_service import get_llm_config_service
         app = request.app
-        opc_home = app.get("opc_home") or get_opc_home()
-        config = app.get("config")
-        if not config:
-            config = OPCConfig.load(opc_home)
-        llm_cfg = config.llm
-        payload = {
-            "ok": True,
-            "provider": getattr(llm_cfg, "provider", "") or "",
-            "default_model": llm_cfg.default_model,
-            "api_base": llm_cfg.api_base,
-            "api_key": "***" if llm_cfg.api_key else "",
-            "has_api_key": bool(llm_cfg.api_key),
-            "is_local": getattr(llm_cfg, "is_local", False),
-            "context_window": llm_cfg.context_window,
-        }
+        target = app.get("engine") or app.get("opc_home") or get_opc_home()
+        payload = get_llm_config_service(target)
         return aiohttp.web.json_response(payload)
     except Exception as e:
         return aiohttp.web.json_response({"ok": False, "error": str(e)}, status=500)
@@ -247,42 +237,14 @@ async def _handle_get_llm_config_api(request: aiohttp.web.Request) -> aiohttp.we
 
 async def _handle_update_llm_config_api(request: aiohttp.web.Request) -> aiohttp.web.Response:
     try:
+        from opc.plugins.office_ui.llm_config_service import update_llm_config_service
         data = await request.json()
-        new_model = str(data.get("default_model", "") or "").strip()
-        if not new_model:
-            return aiohttp.web.json_response({"ok": False, "error": "Model identifier cannot be empty"}, status=400)
-
         app = request.app
-        opc_home = app.get("opc_home") or get_opc_home()
-        config = OPCConfig.load(opc_home)
-
-        config.llm.default_model = new_model
-        config.llm.api_base = str(data.get("api_base", "") or "").strip()
-        new_api_key = str(data.get("api_key", "") or "").strip()
-        if new_api_key and new_api_key != "***":
-            config.llm.api_key = new_api_key
-        config.llm.provider = str(data.get("provider", "") or "").strip()
-        config.llm.is_local = bool(data.get("is_local", False))
-        config.llm.context_window = int(data.get("context_window", 0) or 0)
-
-        # Save to disk (.opc/config/llm_config.yaml)
-        config.save(opc_home)
-
-        engine = app.get("engine")
-        if engine and hasattr(engine, "llm"):
-            from opc.llm.provider import LLMProvider
-            engine.llm = LLMProvider(config.llm, opc_home=opc_home)
-
-        payload = {
-            "ok": True,
-            "provider": config.llm.provider,
-            "default_model": config.llm.default_model,
-            "api_base": config.llm.api_base,
-            "has_api_key": bool(config.llm.api_key),
-            "is_local": config.llm.is_local,
-            "context_window": config.llm.context_window,
-        }
+        target = app.get("engine") or app.get("opc_home") or get_opc_home()
+        payload = update_llm_config_service(target, data)
         return aiohttp.web.json_response(payload)
+    except ValueError as e:
+        return aiohttp.web.json_response({"ok": False, "error": str(e)}, status=400)
     except Exception as e:
         return aiohttp.web.json_response({"ok": False, "error": str(e)}, status=500)
 
