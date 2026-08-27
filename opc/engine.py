@@ -142,6 +142,7 @@ from opc.layer2_organization.phase import (
     IN_PROGRESS_PHASES,
     IN_REVIEW_PHASES,
     InvalidPhaseTransition,
+    coerce_phase,
     task_status_for_phase,
 )
 from opc.layer2_organization.prompt_contract import (
@@ -10690,6 +10691,35 @@ class OPCEngine:
         )
         return "Self-evolution review ignored."
 
+    async def _linked_work_item_phase_is_settled(self, task: Task) -> bool:
+        """True when this Task's linked WorkItem already reached a done phase.
+
+        Conservative by design: any missing link, missing store method, or
+        lookup failure reports False so the caller keeps its previous
+        behaviour.
+        """
+
+        if not self.store:
+            return False
+        work_item_id = str(linked_work_item_id_for_task(task) or "").strip()
+        if not work_item_id:
+            return False
+        getter = getattr(self.store, "get_delegation_work_item", None)
+        if not callable(getter):
+            return False
+        try:
+            work_item = await getter(work_item_id)
+        except Exception:
+            logger.opt(exception=True).debug(
+                "failed to inspect linked work item {} for delivery review task {}",
+                work_item_id,
+                getattr(task, "id", ""),
+            )
+            return False
+        if work_item is None:
+            return False
+        return coerce_phase(getattr(work_item, "phase", None)) in DONE_PHASES
+
     async def _ensure_open_final_delivery_review_checkpoints(
         self,
         plan: CompanyWorkItemRuntimePlan,
@@ -10709,6 +10739,18 @@ class OPCEngine:
             if task.status == TaskStatus.AWAITING_HUMAN
             and self._is_open_final_delivery_review_task(task)
             and not self._metadata_flag_true(dict(getattr(task, "metadata", {}) or {}).get("self_evolution_review_completed", False))
+        ]
+        # The Task closure and the WorkItem approval are two writes on two
+        # connections, so a crash between them leaves an AWAITING_HUMAN Task
+        # next to an already settled WorkItem.  Republishing the card here
+        # would re-park the Task for good: the pair then fails the attempt
+        # envelope check in every later controller takeover and the session
+        # can never be resumed.  A settled WorkItem means the review is over,
+        # so leave the card closed and let the normal projection converge.
+        open_delivery_tasks = [
+            task
+            for task in open_delivery_tasks
+            if not await self._linked_work_item_phase_is_settled(task)
         ]
         if not open_delivery_tasks:
             return
