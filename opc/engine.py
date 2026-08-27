@@ -999,6 +999,30 @@ class OPCEngine:
             await self._recover_interaction_consumers()
             await self._recover_company_work_item_gate_continuations()
         logger.info("OPC Engine initialized successfully")
+
+    def reconfigure_llm(self, new_config: LLMConfig) -> LLMProvider:
+        """Consistently reconfigure LLMProvider for the engine and all dependent consumers."""
+        self.config.llm = new_config
+        new_llm = LLMProvider(new_config, opc_home=self.opc_home)
+        self.llm = new_llm
+
+        if getattr(self, "history_compactor", None) is not None:
+            self.history_compactor.llm = new_llm
+        if getattr(self, "communication", None) is not None:
+            self.communication.llm = new_llm
+        if getattr(self, "approval_engine", None) is not None:
+            self.approval_engine.llm = new_llm
+        if getattr(self, "secretary", None) is not None:
+            self.secretary.llm = new_llm
+        if getattr(self, "company_runtime_spec_builder", None) is not None:
+            self.company_runtime_spec_builder.llm = new_llm
+        if getattr(self, "company_recruiter", None) is not None:
+            self.company_recruiter.llm = new_llm
+        if getattr(self, "company_executor", None) is not None:
+            self.company_executor.llm = new_llm
+        if getattr(self, "task_router", None) is not None:
+            self.task_router.llm = new_llm
+        return new_llm
         if reconciled:
             logger.warning(
                 "Reconciled {} interrupted task(s) for project {} during startup",

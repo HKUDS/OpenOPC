@@ -9323,6 +9323,36 @@ class WSHandler:
         except ServiceError as exc:
             await self._send_service_error(ws, exc, action="comms_read_message")
 
+    async def _handle_get_llm_config(self, ws: Any, data: dict) -> None:
+        """Return active LLM configuration for Office UI settings modal."""
+        if self._shutting_down:
+            return
+        try:
+            from opc.plugins.office_ui.llm_config_service import get_llm_config_service
+            target = self.engine or self.opc_home
+            payload = get_llm_config_service(target)
+            await ws.send_json({"type": "get_llm_config", "payload": payload})
+        except Exception as exc:
+            await ws.send_json({"type": "get_llm_config", "payload": {"ok": False, "error": str(exc)}})
+
+    async def _handle_update_llm_config(self, ws: Any, data: dict) -> None:
+        """Update and atomically persist LLM configuration, then reconfigure runtime LLMProvider."""
+        if self._shutting_down:
+            return
+        try:
+            from opc.plugins.office_ui.llm_config_service import update_llm_config_service
+            raw_payload = data.get("payload") or {}
+            target = self.engine or self.opc_home
+            response_payload = update_llm_config_service(target, raw_payload)
+            await ws.send_json({"type": "update_llm_config", "payload": response_payload})
+            # Also broadcast config update to all connected clients
+            await self.broadcast({"type": "llm_config_updated", "payload": response_payload})
+        except Exception as exc:
+            logger.error(f"Failed to update LLM configuration: {exc}")
+            await ws.send_json({"type": "update_llm_config", "payload": {"ok": False, "error": str(exc)}})
+
     # Register handlers defined after _HANDLERS class-level dict
     _HANDLERS["comms_state"] = _handle_comms_state
     _HANDLERS["comms_read_message"] = _handle_comms_read_message
+    _HANDLERS["get_llm_config"] = _handle_get_llm_config
+    _HANDLERS["update_llm_config"] = _handle_update_llm_config

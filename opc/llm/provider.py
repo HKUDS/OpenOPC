@@ -171,6 +171,92 @@ def _is_poe_base(api_base: str | None) -> bool:
     return hostname == "api.poe.com"
 
 
+_LOCAL_MODEL_PREFIXES = (
+    "ollama/",
+    "ollama_chat/",
+    "localai/",
+    "vllm/",
+    "hosted_vllm/",
+    "lmstudio/",
+    "llama-cpp/",
+    "llamacpp/",
+    "tgi/",
+)
+
+_LOCAL_HOSTNAME_HINTS = (
+    "localhost",
+    "127.0.0.1",
+    "0.0.0.0",
+    "::1",
+)
+
+
+def _is_local_endpoint(api_base: str | None = None, model: str | None = None) -> bool:
+    """True when target api_base or model represents a self-hosted / local LLM node."""
+    if model:
+        normalized_model = model.strip().lower()
+        if any(normalized_model.startswith(prefix) for prefix in _LOCAL_MODEL_PREFIXES):
+            return True
+
+    if api_base:
+        normalized_base = api_base.strip().lower()
+        try:
+            parsed = urlparse(normalized_base)
+            hostname = (parsed.hostname or "").strip().lower()
+            if hostname in _LOCAL_HOSTNAME_HINTS or hostname.endswith(".local"):
+                return True
+        except Exception:
+            pass
+
+    return False
+
+
+def _normalize_litellm_model(model: str, api_base: str | None = None) -> str:
+    """Normalize model identifier so litellm==1.82.1 resolves provider without error."""
+    normalized = (model or "").strip()
+    if not normalized:
+        return normalized
+
+    prefix = normalized.split("/", 1)[0].lower() if "/" in normalized else ""
+
+    # Standard native LiteLLM provider prefixes in version 1.82.1
+    known_litellm_prefixes = {
+        "ollama",
+        "ollama_chat",
+        "vllm",
+        "hosted_vllm",
+        "openai",
+        "anthropic",
+        "openrouter",
+        "azure",
+        "azure_ai",
+        "gemini",
+        "google",
+        "mistral",
+        "groq",
+        "deepseek",
+        "together_ai",
+        "togetherai",
+        "bedrock",
+        "cohere",
+        "vertex_ai",
+    }
+
+    if prefix in known_litellm_prefixes:
+        return normalized
+
+    # Custom local prefixes: map to OpenAI-compatible provider for LiteLLM
+    if prefix in {"lmstudio", "localai", "llama-cpp", "llamacpp", "tgi"}:
+        sub_model = normalized.split("/", 1)[1] if "/" in normalized else normalized
+        return f"openai/{sub_model}"
+
+    # If unmapped prefix and targeting a local base, route as openai/<model>
+    if _is_local_endpoint(api_base, normalized):
+        return f"openai/{normalized}"
+
+    return normalized
+
+
 def _looks_like_multimodal_model(model: str) -> bool:
     normalized = _normalized_model_name(model)
     if any(hint in normalized for hint in _MULTIMODAL_MODEL_HINTS):
@@ -205,23 +291,30 @@ def _parse_tool_arguments(tool_name: str, arguments: Any) -> tuple[Any, str | No
 
 
 class ProviderQuotaExhaustedError(RuntimeError):
-    """The provider rejected the request for quota/rate-limit reasons.
+    """The provider rejected the request for quota/rate-limit reasons."""
 
-    Raised by the agent runtime instead of retrying in place: replaying the
-    same payload against an exhausted quota can only fail, so the company
-    dispatcher parks the work (returns the item to READY and backs off)
-    rather than failing it terminally (OBS-6).
-    """
+
+_CLOUD_MODEL_PREFIXES = (
+    "anthropic/",
+    "openrouter/",
+    "gemini/",
+    "google/",
+    "azure/",
+    "groq/",
+    "deepseek/",
+    "together_ai/",
+    "mistral/",
+)
+
+
+def _is_cloud_model(model: str) -> bool:
+    m = (model or "").strip().lower()
+    return any(m.startswith(prefix) for prefix in _CLOUD_MODEL_PREFIXES)
 
 
 class LLMProvider:
     """Unified LLM interface via LiteLLM supporting tool calls."""
 
-    # Well-known provider API-key env vars that litellm reads directly when no
-    # explicit api_key is passed. Used only by ``has_credentials()`` to avoid a
-    # false "no credentials" verdict for env-based setups. Missing a provider
-    # here just preserves the old behavior (a real LLM attempt), never a wrong
-    # skip of a working key.
     _CREDENTIAL_ENV_VARS = (
         "OPENAI_API_KEY",
         "ANTHROPIC_API_KEY",
@@ -247,19 +340,116 @@ class LLMProvider:
         self._api_key = config.api_key or (
             os.environ.get(config.api_key_env) if config.api_key_env else None
         ) or None
-        self._api_base = config.api_base or None
 
-    def has_credentials(self) -> bool:
-        """Whether an LLM call can plausibly authenticate.
+    @property
+    def _api_base(self) -> str | None:
+        return self.resolve_api_base()
 
-        True when a key is configured (``api_key`` / ``api_key_env``) or a
-        well-known provider env var is present. False only when no credential
-        is found anywhere — callers use that to skip LLM work that would
-        certainly fail (e.g. native agent selection when an external agent can
-        run the task instead). A False at worst degrades to rule-based behavior,
-        which stays functional; it never blocks execution.
-        """
-        if self._api_key:
+    def resolve_api_base(self, model: str | None = None) -> str | None:
+        """Resolve effective API base URL for a specific model or default model."""
+        target_model = (model or self.config.default_model or "").strip().lower()
+
+        # Cloud models must NOT inherit local loopback config.api_base or local env vars
+        if _is_cloud_model(target_model):
+            if self.config.api_base and not _is_local_endpoint(self.config.api_base, target_model):
+                return self.config.api_base
+            return None
+
+        # Explicit config.api_base takes precedence for local/custom models if set
+        if self.config.api_base:
+            return self.config.api_base
+
+        # Check provider-scoped environment variables and default local endpoints
+        if target_model.startswith("ollama/") or target_model.startswith("ollama_chat/"):
+            return (
+                os.environ.get("OLLAMA_API_BASE")
+                or os.environ.get("OLLAMA_HOST")
+                or os.environ.get("LOCAL_LLM_API_BASE")
+                or "http://localhost:11434"
+            )
+
+        if target_model.startswith("vllm/") or target_model.startswith("hosted_vllm/"):
+            return (
+                os.environ.get("VLLM_API_BASE")
+                or os.environ.get("LOCAL_LLM_API_BASE")
+                or "http://localhost:8000/v1"
+            )
+
+        if (
+            target_model.startswith("localai/")
+            or target_model.startswith("llamacpp/")
+            or target_model.startswith("llama-cpp/")
+        ):
+            return (
+                os.environ.get("LOCALAI_API_BASE")
+                or os.environ.get("LOCAL_LLM_API_BASE")
+                or "http://localhost:8080/v1"
+            )
+
+        if target_model.startswith("lmstudio/"):
+            return (
+                os.environ.get("LMSTUDIO_API_BASE")
+                or os.environ.get("LOCAL_LLM_API_BASE")
+                or "http://localhost:1234/v1"
+            )
+
+        if target_model.startswith("openai/"):
+            return os.environ.get("OPENAI_API_BASE") or None
+
+        return None
+
+    def resolve_credentials(self, model: str | None = None) -> tuple[str | None, bool]:
+        """Resolve effective (api_key, is_local) scoped to the target model."""
+        target_model = (model or self.config.default_model or "").strip().lower()
+        api_base = self.resolve_api_base(target_model)
+        is_cloud = _is_cloud_model(target_model)
+
+        is_local = _is_local_endpoint(api_base, target_model) or (
+            target_model == (self.config.default_model or "").strip().lower()
+            and getattr(self.config, "is_local", False)
+            and not is_cloud
+        )
+
+        if is_local:
+            # If explicit API key was configured, use it; otherwise fallback to "local"
+            if self._api_key and not is_cloud:
+                return self._api_key, True
+            return "local", True
+
+        if is_cloud:
+            if target_model.startswith("anthropic/"):
+                env_key = os.environ.get("ANTHROPIC_API_KEY")
+                if env_key:
+                    return env_key, False
+                if self._api_key and not getattr(self.config, "is_local", False):
+                    return self._api_key, False
+                return None, False
+            if target_model.startswith("openrouter/"):
+                env_key = os.environ.get("OPENROUTER_API_KEY")
+                if env_key:
+                    return env_key, False
+                return self._api_key, False
+            if target_model.startswith("gemini/") or target_model.startswith("google/"):
+                env_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+                if env_key:
+                    return env_key, False
+                return self._api_key, False
+            if target_model.startswith("azure/"):
+                env_key = os.environ.get("AZURE_API_KEY") or os.environ.get("AZURE_OPENAI_API_KEY")
+                if env_key:
+                    return env_key, False
+                return self._api_key, False
+
+        api_key = self._api_key or (
+            os.environ.get(self.config.api_key_env) if self.config.api_key_env else None
+        )
+        return api_key, False
+
+    def has_credentials(self, model: str | None = None) -> bool:
+        """Whether an LLM call can plausibly authenticate for a given model."""
+        target_model = model or self.config.default_model
+        api_key, is_local = self.resolve_credentials(target_model)
+        if is_local or api_key:
             return True
         return any(os.environ.get(var) for var in self._CREDENTIAL_ENV_VARS)
 
@@ -375,8 +565,18 @@ class LLMProvider:
     ) -> ModelCapabilitySet:
         resolved_model = model or self._select_model(task_type)
         normalized = _normalized_model_name(resolved_model)
+        api_base = self.resolve_api_base(resolved_model)
         provider_family = resolved_model.split("/", 1)[0].strip().lower() if "/" in resolved_model else ""
-        supports_thinking = any(hint in normalized for hint in ("o1", "o3", "o4", "gpt-5", "claude", "reason"))
+        if not provider_family and getattr(self.config, "provider", ""):
+            provider_family = self.config.provider.strip().lower()
+        if not provider_family and _is_local_endpoint(api_base, resolved_model):
+            provider_family = "local"
+
+        is_local = (
+            getattr(self.config, "is_local", False)
+            or _is_local_endpoint(api_base, resolved_model)
+        )
+        supports_thinking = any(hint in normalized for hint in ("o1", "o3", "o4", "gpt-5", "claude", "reason", "r1"))
         return ModelCapabilitySet(
             model=resolved_model,
             supports_streaming=True,
@@ -388,7 +588,8 @@ class LLMProvider:
             supports_video=_looks_like_video_capable_model(resolved_model),
             provider_family=provider_family,
             metadata={
-                "api_base": self._api_base or "",
+                "api_base": api_base or "",
+                "is_local": is_local,
             },
         )
 
@@ -559,11 +760,14 @@ class LLMProvider:
         **kwargs: Any,
     ) -> dict[str, Any]:
         model = self._select_model(task_type)
+        api_base = self.resolve_api_base(model)
+        api_key, _ = self.resolve_credentials(model)
+        litellm_model = _normalize_litellm_model(model, api_base)
         temp = temperature if temperature is not None else self.config.temperature
         max_tok = _clamp_max_tokens(model, max_tokens if max_tokens is not None else self.config.max_tokens)
 
         call_kwargs: dict[str, Any] = {
-            "model": model,
+            "model": litellm_model,
             "messages": messages,
             "temperature": temp,
             "max_tokens": max_tok,
@@ -571,15 +775,15 @@ class LLMProvider:
         }
         if self.config.reasoning_effort and "reasoning_effort" not in call_kwargs:
             call_kwargs["reasoning_effort"] = self.config.reasoning_effort
-        if self._api_base:
-            call_kwargs["api_base"] = self._api_base
-        if self._api_key:
-            call_kwargs["api_key"] = self._api_key
+        if api_base:
+            call_kwargs["api_base"] = api_base
+        if api_key:
+            call_kwargs["api_key"] = api_key
         if tools:
             call_kwargs["tools"] = tools
             call_kwargs["tool_choice"] = "auto"
 
-        logger.debug(f"LLM call: model={model}, base={self._api_base or 'default'}, msgs={len(messages)}, tools={len(tools or [])}")
+        logger.debug(f"LLM call: model={model} (litellm={litellm_model}), base={api_base or 'default'}, msgs={len(messages)}, tools={len(tools or [])}")
 
         try:
             response = await litellm.acompletion(**call_kwargs)
@@ -706,11 +910,14 @@ class LLMProvider:
         **kwargs: Any,
     ) -> AsyncIterator[RuntimeLLMEvent]:
         model = self._select_model(task_type)
+        api_base = self.resolve_api_base(model)
+        api_key, _ = self.resolve_credentials(model)
+        litellm_model = _normalize_litellm_model(model, api_base)
         temp = temperature if temperature is not None else self.config.temperature
         max_tok = _clamp_max_tokens(model, max_tokens if max_tokens is not None else self.config.max_tokens)
 
         call_kwargs: dict[str, Any] = {
-            "model": model,
+            "model": litellm_model,
             "messages": messages,
             "temperature": temp,
             "max_tokens": max_tok,
@@ -719,16 +926,16 @@ class LLMProvider:
         }
         if self.config.reasoning_effort and "reasoning_effort" not in call_kwargs:
             call_kwargs["reasoning_effort"] = self.config.reasoning_effort
-        if self._api_base:
-            call_kwargs["api_base"] = self._api_base
-        if self._api_key:
-            call_kwargs["api_key"] = self._api_key
+        if api_base:
+            call_kwargs["api_base"] = api_base
+        if api_key:
+            call_kwargs["api_key"] = api_key
         if tools:
             call_kwargs["tools"] = tools
             call_kwargs["tool_choice"] = "auto"
 
         logger.debug(
-            f"LLM stream call: model={model}, base={self._api_base or 'default'}, msgs={len(messages)}, tools={len(tools or [])}"
+            f"LLM stream call: model={model} (litellm={litellm_model}), base={api_base or 'default'}, msgs={len(messages)}, tools={len(tools or [])}"
         )
 
         last_usage = {"prompt_tokens": 0, "completion_tokens": 0}

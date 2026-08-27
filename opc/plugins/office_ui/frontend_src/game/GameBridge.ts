@@ -13,6 +13,14 @@ export class GameBridge extends Phaser.Events.EventEmitter {
     super()
   }
 
+  override on(event: string | symbol, fn: (...args: any[]) => void, context?: any): this {
+    return super.on(event, fn, context)
+  }
+
+  override off(event: string | symbol, fn?: (...args: any[]) => void, context?: any, once?: boolean): this {
+    return super.off(event, fn, context, once)
+  }
+
   setScene(scene: OfficeScene) {
     this.scene = scene
 

@@ -53,6 +53,8 @@ interface SocketHandlers {
   onReorgList?: (payload: ReorgListPayload) => void
   onWorkItemProgress?: (payload: WorkItemProgressPayload) => void
   onMarketListInstalled?: (payload: { packages: Array<Record<string, unknown>> }) => void
+  onLlmConfig?: (payload: Record<string, unknown>) => void
+  onLlmConfigUpdated?: (payload: Record<string, unknown>) => void
   onMarketBrowse?: (payload: { presets: Array<Record<string, unknown>> }) => void
   onMarketPreview?: (payload: Record<string, unknown>) => void
   onOrgConfigExport?: (payload: { yaml: string }) => void
@@ -786,6 +788,14 @@ export class VisualSocketClient {
     })
   }
 
+  getLlmConfig(): void {
+    this.send({ type: 'get_llm_config' })
+  }
+
+  updateLlmConfig(config: Record<string, unknown>): void {
+    this.send({ type: 'update_llm_config', payload: config })
+  }
+
   // ── Internal ───────────────────────────────────────────────────────────
 
   private normalizeProjectId(value: unknown): string {
@@ -917,6 +927,13 @@ export class VisualSocketClient {
         break
       case 'comms_state':
         this.handlers.onCommsState?.(parsed.payload as unknown as CommsStatePayload)
+        break
+      case 'get_llm_config':
+      case 'update_llm_config':
+        this.handlers.onLlmConfig?.(parsed.payload as Record<string, unknown>)
+        break
+      case 'llm_config_updated':
+        this.handlers.onLlmConfigUpdated?.(parsed.payload as Record<string, unknown>)
         break
       case 'comms_message':
         this.handlers.onCommsMessage?.(parsed.payload as unknown as CommsMessagePayload)

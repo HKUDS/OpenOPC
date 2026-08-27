@@ -16,6 +16,7 @@ import { useSessionStore, type SessionStoreState } from './stores/SessionStore'
 import { useProjectStore, type ProjectStoreState } from './stores/ProjectStore'
 import { ExecutionPanel } from './kanban/ExecutionPanel'
 import { ProjectSelector } from './components/ProjectSelector'
+import { LLMModelSettingsModal } from './components/LLMModelSettingsModal'
 import { OrgTab } from './org/OrgTab'
 import { notifyTaskAssigned } from './lib/taskChatBridge'
 import { mapCollabSyncPayload, mapBackendMessage, mapBackendChannel, mapBackendSession, mapBackendBoard, mapBackendColumn, mapBackendTask, mergeSessionDetailHasMore } from './lib/collabSync'
@@ -483,6 +484,7 @@ export default function App() {
   const [activePage, setActivePage] = useState<AppPage>('workspace')
   const [swarmAgents, setSwarmAgents] = useState<AgentInfo[]>([])
   const [showDevTools, setShowDevTools] = useState(false)
+  const [showLLMModal, setShowLLMModal] = useState(false)
   const [lastTaskDoneAgent, setLastTaskDoneAgent] = useState<string | null>(null)
   const [globalExecMode, setGlobalExecMode] = useState<AppExecMode>('task')
   const [globalCompanyProfile, setGlobalCompanyProfile] = useState<'corporate' | 'custom'>('corporate')
@@ -698,6 +700,19 @@ export default function App() {
   const chatStore = useChatStore()
   const sessionStore = useSessionStore()
   const projectStore = useProjectStore()
+
+  const [llmConfig, setLlmConfig] = useState<import('./components/LLMModelSettingsModal').LLMSettingsData | null>(null)
+
+  useEffect(() => {
+    if (showLLMModal) {
+      fetch('/api/llm/config')
+        .then((res) => res.json())
+        .then((data) => {
+          if (data.ok) setLlmConfig(data)
+        })
+        .catch((err) => console.error('Failed to fetch LLM config:', err))
+    }
+  }, [showLLMModal])
 
   // Per-session recruitment (role_id -> recruited names) for the org canvas.
   // The org_info payload is project-global, so the canvas otherwise can't show
@@ -2491,11 +2506,39 @@ export default function App() {
               <option key={name} value={name}>{t(themeMessageKey(name))}</option>
             ))}
           </select>
+          <button className={`icon-btn ${showLLMModal ? 'active' : ''}`} onClick={() => setShowLLMModal((v) => !v)} title="LLM & Local Model Settings" aria-label="LLM Settings">
+            <span style={{ fontSize: '14px' }}>🤖</span>
+          </button>
           <button className={`icon-btn ${showDevTools ? 'active' : ''}`} onClick={() => setShowDevTools((v) => !v)} title={t('dev.tools')} aria-label={t('dev.tools')}>
             <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M5.5 2L2 5.5 5.5 9" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/><path d="M10.5 7L14 10.5 10.5 14" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/></svg>
           </button>
         </div>
       </header>
+
+      {/* LLM & Local Model Provider Modal */}
+      <LLMModelSettingsModal
+        isOpen={showLLMModal}
+        initialConfig={llmConfig}
+        onClose={() => setShowLLMModal(false)}
+        onSave={async (settings) => {
+          try {
+            const res = await fetch('/api/llm/config', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(settings),
+            })
+            const data = await res.json()
+            if (data.ok) {
+              setLlmConfig(data)
+              return true
+            }
+            throw new Error(data.error || 'Failed to save settings')
+          } catch (err: any) {
+            console.error('Failed to save LLM settings:', err)
+            throw err
+          }
+        }}
+      />
 
       {/* Workspace Page (unified Chat + Kanban) */}
       {activePage === 'workspace' && (

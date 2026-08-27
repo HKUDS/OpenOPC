@@ -162,9 +162,15 @@ async def create_app(
     app["db"] = db
     app["ws_handler"] = ws_handler
     app["instance_lock"] = instance_lock
+    app["opc_home"] = opc_home
+    app["config"] = config
 
     # ── Routes ────────────────────────────────────────────────────────
     app.router.add_get("/ws", ws_handler.handle_ws)
+
+    # LLM Configuration REST API (registered before SPA catch-all)
+    app.router.add_get("/api/llm/config", _handle_get_llm_config_api)
+    app.router.add_post("/api/llm/config", _handle_update_llm_config_api)
 
     # Attachment download (must be registered before the SPA catch-all)
     app.router.add_get(
@@ -216,6 +222,31 @@ async def _serve_spa_fallback(request: aiohttp.web.Request) -> aiohttp.web.Respo
         return aiohttp.web.FileResponse(file_path, headers=_FRONTEND_NO_STORE_HEADERS)
     # SPA fallback
     return aiohttp.web.FileResponse(_STATIC_DIR / "index.html", headers=_FRONTEND_NO_STORE_HEADERS)
+
+
+async def _handle_get_llm_config_api(request: aiohttp.web.Request) -> aiohttp.web.Response:
+    try:
+        from opc.plugins.office_ui.llm_config_service import get_llm_config_service
+        app = request.app
+        target = app.get("engine") or app.get("opc_home") or get_opc_home()
+        payload = get_llm_config_service(target)
+        return aiohttp.web.json_response(payload)
+    except Exception as e:
+        return aiohttp.web.json_response({"ok": False, "error": str(e)}, status=500)
+
+
+async def _handle_update_llm_config_api(request: aiohttp.web.Request) -> aiohttp.web.Response:
+    try:
+        from opc.plugins.office_ui.llm_config_service import update_llm_config_service
+        data = await request.json()
+        app = request.app
+        target = app.get("engine") or app.get("opc_home") or get_opc_home()
+        payload = update_llm_config_service(target, data)
+        return aiohttp.web.json_response(payload)
+    except ValueError as e:
+        return aiohttp.web.json_response({"ok": False, "error": str(e)}, status=400)
+    except Exception as e:
+        return aiohttp.web.json_response({"ok": False, "error": str(e)}, status=500)
 
 
 def _make_attachment_handler(engine: OPCEngine):

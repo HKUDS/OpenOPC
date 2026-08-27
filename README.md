@@ -611,29 +611,27 @@ The parent manager receives a capability summary compiled from the covered roles
 | `.opc/config/company_orgs/org_<id>_config.yaml` | Saved custom company architectures used by Company Mode. |
 | `.opc/config/org_index.yaml` | Active saved company architecture selector. |
 
-### LLM Keys
+### LLM Keys & Local Model Support
 
-After `opc init`, edit `.opc/config/llm_config.yaml` in the repo-local OPC home. If you set `OPC_HOME`, edit `$OPC_HOME/config/llm_config.yaml` instead.
-
-The template leaves secrets empty. Write your key directly into the file:
+After `opc init`, edit `.opc/config/llm_config.yaml` in the repo-local OPC home (or `$OPC_HOME/config/llm_config.yaml`). OpenOPC supports both Cloud LLMs (OpenAI, Anthropic, OpenRouter) and keyless **Local LLMs** (Ollama, vLLM, LM Studio, LocalAI, Llama.cpp, TGI):
 
 ```yaml
 llm:
-  default_model: "openai/gpt-5.4"
-  api_base: "https://openrouter.ai/api/v1"
-  api_key: "sk-or-v1-..."   # your OpenRouter (or other provider) API key
+  default_model: "ollama/llama3.3"         # or "vllm/meta-llama-3.1-8b-instruct", "openai/gpt-4o"
+  api_base: "http://localhost:11434"        # auto-resolved for local model prefixes
+  api_key: ""                               # keyless for local self-hosted nodes!
 
-  max_tokens: 32768         # max output tokens per request; lower it if your
-                            # model's output cap is smaller
-  # context_window: 128000  # total input window. Usually auto-detected via
-                            # litellm; unmapped models fall back to 128000.
-                            # Uncomment and set only when the fallback is
-                            # wrong for your model.
+  max_tokens: 32768         # max output tokens per request
+  is_local: true            # optional explicit local execution flag
 ```
+
+You can also configure LLM settings directly from the browser using the **LLM & Local Model Settings Modal (`🤖` button)** in the top header of Office UI.
+
+See [`docs/LOCAL_MODELS.md`](docs/LOCAL_MODELS.md) for detailed setup guides on Ollama, vLLM, LM Studio, and LocalAI.
 
 Then verify with `opc status`.
 
-If you prefer not to store the key in the file, leave `api_key` empty and set `api_key_env` to the name of an environment variable that holds it (e.g. `api_key_env: "OPENROUTER_API_KEY"`).
+If you prefer not to store cloud keys in the file, leave `api_key` empty and set `api_key_env` to the name of an environment variable that holds it (e.g. `api_key_env: "OPENROUTER_API_KEY"`).
 
 ### Approval & Agent Permissions
 
