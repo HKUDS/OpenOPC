@@ -749,6 +749,27 @@ system:
 Native browser tools include `browser_navigate`, `browser_snapshot`, `browser_click`, `browser_type`, `browser_wait_for`, `browser_scroll`, `browser_select_option`, `browser_evaluate`, `browser_take_screenshot`, and `browser_close`.
 
 MCP servers can be added under `mcp_servers` in `system_config.yaml`. Local servers use stdio commands; remote servers use HTTP/SSE-style URLs. Discovered tools are registered with a server prefix to avoid collisions.
+
+Servers and their tools can optionally be scoped to specific organizations,
+projects, or runtime roles:
+
+```yaml
+mcp_servers:
+  - name: knowledge
+    type: remote
+    url: "https://mcp.example.com/sse"
+    enabled: true
+    tools_filter: ["search", "get_entity"]
+    organizations: ["adroyt"]
+    projects: ["research"]
+    roles: ["researcher", "reviewer"]
+```
+
+Empty scope lists preserve the existing global behavior, and `"*"` matches any
+value. Organization and project scopes are checked before the server is
+connected. Role scopes filter the schemas shown to an agent and are checked
+again when a tool is dispatched. A role-scoped tool without trusted runtime
+role context is denied.
 </details>
 
 ### Troubleshooting

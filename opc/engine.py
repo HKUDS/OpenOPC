@@ -1036,6 +1036,12 @@ class OPCEngine:
         for server_cfg in self.config.system.mcp_servers:
             if not server_cfg.enabled:
                 continue
+            if not self._mcp_server_matches_runtime_scope(server_cfg):
+                logger.info(
+                    "MCP '{}' skipped outside organization/project scope",
+                    server_cfg.name,
+                )
+                continue
             try:
                 server_type = getattr(server_cfg, "type", "local") or "local"
                 if server_type == "remote":
@@ -1059,12 +1065,30 @@ class OPCEngine:
                         timeout=server_cfg.startup_timeout,
                     )
                 tool_filter = set(server_cfg.tools_filter) if server_cfg.tools_filter else None
-                tools = await self.mcp_manager.register_tools(conn, tool_filter)
+                tools = await self.mcp_manager.register_tools(
+                    conn,
+                    tool_filter,
+                    allowed_roles=server_cfg.roles or None,
+                )
                 for tool in tools:
                     self.tool_registry.register(tool)
                 logger.info(f"MCP '{server_cfg.name}' ({server_type}): registered {len(tools)} tools")
             except Exception as exc:
                 logger.warning(f"MCP '{server_cfg.name}' unavailable, skipping: {exc}")
+
+    def _mcp_server_matches_runtime_scope(self, server_cfg: Any) -> bool:
+        organization_id = str(self.config.org.organization_id or "").strip()
+        project_id = str(self.project_id or "default").strip()
+        return self._scope_allows(
+            server_cfg.organizations, organization_id
+        ) and self._scope_allows(
+            server_cfg.projects, project_id
+        )
+
+    @staticmethod
+    def _scope_allows(configured: list[str], actual: str) -> bool:
+        scope = {str(value).strip() for value in configured if str(value).strip()}
+        return not scope or "*" in scope or actual in scope
 
     def _register_collaboration_tools(self) -> None:
         if not self.communication:

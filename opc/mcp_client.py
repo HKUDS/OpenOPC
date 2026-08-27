@@ -265,6 +265,7 @@ class MCPManager:
         self,
         conn: _MCPConnectionBase,
         tool_filter: set[str] | None = None,
+        allowed_roles: list[str] | None = None,
     ) -> list[ToolDefinition]:
         raw_tools = await conn.discover_tools()
         definitions: list[ToolDefinition] = []
@@ -280,6 +281,7 @@ class MCPManager:
                 parameters=tool_spec.get("inputSchema", {"type": "object", "properties": {}}),
                 func=self._make_caller(conn, original_name),
                 category="mcp",
+                allowed_roles=allowed_roles,
             )
             definitions.append(td)
         return definitions

@@ -265,6 +265,10 @@ mcp_servers:
   enabled: false
   env: {}
   tools_filter: []
+  # Optional access scopes. Empty lists preserve global availability.
+  organizations: []
+  projects: []
+  roles: []
   startup_timeout: 30.0
 
 # Example: GitHub MCP server (uncomment and set GITHUB_TOKEN)
@@ -275,6 +279,9 @@ mcp_servers:
 #   env:
 #     GITHUB_TOKEN: "your-github-token"
 #   tools_filter: []
+#   organizations: ["default"]
+#   projects: ["research"]
+#   roles: ["researcher", "reviewer"]
 #   startup_timeout: 30.0
 
 # Example: filesystem MCP server
