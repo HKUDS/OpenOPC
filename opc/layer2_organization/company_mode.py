@@ -92,7 +92,7 @@ from opc.layer2_organization import phase_hooks  # noqa: F401
 from opc.layer2_organization.collaboration_service import CollaborationContext
 from opc.layer2_organization.phase_hooks import reconcile_role_serial_queues
 from opc.layer2_organization.session_scoping import task_session_scope_id
-from opc.layer2_organization.turn_mode import reset_manager_dispatch_turn_metadata
+from opc.layer2_organization.turn_mode import reset_manager_decision_turn_metadata
 from opc.layer2_organization.data_acquisition_policy import (
     DEFAULT_ACQUISITION_EXECUTION_RECORD_RELATIVE_PATH,
     default_download_manifest_path,
@@ -312,24 +312,6 @@ class _CompanyRunControllerHeartbeat:
             if not renewed:
                 self._lost.set()
                 return
-
-# Matches the manager dispatch guard's escape line while tolerating the
-# markdown decoration models routinely wrap protocol tokens in — bold
-# (`**NO_DELEGATION_JUSTIFICATION**:`), headings, quotes, list markers,
-# `_`/`-`/space separator variants, and fullwidth colons. A bare
-# ``startswith("NO_DELEGATION_JUSTIFICATION:")`` here cost project 4444 its
-# CTO card: the justification was written but bold-wrapped, went unparsed,
-# and the guard drove the work item to FAILED.
-_NO_DELEGATION_JUSTIFICATION_LINE = re.compile(
-    r"^\s*(?:>+\s*)*"                     # blockquote markers
-    r"(?:[-*+•]\s+|\d+[.)]\s+)?"          # list markers
-    r"[\s#*_`~\"']*"                       # heading/bold/quote decoration
-    r"NO[_\s-]?DELEGATION[_\s-]?JUSTIFICATION"
-    r"[\s*_`~\"']*"                        # decoration between token and colon
-    r"[:：]\s*(?P<reason>.*?)\s*$",
-    re.IGNORECASE,
-)
-
 
 def review_work_item_id_for_attempt(worker_work_item_id: str, attempt: int) -> str:
     """Compute a per-attempt review work-item ID for a given worker.
@@ -2328,8 +2310,8 @@ class CompanyWorkItemExecutor:
             return "deliver"
         if turn_mode == "synthesize_required":
             return "aggregate"
-        if turn_mode == "dispatch_required":
-            return "dispatch"
+        if turn_mode in {"manager_decide", "dispatch_required"}:
+            return "plan"
         if turn_mode == "monitor_children":
             return "monitor"
         if turn_mode in {"review_execute", "review_pending"}:
@@ -2339,10 +2321,16 @@ class CompanyWorkItemExecutor:
     @staticmethod
     def _attention_title_for_session(session: CompanyMemberSession, work_kind: str) -> str:
         role_label = str(session.role_id or "seat").strip() or "seat"
+        turn_mode = str(
+            session.current_turn_mode
+            or dict(session.inbox_state or {}).get("current_turn_mode", "")
+            or ""
+        ).strip().lower()
+        if turn_mode in {"manager_decide", "dispatch_required"}:
+            return f"Execution Decision: {role_label}"
         mapping = {
             "deliver": f"Delivery Turn: {role_label}",
             "aggregate": f"Aggregation Turn: {role_label}",
-            "dispatch": f"Dispatch Turn: {role_label}",
             "monitor": f"Monitor Children: {role_label}",
             "review": f"Review Turn: {role_label}",
             "plan": f"Attention Turn: {role_label}",
@@ -3153,11 +3141,13 @@ class CompanyWorkItemExecutor:
                 followup_task is not None
                 and followup_task.status == TaskStatus.PENDING
                 and bool((followup_task.metadata or {}).get("followup_routed_to_final_decider", False))
-                and str((followup_task.metadata or {}).get("current_turn_mode", "") or "").strip() == "dispatch_required"
+                and str((followup_task.metadata or {}).get("current_turn_mode", "") or "").strip()
+                in {"manager_decide", "dispatch_required"}
             )
             if (
                 bool(metadata.get("followup_routed_to_final_decider", False))
-                and str(metadata.get("current_turn_mode", "") or "").strip() == "dispatch_required"
+                and str(metadata.get("current_turn_mode", "") or "").strip()
+                in {"manager_decide", "dispatch_required"}
                 and (
                     followup_task is None
                     or followup_task_pending
@@ -5338,8 +5328,9 @@ class CompanyWorkItemExecutor:
                     or external_team_binding.get("failure_policy")
                     or "fail_closed"
                 ).strip(),
-                "jiuwen_provider_mode": str(
-                    work_item_metadata.get("jiuwen_provider_mode")
+                "external_provider_mode": str(
+                    work_item_metadata.get("external_provider_mode")
+                    or work_item_metadata.get("jiuwen_provider_mode")
                     or external_team_binding.get("provider_mode")
                     or ""
                 ).strip(),
@@ -7444,17 +7435,17 @@ class CompanyWorkItemExecutor:
 
         while True:
             task.metadata.pop("_retry_contract_enforcement", None)
-            # The dispatch outcome is attempt-scoped.  Reset every transient
-            # producer/escape marker together so a retry, rework, or follow-up
-            # cannot inherit an earlier turn's board mutation or justification.
-            task.metadata = reset_manager_dispatch_turn_metadata(task.metadata)
-            manager_dispatch_retry_count = int(
-                task.metadata.get("_manager_dispatch_retry_count", 0) or 0
-            )
-            dispatch_guard_before = await self._snapshot_manager_dispatch_state(
+            # A manager's execution choice is attempt-scoped. A retry, rework,
+            # or follow-up must not inherit an earlier board mutation marker.
+            task.metadata = reset_manager_decision_turn_metadata(task.metadata)
+            manager_decision_turn = self._manager_turn_mode(
                 task,
                 member_session=member_session,
-            )
+            ) in {"manager_decide", "dispatch_required"}
+            task.metadata.pop("_manager_dispatch_retry_count", None)
+            task.metadata.pop("manager_dispatch_guard_terminal_violation", None)
+            task.context_snapshot = dict(task.context_snapshot or {})
+            task.context_snapshot.pop("manager_dispatch_guard_violation", None)
             # Phase A: mark work_item RUNNING via phase channel. On retries
             # within this while-loop the phase may have regressed (e.g. to
             # READY_FOR_REWORK) so the explicit transition is still meaningful.
@@ -7557,67 +7548,14 @@ class CompanyWorkItemExecutor:
                     artifacts=dict(result.artifacts or {}),
                 )
 
-            created_follow_up_work_item_ids = await self._materialize_follow_up_work_items(task, result)
-            dispatch_guard_issues = await self._enforce_manager_dispatch_guard(
-                task,
-                result,
-                before_state=dispatch_guard_before,
-                created_follow_up_work_item_ids=created_follow_up_work_item_ids,
-                member_session=member_session,
-            )
-            if dispatch_guard_issues:
-                await self._append_progress(task, "Manager dispatch guard rejected the turn.")
-                await self._append_progress(task, "\n".join(f"- {issue}" for issue in dispatch_guard_issues))
-                max_dispatch_retries = int(
-                    task.metadata.get("manager_dispatch_guard_max_retries", 2) or 2
-                )
-                task.context_snapshot = dict(task.context_snapshot or {})
-                # Build feedback that escalates on each retry: first attempt
-                # restates the rule; later attempts add the counter so the
-                # agent sees "this is strike N of M" and knows the next
-                # non-delegating turn is terminal.
-                violation_text = "\n".join(dispatch_guard_issues)
-                if manager_dispatch_retry_count:
-                    violation_text = (
-                        f"(Retry {manager_dispatch_retry_count}/{max_dispatch_retries}) "
-                        + violation_text
-                    )
-                task.context_snapshot["manager_dispatch_guard_violation"] = violation_text
-                if manager_dispatch_retry_count < max_dispatch_retries:
-                    task.metadata = dict(task.metadata or {})
-                    task.metadata["_manager_dispatch_retry_count"] = (
-                        manager_dispatch_retry_count + 1
-                    )
-                    await self.save_task(task)
-                    await self._emit_progress(
-                        f"[Company:{projection_id}] "
-                        f"retrying manager dispatch turn "
-                        f"({manager_dispatch_retry_count + 1}/{max_dispatch_retries})",
-                        task_id=task.id,
-                    )
-                    continue
-                # Retries exhausted. Dispatch is a soft constraint: the org
-                # chart fixes who *can* delegate, but not every task needs
-                # every seat, so accept the turn output as normal completion
-                # instead of failing the work item. Record the unresolved
-                # guard note so reviewers and the delivery report can weigh
-                # the output accordingly.
+            await self._materialize_follow_up_work_items(task, result)
+            if manager_decision_turn:
                 task.metadata = dict(task.metadata or {})
-                task.metadata["manager_dispatch_guard_unresolved"] = violation_text
-                await self._append_progress(
-                    task,
-                    "Dispatch guard reminders exhausted; accepting the turn output "
-                    "without delegation (noted for review).",
+                task.metadata["manager_execution_choice"] = (
+                    "delegated"
+                    if bool(task.metadata.get("manager_board_mutation_performed", False))
+                    else "direct"
                 )
-                await self._emit_progress(
-                    f"[Company:{projection_id}] accepted manager turn without delegation "
-                    f"after dispatch guard reminders were exhausted",
-                    task_id=task.id,
-                )
-            task.metadata.pop("_manager_dispatch_retry_count", None)
-            task.metadata.pop("manager_dispatch_guard_terminal_violation", None)
-            task.context_snapshot = dict(task.context_snapshot or {})
-            task.context_snapshot.pop("manager_dispatch_guard_violation", None)
             output_bundle = self._capture_work_item_outputs(task, result)
             await self._persist_work_item_owned_output_metadata(task, output_bundle)
             if await self._park_for_delegated_children(task):
@@ -11165,13 +11103,13 @@ class CompanyWorkItemExecutor:
         seat_id = str((task.metadata or {}).get("delegation_seat_id", "") or "").strip()
         if not run_id or not seat_id:
             return
-        turn_mode = self._manager_dispatch_turn_mode(task, member_session=member_session)
+        turn_mode = self._manager_turn_mode(task, member_session=member_session)
         current_work_item_id = linked_work_item_id_for_task(task)
         current_item = None
         if current_work_item_id and hasattr(self.store, "get_delegation_work_item"):
             current_item = await self.store.get_delegation_work_item(current_work_item_id)
         is_attention_turn = self._is_attention_work_item(current_item)
-        if turn_mode not in {"dispatch_required", "monitor_children", "synthesize_required", "deliver_required"} and not is_attention_turn:
+        if turn_mode not in {"manager_decide", "dispatch_required", "monitor_children", "synthesize_required", "deliver_required"} and not is_attention_turn:
             return
         parent_work_item_id, attention_work_item_id = await self._resolve_manager_board_parent_for_task(task)
         if not parent_work_item_id:
@@ -11423,7 +11361,7 @@ class CompanyWorkItemExecutor:
             pass
 
     @staticmethod
-    def _manager_dispatch_turn_mode(
+    def _manager_turn_mode(
         task: Task,
         member_session: CompanyMemberSession | None = None,
     ) -> str:
@@ -11433,309 +11371,6 @@ class CompanyWorkItemExecutor:
             or getattr(member_session, "current_turn_mode", "")
             or ""
         ).strip().lower()
-
-    # Turn kinds where a manager turn completes *without* dispatching any
-    # child work by design: delivery/synthesize/aggregate roll sub-team
-    # results up to the parent, and review evaluates a peer's output.
-    # Firing the dispatch guard on these marks a legitimate terminal turn
-    # as failed (new16/app13 reproduced this: final delivery produced
-    # substantive output, guard rejected "no delegate_work call" → task
-    # status FAILED despite disk artifacts being complete).
-    _NON_DISPATCH_TURN_KINDS: frozenset[str] = frozenset({
-        "deliver", "delivery",
-        "synthesize", "synthesis",
-        "aggregate",
-        "review",
-        "monitor",
-        "self_evolution",
-    })
-
-    @classmethod
-    def _task_turn_kind(cls, task: Task) -> str:
-        """Best-effort turn-kind inference for guard-filtering. Checks the
-        three metadata fields that callers stamp in different code paths —
-        ``work_kind`` is the modern work-item runtime field, the other two are
-        legacy signals from the work-item planner and gate policy."""
-        meta = task.metadata or {}
-        for key in ("work_kind", "delegation_turn_kind", "work_item_turn_type"):
-            value = str(meta.get(key, "") or "").strip().lower()
-            if value:
-                return value
-        return ""
-
-    @classmethod
-    def _requires_manager_dispatch_guard(
-        cls,
-        task: Task,
-        member_session: CompanyMemberSession | None = None,
-    ) -> bool:
-        if str((task.metadata or {}).get("runtime_model", "") or "").strip() != "multi_team_org":
-            return False
-        # Fix 3 (follow-up): skip the guard on work items where "no delegate_work
-        # call" is the expected shape, regardless of what current_turn_mode
-        # resolved to. See ``_NON_DISPATCH_TURN_KINDS``. Without this, the
-        # Final-delivery work item in new16/app13 got marked failed even
-        # though the artifacts were written and the subteam work approved.
-        turn_kind = cls._task_turn_kind(task)
-        if turn_kind in cls._NON_DISPATCH_TURN_KINDS:
-            return False
-        if cls._manager_dispatch_turn_mode(task, member_session=member_session) != "dispatch_required":
-            return False
-        direct_report_seat_ids = [
-            str(item).strip()
-            for item in list(
-                (task.metadata or {}).get("direct_report_seat_ids", [])
-                or dict(getattr(member_session, "metadata", {}) or {}).get("direct_report_seat_ids", [])
-                or []
-            )
-            if str(item).strip()
-        ]
-        allowed_delegate_role_ids = [
-            str(item).strip()
-            for item in list(
-                (task.metadata or {}).get("allowed_delegate_role_ids", [])
-                or dict(getattr(member_session, "metadata", {}) or {}).get("allowed_delegate_role_ids", [])
-                or []
-            )
-            if str(item).strip()
-        ]
-        managed_team_id = str(
-            (task.metadata or {}).get("managed_team_id", "")
-            or dict(getattr(member_session, "metadata", {}) or {}).get("managed_team_id", "")
-            or ""
-        ).strip()
-        return bool(direct_report_seat_ids or allowed_delegate_role_ids or managed_team_id)
-
-    async def _snapshot_manager_dispatch_state(
-        self,
-        task: Task,
-        *,
-        member_session: CompanyMemberSession | None = None,
-    ) -> dict[str, Any] | None:
-        if not self._requires_manager_dispatch_guard(task, member_session=member_session):
-            return None
-        if not self.store or not hasattr(self.store, "list_delegation_work_items"):
-            return None
-        run_id = str((task.metadata or {}).get("delegation_run_id", "") or "").strip()
-        parent_work_item_id = linked_work_item_id_for_task(task)
-        if not run_id or not parent_work_item_id:
-            return None
-        work_items = await self.store.list_delegation_work_items(run_id)
-        child_mutation_state: dict[str, dict[str, Any]] = {}
-        child_work_item_ids = {
-            str(getattr(item, "work_item_id", "") or "").strip()
-            for item in work_items
-            if str(getattr(item, "parent_work_item_id", "") or "").strip() == parent_work_item_id
-            and not is_runtime_auxiliary_work_item(item)
-            and str(getattr(item, "work_item_id", "") or "").strip()
-        }
-        for item in work_items:
-            item_id = str(getattr(item, "work_item_id", "") or "").strip()
-            if not item_id or item_id not in child_work_item_ids:
-                continue
-            metadata = dict(getattr(item, "metadata", {}) or {})
-            try:
-                mutation_revision = int(metadata.get("manager_mutation_revision", 0) or 0)
-            except (TypeError, ValueError):
-                mutation_revision = 0
-            child_mutation_state[item_id] = {
-                "manager_mutation_revision": mutation_revision,
-                "manager_mutation_action": str(metadata.get("manager_mutation_action", "") or "").strip(),
-                "deleted_by_manager_tool": bool(metadata.get("deleted_by_manager_tool", False)),
-                "hidden_from_company_kanban": bool(metadata.get("hidden_from_company_kanban", False)),
-                "upstream_visibility": str(metadata.get("upstream_visibility", "") or "").strip().lower(),
-            }
-        dependency_work_item_ids = {
-            str(item).strip()
-            for item in list((task.metadata or {}).get("delegation_wait_for_work_item_ids", []) or [])
-            if str(item).strip()
-        }
-        parent = await self.store.get_delegation_work_item(parent_work_item_id) if hasattr(self.store, "get_delegation_work_item") else None
-        if parent is not None:
-            dependency_work_item_ids.update(
-                str(item).strip()
-                for item in list((getattr(parent, "metadata", {}) or {}).get("dependency_work_item_ids", []) or [])
-                if str(item).strip()
-            )
-        work_item_by_id = {
-            str(getattr(item, "work_item_id", "") or "").strip(): item
-            for item in work_items
-            if str(getattr(item, "work_item_id", "") or "").strip()
-        }
-        normalized_dependency_ids, _pruned_dependency_ids = normalize_dependency_work_item_ids(
-            list(dependency_work_item_ids),
-            work_item_by_id,
-            owner_work_item_id=parent_work_item_id,
-        )
-        return {
-            "run_id": run_id,
-            "parent_work_item_id": parent_work_item_id,
-            "child_work_item_ids": child_work_item_ids,
-            "dependency_work_item_ids": set(normalized_dependency_ids),
-            "child_mutation_state": child_mutation_state,
-        }
-
-    @staticmethod
-    def _genuine_no_delegation_justification(text: str) -> str:
-        """Cleaned justification text, or "" for empty input or an echo of
-        the instruction template's `<specific reason>` placeholder — with
-        any markdown decoration, quoting, or trailing punctuation around
-        the placeholder stripped before the check."""
-        reason = re.sub(r"[\s*_`~\"']+$", "", str(text or "")).strip()
-        if not reason:
-            return ""
-        core = reason
-        previous = None
-        while previous != core:
-            previous = core
-            core = core.strip().strip("*_~`\"'")
-            core = re.sub(r"[\s.。!！,，;；:：]+$", "", core)
-        if re.fullmatch(r"<[^<>]*>", core):
-            return ""
-        return reason
-
-    @staticmethod
-    def _extract_no_delegation_justification(task: Task, result: TaskResult | None) -> str:
-        artifact_candidates = []
-        if result and getattr(result, "artifacts", None):
-            artifacts = dict(result.artifacts or {})
-            artifact_candidates.extend(
-                [
-                    str(artifacts.get("manager_no_delegation_justification", "") or "").strip(),
-                    str(artifacts.get("no_delegation_justification", "") or "").strip(),
-                    str(artifacts.get("manager_no_delegation_reason", "") or "").strip(),
-                    str(artifacts.get("no_delegation_reason", "") or "").strip(),
-                ]
-            )
-        artifact_candidates.extend(
-            [
-                str((task.metadata or {}).get("manager_no_delegation_justification", "") or "").strip(),
-                str((task.metadata or {}).get("no_delegation_justification", "") or "").strip(),
-            ]
-        )
-        for candidate in artifact_candidates:
-            cleaned = CompanyWorkItemExecutor._genuine_no_delegation_justification(candidate)
-            if cleaned:
-                return cleaned
-        content = str(getattr(result, "content", "") or "").strip()
-        for line in content.splitlines():
-            match = _NO_DELEGATION_JUSTIFICATION_LINE.match(str(line))
-            if not match:
-                continue
-            reason = CompanyWorkItemExecutor._genuine_no_delegation_justification(
-                match.group("reason")
-            )
-            if reason:
-                return reason
-        return ""
-
-    @staticmethod
-    def _no_delegation_justification_is_infra_failure(
-        justification: str,
-        result: TaskResult | None,
-    ) -> bool:
-        artifacts = dict(getattr(result, "artifacts", {}) or {}) if result is not None else {}
-        failure = artifacts.get("collaboration_infrastructure_failure")
-        if isinstance(failure, dict) and str(failure.get("error_type", "") or "").strip() == "infrastructure":
-            return True
-        text = str(justification or "").strip().lower()
-        if not text:
-            return False
-        markers = (
-            "disk i/o error",
-            "database is locked",
-            "readonly database",
-            "unable to open database file",
-            "collaboration broker rpc",
-            "broker rpc failed",
-            "sqlite3.operationalerror",
-            "sqlite operationalerror",
-        )
-        return any(marker in text for marker in markers)
-
-    async def _enforce_manager_dispatch_guard(
-        self,
-        task: Task,
-        result: TaskResult | None,
-        *,
-        before_state: dict[str, Any] | None,
-        created_follow_up_work_item_ids: list[str] | None = None,
-        member_session: CompanyMemberSession | None = None,
-    ) -> list[str]:
-        if before_state is None:
-            return []
-        after_state = await self._snapshot_manager_dispatch_state(task, member_session=member_session)
-        if after_state is None:
-            return []
-        before_child_ids = set(before_state.get("child_work_item_ids", set()) or set())
-        after_child_ids = set(after_state.get("child_work_item_ids", set()) or set())
-        before_dependency_ids = set(before_state.get("dependency_work_item_ids", set()) or set())
-        after_dependency_ids = set(after_state.get("dependency_work_item_ids", set()) or set())
-        before_child_mutation_state = dict(before_state.get("child_mutation_state", {}) or {})
-        after_child_mutation_state = dict(after_state.get("child_mutation_state", {}) or {})
-
-        def _is_manager_mutation_marker(state: dict[str, Any]) -> bool:
-            try:
-                mutation_revision = int(state.get("manager_mutation_revision", 0) or 0)
-            except (TypeError, ValueError):
-                mutation_revision = 0
-            return (
-                mutation_revision > 0
-                or bool(state.get("deleted_by_manager_tool", False))
-                or bool(state.get("hidden_from_company_kanban", False))
-                or str(state.get("upstream_visibility", "") or "") == "hidden"
-            )
-
-        manager_mutated_existing_child_ids = {
-            item_id
-            for item_id in before_child_ids & after_child_ids
-            if (after_marker := dict(after_child_mutation_state.get(item_id, {}) or {}))
-            != dict(before_child_mutation_state.get(item_id, {}) or {})
-            and _is_manager_mutation_marker(after_marker)
-        }
-        created_follow_up_ids = {
-            str(item).strip()
-            for item in list(created_follow_up_work_item_ids or [])
-            if str(item).strip()
-        }
-        if (
-            after_child_ids - before_child_ids
-            or before_child_ids - after_child_ids
-            or after_dependency_ids - before_dependency_ids
-            or manager_mutated_existing_child_ids
-            or created_follow_up_ids
-            or bool((task.metadata or {}).get("manager_board_mutation_performed", False))
-        ):
-            task.metadata = dict(task.metadata or {})
-            task.metadata["manager_board_mutation_performed"] = True
-            task.metadata.pop("manager_no_delegation_justification", None)
-            task.metadata.pop("manager_dispatch_guard_unresolved", None)
-            return []
-        justification = self._extract_no_delegation_justification(task, result)
-        if justification:
-            if self._no_delegation_justification_is_infra_failure(justification, result):
-                return [
-                    "Dispatch-required manager turn hit a collaboration infrastructure failure "
-                    "while trying to inspect or mutate the work-item board. Retry the collaboration "
-                    "tool path instead of accepting `NO_DELEGATION_JUSTIFICATION` as normal completion."
-                ]
-            task.metadata = dict(task.metadata or {})
-            task.metadata["manager_no_delegation_justification"] = justification
-            task.metadata.pop("manager_dispatch_guard_unresolved", None)
-            return []
-        direct_reports = [
-            str(item).strip()
-            for item in list((task.metadata or {}).get("direct_report_role_ids", []) or [])
-            if str(item).strip()
-        ]
-        direct_report_hint = f" Direct reports in scope: {', '.join(direct_reports[:6])}." if direct_reports else ""
-        return [
-            "Dispatch-required manager turn finished without creating child work. "
-            "Use `delegate_work(...)` for new child work, or `modify_work_item(...)` / `delete_work_item(...)` "
-            "when revising an existing board, "
-            "or finish with `NO_DELEGATION_JUSTIFICATION: <specific reason>` when no downstream seat is a fit."
-            + direct_report_hint
-        ]
 
     def _snapshot_inbox_for_turn(self, task: Task) -> None:
         """Record the set of unread message filenames at turn start.

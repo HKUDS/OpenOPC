@@ -1285,7 +1285,7 @@ class CompanyRuntimeSuspendResumeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(refreshed_item.metadata.get("resume_user_reply"), followup_text)
         self.assertEqual(refreshed_item.metadata.get("latest_user_directive"), followup_text)
         self.assertEqual(refreshed_item.metadata.get("manager_mutation_user_input"), followup_text)
-        self.assertEqual(refreshed_item.metadata.get("current_turn_mode"), "dispatch_required")
+        self.assertEqual(refreshed_item.metadata.get("current_turn_mode"), "manager_decide")
         self.assertTrue(refreshed_item.metadata.get("followup_routed_to_final_decider"))
 
     async def test_text_after_stop_from_child_session_routes_to_parent_final_decider(self) -> None:
@@ -1820,7 +1820,7 @@ class CompanyRuntimeSuspendResumeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(refreshed_task.metadata.get("work_item_turn_type"), "deliver")
         self.assertEqual(refreshed_task.metadata.get("work_kind"), "delivery")
         self.assertEqual(refreshed_task.metadata.get("delegation_turn_kind"), "delivery")
-        self.assertEqual(refreshed_task.metadata.get("current_turn_mode"), "dispatch_required")
+        self.assertEqual(refreshed_task.metadata.get("current_turn_mode"), "manager_decide")
         self.assertEqual(refreshed_task.metadata.get("feedback_scope"), "final")
         self.assertTrue(refreshed_task.metadata.get("requires_user_feedback"))
         self.assertEqual(refreshed_task.metadata.get("delivery_revision"), 3)
@@ -1838,7 +1838,7 @@ class CompanyRuntimeSuspendResumeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(refreshed_item.metadata.get("work_item_turn_type"), "deliver")
         self.assertEqual(refreshed_item.metadata.get("work_kind"), "delivery")
         self.assertEqual(refreshed_item.metadata.get("delegation_turn_kind"), "delivery")
-        self.assertEqual(refreshed_item.metadata.get("current_turn_mode"), "dispatch_required")
+        self.assertEqual(refreshed_item.metadata.get("current_turn_mode"), "manager_decide")
         self.assertEqual(refreshed_item.metadata.get("delivery_revision"), 3)
         self.assertEqual(refreshed_item.metadata.get("owner_directive_revision"), 3)
         self.assertNotIn("delivery_package", refreshed_item.metadata)
@@ -2076,7 +2076,7 @@ class CompanyRuntimeSuspendResumeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(refreshed_task.context_snapshot["user_supplied_input"], "change the plan")
         self.assertEqual(refreshed_item.phase, Phase.READY_FOR_REWORK)
         self.assertEqual(refreshed_item.metadata.get("resume_source"), "primary_session_followup")
-        self.assertEqual(refreshed_item.metadata.get("current_turn_mode"), "dispatch_required")
+        self.assertEqual(refreshed_item.metadata.get("current_turn_mode"), "manager_decide")
         self.assertTrue(refreshed_item.metadata.get("followup_routed_to_final_decider"))
         self.assertEqual(refreshed_role_session.status, "idle")
         self.assertEqual(refreshed_role_session.focused_work_item_id, "")
@@ -2228,19 +2228,16 @@ class CompanyRuntimeSuspendResumeTests(unittest.IsolatedAsyncioTestCase):
 
         task.metadata = {
             **dict(task.metadata or {}),
-            "manager_no_delegation_justification": "The existing board still matches the follow-up.",
+            "manager_execution_choice": "direct",
         }
         await store.save_task(task)
         self.assertTrue(await engine._company_followup_target_progressed("task-ceo"))
 
-        task.metadata.pop("manager_no_delegation_justification", None)
-        task.metadata["manager_dispatch_guard_unresolved"] = (
-            "Soft dispatch constraint exhausted; accept the top-seat output."
-        )
+        task.metadata["manager_execution_choice"] = "delegated"
         await store.save_task(task)
         self.assertTrue(await engine._company_followup_target_progressed("task-ceo"))
 
-        task.metadata.pop("manager_dispatch_guard_unresolved", None)
+        task.metadata.pop("manager_execution_choice", None)
         await store.save_task(task)
         await store.update_delegation_work_item(
             "wi-ceo",
@@ -2250,7 +2247,7 @@ class CompanyRuntimeSuspendResumeTests(unittest.IsolatedAsyncioTestCase):
         # WorkItem copy must not make a later follow-up look progressed.
         self.assertFalse(await engine._company_followup_target_progressed("task-ceo"))
 
-    async def test_final_decider_followup_keeps_dispatch_turn_mode_with_existing_children(self) -> None:
+    async def test_final_decider_followup_keeps_decision_turn_mode_with_existing_children(self) -> None:
         runtime = CompanyRuntime(org_engine=None, communication=None, store=None)
         session = CompanyMemberSession(
             member_session_id="member-ceo",
@@ -2270,7 +2267,7 @@ class CompanyRuntimeSuspendResumeTests(unittest.IsolatedAsyncioTestCase):
             metadata={
                 "runtime_model": "multi_team_org",
                 "work_item_runtime": True,
-                "current_turn_mode": "dispatch_required",
+                "current_turn_mode": "manager_decide",
             },
         )
         followup_task = Task(
@@ -2281,14 +2278,14 @@ class CompanyRuntimeSuspendResumeTests(unittest.IsolatedAsyncioTestCase):
             metadata={
                 "runtime_model": "multi_team_org",
                 "work_item_runtime": True,
-                "current_turn_mode": "dispatch_required",
+                "current_turn_mode": "manager_decide",
                 "followup_routed_to_final_decider": True,
             },
-            context_snapshot={"current_turn_mode": "dispatch_required"},
+            context_snapshot={"current_turn_mode": "manager_decide"},
         )
 
         self.assertEqual(runtime._resolve_current_turn_mode(session, normal_task), "monitor_children")
-        self.assertEqual(runtime._resolve_current_turn_mode(session, followup_task), "dispatch_required")
+        self.assertEqual(runtime._resolve_current_turn_mode(session, followup_task), "manager_decide")
 
     def test_final_decider_followup_contract_requires_board_reconciliation(self) -> None:
         task = Task(

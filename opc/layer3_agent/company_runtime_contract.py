@@ -63,19 +63,9 @@ _MULTI_TEAM_ORG_GUIDELINES = """
 """
 
 
-_OPAQUE_EXTERNAL_TEAM_GUIDELINES = """
-## Opaque External Team Contract
-- You are the single execution boundary for a JiuwenSwarm Team. OpenOPC owns one WorkItem for this whole boundary; Jiuwen may organize any internal teammates and subtasks it needs.
-- Do not create OpenOPC child WorkItems and do not model Jiuwen teammates as OpenOPC roles, Tasks, sessions, or Kanban cards.
-- Complete the whole assigned boundary described by the injected Team Capability Manifest inside this one provider session.
-- Treat OpenOPC WorkItem state as authoritative. Jiuwen `chat.final`, teammate messages, and internal task completion are telemetry; the outer run completes only when the provider reports processing finished.
-- Work only inside the supplied trusted workspace. Do not treat `.agent_teams/**`, Jiuwen caches, or internal team traces as deliverables.
-- End with one JSON object containing: `work_item_id`, `attempt_id`, `status`, `summary`, `deliverables`, `verification`, `risks`, `open_questions`, and `handoff`. Use the exact OpenOPC ids supplied below. Do not invent ids.
-"""
-
 _MANAGER_RUNTIME_CONTRACT = """
 ## Manager Runtime Contract
-- You have direct reports or an allowed delegation surface; prefer delegation and monitoring before local execution.
+- You have direct reports or an allowed delegation surface. Decide from the current WorkItem whether child WorkItems improve capability fit, parallelism, or independent review; having reports alone is not a reason to delegate.
 - Use `delegate_work` only to CREATE child WorkItems for direct reports.
 - Use `modify_work_item` to revise an existing child WorkItem when the owner is still right but the brief, deliverables, acceptance criteria, or dependencies changed.
 - Use `delete_work_item` to cancel/hide an obsolete or wrong child WorkItem so it no longer blocks the parent board.
@@ -94,7 +84,7 @@ _COMPANY_PLAN_WORK_ITEM_GUIDELINES = """
 
 _COMPANY_EXECUTE_WORK_ITEM_GUIDELINES = """
 ## Company Work Item Turn: Execute
-- Prefer direct execution for the assigned slice once the approach is clear.
+- Follow the current WorkItem's assigned execution scope once the approach is clear.
 - Use `agent_spawn(profile='explore')` for read-only exploration when it reduces context noise.
 - If work-item swarm tools are available, use the shared microtask board to break the assigned slice into tactical work items before spawning burst workers.
 - Before handing off, leave evidence that a reviewer can verify quickly: changed areas, artifact pointers, and any remaining risks.
@@ -559,28 +549,23 @@ def _multi_team_manager_capable(task: Task) -> bool:
     return bool(str(current_seat.get("managed_team_id", "") or "").strip())
 
 
-def _dispatch_requirement_block(task: Task) -> str:
+def _manager_execution_decision_block(task: Task) -> str:
     runtime_model = str(task.metadata.get("runtime_model", "") or "").strip()
     if runtime_model != "multi_team_org":
         return ""
-    if resolve_company_turn_mode(task) != "dispatch_required":
+    if resolve_company_turn_mode(task) not in {"manager_decide", "dispatch_required"}:
         return ""
     if not _multi_team_manager_capable(task):
         return ""
     lines = [
         """
-## Dispatch Planning Contract
-- This turn is currently in `dispatch_required`.
-- Scope first: preserve the upstream goal, requested deliverable form, required paths, constraints, and hard dependencies.
-- Delegate outcome-based child WorkItems; planning or checklist work must not replace requested production work.
-- Separate hard blockers from startable preparation, and split phases only when they have distinct outputs, blockers, or handoff points.
-- If production cannot happen in this environment, dispatch or escalate the blocker instead of substituting a plan.
-- After that, do exactly one of the following:
-  1. Use `delegate_work` to create downstream child work for at least one direct report.
-  2. If local execution is truly required because no downstream seat is a fit, include exactly one line in your final response:
-     `NO_DELEGATION_JUSTIFICATION: <specific reason>`
-- If you execute locally without delegation or the justification line, the runtime will reject the turn and ask you to dispatch first.
-- If this is a follow-up over an existing board, inspect it with `manager_board_read` and use `modify_work_item` / `delete_work_item` for wrong existing items before creating additional work.
+## Manager Execution Decision
+- Assess the assigned outcome before choosing an execution shape. Preserve its requested deliverables, constraints, dependencies, and acceptance criteria.
+- Delegate only when distinct downstream outcomes benefit from a direct report's capabilities, parallel execution, or independent review.
+- Complete the WorkItem directly when it is small, primarily requires this leader's judgment, or decomposition would add coordination without improving the result.
+- If delegating, create outcome-based child WorkItems with clear scope, dependencies, deliverables, and acceptance criteria. Do not create make-work merely because direct reports exist.
+- If completing directly, produce the requested result in this turn; a plan or delegation discussion is not a substitute for the deliverable.
+- For a follow-up over an existing board, inspect it with `manager_board_read` and use `modify_work_item` / `delete_work_item` when the existing allocation is no longer correct.
 """.strip()
     ]
     metadata = dict(task.metadata or {})
@@ -704,7 +689,7 @@ def _team_capability_manifest_block(task: Task) -> str:
         f"- organizational_target_role_id: `{manifest.get('organizational_identity', '')}`",
         f"- display_name: `{manifest.get('display_name', '')}`",
         f"- manifest_hash: `{manifest.get('manifest_hash', '')}`",
-        "- This manifest is compiled from OpenOPC role configuration; it is the assigned organizational boundary, not a description of Jiuwen's internal members.",
+        "- This manifest is compiled from OpenOPC role configuration; it describes the assigned organizational boundary, not the external team's internal structure.",
     ]
     covered_roles = [
         dict(item)
@@ -866,10 +851,14 @@ def build_company_work_item_contract(
             ]
             identity = "\n".join(
                 [
-                    "## OpenOPC Team Boundary Identity",
+                    "## OpenOPC WorkItem",
                     f"- work_item_id: `{work_item_id}`",
                     f"- attempt_id: `{attempt_id}`",
                     f"- covered_role_ids: `{', '.join(covered_roles)}`",
+                    "- Final response: one JSON object containing `work_item_id`, "
+                    "`attempt_id`, `status`, `summary`, `deliverables`, "
+                    "`verification`, `risks`, `open_questions`, and `handoff`. "
+                    "Use the exact ids above.",
                 ]
             )
             manifest_block = _team_capability_manifest_block(task)
@@ -878,7 +867,6 @@ def build_company_work_item_contract(
                     part
                     for part in (
                         runtime_clock,
-                        _OPAQUE_EXTERNAL_TEAM_GUIDELINES.strip(),
                         identity,
                         manifest_block,
                     )
@@ -904,9 +892,9 @@ def build_company_work_item_contract(
         review_block = _review_pending_block(task)
         if review_block:
             parts.append(review_block)
-        dispatch_block = _dispatch_requirement_block(task)
-        if dispatch_block:
-            parts.append(dispatch_block)
+        decision_block = _manager_execution_decision_block(task)
+        if decision_block:
+            parts.append(decision_block)
         return _contract_text_for_audience("\n\n".join(parts), resolved_audience)
 
     turn_type = turn_type_for_task(task, fallback="execute")

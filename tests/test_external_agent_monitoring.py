@@ -1766,7 +1766,7 @@ class ExternalAgentMonitoringTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(external_task.description, "plain task body")
 
-    async def test_engine_prepends_shared_runtime_contract_for_external_company_dispatch_turn(self) -> None:
+    async def test_engine_prepends_shared_runtime_contract_for_external_company_manager_decision_turn(self) -> None:
         engine = OPCEngine()
 
         class _Assembler:
@@ -1788,7 +1788,7 @@ class ExternalAgentMonitoringTests(unittest.IsolatedAsyncioTestCase):
             metadata={
                 "execution_mode": "company_mode",
                 "runtime_model": "multi_team_org",
-                "current_turn_mode": "dispatch_required",
+                "current_turn_mode": "manager_decide",
                 "direct_report_seat_ids": ["seat::team::ceo::cto"],
             },
         )
@@ -1798,14 +1798,14 @@ class ExternalAgentMonitoringTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(external_task.description.startswith("## Runtime Contract (MANDATORY)"))
         self.assertIn("## Organization Runtime Contract", external_task.description)
         self.assertIn("## Manager Runtime Contract", external_task.description)
-        self.assertIn("## Dispatch Planning Contract", external_task.description)
+        self.assertIn("## Manager Execution Decision", external_task.description)
         self.assertNotIn("## Leader Delegation Planning Overlay", external_task.description)
-        self.assertIn("Scope first", external_task.description)
-        self.assertIn("requested deliverable form", external_task.description)
+        self.assertIn("Assess the assigned outcome", external_task.description)
+        self.assertIn("requested deliverables, constraints, dependencies", external_task.description)
         self.assertIn("outcome-based child WorkItems", external_task.description)
-        self.assertIn("startable preparation", external_task.description)
-        self.assertIn("must not replace requested production work", external_task.description)
-        self.assertIn("NO_DELEGATION_JUSTIFICATION", external_task.description)
+        self.assertIn("Complete the WorkItem directly", external_task.description)
+        self.assertIn("Do not create make-work", external_task.description)
+        self.assertNotIn("NO_DELEGATION_JUSTIFICATION", external_task.description)
         self.assertIn("## Task Brief", external_task.description)
         self.assertIn("## Company Runtime Context", external_task.description)
         self.assertIn("## Collaboration Context", external_task.description)
@@ -1821,7 +1821,7 @@ class ExternalAgentMonitoringTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("## Native Working Contract", external_task.description)
         self.assertNotIn("Tool Strategy", external_task.description)
 
-    async def test_engine_dispatch_contract_uses_allowed_delegate_role_fallback(self) -> None:
+    async def test_engine_manager_decision_contract_uses_allowed_delegate_role_fallback(self) -> None:
         engine = OPCEngine()
 
         class _Assembler:
@@ -1839,18 +1839,19 @@ class ExternalAgentMonitoringTests(unittest.IsolatedAsyncioTestCase):
             metadata={
                 "execution_mode": "company_mode",
                 "runtime_model": "multi_team_org",
-                "current_turn_mode": "dispatch_required",
+                "current_turn_mode": "manager_decide",
                 "allowed_delegate_role_ids": ["cto", "cmo"],
             },
         )
 
         external_task = await engine._build_external_agent_task(task)
 
-        self.assertIn("## Dispatch Planning Contract", external_task.description)
+        self.assertIn("## Manager Execution Decision", external_task.description)
         self.assertIn("## Manager Runtime Contract", external_task.description)
         self.assertNotIn("Leader Delegation Planning Overlay", external_task.description)
-        self.assertIn("hard dependencies", external_task.description)
-        self.assertIn("NO_DELEGATION_JUSTIFICATION", external_task.description)
+        self.assertIn("dependencies, deliverables, and acceptance criteria", external_task.description)
+        self.assertIn("Complete the WorkItem directly", external_task.description)
+        self.assertNotIn("NO_DELEGATION_JUSTIFICATION", external_task.description)
 
     async def test_engine_resume_company_task_still_gets_runtime_contract_and_assignment_context(self) -> None:
         engine = OPCEngine()
@@ -1891,8 +1892,9 @@ class ExternalAgentMonitoringTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(external_task.description.startswith("## Runtime Contract (MANDATORY)"))
         self.assertIn("Manager Runtime Contract", external_task.description)
-        self.assertIn("Dispatch Planning Contract", external_task.description)
+        self.assertIn("Manager Execution Decision", external_task.description)
         self.assertNotIn("Leader Delegation Planning Overlay", external_task.description)
+        self.assertNotIn("NO_DELEGATION_JUSTIFICATION", external_task.description)
         self.assertIn("## Task Brief", external_task.description)
         self.assertIn("CTO must decompose the implementation work for direct reports.", external_task.description)
         self.assertIn("## Company Runtime Context", external_task.description)

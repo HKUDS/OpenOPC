@@ -962,7 +962,27 @@ class BuildTurnModeContextTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("- Required action:", rendered)
         self.assertIn("execute", rendered)
 
-    async def test_delegate_mode_renders_runtime_state_and_required_action(self) -> None:
+    async def test_opaque_external_team_does_not_receive_internal_turn_guidance(self) -> None:
+        task = Task(
+            id="t-opaque-team",
+            title="Opaque team assignment",
+            description="",
+            assigned_to="cto",
+            status=TaskStatus.PENDING,
+            project_id="p",
+            session_id="s",
+            metadata={
+                "runtime_model": "multi_team_org",
+                "execution_unit_kind": "opaque_external_team",
+                "current_turn_mode": "worker_execute",
+            },
+        )
+
+        rendered = await self.assembler.build_turn_mode_context(task)
+
+        self.assertEqual(rendered, "")
+
+    async def test_legacy_dispatch_mode_is_upgraded_to_manager_decision(self) -> None:
         wi = _build_wi(
             work_item_id="wi-delegate",
             phase=Phase.RUNNING,
@@ -987,8 +1007,108 @@ class BuildTurnModeContextTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(rendered.startswith("## Turn Mode"))
         self.assertIn("- Runtime state: `dispatch_required`", rendered)
         self.assertIn("- Required action:", rendered)
-        self.assertIn("delegate", rendered)
-        self.assertIn("outcome-based child WorkItems", rendered)
+        self.assertIn("decide", rendered)
+        self.assertIn("delegate outcome-based child WorkItems or complete it", rendered)
+
+    async def test_authoritative_dispatch_mode_never_falls_back_to_execute_without_loaded_work_item(self) -> None:
+        task = Task(
+            id="t-manager-dispatch-without-link",
+            title="CMO outcome",
+            description="",
+            assigned_to="cmo",
+            status=TaskStatus.PENDING,
+            project_id="p",
+            session_id="s",
+            metadata={
+                "runtime_model": "multi_team_org",
+                "current_turn_mode": "dispatch_required",
+                "direct_report_seat_ids": ["seat::team::cmo::content_specialist"],
+            },
+        )
+
+        rendered = await self.assembler.build_turn_mode_context(task)
+
+        self.assertIn("- Runtime state: `dispatch_required`", rendered)
+        self.assertIn("- Required action: decide", rendered)
+        self.assertIn("delegate outcome-based child WorkItems or complete it", rendered)
+        self.assertNotIn("deliverable yourself", rendered)
+
+    async def test_manager_decide_mode_preserves_manager_choice(self) -> None:
+        task = Task(
+            id="t-manager-decide",
+            title="CMO outcome",
+            description="",
+            assigned_to="cmo",
+            status=TaskStatus.PENDING,
+            project_id="p",
+            session_id="s",
+            metadata={
+                "runtime_model": "multi_team_org",
+                "current_turn_mode": "manager_decide",
+                "direct_report_seat_ids": ["seat::team::cmo::content_specialist"],
+            },
+        )
+
+        rendered = await self.assembler.build_turn_mode_context(task)
+
+        self.assertIn("- Runtime state: `manager_decide`", rendered)
+        self.assertIn("- Required action: decide", rendered)
+        self.assertIn("delegate outcome-based child WorkItems or complete it", rendered)
+
+    async def test_inferred_legacy_manager_mode_is_also_a_choice(self) -> None:
+        wi = _build_wi(
+            work_item_id="wi-inferred-manager",
+            phase=Phase.RUNNING,
+            metadata={"allowed_delegate_role_ids": ["content_specialist"]},
+        )
+        await self.store.save_delegation_work_item(wi)
+        task = Task(
+            id="t-inferred-manager",
+            title="CMO outcome",
+            description="",
+            assigned_to="cmo",
+            status=TaskStatus.PENDING,
+            project_id="p",
+            session_id="s",
+            metadata={"runtime_model": "multi_team_org"},
+        )
+        task = _link_task(task, "wi-inferred-manager")
+
+        rendered = await self.assembler.build_turn_mode_context(task)
+
+        self.assertIn("- Required action: decide", rendered)
+        self.assertIn("delegate outcome-based child WorkItems or complete it", rendered)
+        self.assertNotIn("execute locally only when", rendered)
+
+    async def test_authoritative_manager_states_render_their_own_actions(self) -> None:
+        cases = {
+            "monitor_children": "monitor",
+            "review_pending": "review",
+            "synthesize_required": "integrate",
+            "deliver_required": "deliver",
+        }
+        for runtime_state, expected_action in cases.items():
+            with self.subTest(runtime_state=runtime_state):
+                task = Task(
+                    id=f"t-manager-{runtime_state}",
+                    title="Manager outcome",
+                    description="",
+                    assigned_to="cto",
+                    status=TaskStatus.PENDING,
+                    project_id="p",
+                    session_id="s",
+                    metadata={
+                        "runtime_model": "multi_team_org",
+                        "current_turn_mode": runtime_state,
+                        "direct_report_seat_ids": ["seat::team::cto::engineer"],
+                    },
+                )
+
+                rendered = await self.assembler.build_turn_mode_context(task)
+
+                self.assertIn(f"- Runtime state: `{runtime_state}`", rendered)
+                self.assertIn(f"- Required action: {expected_action}", rendered)
+                self.assertNotIn("deliverable yourself", rendered)
 
     async def test_work_item_assignment_context_renders_manager_planning_packet(self) -> None:
         wi = _build_wi(
@@ -1049,6 +1169,9 @@ class BuildTurnModeContextTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("CEO plan: app build first", rendered)
         self.assertNotIn("Context: CTO owns the realtime translation app outcome.", rendered)
         self.assertIn("Manager outcome turn", rendered)
+        self.assertIn("complete it directly, delegate suitable parts", rendered)
+        self.assertNotIn("starts with delegation", rendered)
+        self.assertNotIn("Do not execute the production work yourself", rendered)
         self.assertIn("src app scaffold", rendered)
         self.assertIn("child work items can execute without guessing", rendered)
         self.assertIn("CMO depends on feature inventory.", rendered)

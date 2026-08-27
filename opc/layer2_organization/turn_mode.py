@@ -30,10 +30,13 @@ from typing import Any, Mapping
 from opc.core.models import Phase
 
 
-MANAGER_DISPATCH_TURN_METADATA_KEYS: tuple[str, ...] = (
+MANAGER_DECISION_TURN_METADATA_KEYS: tuple[str, ...] = (
+    "manager_execution_choice",
     "manager_board_mutation_performed",
     "manager_board_modified_work_item_ids",
     "manager_board_deleted_work_item_ids",
+    # Legacy fields are cleared when resuming sessions created before the
+    # compulsory dispatch guard was removed.
     "manager_no_delegation_justification",
     "no_delegation_justification",
     "manager_dispatch_guard_unresolved",
@@ -46,7 +49,7 @@ GATE_HARNESS_REWORK_METADATA_KEYS: tuple[str, ...] = (
 )
 
 
-def reset_manager_dispatch_turn_metadata(metadata: Mapping[str, Any] | None) -> dict[str, Any]:
+def reset_manager_decision_turn_metadata(metadata: Mapping[str, Any] | None) -> dict[str, Any]:
     """Return mutable metadata with prior manager-turn outcomes removed.
 
     These keys describe what happened in one agent turn.  They must not be
@@ -54,7 +57,7 @@ def reset_manager_dispatch_turn_metadata(metadata: Mapping[str, Any] | None) -> 
     (dependencies and child mutation revisions) is intentionally untouched.
     """
     result = dict(metadata or {})
-    for key in MANAGER_DISPATCH_TURN_METADATA_KEYS:
+    for key in MANAGER_DECISION_TURN_METADATA_KEYS:
         result.pop(key, None)
     return result
 
@@ -221,7 +224,9 @@ def infer_turn_mode(
     ):
         return TurnMode.INTEGRATE
 
-    # Priority 4: delegate. Manager role with nothing spawned yet.
+    # Priority 4: manager decision surface. ``DELEGATE`` is the legacy enum
+    # name; downstream prompt assembly treats it as a direct-or-delegate
+    # choice rather than compulsory dispatch.
     allowed_delegate_role_ids = [
         str(x).strip()
         for x in list(metadata.get("allowed_delegate_role_ids", []) or [])

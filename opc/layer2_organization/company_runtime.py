@@ -454,9 +454,9 @@ class CompanyRuntime:
         ).strip()
         if (
             bool(task_metadata.get("followup_routed_to_final_decider", False))
-            and explicit_task_turn_mode == "dispatch_required"
+            and explicit_task_turn_mode in {"manager_decide", "dispatch_required"}
         ):
-            return "dispatch_required"
+            return "manager_decide"
         work_item_turn_type = (
             turn_type_for_task(task, fallback="")
             if task is not None
@@ -505,7 +505,7 @@ class CompanyRuntime:
             # dispatching or monitoring further children.
             if self._pending_reviews_from_board_summary(session):
                 return "review_pending"
-            return "monitor_children" if total_children > 0 else "dispatch_required"
+            return "monitor_children" if total_children > 0 else "manager_decide"
         return "worker_execute"
 
     def _update_current_turn_mode(
@@ -2404,7 +2404,13 @@ class CompanyRuntime:
                 work_item_id,
                 expected_phase=getattr(work_item, "phase", Phase.READY),
                 role_runtime_session_id=role_session.role_session_id,
-                seat_id=str(getattr(session, "seat_id", "") or "").strip(),
+                # A manager can occupy both a seat in its parent's team and
+                # the lead seat in its own team.  CompanyMemberSession is
+                # role-scoped, so its current seat is not stable enough to
+                # identify this particular assignment.  The WorkItem owns
+                # the exact assignment seat and the runtime Task is its
+                # projection; claim that durable seat instead.
+                seat_id=str(getattr(work_item, "seat_id", "") or "").strip(),
                 task_id=task.id,
                 work_item_revision=work_item_revision,
                 controller_owner_token=self._state().controller_owner_token,

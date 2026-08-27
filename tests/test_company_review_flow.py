@@ -1554,8 +1554,9 @@ class MultiTeamOrgGuidelineDifferentiationTests(unittest.TestCase):
         self.assertIn("Manager Runtime Contract", contract)
         self.assertNotIn("Leader Delegation Planning Overlay", contract)
         self.assertNotIn("Dispatch Planning Contract", contract)
+        self.assertNotIn("Prefer direct execution", contract)
 
-    def test_dispatch_required_contract_requires_production_briefs(self) -> None:
+    def test_manager_decision_contract_preserves_direct_or_delegate_choice(self) -> None:
         task = Task(
             id="mgr-turn",
             title="Manager turn",
@@ -1564,7 +1565,7 @@ class MultiTeamOrgGuidelineDifferentiationTests(unittest.TestCase):
             status=TaskStatus.PENDING,
             metadata={
                 "runtime_model": "multi_team_org",
-                "current_turn_mode": "dispatch_required",
+                "current_turn_mode": "manager_decide",
                 "direct_report_seat_ids": ["seat::marketing-specialist"],
                 "allowed_delegate_role_ids": ["marketing_specialist"],
             },
@@ -1572,20 +1573,14 @@ class MultiTeamOrgGuidelineDifferentiationTests(unittest.TestCase):
 
         contract = build_company_work_item_contract(task)
 
-        self.assertIn("Dispatch Planning Contract", contract)
+        self.assertIn("Manager Execution Decision", contract)
         self.assertIn("Manager Runtime Contract", contract)
         self.assertNotIn("Leader Delegation Planning Overlay", contract)
-        self.assertIn("Scope first", contract)
-        self.assertIn("upstream goal", contract)
-        self.assertIn("requested deliverable form", contract)
-        self.assertIn("hard dependencies", contract)
-        self.assertIn("startable preparation", contract)
-        self.assertIn("outcome-based child WorkItems", contract)
-        self.assertIn("must not replace requested production work", contract)
-        self.assertIn("dispatch or escalate the blocker", contract)
-        self.assertNotIn("`task_brief`", contract)
-        self.assertNotIn("concrete output/handoff paths", contract)
-        self.assertNotIn("cmo-preproduction", contract)
+        self.assertIn("Assess the assigned outcome before choosing an execution shape", contract)
+        self.assertIn("Delegate only when distinct downstream outcomes benefit", contract)
+        self.assertIn("Complete the WorkItem directly when", contract)
+        self.assertNotIn("NO_DELEGATION_JUSTIFICATION", contract)
+        self.assertNotIn("must delegate", contract)
 
 
 # ---------------------------------------------------------------------------

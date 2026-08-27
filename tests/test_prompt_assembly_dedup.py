@@ -661,6 +661,7 @@ class BundledPlaybookSkillTests(unittest.TestCase):
         # in company mode and invisible in task mode.
         self.assertIn("modes:", text)
         self.assertIn("- company_mode", text)
+        self.assertNotIn("Prefer direct execution", text)
 
     def test_bundled_playbook_loads_through_skill_library(self) -> None:
         library = SkillLibrary(self.repo_root / ".opc")

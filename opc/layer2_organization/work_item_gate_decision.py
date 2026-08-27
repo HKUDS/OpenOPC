@@ -146,6 +146,11 @@ def plan_company_work_item_done_routing(
         board_mutated = _flag(
             task_metadata.get("manager_board_mutation_performed", False)
         )
+        execution_choice = str(
+            task_metadata.get("manager_execution_choice", "") or ""
+        ).strip().lower()
+        if execution_choice == "delegated":
+            board_mutated = True
         justification = str(
             task_metadata.get("manager_no_delegation_justification", "") or ""
         ).strip()
@@ -155,7 +160,9 @@ def plan_company_work_item_done_routing(
         manager_context = {
             "outcome": "delegated" if board_mutated else "self_produced",
             "source": (
-                "board_mutation"
+                "manager_decision"
+                if execution_choice in {"delegated", "direct"}
+                else "board_mutation"
                 if board_mutated
                 else "justified"
                 if justification
@@ -174,6 +181,21 @@ def plan_company_work_item_done_routing(
         ).strip()
         if not board_mutated and manager_role and manager_role != "owner":
             manager_reviewable = True
+        elif not board_mutated and manager_role in {"", "owner"}:
+            # A top-seat manager that completes the company outcome directly
+            # has no organizational manager to review it.  Treat that output
+            # as the authoritative delivery and route it to the owner instead
+            # of silently auto-approving an unreviewed result.
+            task_metadata.update(
+                {
+                    "authoritative_output": True,
+                    "user_visible": True,
+                    "feedback_scope": "final",
+                    "review_owner_kind": "human",
+                    "requires_user_feedback": True,
+                }
+            )
+            is_delivery = True
 
     final_human_acceptance = bool(
         str(task_metadata.get("execution_mode", "") or "").strip()

@@ -27,8 +27,8 @@ You are never the whole project. Stay inside your work-item boundary.
 - Your completion bar is higher than "it works on my turn." Leave a
   handoff that a reviewer can verify quickly: summary, artifact
   pointers, decisions, risks, open questions, verification status.
-- Prefer direct execution for the assigned slice once the approach is
-  clear. Investigate first, then act.
+- Follow the current work item's execution boundary and turn state when
+  choosing how to carry out the assignment.
 
 ## Messaging (the default path)
 

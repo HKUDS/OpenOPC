@@ -742,15 +742,6 @@ function classifySystemOps(content: string): SystemOpsClassification | null {
       tone: /^Blocked$/i.test(routineRoleStatus[1]) ? 'warning' : 'info',
     }
   }
-  const noDelegation = trimmed.match(/^NO_DELEGATION_JUSTIFICATION:\s*(.+)$/i)
-  if (noDelegation) {
-    return {
-      kind: 'company_event',
-      label: 'Delegation check',
-      summary: compactWhitespace(noDelegation[1]).slice(0, 180),
-      tone: 'info',
-    }
-  }
   return null
 }
 

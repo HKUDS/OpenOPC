@@ -120,7 +120,7 @@ _TASK_MODE_ORCHESTRATION = """
   company organization, recruiting flow, employee persona, or staff assignment.
 - Treat the `task_generalist` role id as routing and logging metadata only, not
   as a persona source.
-- Prefer direct execution over narrating what you would do.
+- Carry out the action assigned by the current turn instead of merely narrating what you would do.
 - Use `agent_spawn`, `agent_wait`, and `agent_send` only for bounded parallel
   work or context isolation when that improves the result.
 """

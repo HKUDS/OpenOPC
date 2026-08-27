@@ -664,11 +664,14 @@ def _current_turn_mode(task: Task | None) -> str:
     ).strip().lower()
 
 
-def _requires_structured_dispatch_plan(task: Task | None) -> bool:
+def _requires_structured_delegation_brief(task: Task | None) -> bool:
     if task is None:
         return False
     runtime_model = str(task.metadata.get("runtime_model", "") or "").strip().lower()
-    return runtime_model == "multi_team_org" and _current_turn_mode(task) == "dispatch_required"
+    return runtime_model == "multi_team_org" and _current_turn_mode(task) in {
+        "manager_decide",
+        "dispatch_required",
+    }
 
 
 def _int_metadata_value(value: Any) -> int:
@@ -994,8 +997,9 @@ def _external_team_execution_metadata(target_seat: dict[str, Any]) -> dict[str, 
             or binding.get("failure_policy")
             or "fail_closed"
         ).strip(),
-        "jiuwen_provider_mode": str(
-            target_seat.get("jiuwen_provider_mode")
+        "external_provider_mode": str(
+            target_seat.get("external_provider_mode")
+            or target_seat.get("jiuwen_provider_mode")
             or binding.get("provider_mode")
             or "team"
         ).strip(),
@@ -1797,12 +1801,8 @@ def create_collaboration_tools(
                 "human_review_closed": True,
                 "human_review_closed_at": now,
                 "human_review_closed_by_role": role_id,
-                "manager_no_delegation_justification": "Owner-facing human review was closed by the final decider.",
                 "progress_log": task_progress[-50:],
             })
-            await store.save_task(task)
-        else:
-            task.metadata["manager_no_delegation_justification"] = "Owner-facing human review was closed by the final decider."
             await store.save_task(task)
 
         review_work_item_id = str(
@@ -1954,7 +1954,7 @@ def create_collaboration_tools(
         if not run_id or not parent_work_item_id or not seat_id:
             raise ValueError("delegate_work requires runtime team work-item task metadata")
         _validate_delegate_work_items(items)
-        structured_dispatch_required = _requires_structured_dispatch_plan(task)
+        structured_delegation_brief = _requires_structured_delegation_brief(task)
         normalized_planning_context = str(planning_context or "").strip()
         latest_user_directive = _user_supplied_input_from_task(task)
         latest_user_directive_preview = (
@@ -1973,17 +1973,18 @@ def create_collaboration_tools(
                 if normalized_planning_context
                 else output_contract_context
             )
-        if structured_dispatch_required and not normalized_planning_context:
+        if structured_delegation_brief and not normalized_planning_context:
             # Auto-fill a minimal context so delegation can proceed.  The LLM
-            # schema marks planning_context optional but dispatch mode needs it;
+            # schema marks planning_context optional but a delegated child
+            # still benefits from explicit upstream context;
             # blocking the whole call is worse than proceeding with a sparse
             # context since the work items still carry deliverables/summaries.
             normalized_planning_context = (
-                f"Auto-generated dispatch context: {role_id} initiating delegation "
+                f"Auto-generated delegation context: {role_id} initiating delegation "
                 f"for parent work item {parent_work_item_id}."
             )
             logger.warning(
-                "delegate_work: planning_context was empty in dispatch_required mode — "
+                "delegate_work: planning_context was empty for a manager decision turn — "
                 "auto-filled a placeholder. The calling agent should provide an explicit planning_context."
             )
         playbook = dict(task.metadata.get("delegation_playbook", {}) or {})
@@ -2197,7 +2198,7 @@ def create_collaboration_tools(
             delegation_rationale = str(item.get("delegation_rationale", "") or "").strip()
             non_overlap_guard = str(replace_output_aliases(item.get("non_overlap_guard", ""), output_contract) or "").strip()
             coordination_notes = str(replace_output_aliases(item.get("coordination_notes", ""), output_contract) or "").strip()
-            if structured_dispatch_required:
+            if structured_delegation_brief:
                 missing_fields: list[str] = []
                 if not deliverables:
                     missing_fields.append("deliverables")
@@ -2212,7 +2213,7 @@ def create_collaboration_tools(
                     # delegation because the LLM omitted optional-in-schema
                     # fields is worse than proceeding with sparse metadata.
                     logger.warning(
-                        "delegate_work: dispatch_required item `{}` is missing {} — "
+                        "delegate_work: manager-decision item `{}` is missing {} — "
                         "proceeding anyway, but quality of downstream briefs may suffer.",
                         title or target_role,
                         ", ".join(missing_fields),

@@ -816,6 +816,83 @@ class CompanyCollaborationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(claimed_task.id, task.id)
         self.assertEqual(claimed_session.member_session_id, "role-session::proj1::root-a::executor::backend-architect")
 
+    async def test_company_runtime_claim_uses_work_item_seat_not_mutable_role_session_seat(self) -> None:
+        runtime = CompanyRuntime(
+            org_engine=DummyOrgEngine(),
+            communication=DummyRuntimeCommunication(),
+        )
+        assignment_seat_id = "seat::team::ceo::cto"
+        manager_home_seat_id = "seat::team::cto::cto"
+        task = Task(
+            id="cto-work-item-task",
+            title="CTO assignment from CEO",
+            session_id="root-a",
+            parent_session_id="root-a",
+            assigned_to="executor",
+            status=TaskStatus.PENDING,
+            project_id="proj1",
+            metadata={
+                "work_item_projection_id": "cto_assignment",
+                "work_item_role_id": "executor",
+                "delegation_seat_id": assignment_seat_id,
+                "employee_assignment": {
+                    "employee_id": "backend-architect",
+                    "role_id": "executor",
+                },
+            },
+        )
+        set_linked_work_item_id(task, "cto-work-item")
+        work_item = DelegationWorkItem(
+            work_item_id="cto-work-item",
+            run_id="run-1",
+            cell_id="team::ceo",
+            team_id="team::ceo",
+            role_id="executor",
+            seat_id=assignment_seat_id,
+            projection_id="cto_assignment",
+            phase=Phase.READY,
+        )
+
+        await runtime.bootstrap([task])
+        session = runtime.session_for_task(task)
+        # A later roster/bootstrap pass may focus this role-scoped session on
+        # the same manager's home-team lead seat.
+        session.seat_id = manager_home_seat_id
+        runtime.enqueue_runnable_work_items(
+            [work_item],
+            task_by_work_item_id={work_item.work_item_id: task},
+        )
+
+        async def claim_work_item(
+            *_args: object, **kwargs: object
+        ) -> DelegationWorkItem:
+            role_session_id = str(kwargs["role_runtime_session_id"])
+            work_item.phase = Phase.RUNNING
+            work_item.claimed_by_role_runtime_session_id = role_session_id
+            work_item.claimed_by_seat_id = str(kwargs["seat_id"])
+            work_item.metadata = {
+                **dict(work_item.metadata or {}),
+                "claimed_by_role_session_id": role_session_id,
+                "claimed_task_id": str(kwargs["task_id"]),
+            }
+            return work_item
+
+        claim = AsyncMock(side_effect=claim_work_item)
+        runtime.store = SimpleNamespace(
+            is_ready=True,
+            claim_delegation_work_item_if_dispatchable=claim,
+            save_delegation_role_session=AsyncMock(),
+        )
+
+        claims = await runtime.claim_runnable_tasks(
+            [task], work_items=[work_item]
+        )
+
+        self.assertEqual(len(claims), 1)
+        self.assertEqual(work_item.claimed_by_seat_id, assignment_seat_id)
+        self.assertNotEqual(work_item.claimed_by_seat_id, manager_home_seat_id)
+        self.assertEqual(claim.await_args.kwargs["seat_id"], assignment_seat_id)
+
     async def test_company_runtime_does_not_spawn_after_atomic_claim_loses_to_hold(self) -> None:
         runtime = CompanyRuntime(
             org_engine=DummyOrgEngine(),
@@ -6039,7 +6116,7 @@ class CompanyCollaborationTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertEqual(coo_item.metadata["dependency_specs"][0]["value"], "cto")
             cto_item = await store.get_delegation_work_item(cto_id)
-            self.assertEqual(cto_item.metadata["current_turn_mode"], "dispatch_required")
+            self.assertEqual(cto_item.metadata["current_turn_mode"], "manager_decide")
             self.assertEqual(cmo_final_item.metadata["current_turn_mode"], "worker_execute")
             self.assertEqual(coo_item.metadata["current_turn_mode"], "worker_execute")
             self.assertEqual(cto_item.team_instance_id, "team-instance::run-1::team::cto")

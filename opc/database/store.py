@@ -144,6 +144,9 @@ from opc.layer2_organization.work_item_runtime import (
 from opc.layer2_organization.work_item_runtime_invariants import (
     validate_work_item_runtime_projection,
 )
+from opc.layer2_organization.metadata_ownership import (
+    copy_work_item_execution_metadata,
+)
 from opc.layer2_organization.org_work_item_planner import (
     WorkItemGatePolicy,
     deserialize_company_work_item_plan,
@@ -13956,6 +13959,38 @@ class OPCStore:
             persisted_work_item_metadata = dict(
                 persisted_work_item.metadata or {}
             )
+            supplied_execution_metadata = copy_work_item_execution_metadata(
+                work_item
+            )
+            materialization_metadata_updates: dict[str, Any] = {}
+            for key, supplied_value in supplied_execution_metadata.items():
+                persisted_value = persisted_work_item_metadata.get(key)
+                if persisted_value not in (None, "", [], {}):
+                    if persisted_value != supplied_value:
+                        raise ValueError(
+                            "runtime Task materialization WorkItem execution "
+                            f"metadata changed before commit: {key}"
+                        )
+                    continue
+                materialization_metadata_updates[key] = copy.deepcopy(
+                    supplied_value
+                )
+            if materialization_metadata_updates:
+                persisted_work_item_metadata.update(
+                    materialization_metadata_updates
+                )
+                persisted_work_item.metadata = persisted_work_item_metadata
+                persisted_work_item.updated_at = datetime.now()
+                await self._db.execute(
+                    """UPDATE delegation_work_items
+                       SET metadata=?, updated_at=?
+                       WHERE work_item_id=?""",
+                    (
+                        _json_dumps(persisted_work_item_metadata),
+                        persisted_work_item.updated_at.isoformat(),
+                        wid,
+                    ),
+                )
             work_item_is_unclaimed = not bool(
                 str(
                     persisted_work_item.claimed_by_role_runtime_session_id

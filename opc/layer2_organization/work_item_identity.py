@@ -84,7 +84,7 @@ def initial_current_turn_mode_for_work_item(
     if review_execution_work_item or normalized_turn == "review":
         return "review_execute"
     if manager_can_delegate:
-        return "dispatch_required"
+        return "manager_decide"
     return "worker_execute"
 
 

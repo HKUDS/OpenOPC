@@ -159,7 +159,7 @@ from opc.layer2_organization.session_scoping import (
     is_top_level_company_session,
     task_session_scope_id,
 )
-from opc.layer2_organization.turn_mode import reset_manager_dispatch_turn_metadata
+from opc.layer2_organization.turn_mode import reset_manager_decision_turn_metadata
 from opc.layer2_organization.seat_executor import EngineSeatExecutor
 from opc.layer2_organization.work_item_runtime import (
     is_work_item_runtime_metadata,
@@ -4555,8 +4555,9 @@ class OPCEngine:
                     or external_team_binding.get("failure_policy")
                     or "fail_closed"
                 ).strip(),
-                "jiuwen_provider_mode": str(
-                    work_item_metadata.get("jiuwen_provider_mode")
+                "external_provider_mode": str(
+                    work_item_metadata.get("external_provider_mode")
+                    or work_item_metadata.get("jiuwen_provider_mode")
                     or external_team_binding.get("provider_mode")
                     or ""
                 ).strip(),
@@ -10031,7 +10032,7 @@ class OPCEngine:
         if not isinstance(task.context_snapshot.get("runtime_resume"), dict):
             task.context_snapshot.pop("runtime_resume", None)
         task.context_snapshot["skip_session_history"] = True
-        task.context_snapshot["current_turn_mode"] = "dispatch_required"
+        task.context_snapshot["current_turn_mode"] = "manager_decide"
         if context_updates:
             task.context_snapshot.update(dict(context_updates))
         task.status = TaskStatus.PENDING
@@ -10054,7 +10055,7 @@ class OPCEngine:
             task.context_snapshot["delivery_revision"] = next_delivery_revision
             task.context_snapshot["owner_directive_revision"] = next_delivery_revision
         task.metadata["followup_routed_to_final_decider"] = True
-        task.metadata["current_turn_mode"] = "dispatch_required"
+        task.metadata["current_turn_mode"] = "manager_decide"
         if final_delivery_followup:
             task.metadata.update({
                 "work_kind": "delivery",
@@ -10070,7 +10071,7 @@ class OPCEngine:
                 task.metadata["delivery_revision"] = next_delivery_revision
                 task.metadata["owner_directive_revision"] = next_delivery_revision
         else:
-            task.metadata["delegation_turn_kind"] = "dispatch"
+            task.metadata["delegation_turn_kind"] = "plan"
         if reply:
             task.metadata["latest_user_directive"] = reply
             task.metadata["manager_mutation_user_input"] = reply
@@ -10082,7 +10083,7 @@ class OPCEngine:
         task.metadata.pop("delegation_pending_work_item_ids", None)
         task.metadata.pop("delegated_children_pending", None)
         task.metadata.pop("delegation_wait_for_work_item_ids", None)
-        task.metadata = reset_manager_dispatch_turn_metadata(task.metadata)
+        task.metadata = reset_manager_decision_turn_metadata(task.metadata)
         progress = list(task.metadata.get("progress_log", []) or [])
         progress.append(f"Company follow-up routed to final decider ({resume_source}): {reply}")
         task.metadata["progress_log"] = progress[-20:]
@@ -10124,8 +10125,8 @@ class OPCEngine:
                 "resume_requested_at": datetime.now().isoformat(),
                 "resume_user_reply": reply,
                 "resume_source": resume_source,
-                "current_turn_mode": "dispatch_required",
-                "delegation_turn_kind": "dispatch",
+                "current_turn_mode": "manager_decide",
+                "delegation_turn_kind": "plan",
                 "followup_routed_to_final_decider": True,
                 "followup_attention": "user_supplied_input",
                 "latest_user_directive": reply,
@@ -10247,7 +10248,7 @@ class OPCEngine:
                     "resume_requested_at": datetime.now().isoformat(),
                     "resume_user_reply": reply,
                     "resume_source": resume_source,
-                    "current_turn_mode": "dispatch_required",
+                    "current_turn_mode": "manager_decide",
                 },
                 **controller_write_kwargs,
             )
@@ -13066,7 +13067,7 @@ class OPCEngine:
         """Return the tool schemas worth expanding for this specific turn."""
         allowed = {str(tool).strip() for tool in allowed_tools if str(tool).strip()}
         turn_mode = resolve_company_turn_mode(task)
-        if turn_mode == "dispatch_required":
+        if turn_mode in {"manager_decide", "dispatch_required"}:
             preferred = {"delegate_work", "modify_work_item", "delete_work_item", "manager_board_read", "inbox"}
         elif turn_mode == "review_execute":
             preferred = {"manager_board_read"}
@@ -17876,6 +17877,13 @@ class OPCEngine:
         if task is None:
             return False
         task_metadata = dict(task.metadata or {})
+        if str(task_metadata.get("manager_execution_choice", "") or "").strip() in {
+            "delegated",
+            "direct",
+        }:
+            return True
+        if task.status in {TaskStatus.DONE, TaskStatus.AWAITING_REVIEW, TaskStatus.AWAITING_HUMAN}:
+            return True
         if bool(task_metadata.get("manager_board_mutation_performed", False)):
             return True
         if str(task_metadata.get("manager_no_delegation_justification", "") or "").strip():

@@ -255,7 +255,7 @@ def _team_capability_manifest(
         "display_name": str(
             binding_metadata.get("display_name") or f"{boundary_name} Team"
         ).strip(),
-        "provider": str(binding.external_agent or "jiuwenswarm").strip(),
+        "provider": str(binding.external_agent).strip(),
         "provider_mode": str(binding.provider_mode or "team").strip(),
         "scope": str(binding.scope or "subtree").strip(),
         "covered_role_ids": list(covered_role_ids),
@@ -396,7 +396,7 @@ def compile_external_team_bindings(
             CompiledExternalTeamBinding(
                 binding_id=binding_id,
                 boundary_role_id=boundary,
-                external_agent=str(binding.external_agent or "jiuwenswarm").strip(),
+                external_agent=str(binding.external_agent).strip(),
                 covered_role_ids=tuple(covered),
                 canonical_seat_id=canonical_seat_id,
                 scope=str(binding.scope or "subtree"),
@@ -518,7 +518,7 @@ def apply_external_team_bindings_to_topology(
                     "external_session_scope": binding.session_scope,
                     "external_max_inflight": binding.max_inflight,
                     "external_failure_policy": binding.failure_policy,
-                    "jiuwen_provider_mode": binding.provider_mode,
+                    "external_provider_mode": binding.provider_mode,
                 }
             )
         seat["metadata"] = {
@@ -628,12 +628,15 @@ def apply_external_team_bindings_to_plan(
                 )
         role = org_engine.get_agent(binding.boundary_role_id)
         role_name = str(getattr(role, "name", "") or binding.boundary_role_id).strip()
+        team_display_name = str(
+            binding.capability_manifest.get("display_name") or f"{role_name} Team"
+        ).strip()
         canonical.turn_type = "execute"
-        canonical.title = f"{role_name} · JiuwenSwarm Team"
+        canonical.title = team_display_name
         canonical.summary = (
-            f"{binding.capability_manifest.get('display_name', 'JiuwenSwarm Team')} owns "
+            f"{team_display_name} owns "
             f"the {binding.boundary_role_id} organization boundary and its covered "
-            "responsibilities as one opaque team for this work item."
+            "responsibilities for this work item."
         )
         canonical.dependency_projection_ids = incoming_dependencies
         canonical.dependency_classes = dependency_classes
@@ -674,7 +677,7 @@ def apply_external_team_bindings_to_plan(
             "external_session_scope": binding.session_scope,
             "external_max_inflight": binding.max_inflight,
             "external_failure_policy": binding.failure_policy,
-            "jiuwen_provider_mode": binding.provider_mode,
+            "external_provider_mode": binding.provider_mode,
             "capability_manifest": copy.deepcopy(binding.capability_manifest),
             "capability_manifest_hash": str(
                 binding.capability_manifest.get("manifest_hash", "") or ""

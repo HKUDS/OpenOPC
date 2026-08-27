@@ -8,10 +8,6 @@
   longer produces ``_no_team::{role}`` sentinel rows when the task knows
   its team. Migration collapses legacy sentinel rows into the canonical
   companion when both exist for a (run_id, role_id).
-- Fix 3 guard: the manager-dispatch guard whitelists turn kinds where
-  "no delegate_work call" is the expected shape (delivery / synthesize /
-  aggregate / review), so the CEO final-delivery work item is no longer
-  marked failed when its subteam work is complete.
 """
 
 from __future__ import annotations
@@ -24,14 +20,12 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 from opc.core.models import (
-    CompanyMemberSession,
     DelegationWorkItem,
     Phase,
     Task,
     TaskStatus,
 )
 from opc.database.store import OPCStore
-from opc.layer2_organization.company_mode import CompanyWorkItemExecutor
 from opc.layer2_organization.company_runtime import (
     _NO_TEAM_SENTINEL,
     canonical_role_session_id,
@@ -249,112 +243,6 @@ class SentinelLegacyMigrationTests(unittest.IsolatedAsyncioTestCase):
 
 
 # ── Fix 3 guard whitelist ────────────────────────────────────────────────
-
-
-class ManagerDispatchGuardWhitelistTests(unittest.TestCase):
-    """The guard fires when (runtime_model=multi_team_org + turn_mode=
-    dispatch_required + has direct reports). Fix 3 skips the whole chain
-    for delivery / synthesize / aggregate / review work items regardless of
-    the upstream turn-mode resolution, because those work items legitimately
-    produce no children."""
-
-    def _session_with_reports(self) -> CompanyMemberSession:
-        return CompanyMemberSession(
-            member_session_id="ms-1",
-            role_id="ceo",
-            employee_id="e",
-            metadata={
-                "direct_report_seat_ids": ["seat::team::ceo::cto"],
-                "allowed_delegate_role_ids": ["cto", "cmo", "coo"],
-            },
-        )
-
-    def _task(self, metadata: dict) -> Task:
-        base = {
-            "runtime_model": "multi_team_org",
-            "current_turn_mode": "dispatch_required",
-            "direct_report_seat_ids": ["seat::team::ceo::cto"],
-            "allowed_delegate_role_ids": ["cto", "cmo", "coo"],
-        }
-        base.update(metadata)
-        return Task(
-            id="t",
-            title="t", description="",
-            assigned_to="ceo",
-            status=TaskStatus.RUNNING,
-            project_id="p", session_id="s",
-            metadata=base,
-        )
-
-    def test_dispatch_work_item_still_guarded(self) -> None:
-        task = self._task({"work_kind": "dispatch", "work_item_turn_type": "dispatch"})
-        self.assertTrue(
-            CompanyWorkItemExecutor._requires_manager_dispatch_guard(
-                task, member_session=self._session_with_reports()
-            )
-        )
-
-    def test_delivery_work_item_skips_guard(self) -> None:
-        # The app13 smoking gun: CEO delivery with current_turn_mode
-        # accidentally set to dispatch_required. Fix 3 short-circuits
-        # on the work_kind signal.
-        task = self._task({
-            "work_kind": "delivery",
-            "work_item_turn_type": "execute",  # not "deliver" because of the upstream resolver bug
-        })
-        self.assertFalse(
-            CompanyWorkItemExecutor._requires_manager_dispatch_guard(
-                task, member_session=self._session_with_reports()
-            )
-        )
-
-    def test_synthesize_work_item_skips_guard(self) -> None:
-        task = self._task({"work_kind": "synthesize"})
-        self.assertFalse(
-            CompanyWorkItemExecutor._requires_manager_dispatch_guard(
-                task, member_session=self._session_with_reports()
-            )
-        )
-
-    def test_aggregate_work_item_skips_guard(self) -> None:
-        task = self._task({"work_kind": "aggregate"})
-        self.assertFalse(
-            CompanyWorkItemExecutor._requires_manager_dispatch_guard(
-                task, member_session=self._session_with_reports()
-            )
-        )
-
-    def test_review_work_item_skips_guard(self) -> None:
-        task = self._task({"work_kind": "review"})
-        self.assertFalse(
-            CompanyWorkItemExecutor._requires_manager_dispatch_guard(
-                task, member_session=self._session_with_reports()
-            )
-        )
-
-    def test_turn_kind_falls_through_to_delegation_turn_kind(self) -> None:
-        # Older work items stamp the kind under delegation_turn_kind only.
-        task = self._task({
-            "work_kind": "",  # modern field missing
-            "delegation_turn_kind": "delivery",
-        })
-        self.assertFalse(
-            CompanyWorkItemExecutor._requires_manager_dispatch_guard(
-                task, member_session=self._session_with_reports()
-            )
-        )
-
-    def test_turn_kind_falls_through_to_work_item_turn_type(self) -> None:
-        task = self._task({
-            "work_kind": "",
-            "delegation_turn_kind": "",
-            "work_item_turn_type": "deliver",
-        })
-        self.assertFalse(
-            CompanyWorkItemExecutor._requires_manager_dispatch_guard(
-                task, member_session=self._session_with_reports()
-            )
-        )
 
 
 if __name__ == "__main__":

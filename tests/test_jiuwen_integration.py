@@ -313,7 +313,8 @@ def test_opaque_team_binding_collapses_cto_subtree_to_one_projection() -> None:
     assert projection.preferred_external_agent == "jiuwenswarm"
     assert projection.metadata["execution_unit_kind"] == "opaque_external_team"
     assert set(projection.metadata["covered_role_ids"]) == covered
-    assert "JiuwenSwarm Team" in projection.title
+    assert projection.title == "CTO Team"
+    assert "Jiuwen" not in projection.summary
     assert topology["external_execution_units"][0]["boundary_role_id"] == "cto"
 
     covered_seats = [seat for seat in topology["seats"] if seat.get("role_id") in covered]
@@ -331,11 +332,16 @@ def test_external_team_bindings_reject_overlapping_subtrees() -> None:
             runtime_topology=org.build_runtime_delegation_topology(),
         )
 
-    with pytest.raises(ValueError, match="jiuwenswarm"):
-        ExternalTeamBindingConfig(
-            boundary_role_id="cto",
-            external_agent="codex",
-        )
+    provider_neutral = ExternalTeamBindingConfig(
+        boundary_role_id="cto",
+        external_agent="future_swarm",
+        provider_mode="swarm",
+    )
+    assert provider_neutral.external_agent == "future_swarm"
+    assert provider_neutral.provider_mode == "swarm"
+
+    with pytest.raises(ValueError, match="non-empty external_agent"):
+        ExternalTeamBindingConfig(boundary_role_id="cto", external_agent="")
 
 
 def test_external_team_capability_manifest_is_compiled_from_live_org() -> None:
@@ -412,7 +418,7 @@ def test_manager_contract_receives_team_routing_catalog_and_canonical_seat() -> 
     assert execution_metadata["external_company_execution_allowed"] is True
     assert execution_metadata["external_company_execution_fence"] == "validated_workspace"
     assert execution_metadata["external_session_scope"] == "company_run"
-    assert execution_metadata["jiuwen_provider_mode"] == "team"
+    assert execution_metadata["external_provider_mode"] == "team"
     assert set(execution_metadata["covered_role_ids"]) == {
         "cto",
         "senior_engineer",
@@ -804,11 +810,49 @@ def test_opaque_team_contract_includes_full_compiled_responsibilities() -> None:
         },
     )
     contract = build_company_work_item_contract(task, audience="external")
+    assert "## OpenOPC WorkItem" in contract
+    assert "Final response: one JSON object" in contract
+    assert "Jiuwen" not in contract
+    assert "Opaque External Team" not in contract
     assert "## Team Capability Manifest" in contract
     assert "### Covered Role Responsibilities" in contract
     assert "`senior_engineer` (Senior Engineer)" in contract
     assert "Code implementation, system development" in contract
     assert "env_provisioning" in contract
+
+
+def test_external_team_work_item_contract_is_provider_neutral() -> None:
+    org = _corporate_org(
+        ExternalTeamBindingConfig(
+            boundary_role_id="cto",
+            external_agent="future_swarm",
+            provider_mode="swarm",
+        )
+    )
+    topology = apply_external_team_bindings_to_topology(
+        org,
+        org.build_runtime_delegation_topology(),
+    )
+    plan = org.build_company_work_item_runtime_plan(
+        "corporate",
+        runtime_topology=topology,
+        original_request="Ship the product",
+    )
+    projection = next(item for item in plan.projections if item.role_id == "cto")
+    task = Task(
+        title=projection.title,
+        assigned_to="cto",
+        metadata={"runtime_model": "multi_team_org", **projection.metadata},
+    )
+
+    contract = build_company_work_item_contract(task, audience="external")
+
+    assert projection.preferred_external_agent == "future_swarm"
+    assert projection.metadata["external_provider_mode"] == "swarm"
+    assert projection.title == "CTO Team"
+    assert "future_swarm" not in contract
+    assert "Jiuwen" not in contract
+    assert "Opaque External Team" not in contract
 
 def _team_envelope(**updates: object) -> str:
     payload: dict[str, object] = {

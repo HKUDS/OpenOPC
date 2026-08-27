@@ -85,6 +85,9 @@ COMPANY_APPROVAL_EXEMPT_TOOL_NAMES: tuple[str, ...] = (
 
 MULTI_TEAM_COORDINATION_TURN_MODES: frozenset[str] = frozenset(
     {
+        "manager_decide",
+        # Read compatibility for sessions persisted before manager_decide
+        # replaced the compulsory dispatch state.
         "dispatch_required",
         "monitor_children",
         "synthesize_required",

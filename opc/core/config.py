@@ -924,16 +924,14 @@ class ExternalTeamBindingConfig(BaseModel):
     @classmethod
     def _validate_external_team_agent(cls, value: str) -> str:
         normalized = str(value or "").strip().lower()
-        if normalized != "jiuwenswarm":
-            raise ValueError("opaque external team bindings require external_agent=jiuwenswarm")
+        if not normalized:
+            raise ValueError("opaque external team bindings require a non-empty external_agent")
         return normalized
 
     @field_validator("provider_mode")
     @classmethod
     def _validate_external_team_provider_mode(cls, value: str) -> str:
         normalized = str(value or "team").strip().lower() or "team"
-        if "team" not in normalized.split("."):
-            raise ValueError("opaque external team bindings require a Jiuwen team provider_mode")
         return normalized
 
 

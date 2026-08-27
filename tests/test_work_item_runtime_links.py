@@ -12,6 +12,9 @@ from opc.database.store import OPCStore
 from opc.layer2_organization import phase_hooks  # noqa: F401
 from opc.layer2_organization.work_item_identity import mark_work_item_projection
 from opc.layer2_organization.work_item_runtime import mark_work_item_runtime
+from opc.layer2_organization.work_item_runtime_invariants import (
+    validate_work_item_runtime_projection,
+)
 from opc.layer2_organization.work_item_transition import transition_work_item_from_task
 
 
@@ -181,6 +184,84 @@ class WorkItemRuntimeLinkTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(ensured.id, candidate.id)
         self.assertEqual(fetched.linked_work_item_id, item.work_item_id)
+
+    async def test_ensure_runtime_task_atomically_persists_new_execution_copy_owner(self) -> None:
+        projection_id = "corporate::execute::employee-assignment"
+        item = _work_item("wi-employee-assignment", projection_id=projection_id)
+        await self.store.save_delegation_work_item(item)
+
+        assignment = {"employee_id": "employee-1", "role_id": "worker"}
+        item.metadata["employee_assignment"] = assignment
+        candidate = _runtime_task(
+            "task-employee-assignment",
+            projection_id=projection_id,
+            project_id="project-1",
+            session_id="root-session:wi-employee-assignment",
+            parent_session_id="root-session",
+        )
+        candidate.metadata["employee_assignment"] = dict(assignment)
+
+        ensured = await self.store.ensure_runtime_task_for_work_item(
+            item,
+            lambda: candidate,
+        )
+        persisted_item = await self.store.get_delegation_work_item(
+            item.work_item_id
+        )
+
+        self.assertEqual(
+            persisted_item.metadata["employee_assignment"],
+            assignment,
+        )
+        self.assertNotIn(
+            "metadata_ownership_violation",
+            {
+                issue.code
+                for issue in validate_work_item_runtime_projection(
+                    ensured,
+                    persisted_item,
+                )
+            },
+        )
+
+    async def test_ensure_runtime_task_rejects_conflicting_execution_copy_owner(self) -> None:
+        projection_id = "corporate::execute::employee-conflict"
+        item = _work_item(
+            "wi-employee-conflict",
+            projection_id=projection_id,
+            metadata={
+                "employee_assignment": {
+                    "employee_id": "persisted-employee",
+                    "role_id": "worker",
+                }
+            },
+        )
+        await self.store.save_delegation_work_item(item)
+        item.metadata["employee_assignment"] = {
+            "employee_id": "stale-employee",
+            "role_id": "worker",
+        }
+        candidate = _runtime_task(
+            "task-employee-conflict",
+            projection_id=projection_id,
+            project_id="project-1",
+            session_id="root-session:wi-employee-conflict",
+            parent_session_id="root-session",
+        )
+        candidate.metadata["employee_assignment"] = dict(
+            item.metadata["employee_assignment"]
+        )
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "employee_assignment",
+        ):
+            await self.store.ensure_runtime_task_for_work_item(
+                item,
+                lambda: candidate,
+            )
+
+        self.assertIsNone(await self.store.get_task(candidate.id))
 
     async def test_ensure_runtime_task_accepts_canonical_delivery_turn_kind(self) -> None:
         projection_id = "corporate::delivery::create"

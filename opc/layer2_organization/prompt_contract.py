@@ -260,10 +260,10 @@ def render_assignment_context_from_contract(
     if include_dispatch_fields and assignment.get("manager_outcome_dispatch"):
         owned_kind = str(assignment.get("owned_outcome_kind") or "execute").strip()
         lines.append(
-            "Manager outcome turn: you own the final outcome, but this turn "
-            "starts with delegation to direct reports before local integration. "
-            f"Owned outcome kind: {owned_kind}. Do not execute the production "
-            "work yourself in this dispatch turn unless no downstream seat is a fit."
+            "Manager outcome turn: you own the final outcome. Decide whether to "
+            "complete it directly, delegate suitable parts to direct reports, or "
+            f"combine both approaches. Owned outcome kind: {owned_kind}. Base the "
+            "choice on the work itself and the available downstream seats."
         )
     if assignment.get("upstream_intent_summary"):
         lines.extend(["", "### Upstream Intent Summary", str(assignment["upstream_intent_summary"])])

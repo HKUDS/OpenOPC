@@ -80,7 +80,10 @@ class JiuwenAdapter(ExternalAgentAdapter):
 
     def _provider_mode(self, task: Task | None = None) -> str:
         task_mode = str(
-            (getattr(task, "metadata", {}) or {}).get("jiuwen_provider_mode", "")
+            (
+                (getattr(task, "metadata", {}) or {}).get("external_provider_mode")
+                or (getattr(task, "metadata", {}) or {}).get("jiuwen_provider_mode", "")
+            )
             if task is not None
             else ""
         ).strip()

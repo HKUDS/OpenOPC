@@ -252,7 +252,7 @@ class ContextAssembler:
     async def _is_dispatch_prompt_turn(self, task: Task) -> bool:
         current = str(resolve_company_turn_mode(task) or "").strip()
         if current:
-            return current in {"dispatch_required", "delegate"}
+            return current in {"manager_decide", "dispatch_required", "delegate"}
         return await self._infer_turn_mode(task) == TurnMode.DELEGATE
 
     def _is_manager_capable_task(self, task: Task, *, work_meta: dict[str, Any] | None = None) -> bool:
@@ -381,13 +381,20 @@ class ContextAssembler:
             if retry_feedback:
                 lines.append(f"- Retry feedback: {retry_feedback}")
             return "\n".join(lines)
-        mode = await self._infer_turn_mode(task)
+        opaque_external_team = (
+            str((task.metadata or {}).get("execution_unit_kind", "") or "").strip()
+            == "opaque_external_team"
+        )
+        if opaque_external_team:
+            return ""
         raw_turn_mode = str(resolve_company_turn_mode(task) or "").strip()
+        mode = await self._infer_turn_mode(task)
         guidance = {
-            TurnMode.EXECUTE: "Produce this work item's deliverable yourself.",
+            TurnMode.EXECUTE: "Complete the current WorkItem according to its assigned execution scope.",
             TurnMode.DELEGATE: (
-                "Delegate outcome-based child WorkItems with `delegate_work`; "
-                "execute locally only when no downstream seat fits."
+                "Assess the WorkItem and choose whether to delegate outcome-based child WorkItems "
+                "or complete it within this leader-owned WorkItem. Delegate only when the split "
+                "improves capability fit, parallelism, or independent review."
             ),
             TurnMode.REVIEW: (
                 "A subordinate has handed back a deliverable. Inspect it, "
@@ -411,7 +418,70 @@ class ContextAssembler:
                 "handoff report on this turn — do NOT do new work."
             ),
         }
-        action = f"{mode.value} — {guidance.get(mode, guidance[TurnMode.EXECUTE])}"
+        runtime_guidance = {
+            "worker_execute": (
+                "execute",
+                guidance[TurnMode.EXECUTE],
+            ),
+            "manager_decide": (
+                "decide",
+                "Assess the WorkItem and choose whether to delegate outcome-based child WorkItems "
+                "or complete it within this leader-owned WorkItem. Delegate only when the split "
+                "improves capability fit, parallelism, or independent review.",
+            ),
+            # Persisted sessions may still carry the former state name. Its
+            # semantics are upgraded in place; it no longer mandates dispatch.
+            "dispatch_required": (
+                "decide",
+                "Assess the WorkItem and choose whether to delegate outcome-based child WorkItems "
+                "or complete it within this leader-owned WorkItem. Delegate only when the split "
+                "improves capability fit, parallelism, or independent review.",
+            ),
+            "monitor_children": (
+                "monitor",
+                "Inspect child WorkItem state and address blockers or pending coordination; "
+                "do not redo work assigned to a child.",
+            ),
+            "review_pending": (
+                "review",
+                "Review pending child submissions and record approve or rework verdicts before continuing.",
+            ),
+            "review_execute": (
+                "review",
+                guidance[TurnMode.REVIEW],
+            ),
+            "synthesize_required": (
+                "integrate",
+                guidance[TurnMode.INTEGRATE],
+            ),
+            "deliver_required": (
+                "deliver",
+                "Produce the owner-facing delivery from approved and integrated results; "
+                "reopen delegation only for a concrete remedial gap.",
+            ),
+            "report_required": (
+                "report",
+                guidance[TurnMode.REPORT],
+            ),
+        }
+        # ``current_turn_mode`` is the Company runtime's authoritative
+        # scheduler decision.  WorkItem inference remains the compatibility
+        # fallback and the source for first-class rework, whose correction
+        # requirement must not be hidden by a stale execute/manager state.
+        if mode == TurnMode.REWORK:
+            action_name = mode.value
+            action_guidance = guidance[mode]
+        elif raw_turn_mode in runtime_guidance:
+            action_name, action_guidance = runtime_guidance[raw_turn_mode]
+        elif mode == TurnMode.DELEGATE:
+            # Unstamped/legacy manager tasks use the inferred enum. The enum's
+            # historical name describes available delegation, not a mandate.
+            action_name = "decide"
+            action_guidance = guidance[mode]
+        else:
+            action_name = mode.value
+            action_guidance = guidance.get(mode, guidance[TurnMode.EXECUTE])
+        action = f"{action_name} — {action_guidance}"
         lines = []
         if raw_turn_mode:
             lines.append(f"- Runtime state: `{raw_turn_mode}`")
@@ -1930,7 +2000,6 @@ class ContextAssembler:
         parts: list[str] = []
         collaboration_enabled = company_collaboration_enabled_for_task(task)
         supplied = str(task.context_snapshot.get("user_supplied_input", "")).strip()
-        dispatch_violation = str(task.context_snapshot.get("manager_dispatch_guard_violation", "")).strip()
         self_evolution_retry = str(
             task.context_snapshot.get("self_evolution_patch_retry_feedback", "")
             or task.metadata.get("self_evolution_patch_retry_feedback", "")
@@ -1947,15 +2016,6 @@ class ContextAssembler:
         requested = task.context_snapshot.get("requested_user_input")
         if requested:
             parts.append(f"## Previous User-Input Request\n{requested}")
-        if dispatch_violation:
-            parts.append(
-                "## Manager Dispatch Retry\n"
-                "Your previous turn was rejected by the runtime dispatch guard.\n\n"
-                f"{dispatch_violation}\n\n"
-                "Retry this turn by either delegating downstream work with `delegate_work`, "
-                "or, if no downstream seat is a fit, include exactly one line in your final response:\n"
-                "`NO_DELEGATION_JUSTIFICATION: <specific reason>`"
-            )
         if self_evolution_retry:
             parts.append(
                 "## Self-Evolution JSON Retry\n"
