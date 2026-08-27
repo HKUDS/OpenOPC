@@ -411,8 +411,8 @@ class LLMProvider:
         )
 
         if is_local:
-            # Prevent leaking cloud keys to local loopback servers
-            if self._api_key and getattr(self.config, "is_local", False) and not is_cloud:
+            # If explicit API key was configured, use it; otherwise fallback to "local"
+            if self._api_key and not is_cloud:
                 return self._api_key, True
             return "local", True
 
