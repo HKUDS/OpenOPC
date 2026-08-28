@@ -2429,6 +2429,10 @@
   color: color-mix(in srgb, var(--green) 74%, var(--text-secondary) 26%);
 }
 
+.composer-mode-inline[data-kind='permissions'] .composer-mode-inline-label {
+  color: color-mix(in srgb, var(--blue, #60a5fa) 76%, var(--text-secondary) 24%);
+}
+
 .composer-mode-select-wrap {
   position: relative;
   display: inline-flex;
@@ -2477,6 +2481,34 @@
 
 .composer-mode-select:disabled {
   opacity: 0.5;
+  cursor: default;
+}
+
+.composer-mode-select[data-danger='true'] {
+  color: var(--red);
+  border-color: color-mix(in srgb, var(--red) 38%, transparent 62%);
+}
+
+.composer-permission-default-btn {
+  min-height: 28px;
+  padding: 4px 9px;
+  border: 1px solid color-mix(in srgb, var(--border) 76%, transparent 24%);
+  border-radius: 10px;
+  background: transparent;
+  color: var(--text-secondary);
+  font: inherit;
+  font-size: 10px;
+  cursor: pointer;
+}
+
+.composer-permission-default-btn:hover:not(:disabled) {
+  color: var(--text);
+  border-color: var(--border-hover);
+}
+
+.composer-permission-default-btn:disabled,
+.composer-permission-default-btn[data-active='true'] {
+  opacity: 0.55;
   cursor: default;
 }
 
@@ -5043,7 +5075,6 @@
   gap: 4px;
   flex-shrink: 0;
   margin-left: auto;
-  animation: msgListFadeIn 0.15s ease-out;
 }
 .session-confirm-yes {
   font-size: 11px;
@@ -5066,13 +5097,6 @@
   cursor: pointer;
 }
 .session-confirm-no:hover { background: var(--surface-hover, #f0f0f0); }
-
-/* ── Session switch fade-in ────────────────────────────────── */
-@keyframes msgListFadeIn {
-  from { opacity: 0; }
-  to   { opacity: 1; }
-}
-.msg-list { animation: msgListFadeIn 0.2s ease-out; }
 
 /* ══════════════════════════════════════════════════════════════════════════
    Message Content Collapsing & Code Block Truncation

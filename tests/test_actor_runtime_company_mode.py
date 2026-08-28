@@ -904,7 +904,7 @@ class ActorRuntimeManagerDecisionTests(unittest.IsolatedAsyncioTestCase):
                 role_runtime_session_id="role-runtime::run-1::seat::team::ceo::ceo",
                 title="CEO Dispatch",
                 summary="Route the work.",
-                kind="dispatch",
+                kind="intake",
                 projection_id="ceo-work-item",
                 phase=Phase.READY,
                 metadata={"work_item_runtime": True, "runtime_model": "multi_team_org"},
@@ -1228,10 +1228,10 @@ class ActorRuntimeManagerDecisionTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("turn_output_kind", work_item.metadata or {})
         self.assertNotIn("turn_output_source", work_item.metadata or {})
 
-    async def test_top_seat_self_produced_routes_to_owner_review(self) -> None:
-        # The CEO has no organizational manager. A directly produced outcome
-        # is therefore the authoritative delivery and must go to the owner;
-        # silently auto-approving it would bypass the final quality gate.
+    async def test_top_seat_intake_cannot_masquerade_as_final_delivery(self) -> None:
+        # Human review belongs to a typed delivery WorkItem. An intake result
+        # must never become a final delivery merely because the CEO created no
+        # child cards during this turn.
         self.task.status = TaskStatus.DONE
         self.task.metadata["work_kind"] = "intake"
         self.task.metadata["manager_execution_choice"] = "direct"
@@ -1241,14 +1241,12 @@ class ActorRuntimeManagerDecisionTests(unittest.IsolatedAsyncioTestCase):
             self.task, result=TaskResult(status=TaskStatus.DONE, content="Handled at the top."),
         )
 
-        self.assertEqual(phase, Phase.AWAITING_HUMAN)
+        self.assertEqual(phase, Phase.APPROVED)
         work_item = await self.store.get_delegation_work_item("ceo-work-item")
-        self.assertEqual(work_item.phase, Phase.AWAITING_HUMAN)
-        self.assertTrue(self.task.metadata["authoritative_output"])
-        self.assertTrue(self.task.metadata["user_visible"])
-        self.assertEqual(self.task.metadata["feedback_scope"], "final")
-        self.assertEqual(self.task.metadata["review_owner_kind"], "human")
-        self.assertTrue(self.task.metadata["requires_user_feedback"])
+        self.assertEqual(work_item.phase, Phase.APPROVED)
+        self.assertNotIn("feedback_scope", self.task.metadata)
+        self.assertNotIn("review_owner_kind", self.task.metadata)
+        self.assertNotIn("requires_user_feedback", self.task.metadata)
         self.assertEqual(
             await self._aux_cards_targeting("ceo-work-item", "report_target_work_item_id"),
             [],
@@ -1257,6 +1255,39 @@ class ActorRuntimeManagerDecisionTests(unittest.IsolatedAsyncioTestCase):
             await self._aux_cards_targeting("ceo-work-item", "review_target_work_item_id"),
             [],
         )
+
+    async def test_top_seat_direct_intake_spawns_typed_delivery(self) -> None:
+        self.executor.execute_task = AsyncMock(
+            return_value=TaskResult(
+                status=TaskStatus.DONE,
+                content="Completed the requested research directly.",
+            )
+        )
+
+        result = await self.executor._run_work_item(self.task, {})
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result.status, TaskStatus.DONE)
+        intake = await self.store.get_delegation_work_item("ceo-work-item")
+        self.assertEqual(intake.phase, Phase.APPROVED)
+        self.assertTrue((intake.metadata or {}).get("intake_delivery_spawned"))
+        self.assertIn(
+            "Completed the requested research directly.",
+            str(intake.deliverable_summary or ""),
+        )
+        run_items = await self.store.list_delegation_work_items("run-1")
+        deliveries = [item for item in run_items if item.kind == "delivery"]
+        self.assertEqual(len(deliveries), 1)
+        self.assertEqual(deliveries[0].phase, Phase.READY)
+        self.assertEqual(
+            (deliveries[0].metadata or {}).get("dependency_work_item_ids"),
+            ["ceo-work-item"],
+        )
+        self.assertEqual(
+            (deliveries[0].metadata or {}).get("work_item_turn_type"),
+            "deliver",
+        )
+        self.assertFalse(self.executor._requires_user_feedback(self.task))
 
     async def test_reconcile_rebuilds_missing_report_card(self) -> None:
         # Current-state crash shape: phase was durably written but the process

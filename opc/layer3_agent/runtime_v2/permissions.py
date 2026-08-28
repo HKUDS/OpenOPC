@@ -132,6 +132,18 @@ class RuntimePermissionAdapter:
             except Exception:
                 logger.opt(exception=True).debug("Failed to record permission denial")
 
+    def sandbox_for_task(self, task: Any = None) -> dict[str, Any]:
+        native_policy = getattr(self.policy, "native_policy", None)
+        if native_policy is None:
+            return {}
+        try:
+            return dict(native_policy.sandbox_for_task(task) or {})
+        except Exception:
+            logger.opt(exception=True).warning(
+                "Native sandbox policy resolution failed; keeping the current sandbox"
+            )
+            return {}
+
     def build_blocked_result(
         self,
         decision: RuntimePermissionDecision,

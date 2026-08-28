@@ -394,6 +394,7 @@ def create_shell_tools() -> list[ToolDefinition]:
             concurrency_safe=False,
             read_only=False,
             company_effect_kind=COMPANY_EFFECT_OPAQUE_EXACT,
+            permission_effects=["process_execute", "workspace_write"],
         ),
     ]
 

@@ -23,6 +23,7 @@ from urllib.parse import urlparse
 
 from opc.core.config import ExternalAgentConfig
 from opc.core.models import AgentStatus, Task, TaskResult, TaskStatus
+from opc.layer2_organization.work_item_links import linked_work_item_id_for_task
 from opc.layer3_agent.adapters.base import (
     ExternalAgentAdapter,
     ExternalAgentStdinPolicy,
@@ -1169,12 +1170,7 @@ class JiuwenSwarmAdapter(JiuwenAdapter):
                 "(attempt_id, deliverables, handoff, open_questions, risks, status, summary, "
                 "verification, work_item_id)"
             )
-        expected_work_item_id = str(
-            (task.metadata or {}).get("work_item_id")
-            or (task.metadata or {}).get("linked_work_item_id")
-            or (task.metadata or {}).get("delegation_work_item_id")
-            or ""
-        ).strip()
+        expected_work_item_id = linked_work_item_id_for_task(task)
         actual_work_item_id = str(envelope.get("work_item_id") or "").strip()
         if expected_work_item_id and actual_work_item_id != expected_work_item_id:
             return (

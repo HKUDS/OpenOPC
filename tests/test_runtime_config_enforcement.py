@@ -1721,6 +1721,38 @@ class RuntimeConfigEnforcementTests(unittest.IsolatedAsyncioTestCase):
         _, kwargs = engine.memory.record_assistant_turn.await_args
         self.assertEqual(kwargs["content"], dispatch_text)
 
+    async def test_company_checkpoint_prompt_is_typed_in_session_history(self) -> None:
+        engine = OPCEngine(config=OPCConfig(), project_id="proj1")
+        checkpoint = ExecutionCheckpoint(
+            checkpoint_id="staffing-cp",
+            project_id="proj1",
+            session_id="sess-company",
+            checkpoint_type="company_staffing_selection",
+        )
+        engine.store = SimpleNamespace(
+            get_tasks=AsyncMock(return_value=[]),
+            get_latest_pending_checkpoint=AsyncMock(return_value=checkpoint),
+        )
+        engine.memory = SimpleNamespace(record_assistant_turn=AsyncMock())
+
+        await engine._record_primary_exchange(
+            "sess-company",
+            "调研 AI agent",
+            "Company mode has a pending manual staffing selection before execution.",
+            mode="company",
+            origin_task_id="ui-anchor",
+        )
+
+        _, kwargs = engine.memory.record_assistant_turn.await_args
+        self.assertEqual(
+            kwargs["metadata"],
+            {
+                "kind": "top_level_reply",
+                "owner_checkpoint_prompt_type": "company_staffing_selection",
+                "owner_checkpoint_prompt_id": "staffing-cp",
+            },
+        )
+
     async def test_task_mode_followup_restores_runtime_resume_on_reused_task(self) -> None:
         engine = self._build_task_mode_engine()
         existing = Task(

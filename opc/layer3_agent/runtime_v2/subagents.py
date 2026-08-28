@@ -565,6 +565,7 @@ class SubagentManager:
                 "category": getattr(tool, "category", "general"),
                 "requires_confirmation": getattr(tool, "requires_confirmation", False),
                 "description": getattr(tool, "description", ""),
+                "permission_effects": list(getattr(tool, "permission_effects", None) or []),
                 "subagent_id": state.agent_id,
                 "subagent_profile": state.profile,
                 "subagent_name": state.name,
@@ -581,6 +582,7 @@ class SubagentManager:
                 metadata=metadata,
                 on_progress=on_progress,
                 call_context=dict(call_context or {}),
+                tool=tool,
             )
 
         return _bridge

@@ -4829,6 +4829,12 @@ class WSHandler:
                 if engine_mode == "project" or preferred_agent != "native"
                 else None
             )
+            permission_config = (
+                self._ensure_office_services().session.resolve_task_native_permission_config(
+                    config_task or task,
+                    engine,
+                )
+            )
             if task_id:
                 # Per-task lock: same session serialized, different sessions concurrent
                 async with self._get_task_lock(task_id):
@@ -4867,6 +4873,7 @@ class WSHandler:
                         company_profile=company_profile,
                         preferred_agent=engine_preferred_agent,
                         origin_task_id=task_id,
+                        message_metadata=permission_config,
                     )
                 await self._sync_task_transcript_messages(task_id, engine=engine)
             else:
@@ -4877,6 +4884,7 @@ class WSHandler:
                     org_id=session_org_id or None,
                     company_profile=company_profile,
                     preferred_agent=engine_preferred_agent,
+                    message_metadata=permission_config,
                 )
 
             # Broadcast: task idle (agent responded, waiting for user)
@@ -5054,6 +5062,7 @@ class WSHandler:
                 company_profile=data.get("company_profile"),
                 preferred_agent=data.get("preferred_agent", self._task_preferred_agent),
                 org_id=data.get("org_id") or data.get("organization_id"),
+                native_approval_level=data.get("native_approval_level"),
                 interface="office_ui",
             )
             self._session_to_task.update(self.services_context.session_to_task)
@@ -5073,11 +5082,62 @@ class WSHandler:
                 company_profile=data.get("company_profile"),
                 preferred_agent=data.get("preferred_agent"),
                 org_id=data.get("org_id") or data.get("organization_id"),
+                native_approval_level=data.get("native_approval_level"),
             )
             await self._publish_service_result(result)
             await self._send_ack(ws, ok=True, **result.payload)
         except ServiceError as exc:
             await self._send_service_error(ws, exc, action="session_update_config")
+
+    async def _handle_native_permission_default_set(self, ws: Any, data: dict) -> None:
+        """Persist the default used only when creating future native sessions."""
+        from opc.core.native_permissions import parse_native_approval_level
+        from opc.core.workspace_trust import save_explicit_workspace_authority_change
+
+        raw = data.get("native_approval_level")
+        try:
+            normalized = parse_native_approval_level(raw)
+        except ValueError:
+            await self._send_ack(
+                ws, ok=False, action="native_permission_default_set",
+                error="invalid_native_approval_level",
+            )
+            return
+        root = self._root_engine
+        previous = root.config.autonomy.native_approval_level
+        root.config.autonomy.native_approval_level = normalized
+        try:
+            save_explicit_workspace_authority_change(
+                root.config,
+                root.opc_home / "config",
+            )
+        except Exception as exc:
+            root.config.autonomy.native_approval_level = previous
+            await self._send_ack(
+                ws,
+                ok=False,
+                action="native_permission_default_set",
+                error="native_permission_default_persist_failed",
+                detail=str(exc),
+            )
+            return
+        if getattr(root, "approval_engine", None):
+            root.approval_engine.native_policy.set_config(root.config.autonomy)
+        # Existing session levels live in their scope registries and are not
+        # rewritten. Every already-created project delegate receives only the
+        # new creation default; future delegates copy it from the root config.
+        delegates = list(
+            dict(getattr(root, "_project_engine_delegates", {}) or {}).values()
+        )
+        for engine in [self.engine, *delegates]:
+            if engine is root:
+                continue
+            engine.config.autonomy.native_approval_level = normalized
+            if getattr(engine, "approval_engine", None):
+                engine.approval_engine.native_policy.set_config(engine.config.autonomy)
+        payload = {"native_approval_default": normalized}
+        await self.broadcast({"type": "native_permission_default_updated", "payload": payload})
+        await self._send_ack(ws, ok=True, action="native_permission_default_set", **payload)
 
     async def _handle_session_detail(self, ws: Any, data: dict) -> None:
         """Return a paginated persisted transcript/context for a single session."""
@@ -5233,6 +5293,17 @@ class WSHandler:
         exec_mode_val = identity.exec_mode
         company_profile_val = identity.company_profile
         org_id_val = identity.org_id
+        config_task = await self._resolve_session_runtime_config_task(
+            task_id,
+            task,
+            engine=run_engine,
+        )
+        permission_config = (
+            self._ensure_office_services().session.resolve_task_native_permission_config(
+                config_task or task,
+                run_engine,
+            )
+        )
         project_tasks = [task]
         if self._is_company_session_exec_mode(exec_mode_val):
             try:
@@ -5260,6 +5331,7 @@ class WSHandler:
             "exec_mode": exec_mode_val,
             "company_profile": company_profile_val,
             "org_id": org_id_val,
+            **permission_config,
             "channel_id": channel_id,
             "title": getattr(task, "title", "") or "Session",
             "status": status_val,
@@ -7186,6 +7258,21 @@ class WSHandler:
                 except Exception:
                     logger.opt(exception=True).debug("failed to mark company session runtime running")
             try:
+                if config_task is not None and not str(
+                    (getattr(config_task, "metadata", {}) or {}).get(
+                        "native_approval_level", ""
+                    )
+                    or ""
+                ).strip():
+                    session_service = self._ensure_office_services().session
+                    await session_service.persist_native_permission_config(
+                        config_task,
+                        level=session_service.resolve_task_native_approval_level(
+                            config_task,
+                            engine,
+                        ),
+                        engine=engine,
+                    )
                 config_task_id = str(getattr(config_task, "id", "") or "").strip()
                 selected_task_id = str(getattr(task, "id", "") or "").strip()
                 should_persist_selected_config = bool(
@@ -7231,6 +7318,15 @@ class WSHandler:
                     conversation_turn_id=_ui_conversation_turn_id(user_message_id),
                     created_at=user_message_created_at,
                 ))
+                # Permission state is server-owned and session-scoped.  Never
+                # let an omitted or client-supplied value fall back to the
+                # mutable system default for an existing session.
+                engine_message_metadata.update(
+                    self._ensure_office_services().session.resolve_task_native_permission_config(
+                        config_task or task,
+                        engine,
+                    )
+                )
                 await engine.process_message(
                     content,
                     project_id=pid,
@@ -9237,6 +9333,7 @@ class WSHandler:
         # Session handlers
         "create_session":      _handle_create_session,
         "session_update_config": _handle_session_update_config,
+        "native_permission_default_set": _handle_native_permission_default_set,
         "session_detail":      _handle_session_detail,
         "interaction_reply":   _handle_interaction_reply,
         "session_send":        _handle_session_send,

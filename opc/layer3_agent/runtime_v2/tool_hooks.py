@@ -18,7 +18,7 @@ from opc.layer4_tools.opaque_execution import (
     OpaqueExecutionPlan,
     build_company_opaque_execution_plan,
     company_opaque_execution_identity,
-    company_workspace_read_only_shell_decision,
+    exact_tool_call_fingerprint,
     install_opaque_execution_plan,
     reset_opaque_execution_plan,
 )
@@ -374,14 +374,6 @@ class RuntimeCompanyControllerToolFence:
     ) -> dict[str, Any] | None:
         if tool_name not in {"shell_exec", "python_exec"}:
             return None
-        if tool_name == "shell_exec":
-            read_only, _ = company_workspace_read_only_shell_decision(
-                task,
-                arguments,
-                execution_plan=execution_plan,
-            )
-            if read_only:
-                return None
 
         work_item_id = linked_work_item_id_for_task(task)
         runtime_task_id = str(getattr(task, "id", "") or "").strip()
@@ -395,6 +387,37 @@ class RuntimeCompanyControllerToolFence:
         if subagent_run_id:
             work_item_id = ""
         permit = tool_call.get("_approval_permit")
+        auto_sign = dict(tool_call.get("_native_permission_auto_sign", {}) or {})
+        auto_approved = bool(auto_sign)
+        if auto_approved:
+            runtime_session_id = str(
+                tool_call.get("_runtime_session_id", "") or ""
+            ).strip()
+            fingerprint = exact_tool_call_fingerprint(
+                tool_call_id=str(tool_call.get("id", "") or "").strip(),
+                tool_name=tool_name,
+                arguments=arguments,
+                runtime_session_id=runtime_session_id,
+                execution_envelope=execution_plan.envelope,
+                execution_identity=company_opaque_execution_identity(task),
+            )
+            permit = {
+                "id": str(tool_call.get("id", "") or "").strip(),
+                "function": tool_name,
+                "arguments": dict(arguments or {}),
+                "execution_envelope": dict(execution_plan.envelope or {}),
+                "execution_identity": company_opaque_execution_identity(task),
+                "fingerprint": fingerprint,
+                "runtime_session_id": runtime_session_id,
+                "decision": "native_policy_allow",
+                "approved": True,
+                "state": "executing",
+                "native_approval_level": str(auto_sign.get("level", "") or ""),
+                "native_policy_source": str(
+                    auto_sign.get("policy_source", "") or ""
+                ),
+                "native_permission_scope_id": str(auto_sign.get("scope_id", "") or ""),
+            }
         claim = getattr(
             self.store,
             "authorize_company_opaque_tool_effect_for_controller",
@@ -426,6 +449,7 @@ class RuntimeCompanyControllerToolFence:
                 execution_envelope=execution_plan.envelope,
                 execution_identity=company_opaque_execution_identity(task),
                 permit=dict(permit),
+                auto_approved=auto_approved,
             )
         except CompanyRunControllerLeaseLost:
             raise

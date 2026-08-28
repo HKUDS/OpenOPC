@@ -9,6 +9,7 @@ from typing import Any, Callable, Coroutine
 from loguru import logger
 
 from opc.layer4_tools.output_budget import budget_tool_output
+from opc.core.native_permissions import NATIVE_PERMISSION_EFFECTS
 
 # Maximum serialized tool output size (characters). Outputs exceeding this
 # limit are previewed before being returned to the agent loop; recoverable
@@ -99,6 +100,7 @@ class ToolDefinition:
         self_bounded_output: bool = False,
         preview_chars: int | None = None,
         company_effect_kind: str = COMPANY_EFFECT_UNKNOWN,
+        permission_effects: list[str] | tuple[str, ...] | set[str] | None = None,
     ) -> None:
         self.name = name
         self.description = description
@@ -119,6 +121,18 @@ class ToolDefinition:
                 f"Unknown company tool-effect capability: {company_effect_kind}"
             )
         self.company_effect_kind = normalized_effect_kind
+        if permission_effects is None:
+            self.permission_effects = None
+        else:
+            normalized_permission_effects = tuple(
+                dict.fromkeys(str(item or "").strip().lower() for item in permission_effects)
+            )
+            invalid = set(normalized_permission_effects) - NATIVE_PERMISSION_EFFECTS
+            if invalid:
+                raise ValueError(
+                    "Unknown native permission effect(s): " + ", ".join(sorted(invalid))
+                )
+            self.permission_effects = normalized_permission_effects
 
     def to_schema(self) -> dict[str, Any]:
         return {

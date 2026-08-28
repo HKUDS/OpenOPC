@@ -19,6 +19,7 @@ from opc.core.models import (
     SessionRecord,
     TaskStatus,
 )
+from opc.core.interaction_protocol import COMPANY_ADMISSION_CHECKPOINT_TYPES
 from opc.layer5_memory.employee_evolution import EmployeeEvolutionManager
 from opc.layer5_memory.markdown_memory import MarkdownMemoryStore
 from opc.layer2_organization.work_item_identity import projection_id_for_task, work_item_identity_payload_for_task
@@ -1138,10 +1139,33 @@ class MemoryManager:
     async def build_session_memory_context(self, session_id: str) -> str:
         if not self.store:
             return ""
+        session = await self.store.get_session(session_id)
         snapshot = await self.store.get_latest_session_memory_snapshot(session_id)
         if snapshot and snapshot.memory_text.strip():
+            recruitment_state = dict(
+                (getattr(session, "metadata", {}) or {}).get(
+                    "recruitment_confirmation", {}
+                )
+                or {}
+            )
+            completed_at = str(
+                recruitment_state.get("completed_at", "") or ""
+            ).strip()
+            boundary_loader = getattr(self.store, "get_session_message", None)
+            if recruitment_state.get("completed") and completed_at and callable(
+                boundary_loader
+            ):
+                try:
+                    boundary = await boundary_loader(
+                        snapshot.source_boundary_message_id
+                    )
+                    if boundary is not None and boundary.created_at <= datetime.fromisoformat(
+                        completed_at
+                    ):
+                        return ""
+                except Exception:
+                    pass
             return f"## Session Memory\n{snapshot.memory_text.strip()}"
-        session = await self.store.get_session(session_id)
         if session and session.summary.strip():
             return f"## Session Memory\n{session.summary.strip()}"
         return ""
@@ -1489,11 +1513,20 @@ class MemoryManager:
         visible_items: list[dict[str, Any]],
         *,
         include_latest_user_turn: bool,
+        excluded_checkpoint_prompt_types: set[str] | None = None,
     ) -> list[dict[str, Any]]:
+        excluded_types = set(excluded_checkpoint_prompt_types or set())
         filtered = [
             item
             for item in list(visible_items)
             if not self._is_child_session_seed_item(item)
+            and str(
+                getattr(item.get("message"), "metadata", {}).get(
+                    "owner_checkpoint_prompt_type", ""
+                )
+                or ""
+            ).strip()
+            not in excluded_types
         ]
         if include_latest_user_turn:
             return filtered
@@ -1507,6 +1540,21 @@ class MemoryManager:
                 return [*filtered[:idx], *filtered[idx + 1 :]]
             break
         return filtered
+
+    async def _resolved_checkpoint_prompt_types(
+        self,
+        session_id: str,
+    ) -> set[str]:
+        if not self.store:
+            return set()
+        session = await self.store.get_session(session_id)
+        metadata = dict(getattr(session, "metadata", {}) or {})
+        recruitment_state = dict(metadata.get("recruitment_confirmation", {}) or {})
+        if recruitment_state.get("completed") or metadata.get(
+            "recruitment_confirmation_completed"
+        ):
+            return set(COMPANY_ADMISSION_CHECKPOINT_TYPES)
+        return set()
 
     def _is_child_session_seed_item(self, item: dict[str, Any]) -> bool:
         message = item.get("message")
@@ -1527,6 +1575,9 @@ class MemoryManager:
         visible_items = self._filter_prompt_history_items(
             visible_items,
             include_latest_user_turn=include_latest_user_turn,
+            excluded_checkpoint_prompt_types=(
+                await self._resolved_checkpoint_prompt_types(session_id)
+            ),
         )
         messages: list[dict[str, Any]] = []
         for item in visible_items:
@@ -1559,6 +1610,9 @@ class MemoryManager:
         visible_items = self._filter_prompt_history_items(
             visible_items,
             include_latest_user_turn=include_latest_user_turn,
+            excluded_checkpoint_prompt_types=(
+                await self._resolved_checkpoint_prompt_types(session_id)
+            ),
         )
         session_memory = await self.build_session_memory_context(session_id)
         blocks: list[str] = []

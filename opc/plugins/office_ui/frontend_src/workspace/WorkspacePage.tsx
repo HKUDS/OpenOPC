@@ -9,7 +9,7 @@ import type {
   OutgoingAttachmentPayload,
   SessionSendMetadata,
 } from '../types/chat'
-import type { KanbanTask, Session, TaskPreferredAgent } from '../types/kanban'
+import type { KanbanTask, NativeApprovalLevel, Session, TaskPreferredAgent } from '../types/kanban'
 import type { BoardStoreState } from '../kanban/BoardStore'
 import type { ChatStoreState } from '../chat/ChatStore'
 import type { SessionStoreState } from '../stores/SessionStore'
@@ -39,6 +39,28 @@ type ActiveView =
   | { kind: 'child-detail' }
 
 const SESSION_DETAIL_PAGE_SIZE = 200
+export const MULTI_SESSION_PREVIEW_LIMIT = 4
+
+export function selectMultiViewSessions(
+  openSessions: Session[],
+  activeSessionId: string | null,
+  limit = MULTI_SESSION_PREVIEW_LIMIT,
+): Session[] {
+  const boundedLimit = Math.max(0, Math.floor(limit))
+  if (boundedLimit === 0 || openSessions.length === 0) return []
+  if (openSessions.length <= boundedLimit) return openSessions
+
+  const activeSession = activeSessionId
+    ? openSessions.find(session => session.taskId === activeSessionId)
+    : undefined
+  const inactiveSlots = boundedLimit - (activeSession ? 1 : 0)
+  const recentInactive = inactiveSlots > 0
+    ? openSessions
+      .filter(session => session.taskId !== activeSession?.taskId)
+      .slice(-inactiveSlots)
+    : []
+  return activeSession ? [...recentInactive, activeSession] : recentInactive
+}
 
 function makeOptimisticUserMessageId(): string {
   const cryptoApi = globalThis.crypto
@@ -148,9 +170,35 @@ function isCompanyConversation(session: Session | null | undefined, relatedSessi
     || mode === 'custom'
 }
 
-function sessionBoardId(session: Session | null | undefined): string | null {
+export function sessionBoardId(session: Session | null | undefined): string | null {
   const boardId = String(session?.originTaskId ?? session?.taskId ?? '').trim()
   return boardId || null
+}
+
+export function resolveWorkspaceBoardId({
+  boardIds,
+  sessionScopedBoardIds,
+  activeSessionBoardId,
+  activeTaskBoardId,
+  currentActiveBoardId,
+}: {
+  boardIds: string[]
+  sessionScopedBoardIds: string[]
+  activeSessionBoardId: string | null
+  activeTaskBoardId: string | null
+  currentActiveBoardId: string | null
+}): string | null {
+  const available = new Set(boardIds)
+  if (activeTaskBoardId && available.has(activeTaskBoardId)) return activeTaskBoardId
+  if (activeSessionBoardId && available.has(activeSessionBoardId)) return activeSessionBoardId
+
+  // Once the backend exposes session-scoped boards, an absent session board
+  // means that session's projection has not arrived yet.  Showing any other
+  // session's board during that gap leaks work items across chats.
+  if (sessionScopedBoardIds.length > 0) return null
+
+  if (currentActiveBoardId && available.has(currentActiveBoardId)) return currentActiveBoardId
+  return boardIds[0] ?? null
 }
 
 /**
@@ -235,6 +283,7 @@ interface WorkspacePageProps {
   execMode: string
   companyProfile: string
   taskPreferredAgent: TaskPreferredAgent
+  nativeApprovalDefault: NativeApprovalLevel
 
   chatStore: ChatStoreState
   sessionStore: SessionStoreState
@@ -256,6 +305,8 @@ interface WorkspacePageProps {
   onTitleChange: (taskId: string, title: string) => void
   onSessionConfigChange?: (taskId: string, execMode: string, companyProfile?: string, orgId?: string) => void
   onSessionTaskAgentChange?: (taskId: string, preferredAgent: TaskPreferredAgent) => void
+  onSessionNativeApprovalLevelChange?: (taskId: string, level: NativeApprovalLevel) => void
+  onSetNativeApprovalDefault?: (level: NativeApprovalLevel) => void
   /**
    * Forwarded to ContextPanel → MessageComposer locked-mode chip popover.
    * Spawns a fresh chat in the requested mode under the active project so
@@ -291,6 +342,7 @@ export function WorkspacePage({
   execMode,
   companyProfile,
   taskPreferredAgent,
+  nativeApprovalDefault,
   chatStore,
   sessionStore,
   projectId,
@@ -305,6 +357,8 @@ export function WorkspacePage({
   onTitleChange,
   onSessionConfigChange,
   onSessionTaskAgentChange,
+  onSessionNativeApprovalLevelChange,
+  onSetNativeApprovalDefault,
   onContinueInNewChat,
   onSessionStop,
   onSessionResume,
@@ -354,8 +408,6 @@ export function WorkspacePage({
 
   sessionsRef.current = sessions
   getChannelMessagesRef.current = chatStore.getChannelMessages
-
-  const isCompanyMode = execMode === 'company' || execMode === 'org' || execMode === 'custom'
 
   // Per-project channel IDs
   const secretaryChannelId = `secretary:${projectId}`
@@ -469,6 +521,9 @@ export function WorkspacePage({
     historyRequestInFlightRef.current.clear()
     autoHistoryRequestRef.current = { scope: null, active: new Set(), child: null }
     setSessionHistoryLoading({})
+    setOpenSessionIds([])
+    setMultiSessionView(false)
+    setChildDetailTaskId(null)
   }, [projectId])
 
   useEffect(() => () => {
@@ -626,34 +681,56 @@ export function WorkspacePage({
     if (!childDetailSession) return []
     return chatStore.getChannelMessages(childDetailSession.channelId)
   }, [chatStore.messages, chatStore.getChannelMessages, childDetailSession])
-  // Hide child sessions from sidebar in Company mode
+  // Company child sessions belong to their root conversation and are opened
+  // from that conversation's execution view. Decide this per session: the
+  // global new-chat default can differ from existing chats in the project.
   const sidebarSessions = useMemo(() => {
-    const filtered = isCompanyMode ? sessions.filter(s => s.mode !== 'child') : sessions
+    const filtered = sessions.filter(s => !(s.mode === 'child' && isCompanyConversation(s)))
     return [...filtered].sort((a, b) => b.updatedAt - a.updatedAt)
-  }, [sessions, isCompanyMode])
+  }, [sessions])
 
-  const childTaskIds = useMemo(() => {
-    if (!isCompanyMode) return null
+  const companyChildTaskIds = useMemo(() => {
     const set = new Set<string>()
     for (const s of sessions) {
-      if (s.mode === 'child') set.add(s.taskId)
+      if (s.mode === 'child' && isCompanyConversation(s)) set.add(s.taskId)
     }
     return set.size > 0 ? set : null
-  }, [sessions, isCompanyMode])
+  }, [sessions])
 
   const filteredTasksByColumn = useMemo(() => {
-    if (!childTaskIds) return boardStore.tasksByColumn
+    if (!companyChildTaskIds) return boardStore.tasksByColumn
     const result: Record<string, import('../types/kanban').KanbanTask[]> = {}
     for (const [colId, tasks] of Object.entries(boardStore.tasksByColumn)) {
-      result[colId] = tasks.filter(t => !childTaskIds.has(t.id))
+      result[colId] = tasks.filter(t => !companyChildTaskIds.has(t.id))
     }
     return result
-  }, [boardStore.tasksByColumn, childTaskIds])
+  }, [boardStore.tasksByColumn, companyChildTaskIds])
 
   // Keep the Agents tab visible whenever company-style runtime is active for a session.
   const isCompanyRuntime = !!(activeSession && (activeSession.isCompanyRuntime || childSessions.length > 0))
-  const canShowAgentsTab = !!(activeSession && (isCompanyMode || isCompanyRuntime))
-  const canShowTeamTab = !!(activeSession && isCompanyMode && hasWorkspaceTeamInfo(orgInfoData))
+  const activeSessionIsCompany = isCompanyConversation(activeSession, childSessions.length)
+  const canShowAgentsTab = !!(activeSession && (activeSessionIsCompany || isCompanyRuntime))
+  const canShowTeamTab = !!(activeSession && activeSessionIsCompany && hasWorkspaceTeamInfo(orgInfoData))
+  const boardIdSet = useMemo(
+    () => new Set(boardStore.boards.map(board => board.id)),
+    [boardStore.boards],
+  )
+  const sessionScopedBoardIds = useMemo(() => {
+    const result = new Set<string>()
+    for (const session of sessions) {
+      if (session.mode === 'child') continue
+      const boardId = sessionBoardId(session)
+      if (boardId && boardIdSet.has(boardId)) result.add(boardId)
+    }
+    return result
+  }, [sessions, boardIdSet])
+  const boardFollowsSession = sessionScopedBoardIds.size > 0
+  const activeBoardTasks = useMemo(
+    () => boardStore.activeBoardId
+      ? boardStore.tasks.filter(task => task.boardId === boardStore.activeBoardId)
+      : [],
+    [boardStore.tasks, boardStore.activeBoardId],
+  )
   useEffect(() => {
     if (panelTab === 'agents' && !canShowAgentsTab) {
       setPanelTab('chat')
@@ -683,9 +760,15 @@ export function WorkspacePage({
     [openSessionIds, sessions],
   )
 
-  const openSessionMessages = useMemo<Record<string, ChatMessage[]>>(() => {
+  const multiViewSessions = useMemo(
+    () => selectMultiViewSessions(openSessions, activeSessionId),
+    [openSessions, activeSessionId],
+  )
+
+  const multiSessionMessages = useMemo<Record<string, ChatMessage[]>>(() => {
+    if (!multiSessionView) return {}
     const result: Record<string, ChatMessage[]> = {}
-    for (const session of openSessions) {
+    for (const session of multiViewSessions) {
       const sessionChildren = getWorkItemChildSessions(session, sessions)
       const sessionPeers = getConversationPeerSessions(session, sessions)
       const projection = projectSessionConversation(session, [...sessionPeers, ...sessionChildren])
@@ -697,15 +780,7 @@ export function WorkspacePage({
         : mergeConversationMessages(messageGroups)
     }
     return result
-  }, [openSessions, sessions, chatStore.getChannelMessages])
-
-  const openSessionChildren = useMemo<Record<string, Session[]>>(() => {
-    const result: Record<string, Session[]> = {}
-    for (const session of openSessions) {
-      result[session.taskId] = getWorkItemChildSessions(session, sessions)
-    }
-    return result
-  }, [openSessions, sessions])
+  }, [multiSessionView, multiViewSessions, sessions, chatStore.getChannelMessages])
 
   const ensureSessionOpen = useCallback((taskId: string) => {
     setOpenSessionIds(prev => prev.includes(taskId) ? prev : [...prev, taskId])
@@ -723,7 +798,7 @@ export function WorkspacePage({
 
   useEffect(() => {
     if (activeSessionId) ensureSessionOpen(activeSessionId)
-  }, [activeSessionId, ensureSessionOpen])
+  }, [projectId, activeSessionId, ensureSessionOpen])
 
   useEffect(() => {
     const validTaskIds = new Set(sessions.map(session => session.taskId))
@@ -758,11 +833,6 @@ export function WorkspacePage({
       markRead(visibleChannelId)
     }
   }, [visibleChannelIds, markRead])
-
-  const handleMarkSessionRead = useCallback((taskId: string) => {
-    const session = sessions.find(item => item.taskId === taskId)
-    if (session) markRead(session.channelId)
-  }, [sessions, markRead])
 
   const focusSession = useCallback((taskId: string) => {
     const session = sessions.find(item => item.taskId === taskId)
@@ -803,15 +873,16 @@ export function WorkspacePage({
 
     const session = sessions.find(s => s.taskId === taskId)
 
-    // Company mode child → open child detail
-    if (isCompanyMode && session?.mode === 'child') {
+    // A company child belongs to its root conversation regardless of the
+    // current global new-chat default.
+    if (session?.mode === 'child' && isCompanyConversation(session)) {
       setChildDetailTaskId(taskId)
       setPanelState('open')
       return
     }
 
     focusSession(taskId)
-  }, [sessions, sessionStore, isCompanyMode, focusSession])
+  }, [sessions, sessionStore, focusSession])
 
   const handleSelectSecretary = useCallback(() => {
     setActiveView({ kind: 'secretary' })
@@ -823,7 +894,7 @@ export function WorkspacePage({
   // ── Board interactions ──
   const handleCardClick = useCallback((task: { id: string }) => {
     const boardTask = boardStore.tasks.find(t => t.id === task.id)
-    if (isCompanyMode && boardTask) {
+    if (boardTask && sessionScopedBoardIds.has(boardTask.boardId)) {
       setChildDetailTaskId(null)
       setActiveView({ kind: 'task-detail', taskId: boardTask.id })
       setPanelState('open')
@@ -862,7 +933,7 @@ export function WorkspacePage({
         onCollabSync?.()
       }
     }
-  }, [sessions, boardStore.tasks, sessionStore, focusSession, ensureSessionOpen, onCollabSync, isCompanyMode])
+  }, [sessions, boardStore.tasks, sessionStore, focusSession, ensureSessionOpen, onCollabSync, sessionScopedBoardIds])
 
   const handleQuickCreate = useCallback((title: string) => {
     if (!boardStore.activeBoardId) return
@@ -888,37 +959,21 @@ export function WorkspacePage({
     sessionStore.setActiveSession(null)
   }, [boardStore, sessions, focusSession, sessionStore])
 
-  const boardIdSet = useMemo(
-    () => new Set(boardStore.boards.map(board => board.id)),
-    [boardStore.boards],
-  )
   useEffect(() => {
-    if (isCompanyMode) {
-      // Company mode: active board follows the selected session's board.
-      const targetBoardId = activeTask?.boardId
-        ?? sessionBoardId(activeSession)
-        ?? null
-      if (!targetBoardId || !boardIdSet.has(targetBoardId)) {
-        // No session selected, or the session's board hasn't been pushed yet.
-        if (boardStore.activeBoardId !== null) {
-          boardStore.setActiveBoard(null)
-        }
-        return
-      }
-      if (boardStore.activeBoardId !== targetBoardId) {
-        boardStore.setActiveBoard(targetBoardId)
-      }
-      return
-    }
-    // Non-company mode: there's 1 project-wide board. Select it once.
-    if (boardStore.boards.length > 0 && !boardStore.activeBoardId) {
-      boardStore.setActiveBoard(boardStore.boards[0].id)
+    const targetBoardId = resolveWorkspaceBoardId({
+      boardIds: boardStore.boards.map(board => board.id),
+      sessionScopedBoardIds: [...sessionScopedBoardIds],
+      activeSessionBoardId: sessionBoardId(activeSession),
+      activeTaskBoardId: activeTask?.boardId ?? null,
+      currentActiveBoardId: boardStore.activeBoardId,
+    })
+    if (boardStore.activeBoardId !== targetBoardId) {
+      boardStore.setActiveBoard(targetBoardId)
     }
   }, [
-    isCompanyMode,
     activeTask?.boardId,
     activeSession,
-    boardIdSet,
+    sessionScopedBoardIds,
     boardStore.activeBoardId,
     boardStore.boards,
     boardStore.setActiveBoard,
@@ -1154,8 +1209,8 @@ export function WorkspacePage({
       {/* Middle column: Kanban Board (hidden when panel maximized) */}
       {panelState !== 'maximized' && (
         <div className="workspace-board">
-          {agents.length > 0 && <AgentStatusBar agents={agents} tasks={boardStore.tasks} />}
-          {isCompanyMode ? (
+          {agents.length > 0 && <AgentStatusBar agents={agents} tasks={activeBoardTasks} />}
+          {boardFollowsSession ? (
             boardStore.activeBoard && activeSession && (
               <BoardTitleEditor
                 key={activeSession.taskId}
@@ -1171,7 +1226,7 @@ export function WorkspacePage({
               onSelect={handleBoardSelect}
             />
           )}
-          {isCompanyMode && !boardStore.activeBoard ? (
+          {boardFollowsSession && !boardStore.activeBoard ? (
             <div className="kanban-empty-state">
               <p>{t('workspace.selectRuntimeSession')}</p>
             </div>
@@ -1183,14 +1238,14 @@ export function WorkspacePage({
                 agents={agents}
                 officeMap={officeMap}
                 store={boardStore}
-                companyMode={isCompanyMode}
+                companyMode={activeSessionIsCompany}
                 selectedTaskId={effectiveView.kind === 'task-detail' ? effectiveView.taskId : activeSessionId}
                 onCardClick={handleCardClick}
                 onStartTask={handleStartTask}
                 onQuickCreate={handleQuickCreate}
                 onMoveTask={onMoveTask}
               />
-              {isCompanyMode && boardStore.activeBoard && boardStore.tasks.filter(t => t.boardId === boardStore.activeBoardId).length === 0 && (
+              {boardFollowsSession && boardStore.activeBoard && activeBoardTasks.length === 0 && (
                 <div className="kanban-empty-state kanban-empty-state-inline">
                   <p>{t('workspace.noWorkItems')}</p>
                 </div>
@@ -1216,12 +1271,13 @@ export function WorkspacePage({
         childDetailMessages={childDetailMessages}
         allSessions={sessions}
         openSessions={openSessions}
-        openSessionMessages={openSessionMessages}
-        openSessionChildren={openSessionChildren}
+        multiViewSessions={multiViewSessions}
+        multiSessionMessages={multiSessionMessages}
         agents={agents}
         childSessions={childSessions}
         execMode={execMode}
         taskPreferredAgent={taskPreferredAgent}
+        nativeApprovalDefault={nativeApprovalDefault}
         savedOrgsList={savedOrgsList ?? null}
         activeSavedOrg={activeSavedOrg ?? null}
         onSavedOrgsList={onSavedOrgsList}
@@ -1244,6 +1300,8 @@ export function WorkspacePage({
         onTitleChange={onTitleChange}
         onSessionConfigChange={handleSessionConfigChange}
         onSessionTaskAgentChange={onSessionTaskAgentChange}
+        onSessionNativeApprovalLevelChange={onSessionNativeApprovalLevelChange}
+        onSetNativeApprovalDefault={onSetNativeApprovalDefault}
         onContinueInNewChat={onContinueInNewChat}
         onStop={handleStop}
         onComplete={handleComplete}
@@ -1264,11 +1322,9 @@ export function WorkspacePage({
         onMaximize={() => setPanelState(prev => prev === 'maximized' ? 'open' : 'maximized')}
         onComposerSend={handleComposerSend}
         onInteractionReply={handleInteractionReply}
-        onSessionSend={dispatchSessionSend}
         onWorkItemClick={handleWorkItemClick}
         onWorkItemOpenSession={handleOpenWorkItemSession}
         onMarkRead={handleMarkRead}
-        onSessionMarkRead={handleMarkSessionRead}
         onLoadSessionHistory={requestSessionHistory}
         isSessionHistoryLoading={isSessionHistoryLoading}
       />

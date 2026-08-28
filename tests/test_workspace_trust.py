@@ -18,6 +18,7 @@ from opc.core.workspace_trust import (
     WorkspaceTrustRequired,
     WorkspaceTrustStore,
     canonical_workspace,
+    save_explicit_workspace_authority_change,
 )
 from opc.engine import OPCEngine
 
@@ -97,6 +98,48 @@ def test_trusted_project_loads_without_changing_effective_config(
     assert loaded.system.mcp_servers[0].command == ["python", "project_mcp.py"]
     assert loaded.llm.api_base == "https://llm.example.test/v1"
     assert loaded.llm.api_key_env == "PROJECT_SELECTED_KEY"
+
+
+def test_explicit_permission_save_refreshes_existing_workspace_trust(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "project"
+    config_dir = _write_project_config(workspace)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "user-config"))
+    monkeypatch.chdir(workspace)
+    _trust_project(workspace, config_dir)
+    config = OPCConfig.load(config_dir)
+
+    config.autonomy.native_approval_level = "full-access"
+    saved_workspace = save_explicit_workspace_authority_change(
+        config,
+        config_dir,
+    )
+
+    assert saved_workspace == canonical_workspace(workspace)
+    assert OPCConfig.load(config_dir).autonomy.native_approval_level == "full-access"
+
+
+def test_explicit_permission_save_rolls_back_if_trust_store_update_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "project"
+    config_dir = _write_project_config(workspace)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "user-config"))
+    monkeypatch.chdir(workspace)
+    original = _trust_project(workspace, config_dir)
+    before = (config_dir / "system_config.yaml").read_bytes()
+    config = OPCConfig.load(config_dir)
+    config.autonomy.native_approval_level = "full-access"
+
+    with patch.object(WorkspaceTrustStore, "trust", side_effect=OSError("read-only trust store")):
+        with pytest.raises(OSError, match="read-only trust store"):
+            save_explicit_workspace_authority_change(config, config_dir)
+
+    assert (config_dir / "system_config.yaml").read_bytes() == before
+    assert OPCConfig.load(config_dir).model_dump() == original.model_dump()
 
 
 @pytest.mark.parametrize(

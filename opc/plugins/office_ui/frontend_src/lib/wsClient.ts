@@ -22,7 +22,7 @@ import type {
   OutgoingAttachmentPayload,
   SessionSendMetadata,
 } from '../types/chat'
-import type { TaskPreferredAgent } from '../types/kanban'
+import type { NativeApprovalLevel, TaskPreferredAgent } from '../types/kanban'
 
 interface SocketHandlers {
   onSnapshot?: (snapshot: VisualSnapshot) => void
@@ -37,8 +37,9 @@ interface SocketHandlers {
   onRuntimeStatusSync?: (payload: RuntimeStatusSyncPayload) => void
   onWorkerNotification?: (payload: WorkerNotificationPayload) => void
   onKanbanViewData?: (payload: KanbanViewDataPayload) => void
-  onSessionCreated?: (payload: { project_id: string; task_id: string; channel_id: string; session_id?: string; parent_session_id?: string; origin_task_id?: string; title: string; status: string; created_at: number; assignee_ids?: string[]; exec_mode?: string; company_profile?: string; org_id?: string; organization_id?: string; preferred_agent?: TaskPreferredAgent; selected_execution_agent?: TaskPreferredAgent }) => void
-  onSessionUpdated?: (payload: { project_id: string; task_id: string; exec_mode?: string; company_profile?: string; org_id?: string; organization_id?: string; preferred_agent?: TaskPreferredAgent; selected_execution_agent?: TaskPreferredAgent }) => void
+  onSessionCreated?: (payload: { project_id: string; task_id: string; channel_id: string; session_id?: string; parent_session_id?: string; origin_task_id?: string; title: string; status: string; created_at: number; assignee_ids?: string[]; exec_mode?: string; company_profile?: string; org_id?: string; organization_id?: string; preferred_agent?: TaskPreferredAgent; selected_execution_agent?: TaskPreferredAgent; native_approval_level?: NativeApprovalLevel; native_permission_scope_id?: string }) => void
+  onSessionUpdated?: (payload: { project_id: string; task_id: string; exec_mode?: string; company_profile?: string; org_id?: string; organization_id?: string; preferred_agent?: TaskPreferredAgent; selected_execution_agent?: TaskPreferredAgent; native_approval_level?: NativeApprovalLevel; native_permission_scope_id?: string }) => void
+  onNativePermissionDefaultUpdated?: (payload: { native_approval_default: NativeApprovalLevel }) => void
   onSessionMessage?: (payload: Record<string, unknown>) => void
   onSessionTitleUpdated?: (payload: { project_id: string; task_id: string; title: string }) => void
   onSessionDeleted?: (payload: { project_id: string; task_id: string }) => void
@@ -391,7 +392,7 @@ export class VisualSocketClient {
 
   // ── Session protocol ───────────────────────────────────────────────────
 
-  createSession(projectId: string, title?: string, execMode?: string, companyProfile?: string, preferredAgent?: TaskPreferredAgent, orgId?: string): void {
+  createSession(projectId: string, title?: string, execMode?: string, companyProfile?: string, preferredAgent?: TaskPreferredAgent, orgId?: string, nativeApprovalLevel?: NativeApprovalLevel): void {
     const pid = this.requireProjectId(projectId, 'create_session')
     this.send({
       type: 'create_session',
@@ -401,6 +402,7 @@ export class VisualSocketClient {
       company_profile: companyProfile,
       preferred_agent: preferredAgent,
       org_id: orgId,
+      native_approval_level: nativeApprovalLevel,
     })
   }
 
@@ -497,6 +499,23 @@ export class VisualSocketClient {
       company_profile: companyProfile,
       preferred_agent: preferredAgent,
       org_id: orgId,
+    })
+  }
+
+  sessionUpdateNativePermission(projectId: string, taskId: string, level: NativeApprovalLevel): void {
+    const pid = this.requireProjectId(projectId, 'session_update_config')
+    this.send({
+      type: 'session_update_config',
+      project_id: pid,
+      task_id: taskId,
+      native_approval_level: level,
+    })
+  }
+
+  setNativePermissionDefault(level: NativeApprovalLevel): void {
+    this.send({
+      type: 'native_permission_default_set',
+      native_approval_level: level,
     })
   }
 
@@ -893,6 +912,9 @@ export class VisualSocketClient {
         break
       case 'session_updated':
         this.handlers.onSessionUpdated?.(parsed.payload)
+        break
+      case 'native_permission_default_updated':
+        this.handlers.onNativePermissionDefaultUpdated?.(parsed.payload)
         break
       case 'session_message':
         this.handlers.onSessionMessage?.(parsed.payload as Record<string, unknown>)

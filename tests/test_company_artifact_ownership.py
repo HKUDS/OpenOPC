@@ -761,7 +761,15 @@ class CompanyArtifactOwnershipTests(unittest.IsolatedAsyncioTestCase):
             task=self.owner_task,
             tool_name="shell_exec",
             arguments={"command": "git status --short"},
-            tool_call={"id": "call-read"},
+            tool_call={
+                "id": "call-read",
+                "_runtime_session_id": "rt-read",
+                "_native_permission_auto_sign": {
+                    "level": "auto",
+                    "policy_source": "native_permission_policy",
+                    "scope_id": "root-session",
+                },
+            },
             effect=effect,
         )
         self.assertTrue(read_only["success"])
@@ -1417,11 +1425,13 @@ class CompanyArtifactOwnershipTests(unittest.IsolatedAsyncioTestCase):
             task=self.owner_task,
         )
 
-        self.assertFalse(results[0]["result"]["success"])
-        self.assertEqual(
-            results[0]["result"]["opaque_tool_permission"]["outcome"],
-            "already_consumed",
-            results,
+        # The executor no longer widens workspace-write -> elevated -> off
+        # and therefore never attempts to consume this one-shot permit a
+        # second time.  The single handler failure is returned as-is.
+        self.assertTrue(results[0]["result"]["success"])
+        self.assertEqual(results[0]["result"]["result"]["exit_code"], 1)
+        self.assertFalse(
+            results[0]["result"]["result"]["sandbox"]["fallback_used"]
         )
         self.assertEqual(observed_modes, ["workspace-write"])
 

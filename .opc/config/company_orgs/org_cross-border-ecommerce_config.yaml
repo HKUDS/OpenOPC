@@ -406,6 +406,7 @@ team_runtime:
   allow_shared_role_sessions: true
   seat_refresh_interval_seconds: 30
   metadata: {}
+external_team_bindings: []
 installed_packages: []
 role_serial_queue_enabled: true
 metadata:

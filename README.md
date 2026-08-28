@@ -530,6 +530,7 @@ See [`docs/cli-chat-slash.md`](docs/cli-chat-slash.md) for the full command tabl
 | `opc talent` | `list`, `employees`, `import`, `hire`, `scan`, `import-selected`, `employee-detail`, `import-agent` |
 | `opc market` | `presets`, `browse`, `preview`, `apply-preset`, `export`, `install`, `list`, `uninstall --yes` |
 | `opc runtime` | `status`, `checkpoints`, `logs`, `run` |
+| `opc permissions` | Show the Native default, or `set read-only|auto|full-access` for new sessions |
 | `opc channels` | `status`, `login`, `start`, `stop` |
 
 Most service-style commands accept `--project/-p` and `--json`.
@@ -637,22 +638,36 @@ If you prefer not to store the key in the file, leave `api_key` empty and set `a
 
 ### Approval & Agent Permissions
 
-The `autonomy` section of `.opc/config/system_config.yaml` controls how much an agent can do without asking. The key knob is `max_auto_approve_risk` — the highest risk level that can be auto-approved:
+OpenOPC Native has three permission levels. Set the default copied into each new session in `.opc/config/system_config.yaml`:
 
 ```yaml
 autonomy:
-  max_auto_approve_risk: medium   # low | medium | high | critical
-  allow_native_tool_auto_approval: true
-  tool_first_use_approval: true   # first use of each tool always asks
+  native_approval_level: auto   # read-only | auto | full-access
 ```
 
-Every native tool call is risk-classified before it runs: known destructive commands (`rm -rf`, `drop table`, force-push, …) and sensitive keywords (credentials, deploys, …) are `high`/`critical` and always escalate to a human; allowlisted safe prefixes (`ls`, `git status`, …) are `low`; everything else is `medium` and goes through an LLM review before auto-approval.
+| Level | Runs automatically | Asks first | Sandbox |
+|---|---|---|---|
+| `read-only` | Local reads and side-effect-free internal tools | Writes, processes that may write, network, external effects, and outside access | Read-only, offline |
+| `auto` | Reads, workspace edits, commands, and tests | Network, workspace-external access/effects, and explicit safety rules | Workspace-write, offline |
+| `full-access` | All registered Native tools | No Native tool approval prompts | Off |
 
-- `medium` (default): balanced — ordinary commands run without prompts; dangerous ones escalate.
-- `low`: strict — anything not on the safe allowlist asks for approval. Recommended for shared or production machines.
-- `high`/`critical`: permissive — only for throwaway sandboxes.
+Use the **Permissions** selector beside Mode/Agent in the UI, including while a session is running. Changes take effect at the next tool call; already-open approval requests are not replayed or auto-approved. The same setting is available from the CLI:
 
-The first time a tool is used you are always prompted (unless the tool is in `tool_approval_exemptions`), and your "Always allow" choices accumulate in a per-project allowlist.
+```bash
+opc permissions
+opc permissions set auto
+opc chat --approval-level read-only
+opc exec --approval-level full-access "Run the task"
+opc session config <task-id> --approval-level auto
+```
+
+Interactive chat supports `/permissions` and `/permissions read-only|auto|full-access`; `opc status` and `/status` show the effective level and sandbox. A new session freezes the current default. Native subagents and all Native Company roles inherit the root session level, while different projects and sessions remain isolated.
+
+Changing the default through the UI or `opc permissions set` atomically refreshes the trust fingerprint of an already trusted workspace. If you edit `.opc/config/*.yaml` by hand, review the change and run `opc trust add <workspace>` as usual.
+
+When a call asks, approval cards retain once/session/project/global scopes; no grant can override an explicit deny. **Default** in the UI changes only future sessions.
+
+`full-access` bypasses only Native tool permission prompts. Organization reviews, hiring decisions, user questions, Company WorkItem gates, controller ownership, durable effect fences, and explicit deny rules remain active. **This setting does not control Codex, Claude Code, Jiuwen, JiuwenSwarm, or any other external harness; their approval and sandbox settings remain independent.** Legacy Native risk settings are read once for migration, then `native_approval_level` is authoritative.
 
 ### External Agents
 

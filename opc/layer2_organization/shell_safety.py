@@ -7,9 +7,9 @@ standalone read-only command (auto-approvable without an approval card).
 
 Design rules (mirroring the codex / Claude Code permission engines):
 - Fail closed: anything unparseable, too dynamic, or unknown is NOT safe.
-- Compound commands and active shell syntax always require explicit review.
-  A safe first command must never confer trust on a pipeline, redirection,
-  substitution, subshell, background job, or subsequent command.
+- Compound commands are safe only when every executable segment independently
+  passes the flag audit. Dynamic evaluation, background jobs, unsafe
+  redirection, and unparseable structure still require explicit review.
 - Audited commands are classified by their flags, not just their name —
   ``find .`` is read-only, ``find . -delete`` is not. For audited commands the
   built-in verdict is final; a bare config prefix cannot rescue a failing
@@ -21,6 +21,7 @@ Design rules (mirroring the codex / Claude Code permission engines):
 
 from __future__ import annotations
 
+import glob
 import re
 import shlex
 from pathlib import Path
@@ -368,11 +369,11 @@ def _active_shell_syntax(command: str) -> set[str]:
 
 
 def shell_structure_requires_review(command: str) -> tuple[bool, str]:
-    """Whether a command contains active shell syntax requiring a checkpoint.
+    """Whether a command contains active shell syntax needing risk analysis.
 
-    This is intentionally stricter than a per-segment read-only audit.  The
-    approval boundary authorizes one standalone command at a time; compound
-    execution and shell evaluation are never inferred safe from a prefix.
+    This syntactic detector is intentionally conservative. The approval layer
+    may suppress the checkpoint only after the read-only classifier proves
+    every segment safe; a prefix match alone is never sufficient.
     """
     found = _active_shell_syntax(command)
     if not found:
@@ -495,6 +496,72 @@ def command_has_redirection(command: str) -> bool:
     except ValueError:
         return any(marker in text for marker in (">", "<"))
     return any(token in {">", ">>", "<", "<<", "<<<"} for token in tokens)
+
+
+def literal_shell_path_outside_workspace(
+    command: str,
+    *,
+    working_directory: str,
+    workspace_root: str,
+) -> str:
+    """Return the first literal shell operand outside the workspace.
+
+    This supplements the OS sandbox with a preflight decision for ordinary
+    absolute/parent-relative operands and redirection targets. Dynamic shell
+    expansion remains enforced by the sandbox instead of being guessed here.
+    """
+
+    try:
+        root = Path(workspace_root).expanduser().resolve(strict=False)
+        cwd = Path(working_directory).expanduser().resolve(strict=False)
+    except (OSError, RuntimeError, ValueError):
+        return ""
+    segments = split_shell_segments(command)
+    if not segments:
+        return ""
+    redirection_prefix = re.compile(r"^(?:\d*(?:>>?|<<?)|&>>?)(.+)$")
+    for segment in segments:
+        # The first token is the executable. System executables are part of
+        # process execution, not an arbitrary data-path grant.
+        for token in segment[1:]:
+            candidate = str(token or "").strip()
+            if not candidate or candidate in {">", ">>", "<", "<<", "<<<"}:
+                continue
+            redirect_match = redirection_prefix.match(candidate)
+            if redirect_match:
+                candidate = redirect_match.group(1).strip()
+            if "=" in candidate and candidate.startswith("-"):
+                candidate = candidate.split("=", 1)[1].strip()
+            if candidate.startswith("@") and len(candidate) > 1:
+                candidate = candidate[1:]
+            if not candidate.startswith(("/", "~/", "../", "./")):
+                continue
+            if candidate.startswith(("http://", "https://")):
+                continue
+            if any(marker in candidate for marker in ("$", "`")):
+                continue
+            if candidate in {
+                "/dev/null",
+                "/dev/stdin",
+                "/dev/stdout",
+                "/dev/stderr",
+                "/proc/self/fd/0",
+                "/proc/self/fd/1",
+                "/proc/self/fd/2",
+            }:
+                continue
+            try:
+                path = Path(candidate).expanduser()
+                resolved = (
+                    path.resolve(strict=False)
+                    if path.is_absolute()
+                    else (cwd / path).resolve(strict=False)
+                )
+            except (OSError, RuntimeError, ValueError):
+                continue
+            if resolved != root and root not in resolved.parents:
+                return str(resolved)
+    return ""
 
 
 def _strip_env_assignments(tokens: list[str]) -> tuple[list[str], bool]:
@@ -1088,19 +1155,43 @@ def is_read_only_shell_command(
     command: str,
     config_prefixes: Sequence[str] = (),
 ) -> tuple[bool, str]:
-    """Classify one standalone shell command as read-only-safe.
+    """Classify a shell command as read-only-safe.
 
-    Returns ``(safe, reason)``. Active shell structure and unparseable input
-    fail closed before the flag audit, even when each apparent segment would
-    be read-only in isolation.
+    Compound commands are audited segment by segment. Only null-sink/fd
+    redirections are discarded before parsing; substitutions, background
+    execution, grouping, real file redirections, and unparseable input fail
+    closed.
     """
     cleaned = str(command or "").strip()
     if not cleaned:
         return False, "empty command"
-    requires_review, reason = shell_structure_requires_review(cleaned)
-    if requires_review:
-        return False, reason
-    segments = split_shell_segments(cleaned)
+    structure = _active_shell_syntax(cleaned)
+    hard_structure = structure & {
+        "command substitution",
+        "subshell or grouping",
+        "unbalanced shell quoting",
+    }
+    if hard_structure:
+        ordered = [
+            reason for reason in _SHELL_STRUCTURE_REASON_ORDER
+            if reason in hard_structure
+        ]
+        return False, "manual review required for " + ", ".join(ordered)
+
+    sanitized = strip_safe_redirections(cleaned)
+    if "shell redirection" in _active_shell_syntax(sanitized):
+        return False, "manual review required for shell redirection"
+    try:
+        lexer = shlex.shlex(sanitized, posix=True, punctuation_chars=";&|")
+        lexer.whitespace_split = True
+        lexer.commenters = ""
+        structural_tokens = list(lexer)
+    except ValueError:
+        return False, "command could not be parsed"
+    if any(token in {"&", ";;"} for token in structural_tokens):
+        return False, "manual review required for background or case execution"
+
+    segments = split_shell_segments(sanitized)
     if segments is None:
         return False, "command could not be parsed"
     if not segments:
@@ -1116,8 +1207,42 @@ _COMPANY_WORKSPACE_INSPECTION_HEADS = frozenset({
     "dirname", "du", "egrep", "fgrep", "find", "git", "grep", "head",
     "hexdump", "jq", "ls", "md5sum", "nl", "od", "pwd", "readlink",
     "realpath", "rg", "sed", "sha1sum", "sha256sum", "sha512sum", "stat",
-    "strings", "tail", "wc", "xxd",
+    "strings", "tail", "wc", "xxd", "echo", "printf",
 })
+
+
+def _workspace_path_operands(
+    candidate: str,
+    *,
+    cwd: Path,
+) -> tuple[list[Path], str]:
+    """Resolve a literal or glob operand for company workspace validation."""
+
+    try:
+        raw_path = Path(candidate).expanduser()
+        unresolved = raw_path if raw_path.is_absolute() else cwd / raw_path
+    except (OSError, RuntimeError, ValueError):
+        return [], "command path operand cannot be resolved safely"
+    pattern = str(unresolved)
+    if not glob.has_magic(pattern):
+        return [unresolved.resolve(strict=False)], ""
+
+    anchor_parts: list[str] = []
+    for part in unresolved.parts:
+        if glob.has_magic(part):
+            break
+        anchor_parts.append(part)
+    try:
+        anchor = Path(*anchor_parts).resolve(strict=False)
+        matches = [
+            Path(match).resolve(strict=False)
+            for match in glob.iglob(pattern, recursive=True, include_hidden=True)
+        ]
+    except (OSError, RuntimeError, ValueError):
+        return [], "command glob operand cannot be resolved safely"
+    # An unmatched glob is passed literally by the shell. Its non-dynamic
+    # anchor remains the only possible filesystem boundary to validate.
+    return matches or [anchor], ""
 
 
 def is_workspace_scoped_read_only_shell_command(
@@ -1126,33 +1251,31 @@ def is_workspace_scoped_read_only_shell_command(
     working_directory: str,
     workspace_root: str,
 ) -> tuple[bool, str]:
-    """Prove one shell inspection is read-only and workspace-confined.
+    """Prove a shell inspection is read-only and workspace-confined.
 
     This is deliberately narrower than :func:`is_read_only_shell_command`.
-    Company mode may bypass a human checkpoint only for a single built-in,
-    audited inspection whose cwd and every possible path operand stay under
-    the durable workspace root. Dynamic expansion, wrappers, configured
+    Company mode may bypass a human checkpoint only when every segment is a
+    built-in audited inspection whose cwd and every possible path operand stay
+    under the durable workspace root. Dynamic expansion, wrappers, configured
     prefixes, and Git directory overrides fail closed.
     """
 
     safe, reason = is_read_only_shell_command(command)
     if not safe:
         return False, reason
-    segments = split_shell_segments(command)
-    if not segments or len(segments) != 1:
-        return False, "company read-only execution requires one standalone command"
-    tokens = list(segments[0])
-    if not tokens or tokens[0] not in _COMPANY_WORKSPACE_INSPECTION_HEADS:
-        return False, "command is not a company workspace inspection command"
+    segments = split_shell_segments(strip_safe_redirections(command))
+    if not segments:
+        return False, "company read-only execution has no executable command"
 
     # The POSIX shell expands these tokens after policy evaluation. Quoted
     # literals intentionally stay conservative: exact approval remains
     # available for unusual filenames without weakening the automatic path
     # boundary.
-    expansion_markers = ("$", "`", "*", "?", "{", "}", "[", "]")
+    expansion_markers = ("$", "`", "{", "}")
     if any(
         any(marker in token for marker in expansion_markers)
-        for token in tokens
+        for segment in segments
+        for token in segment
     ):
         return False, "dynamic shell expansion is not workspace-confined"
 
@@ -1172,54 +1295,61 @@ def is_workspace_scoped_read_only_shell_command(
     ):
         return False, "working directory is outside the company workspace"
 
-    if tokens[0] == "git":
-        parsed = _git_parse_global_options(tokens)
-        if parsed is None:
-            return False, "Git invocation is not proven read-only"
-        subcommand, _ = parsed
-        if subcommand in {"config", "worktree"}:
-            return False, (
-                "Git command can inspect state outside the company workspace"
-            )
-        for token in tokens[1:]:
-            if token == subcommand:
-                break
-            if token.split("=", 1)[0] in _GIT_GLOBAL_VALUE_OPTIONS:
-                return False, "Git directory overrides are not workspace-confined"
+    for segment in segments:
+        tokens = list(segment)
+        if not tokens or tokens[0] not in _COMPANY_WORKSPACE_INSPECTION_HEADS:
+            return False, "command is not a company workspace inspection command"
 
-    after_separator = False
-    for token in tokens[1:]:
-        if token == "--" and not after_separator:
-            after_separator = True
-            continue
-        candidate = token
-        if not after_separator and token.startswith("-") and token != "-":
-            if "=" in token:
-                candidate = token.split("=", 1)[1]
-            else:
-                # Attached file options such as ``grep -f../rules`` cannot be
-                # separated safely without a command-specific argv parser.
-                if "/" in token or "~" in token or ".." in token:
-                    return False, (
-                        "attached option path is not workspace-auditable"
-                    )
+        if tokens[0] == "git":
+            parsed = _git_parse_global_options(tokens)
+            if parsed is None:
+                return False, "Git invocation is not proven read-only"
+            subcommand, _ = parsed
+            if subcommand in {"config", "worktree"}:
+                return False, (
+                    "Git command can inspect state outside the company workspace"
+                )
+            for token in tokens[1:]:
+                if token == subcommand:
+                    break
+                if token.split("=", 1)[0] in _GIT_GLOBAL_VALUE_OPTIONS:
+                    return False, "Git directory overrides are not workspace-confined"
+
+        after_separator = False
+        for token in tokens[1:]:
+            if token == "--" and not after_separator:
+                after_separator = True
                 continue
-        if candidate in {"", "-"}:
-            continue
-        if candidate.startswith("@") and len(candidate) > 1:
-            candidate = candidate[1:]
-        try:
-            raw_path = Path(candidate).expanduser()
-            resolved = (
-                raw_path if raw_path.is_absolute() else cwd / raw_path
-            ).resolve(strict=False)
-        except (OSError, RuntimeError, ValueError):
-            return False, "command path operand cannot be resolved safely"
-        if resolved != root and root not in resolved.parents:
-            return False, (
-                f"path operand is outside the company workspace: {candidate}"
+            candidate = token
+            if not after_separator and token.startswith("-") and token != "-":
+                if "=" in token:
+                    candidate = token.split("=", 1)[1]
+                else:
+                    # Attached file options such as ``grep -f../rules`` cannot be
+                    # separated safely without a command-specific argv parser.
+                    if "/" in token or "~" in token or ".." in token:
+                        return False, (
+                            "attached option path is not workspace-auditable"
+                        )
+                    continue
+            if candidate in {"", "-"}:
+                continue
+            if candidate.startswith("@") and len(candidate) > 1:
+                candidate = candidate[1:]
+            resolved_paths, path_error = _workspace_path_operands(
+                candidate,
+                cwd=cwd,
             )
+            if path_error:
+                return False, path_error
+            if any(
+                resolved != root and root not in resolved.parents
+                for resolved in resolved_paths
+            ):
+                return False, (
+                    f"path operand is outside the company workspace: {candidate}"
+                )
 
     return True, (
-        "flag-audited read-only command is confined to the company workspace"
+        "all flag-audited read-only segments are confined to the company workspace"
     )

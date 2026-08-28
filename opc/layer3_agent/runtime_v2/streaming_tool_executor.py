@@ -164,6 +164,12 @@ class StreamingToolExecutor:
         arguments = dict(call.get("arguments", {}) or {})
         tool = self.registry.get(tool_name)
         predicted = self.permission_resolver.predicted_decision(tool, arguments, task=task)
+        sandbox = self.permission_resolver.sandbox_for_task(task)
+        if task is not None and sandbox:
+            task.metadata = dict(getattr(task, "metadata", {}) or {})
+            execution_context = dict(task.metadata.get("_execution_context", {}) or {})
+            execution_context["sandbox"] = sandbox
+            task.metadata["_execution_context"] = execution_context
         started_at_ms = _now_ms()
         started_at_monotonic = time.monotonic()
         if self.emit_event:
@@ -391,78 +397,9 @@ class StreamingToolExecutor:
         batch_id: str,
         call: dict[str, Any],
     ) -> dict[str, Any]:
-        guardian = getattr(self.permission_resolver, "guardian", None)
-        if not guardian or not bool(getattr(guardian, "auto_retry_sandbox", False)):
-            return result
-        payload = result.get("result", {})
-        if not isinstance(payload, dict):
-            return result
-        exit_code = payload.get("exit_code")
-        if bool(result.get("success", True)) and exit_code in (None, 0):
-            return result
-        if tool_name not in {"shell_exec", "python_exec"}:
-            return result
-        sandbox_meta = dict(payload.get("sandbox", {}) or {})
-        error_text = str(result.get("error", "") or payload.get("error", "") or "").lower()
-        if not sandbox_meta and "sandbox" not in error_text:
-            return result
-        if task is None:
-            return result
-        execution_context = dict((getattr(task, "metadata", {}) or {}).get("_execution_context", {}) or {})
-        sandbox_context = dict(execution_context.get("sandbox", {}) or {})
-        current_mode = str(sandbox_context.get("mode", "") or "").strip().lower() or "off"
-        next_mode = self._next_sandbox_mode(current_mode)
-        if not next_mode:
-            return result
-        original_context = dict(execution_context)
-        original_sandbox = dict(sandbox_context)
-        retry_started_at_ms = _now_ms()
-        if self.emit_event:
-            await self.emit_event(
-                "sandbox_retry_requested",
-                {
-                    "batch_id": batch_id,
-                    "tool_call_id": call.get("id", ""),
-                    "tool_name": tool_name,
-                    "from_mode": current_mode,
-                    "to_mode": next_mode,
-                    "started_at_ms": retry_started_at_ms,
-                },
-            )
-        company_exact_call = is_company_runtime_task(task)
-        if not company_exact_call:
-            sandbox_context["mode"] = next_mode
-            execution_context["sandbox"] = sandbox_context
-            task.metadata = dict(getattr(task, "metadata", {}) or {})
-            task.metadata["_execution_context"] = execution_context
-        try:
-            retry_result = await self._invoke_tool_effect(
-                tool_name=tool_name,
-                arguments=arguments,
-                task=task,
-                on_progress=on_progress,
-                call=call,
-            )
-        finally:
-            if not company_exact_call:
-                original_context["sandbox"] = original_sandbox
-                task.metadata["_execution_context"] = original_context
-        if self.emit_event:
-            await self.emit_event(
-                "sandbox_retry_completed",
-                {
-                    "batch_id": batch_id,
-                    "tool_call_id": call.get("id", ""),
-                    "tool_name": tool_name,
-                    "from_mode": current_mode,
-                    "to_mode": next_mode,
-                    "started_at_ms": retry_started_at_ms,
-                    "completed_at_ms": _now_ms(),
-                    "success": bool(retry_result.get("success", True)),
-                    "result_summary": _result_summary(retry_result),
-                },
-            )
-        return retry_result
+        # Never widen workspace-write/read-only to elevated/off after a
+        # failure. More capability is a new, explicitly approved call.
+        return result
 
     async def _invoke_tool_effect(
         self,
@@ -492,26 +429,29 @@ class StreamingToolExecutor:
                 skip_approval=True,
             )
 
-        return await self.controller_tool_fence.run(
-            task=task,
-            tool_name=tool_name,
-            tool_category=str(getattr(tool, "category", "") or ""),
-            tool_effect_kind=str(
-                getattr(tool, "company_effect_kind", "") or ""
-            ),
-            arguments=arguments,
-            tool_call=dict(call or {}),
-            effect=_effect,
-        )
-
-    @staticmethod
-    def _next_sandbox_mode(current_mode: str) -> str:
-        normalized = str(current_mode or "").strip().lower()
-        if normalized == "workspace-write":
-            return "elevated"
-        if normalized == "elevated":
-            return "off"
-        return ""
+        original_context: dict[str, Any] | None = None
+        sandbox_override = dict((call or {}).get("_sandbox_override", {}) or {})
+        if task is not None and sandbox_override:
+            task.metadata = dict(getattr(task, "metadata", {}) or {})
+            original_context = dict(task.metadata.get("_execution_context", {}) or {})
+            elevated_context = dict(original_context)
+            elevated_context["sandbox"] = sandbox_override
+            task.metadata["_execution_context"] = elevated_context
+        try:
+            return await self.controller_tool_fence.run(
+                task=task,
+                tool_name=tool_name,
+                tool_category=str(getattr(tool, "category", "") or ""),
+                tool_effect_kind=str(
+                    getattr(tool, "company_effect_kind", "") or ""
+                ),
+                arguments=arguments,
+                tool_call=dict(call or {}),
+                effect=_effect,
+            )
+        finally:
+            if task is not None and original_context is not None:
+                task.metadata["_execution_context"] = original_context
 
     async def _build_converged_result(
         self,

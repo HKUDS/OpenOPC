@@ -124,6 +124,37 @@ class EngineSessionDefaultsTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(contract["comms_workspace_root"], str(approved_root))
         self.assertEqual(contract["output_root"], str(deliverable_root))
 
+    async def test_native_permission_is_frozen_in_session_execution_defaults(self) -> None:
+        engine = OPCEngine()
+        session = SessionRecord(
+            session_id="permission-session",
+            project_id="proj1",
+            metadata={},
+        )
+        engine.store = _StubStore({session.session_id: session})
+        decision = RouterDecision(
+            mode=ExecutionMode.TASK_MODE,
+            preferred_agent="native",
+            metadata={
+                "native_approval_level": "full-access",
+                "native_permission_scope_id": "permission-scope",
+            },
+        )
+
+        await engine._remember_session_execution_defaults(
+            session.session_id,
+            decision,
+            target_output_dir=None,
+        )
+
+        defaults = await engine._load_session_execution_defaults(session.session_id)
+        self.assertEqual(defaults["native_approval_level"], "full-access")
+        self.assertEqual(defaults["native_permission_scope_id"], "permission-scope")
+        persisted = await engine.store.get_session(session.session_id)
+        assert persisted is not None
+        self.assertEqual(persisted.metadata["native_approval_level"], "full-access")
+        self.assertEqual(persisted.metadata["native_permission_scope_id"], "permission-scope")
+
     async def test_company_mode_defaults_resume_for_followup_requests(self) -> None:
         engine = OPCEngine()
         decision = RouterDecision(

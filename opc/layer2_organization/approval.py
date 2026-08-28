@@ -16,6 +16,10 @@ from loguru import logger
 from opc.core.approval_decision import normalize_escalation_reply
 from opc.core.company_tools import COMPANY_APPROVAL_EXEMPT_TOOL_NAMES
 from opc.core.config import AutonomyConfig, get_opc_home
+from opc.core.native_permissions import (
+    NativePermissionPolicyResolver,
+    permission_effects_for_tool,
+)
 from opc.core.models import (
     ApprovalAction,
     ApprovalDecision,
@@ -65,6 +69,14 @@ _PREDICT_PATH_KEYS = (
     "workspace_path",
 )
 _PREDICT_COMMAND_KEYS = ("command", "cmd")
+_PYTHON_NETWORK_PATTERN = re.compile(
+    r"(?:"
+    r"\b(?:requests|httpx|aiohttp|urllib\.request|socket|ftplib|smtplib)\s*\."
+    r"|\b(?:urlopen|create_connection)\s*\("
+    r"|https?://"
+    r")",
+    flags=re.IGNORECASE,
+)
 _EXTERNAL_AGENT_DIRECT_HUMAN_MARKERS = (
     "--dangerously-bypass-approvals-and-sandbox",
     "--dangerously-skip-permissions",
@@ -140,6 +152,7 @@ class ApprovalEngine:
         self.preferences = preferences
         self.memory = memory
         self.config = config
+        self.native_policy = NativePermissionPolicyResolver(config)
         self.secretary_policies = secretary_policies
         self.interaction_coordinator = interaction_coordinator
         opc_home = getattr(preferences, "opc_home", None)
@@ -159,6 +172,7 @@ class ApprovalEngine:
         metadata: dict[str, Any] | None = None,
         on_progress: Callable[[str], Coroutine[Any, Any, None]] | None = None,
         call_context: dict[str, Any] | None = None,
+        tool: Any = None,
     ) -> tuple[bool, ApprovalDecision]:
         action_name = tool_name
         payload = {
@@ -179,6 +193,7 @@ class ApprovalEngine:
             metadata=payload,
             on_progress=on_progress,
             allow_auto=self.config.allow_native_tool_auto_approval,
+            native_tool=tool,
         )
 
     async def authorize_tool_permission_decision(
@@ -400,6 +415,10 @@ class ApprovalEngine:
         task: Task | None = None,
     ) -> RuntimePermissionDecision:
         p2 = self.config.permissions_v2
+        if not hasattr(self, "native_policy"):
+            # A small number of embedders construct this engine without
+            # calling __init__.  Keep the policy single-sourced even there.
+            self.native_policy = NativePermissionPolicyResolver(self.config)
         if tool is None:
             return self._predict_decision(
                 PermissionResolution.ASK if p2.fail_closed else PermissionResolution.DENY,
@@ -417,77 +436,131 @@ class ApprovalEngine:
                 PermissionResolution.DENY, RiskLevel.HIGH,
                 "Tool is explicitly denied by permission rules.", source="permission_rules",
             )
-        shell_structure_reason = self._shell_structure_review_reason(
-            action_kind="tool",
-            action_name=tool_name,
-            metadata={"arguments": args},
-        )
-        if shell_structure_reason:
-            return self._predict_decision(
-                PermissionResolution.ASK,
-                RiskLevel.MEDIUM,
-                shell_structure_reason,
-                source="shell_structure_guard",
-            )
-        git_option_reason = self._shell_git_option_review_reason(
-            action_kind="tool",
-            action_name=tool_name,
-            metadata={"arguments": args},
-        )
-        if git_option_reason:
-            return self._predict_decision(
-                PermissionResolution.ASK,
-                RiskLevel.MEDIUM,
-                git_option_reason,
-                source="shell_git_option_guard",
-            )
-        shell_pattern_review = self._configured_shell_pattern_review(
-            action_kind="tool",
-            action_name=tool_name,
-            metadata={"arguments": args},
-        )
-        if shell_pattern_review:
-            risk_level, rationale = shell_pattern_review
-            return self._predict_decision(
-                PermissionResolution.ASK,
-                risk_level,
-                rationale,
-                source="shell_pattern",
-            )
-        exact_reason = self._company_opaque_exact_approval_reason(
-            task=task,
-            action_kind="tool",
-            action_name=tool_name,
-            metadata={"arguments": args},
-        )
-        if exact_reason:
-            return self._predict_decision(
-                PermissionResolution.ASK,
-                RiskLevel.MEDIUM,
-                exact_reason,
-                source="company_exact_tool_permission",
-            )
-        if not self.config.enabled or not p2.enabled:
-            return self._predict_decision(
-                PermissionResolution.ALLOW, RiskLevel.LOW,
-                "Autonomy policy is disabled.", source="config",
-            )
         if tool_name in COMPANY_APPROVAL_EXEMPT_TOOL_NAMES:
             return self._predict_decision(
                 PermissionResolution.ALLOW, RiskLevel.LOW,
                 "Built-in company collaboration tool is always auto-approved.",
                 source="company_tool_policy",
             )
-        if self._memory_path_decision("tool", tool_name, {"arguments": args}):
+        memory_path_access = self._memory_path_decision(
+            "tool", tool_name, {"arguments": args}
+        )
+        if memory_path_access:
+            level = self.native_policy.context_for_task(task).level
+            effects = permission_effects_for_tool(tool)
+            # Canonical memory is an OpenOPC-managed path, so auto mode may
+            # access it without treating it as an arbitrary outside-workspace
+            # path. Read-only still asks before any mutation, and an
+            # undeclared look-alike tool never inherits this exception.
+            if "unknown" not in effects and not (
+                level == "read-only" and "workspace_write" in effects
+            ):
+                return self._predict_decision(
+                    PermissionResolution.ALLOW, RiskLevel.LOW,
+                    "Direct agent access to canonical OpenOPC memory files.",
+                    source="memory_path_policy",
+                    metadata=self.native_policy.approved_call_metadata(
+                        tool,
+                        task=task,
+                    ),
+                )
+        candidate = next(
+            (str(args.get(key, "") or "").strip() for key in _PREDICT_PATH_KEYS if str(args.get(key, "") or "").strip()),
+            "",
+        )
+        if candidate and self._matches_path_rule(candidate, p2.denied_paths):
             return self._predict_decision(
-                PermissionResolution.ALLOW, RiskLevel.LOW,
-                "Direct agent access to canonical OpenOPC memory files.",
-                source="memory_path_policy",
+                PermissionResolution.DENY, RiskLevel.HIGH,
+                "Target path matches a denied permission rule.", source="permission_rules",
             )
+        command = next(
+            (str(args.get(key, "") or "").strip() for key in _PREDICT_COMMAND_KEYS if str(args.get(key, "") or "").strip()),
+            "",
+        )
+        safe_read_only_process = tool_name in {"git_status", "git_diff"}
+        if command:
+            safe_prefixes = [
+                item for item in self.config.safe_command_prefixes
+                if str(item or "").strip() not in _LOW_RISK_SHELL_PREFIXES
+            ]
+            safe_read_only_process, _ = shell_safety.is_read_only_shell_command(command, safe_prefixes)
+        python_code = str(args.get("code", "") or "") if tool_name == "python_exec" else ""
+        network_hint = bool(
+            (command and re.search(
+                r"(?:^|[;&|]\s*)(?:curl|wget|yt-dlp|aria2c|git\s+(?:clone|fetch|pull|push)|pip\s+install|npm\s+(?:install|publish)|pnpm\s+(?:install|publish)|yarn\s+(?:add|install|publish))\b|https?://",
+                command,
+                flags=re.IGNORECASE,
+            ))
+            or (python_code and _PYTHON_NETWORK_PATTERN.search(python_code))
+        )
+        workspace_roots = self._predict_workspace_roots(task)
+        candidate_path: Path | None = None
+        if candidate:
+            try:
+                raw_path = Path(candidate)
+                candidate_path = (
+                    raw_path.resolve()
+                    if raw_path.is_absolute()
+                    else (workspace_roots[0] / raw_path).resolve()
+                )
+            except Exception:
+                candidate_path = None
+        path_outside_roots = bool(
+            candidate_path is not None
+            and not any(
+                candidate_path == root or root in candidate_path.parents
+                for root in workspace_roots
+            )
+        )
+        outside_workspace = bool(
+            path_outside_roots
+            and not self._matches_path_rule(candidate, p2.allowed_paths)
+        )
+        outside_workspace_path = (
+            str(candidate_path or "") if path_outside_roots else ""
+        )
+        if command and workspace_roots:
+            working_directory = str(
+                args.get("working_directory", "") or workspace_roots[0]
+            ).strip()
+            literal_outside_path = shell_safety.literal_shell_path_outside_workspace(
+                command,
+                working_directory=working_directory,
+                workspace_root=str(workspace_roots[0]),
+            )
+            if literal_outside_path and not self._matches_path_rule(
+                literal_outside_path,
+                p2.allowed_paths,
+            ):
+                outside_workspace = True
+                outside_workspace_path = literal_outside_path
+        if command and safe_read_only_process and workspace_roots:
+            working_directory = str(
+                args.get("working_directory", "") or workspace_roots[0]
+            ).strip()
+            workspace_safe, workspace_reason = (
+                shell_safety.is_workspace_scoped_read_only_shell_command(
+                    command,
+                    working_directory=working_directory,
+                    workspace_root=str(workspace_roots[0]),
+                )
+            )
+            if not workspace_safe and (
+                "outside" in workspace_reason.lower()
+                or "workspace-confined" in workspace_reason.lower()
+            ):
+                outside_workspace = True
+        grant_metadata = self.native_policy.approved_call_metadata(
+            tool,
+            task=task,
+            outside_workspace_path=outside_workspace_path,
+            network_hint=network_hint,
+        )
         if tool_name in {str(item or "").strip() for item in p2.allow_tools if str(item or "").strip()}:
             return self._predict_decision(
                 PermissionResolution.ALLOW, RiskLevel.LOW,
                 "Tool is explicitly allowed by permission rules.", source="permission_rules",
+                metadata=grant_metadata,
             )
 
         # Persisted human grants win before path/shell heuristics, matching
@@ -502,6 +575,7 @@ class ApprovalEngine:
                 PermissionResolution.ALLOW, RiskLevel.LOW,
                 f"Allowed by session approval ({session_hit['scope']}).",
                 source="session_approval", scope=PermissionScope.SESSION,
+                metadata=grant_metadata,
             )
         persisted_hit = self._lookup_allowlist_policy(
             action_kind="tool", action_name=tool_name, metadata=metadata,
@@ -513,31 +587,35 @@ class ApprovalEngine:
                 PermissionResolution.ALLOW, RiskLevel.LOW,
                 "Allowed by persisted allowlist grant.",
                 source="approval_allowlist", scope=scope,
+                metadata=grant_metadata,
             )
 
-        path_decision = self._predict_path_decision(tool, args, task)
-        if path_decision is not None:
-            return path_decision
-
-        if tool_name in _SHELL_LIKE_TOOL_NAMES:
-            shell_decision = self._predict_shell_decision(tool_name, args, task)
-            if shell_decision is not None:
-                return shell_decision
-
-        if bool(getattr(tool, "requires_confirmation", False)):
-            return self._predict_decision(
-                PermissionResolution.ASK, RiskLevel.MEDIUM,
-                "Tool is marked as requiring confirmation.", source="runtime_prediction",
+        level = self.native_policy.context_for_task(task).level
+        if level != "full-access":
+            git_option_reason = self._shell_git_option_review_reason(
+                action_kind="tool", action_name=tool_name, metadata=metadata,
             )
-        guardian = p2.guardian
-        if guardian.enabled and guardian.auto_allow_read_only and bool(getattr(tool, "read_only", False)):
-            return self._predict_decision(
-                PermissionResolution.ALLOW, RiskLevel.LOW,
-                "Deterministic read-only tool.", source="guardian",
+            if git_option_reason:
+                return self._predict_decision(
+                    PermissionResolution.ASK, RiskLevel.MEDIUM,
+                    git_option_reason, source="shell_git_option_guard",
+                )
+            shell_pattern_review = self._configured_shell_pattern_review(
+                action_kind="tool", action_name=tool_name, metadata=metadata,
             )
-        return self._predict_decision(
-            PermissionResolution.ALLOW, RiskLevel.LOW,
-            "No permission warning triggered.", source="runtime_prediction",
+            if shell_pattern_review:
+                risk_level, rationale = shell_pattern_review
+                return self._predict_decision(
+                    PermissionResolution.ASK, risk_level, rationale, source="shell_pattern",
+                )
+
+        return self.native_policy.evaluate(
+            tool,
+            task=task,
+            outside_workspace=outside_workspace,
+            safe_read_only_process=safe_read_only_process,
+            network_hint=network_hint,
+            outside_workspace_path=outside_workspace_path if outside_workspace else "",
         )
 
     def record_denial(
@@ -813,11 +891,64 @@ class ApprovalEngine:
         metadata: dict[str, Any],
         on_progress: Callable[[str], Coroutine[Any, Any, None]] | None = None,
         allow_auto: bool = True,
+        native_tool: Any = None,
     ) -> tuple[bool, ApprovalDecision]:
-        # Structural shell syntax is a hard human-review boundary.  Keep this
-        # ahead of memory, secretary rules, reusable grants, learned policy,
-        # and LLM review so none of those broad mechanisms can authorize a
-        # second command merely because the first command has a safe prefix.
+        # Native tools have one canonical three-level policy.  External
+        # harness permission callbacks do not pass ``native_tool`` and retain
+        # their independent approval behavior below.
+        if action_kind == "tool" and native_tool is not None:
+            predicted = self.predict(
+                native_tool,
+                dict(metadata.get("arguments", {}) or {}),
+                task=task,
+            )
+            action = (
+                ApprovalAction.AUTO_APPROVE
+                if predicted.resolution == PermissionResolution.ALLOW
+                else ApprovalAction.REJECT
+                if predicted.resolution == PermissionResolution.DENY
+                else ApprovalAction.ESCALATE
+            )
+            decision = ApprovalDecision(
+                action=action,
+                risk_level=predicted.risk_level,
+                rationale=predicted.rationale,
+                confidence=1.0,
+                policy_source=predicted.source,
+                metadata={**metadata, **dict(predicted.metadata or {})},
+            )
+            if action == ApprovalAction.ESCALATE:
+                if action_name in {"shell_exec", "python_exec"} and is_company_runtime_task(task):
+                    try:
+                        build_company_opaque_execution_plan(
+                            task,
+                            action_name,
+                            dict(metadata.get("arguments", {}) or {}),
+                        )
+                    except (OpaqueExecutionEnvelopeError, TypeError, ValueError) as exc:
+                        decision.action = ApprovalAction.REJECT
+                        decision.risk_level = RiskLevel.HIGH
+                        decision.rationale = f"Exact company launch envelope is invalid: {exc}"
+                        decision.policy_source = "company_exact_envelope_invalid"
+                if decision.action == ApprovalAction.ESCALATE and self.interaction_coordinator and task:
+                    approved, decision = await self._ask_user(
+                        task, action_kind, action_name, decision, metadata,
+                    )
+                    await self._record(task, action_kind, action_name, target_agent, decision)
+                    return approved, decision
+            approved = decision.action == ApprovalAction.AUTO_APPROVE
+            await self._record(task, action_kind, action_name, target_agent, decision)
+            if on_progress:
+                await on_progress(
+                    f"[Native permissions] {action_name} -> {decision.action.value} "
+                    f"(level={predicted.metadata.get('native_approval_level', 'auto')})"
+                )
+            return approved, decision
+
+        # Unsafe structural shell syntax is a hard human-review boundary. Keep
+        # this ahead of broad policy mechanisms; the helper exempts a compound
+        # command only after every segment independently passes the read-only
+        # audit.
         shell_structure_reason = self._shell_structure_review_reason(
             action_kind=action_kind,
             action_name=action_name,
@@ -1435,8 +1566,8 @@ class ApprovalEngine:
         exemptions = {item.strip() for item in self.config.tool_approval_exemptions if item.strip()}
         return action_name not in exemptions
 
-    @staticmethod
     def _shell_structure_review_reason(
+        self,
         *,
         action_kind: str,
         action_name: str,
@@ -1453,7 +1584,17 @@ class ApprovalEngine:
         if not command:
             return ""
         requires_review, reason = shell_safety.shell_structure_requires_review(command)
-        return reason if requires_review else ""
+        if not requires_review:
+            return ""
+        safe_prefixes = [
+            item for item in self.config.safe_command_prefixes
+            if str(item or "").strip() not in _LOW_RISK_SHELL_PREFIXES
+        ]
+        read_only, _ = shell_safety.is_read_only_shell_command(
+            command,
+            safe_prefixes,
+        )
+        return "" if read_only else reason
 
     @staticmethod
     def _shell_git_option_review_reason(
@@ -2454,27 +2595,6 @@ class ApprovalEngine:
         if not self.interaction_coordinator:
             return False, decision
         allowlist_enabled = self._allowlist_enabled_for_action(action_kind, metadata)
-        if self._shell_structure_review_reason(
-            action_kind=action_kind,
-            action_name=action_name,
-            metadata=metadata,
-        ) or self._shell_git_option_review_reason(
-            action_kind=action_kind,
-            action_name=action_name,
-            metadata=metadata,
-        ) or self._configured_shell_pattern_review(
-            action_kind=action_kind,
-            action_name=action_name,
-            metadata=metadata,
-        ) or self._company_opaque_exact_approval_reason(
-            task=task,
-            action_kind=action_kind,
-            action_name=action_name,
-            metadata=metadata,
-        ):
-            # Hard shell boundaries are approved only as this exact durable
-            # ToolCall. Do not offer reusable grants that cannot bypass them.
-            allowlist_enabled = False
         allowlist_patterns = (
             self._build_allowlist_patterns(
                 action_kind=action_kind,
@@ -2493,16 +2613,19 @@ class ApprovalEngine:
         )
         if allowlist_hint:
             question += f"\nAllowlist target: {allowlist_hint}"
-        options = [
-            {"id": "approve_once", "label": "Approve once"},
-            {"id": "deny", "label": "Deny"},
-        ]
         if allowlist_enabled:
-            options[1:1] = [{"id": "approve_session", "label": "Allow for this session"}]
-            options.extend([
+            options = [
+                {"id": "approve_once", "label": "Approve once"},
+                {"id": "approve_session", "label": "Allow for this session"},
                 {"id": "always_project", "label": "Always allow for this project"},
                 {"id": "always_global", "label": "Always allow globally"},
-            ])
+                {"id": "deny", "label": "Deny"},
+            ]
+        else:
+            options = [
+                {"id": "approve_once", "label": "Approve once"},
+                {"id": "deny", "label": "Deny"},
+            ]
         approval_context = {
             "action_kind": action_kind,
             "action_name": action_name,
@@ -2621,7 +2744,7 @@ class ApprovalEngine:
         approved = bool(scope_result.get("approved"))
         saved_patterns = list(scope_result.get("patterns", []) or [])
         allowlist_scope = str(scope_result.get("scope", "") or "") or None
-        result_metadata = {**metadata, "human_reply": reply}
+        result_metadata = {**dict(decision.metadata or {}), **metadata, "human_reply": reply}
         if saved_patterns:
             result_metadata["allowlist_patterns"] = saved_patterns
         if allowlist_scope:

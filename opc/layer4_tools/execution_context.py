@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from opc.core.config import OPCConfig
+from opc.core.native_permissions import native_sandbox_profile, normalize_native_approval_level
 
 
 def platform_key() -> str:
@@ -36,6 +37,7 @@ def build_task_execution_context(
     python_executable: str | Path | None = None,
     venv_provider: str = "",
     preparation_error: str = "",
+    native_approval_level: str | None = None,
 ) -> dict[str, Any]:
     workspace = Path(workspace_root or os.getcwd()).resolve()
     output = Path(output_root).resolve() if output_root else workspace
@@ -50,7 +52,7 @@ def build_task_execution_context(
         "python_executable": str(resolved_python) if resolved_python else "",
         "venv_provider": str(venv_provider or "").strip(),
         "preparation_error": str(preparation_error or "").strip(),
-        "sandbox": resolve_sandbox_config(config),
+        "sandbox": resolve_sandbox_config(config, native_approval_level=native_approval_level),
     }
 
 
@@ -58,6 +60,13 @@ def ensure_task_execution_context(task: Any, config: OPCConfig | None = None) ->
     metadata = getattr(task, "metadata", {}) or {}
     existing = dict(metadata.get("_execution_context", {}) or {})
     if existing:
+        level = metadata.get("native_approval_level")
+        if level not in (None, ""):
+            existing["sandbox"] = resolve_sandbox_config(
+                config, native_approval_level=str(level),
+            )
+            metadata["_execution_context"] = existing
+            setattr(task, "metadata", metadata)
         return existing
     workspace_root = (
         str(metadata.get("workspace_root", "") or "").strip()
@@ -79,6 +88,7 @@ def ensure_task_execution_context(task: Any, config: OPCConfig | None = None) ->
         output_root=output_root,
         comms_root=comms_root,
         config=config,
+        native_approval_level=str(metadata.get("native_approval_level", "") or "") or None,
     )
     metadata["_execution_context"] = context
     setattr(task, "metadata", metadata)
@@ -126,8 +136,18 @@ def resolve_task_execution_context(task: Any = None) -> dict[str, Any]:
     return context
 
 
-def resolve_sandbox_config(config: OPCConfig | None = None) -> dict[str, Any]:
+def resolve_sandbox_config(
+    config: OPCConfig | None = None,
+    *,
+    native_approval_level: str | None = None,
+) -> dict[str, Any]:
     platform = platform_key()
+    if native_approval_level not in (None, ""):
+        profile = native_sandbox_profile(
+            normalize_native_approval_level(native_approval_level)
+        )
+        profile["platform"] = platform
+        return profile
     if config is None:
         return {
             "platform": platform,
@@ -256,9 +276,19 @@ def _wrap_with_bwrap(
         "--ro-bind",
         "/",
         "/",
-        "--bind",
-        workspace,
-        workspace,
+    ]
+    sandbox = dict(context.get("sandbox", {}) or {})
+    if str(sandbox.get("mode", "") or "").strip().lower() != "read-only":
+        wrapped.extend(["--bind", workspace, workspace])
+    for raw_path in list(sandbox.get("additional_write_paths", []) or []):
+        try:
+            write_path = str(Path(raw_path).expanduser().resolve(strict=True))
+        except (OSError, RuntimeError):
+            continue
+        if write_path == workspace or write_path.startswith(f"{workspace}{os.sep}"):
+            continue
+        wrapped.extend(["--bind", write_path, write_path])
+    wrapped.extend([
         "--proc",
         "/proc",
         "--dev",
@@ -267,8 +297,7 @@ def _wrap_with_bwrap(
         "/tmp",
         "--chdir",
         cwd,
-    ]
-    sandbox = dict(context.get("sandbox", {}) or {})
+    ])
     if not bool(sandbox.get("allow_network", True)):
         wrapped.append("--unshare-net")
     wrapped.extend(args)
@@ -295,8 +324,20 @@ def _wrap_with_sandbox_exec(
         "(allow process-fork)",
         "(allow signal (target self))",
         "(allow file-read*)",
-        f"(allow file-write* (subpath \"{escaped_workspace}\") (subpath \"/tmp\") (subpath \"/private/tmp\"))",
     ]
+    if str(sandbox.get("mode", "") or "").strip().lower() == "read-only":
+        profile_lines.append('(allow file-write* (subpath "/tmp") (subpath "/private/tmp"))')
+    else:
+        profile_lines.append(
+            f'(allow file-write* (subpath "{escaped_workspace}") (subpath "/tmp") (subpath "/private/tmp"))'
+        )
+    for raw_path in list(sandbox.get("additional_write_paths", []) or []):
+        try:
+            write_path = str(Path(raw_path).expanduser().resolve(strict=True))
+        except (OSError, RuntimeError):
+            continue
+        escaped_path = write_path.replace("\\", "\\\\").replace('"', '\\"')
+        profile_lines.append(f'(allow file-write* (subpath "{escaped_path}"))')
     if allow_network:
         profile_lines.append("(allow network*)")
     meta["available"] = True

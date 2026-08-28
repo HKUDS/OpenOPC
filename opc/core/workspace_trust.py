@@ -399,3 +399,69 @@ class WorkspaceTrustStore:
             and str(canonical_workspace(entry)) == key
             for entry in entries
         )
+
+
+def save_explicit_workspace_authority_change(
+    config: Any,
+    config_dir: str | Path,
+) -> Path | None:
+    """Persist an explicit UI/CLI authority change without invalidating trust.
+
+    A project cannot call this before it is trusted: the current source
+    fingerprint is verified first.  The user-facing permission controls call
+    it only after an explicit action.  If either serialization or the
+    user-owned trust-store update fails, authority source files are restored
+    so the next startup never sees a half-applied change.
+    """
+
+    root = Path(config_dir).expanduser().resolve(strict=False)
+    workspace = project_workspace_for_config(
+        root,
+        active_project_root=Path.cwd(),
+    )
+    if workspace is None:
+        config.save(root)
+        return None
+
+    store = WorkspaceTrustStore()
+    store.require(workspace, root)
+    snapshots: dict[Path, bytes | None] = {}
+    for relative_name in _AUTHORITY_SOURCE_FILES:
+        path = root / relative_name
+        try:
+            snapshots[path] = path.read_bytes()
+        except FileNotFoundError:
+            snapshots[path] = None
+
+    try:
+        config.save(root)
+        normalized = config.__class__.load(root, trusted_source=True)
+        store.trust(workspace, root, normalized)
+        bind = getattr(config, "bind_workspace_trust", None)
+        if callable(bind):
+            bind(workspace, root)
+        return workspace
+    except BaseException:
+        for path, payload in snapshots.items():
+            if payload is None:
+                path.unlink(missing_ok=True)
+                continue
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp_path: Path | None = None
+            try:
+                with tempfile.NamedTemporaryFile(
+                    "wb",
+                    dir=path.parent,
+                    prefix=f".{path.name}.",
+                    suffix=".restore",
+                    delete=False,
+                ) as handle:
+                    tmp_path = Path(handle.name)
+                    handle.write(payload)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.replace(tmp_path, path)
+            finally:
+                if tmp_path is not None:
+                    tmp_path.unlink(missing_ok=True)
+        raise

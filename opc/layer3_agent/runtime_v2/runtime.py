@@ -1569,6 +1569,32 @@ class NativeRuntimeV2:
         runtime_session_id: str = "",
     ) -> dict[str, Any] | None:
         predicted = context.predicted_permission
+        # These fields are runtime credentials, not part of the provider's
+        # ToolCall schema.  Always discard any incoming look-alike value
+        # before attaching policy state computed in this process.
+        context.call.pop("_native_permission_auto_sign", None)
+        context.call["_runtime_session_id"] = str(runtime_session_id or "")
+        if (
+            predicted is not None
+            and getattr(predicted, "resolution", None) == PermissionResolution.ALLOW
+        ):
+            predicted_metadata = dict(getattr(predicted, "metadata", {}) or {})
+            level = str(predicted_metadata.get("native_approval_level", "") or "")
+            # Company shell/Python effects retain the controller-owned exact
+            # effect fence even when the native permission policy allows the
+            # call without asking.  This marker is trusted runtime metadata,
+            # never model-supplied, and the store revalidates the complete
+            # frozen launch envelope before recording the effect.
+            context.call["_native_permission_auto_sign"] = {
+                "level": level,
+                "policy_source": str(getattr(predicted, "source", "") or ""),
+                "scope_id": str(
+                    predicted_metadata.get(
+                        "native_permission_scope_id", "",
+                    )
+                    or ""
+                ),
+            }
         if predicted is not None and getattr(predicted, "resolution", None) == PermissionResolution.DENY:
             return {
                 "result": permission_resolver.build_blocked_result(
@@ -1655,6 +1681,14 @@ class NativeRuntimeV2:
                 )
                 if canonical_permit:
                     context.call["_approval_permit"] = canonical_permit
+                sandbox_override = dict(
+                    dict(getattr(predicted, "metadata", {}) or {}).get(
+                        "sandbox_override", {},
+                    )
+                    or {}
+                )
+                if sandbox_override:
+                    context.call["_sandbox_override"] = sandbox_override
                 return {
                     "approval": {
                         "action": "auto_approve",
@@ -1673,7 +1707,7 @@ class NativeRuntimeV2:
         requires_prompt = (
             predicted is not None
             and getattr(predicted, "resolution", None) == PermissionResolution.ASK
-        ) or bool(getattr(context.tool, "requires_confirmation", False))
+        ) if predicted is not None else bool(getattr(context.tool, "requires_confirmation", False))
         if not requires_prompt:
             return None
         call_context = {
@@ -1711,6 +1745,9 @@ class NativeRuntimeV2:
             "rationale": str(getattr(decision, "rationale", "") or ""),
             **dict(getattr(decision, "metadata", {}) or {}),
         }
+        sandbox_override = approval_payload.get("sandbox_override")
+        if allowed and isinstance(sandbox_override, dict):
+            context.call["_sandbox_override"] = dict(sandbox_override)
         approval_checkpoint_id = str(
             approval_payload.get("approval_checkpoint_id", "") or ""
         ).strip()

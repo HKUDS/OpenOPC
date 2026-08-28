@@ -427,6 +427,59 @@ class TestWSHandlerCreateSession(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(ack_kwargs["company_profile"], "corporate")
         self.assertEqual(ack_kwargs["preferred_agent"], "codex")
 
+    async def test_create_session_persists_native_permission_scope(self) -> None:
+        ws = MagicMock()
+        await self.handler._handle_create_session(ws, {
+            "project_id": "test-project",
+            "title": "Read-only Session",
+            "native_approval_level": "read-only",
+        })
+
+        task = next(iter(self.store._tasks.values()))
+        scope_id = str(task.session_id)
+        self.assertEqual(task.metadata["native_approval_level"], "read-only")
+        self.assertEqual(task.metadata["native_permission_scope_id"], scope_id)
+        session = next(iter(self.memory.sessions.values()))
+        self.assertEqual(session["metadata"]["native_approval_level"], "read-only")
+        self.assertEqual(session["metadata"]["native_permission_scope_id"], scope_id)
+        event = next(b for b in self.broadcasts if b["type"] == "session_created")
+        self.assertEqual(event["payload"]["native_approval_level"], "read-only")
+        self.assertEqual(event["payload"]["native_permission_scope_id"], scope_id)
+
+    async def test_native_permission_default_updates_only_new_session_default(self) -> None:
+        from opc.core.config import OPCConfig
+
+        with tempfile.TemporaryDirectory() as tmp:
+            self.engine.config = OPCConfig()
+            self.engine.opc_home = Path(tmp)
+            self.engine.approval_engine = MagicMock()
+            ws = MagicMock()
+
+            await self.handler._handle_native_permission_default_set(ws, {
+                "native_approval_level": "full-access",
+            })
+
+            self.assertEqual(
+                self.engine.config.autonomy.native_approval_level,
+                "full-access",
+            )
+            self.assertTrue((Path(tmp) / "config" / "system_config.yaml").exists())
+            update = next(
+                b
+                for b in self.broadcasts
+                if b["type"] == "native_permission_default_updated"
+            )
+            self.assertEqual(
+                update["payload"]["native_approval_default"],
+                "full-access",
+            )
+            ack_kwargs = self.handler._send_ack.call_args.kwargs
+            self.assertTrue(ack_kwargs["ok"])
+            self.assertEqual(
+                ack_kwargs["native_approval_default"],
+                "full-access",
+            )
+
     async def test_create_session_company_mode_ignores_stale_custom_profile(self) -> None:
         ws = MagicMock()
 
@@ -942,6 +995,14 @@ class TestWSHandlerSessionSend(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(call_kwargs.kwargs.get("session_id"), self.session_id)
 
     async def test_session_send_passes_ui_identity_to_engine(self) -> None:
+        task = await self.store.get_task(self.task_id)
+        assert task is not None
+        task.metadata.update({
+            "native_approval_level": "full-access",
+            "native_permission_scope_id": "permission-scope-1",
+        })
+        await self.store.save_task(task)
+
         await self.handler._process_session_message(
             self.task_id,
             "test content",
@@ -954,6 +1015,8 @@ class TestWSHandlerSessionSend(unittest.IsolatedAsyncioTestCase):
         call_kwargs = self.engine.process_message.call_args.kwargs
         self.assertEqual(call_kwargs["message_metadata"]["ui_message_id"], "ui-msg-1")
         self.assertEqual(call_kwargs["message_metadata"]["ui_created_at"], 123.5)
+        self.assertEqual(call_kwargs["message_metadata"]["native_approval_level"], "full-access")
+        self.assertEqual(call_kwargs["message_metadata"]["native_permission_scope_id"], "permission-scope-1")
 
     async def test_session_send_uses_session_specific_exec_mode(self) -> None:
         """session_send should use the task's persisted mode/profile, not the global defaults."""
@@ -1837,6 +1900,8 @@ class TestWSHandlerSessionSend(unittest.IsolatedAsyncioTestCase):
             "company_profile": "custom",
             "org_id": "wrong-active-org",
             "organization_id": "wrong-active-org",
+            "native_approval_level": "full-access",
+            "native_permission_scope_id": runtime_session_id,
         }
         anchor.org_id = "vc-investment-firm"
         await self.store.save_task(anchor)
@@ -1875,6 +1940,8 @@ class TestWSHandlerSessionSend(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(call_kwargs["mode"], "org")
         self.assertEqual(call_kwargs["company_profile"], "custom")
         self.assertEqual(call_kwargs["org_id"], "vc-investment-firm")
+        self.assertEqual(call_kwargs["message_metadata"]["native_approval_level"], "full-access")
+        self.assertEqual(call_kwargs["message_metadata"]["native_permission_scope_id"], runtime_session_id)
 
     async def test_process_session_message_fails_closed_when_runtime_identity_is_missing(self) -> None:
         task = await self.store.get_task(self.task_id)
@@ -3188,6 +3255,70 @@ class TestWSHandlerSessionUpdateConfig(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(ack_kwargs["error"], "session_config_locked")
         self.assertEqual(ack_kwargs["reason"], "status:running")
 
+    async def test_permission_only_update_is_live_and_propagates_to_company_descendants(self) -> None:
+        root = await self.store.get_task(self.task_id)
+        assert root is not None
+        root.status = TaskStatus.RUNNING
+        root.metadata.update({
+            "native_approval_level": "auto",
+            "native_permission_scope_id": self.session_id,
+        })
+        child = Task(
+            id="permission-child",
+            title="Company child",
+            session_id="permission-child-session",
+            parent_session_id=self.session_id,
+            project_id="test-project",
+            status=TaskStatus.RUNNING,
+            metadata={"execution_mode": "company_mode"},
+        )
+        grandchild = Task(
+            id="permission-grandchild",
+            title="Native subagent",
+            session_id="permission-grandchild-session",
+            parent_session_id=child.session_id,
+            project_id="test-project",
+            status=TaskStatus.RUNNING,
+            metadata={"execution_mode": "company_mode"},
+        )
+        for task in (root, child, grandchild):
+            await self.store.save_task(task)
+
+        ws = MagicMock()
+        await self.handler._handle_session_update_config(ws, {
+            "project_id": "test-project",
+            "task_id": self.task_id,
+            "native_approval_level": "full-access",
+        })
+
+        for task_id in (self.task_id, child.id, grandchild.id):
+            persisted = await self.store.get_task(task_id)
+            assert persisted is not None
+            self.assertEqual(persisted.metadata["native_approval_level"], "full-access")
+            self.assertEqual(persisted.metadata["native_permission_scope_id"], self.session_id)
+        update = next(b for b in self.broadcasts if b["type"] == "session_updated")
+        self.assertEqual(update["payload"]["native_approval_level"], "full-access")
+        self.assertEqual(update["payload"]["native_permission_scope_id"], self.session_id)
+
+    async def test_permission_update_rejects_invalid_level_without_mutation(self) -> None:
+        ws = MagicMock()
+        await self.handler._handle_session_update_config(ws, {
+            "project_id": "test-project",
+            "task_id": self.task_id,
+            "native_approval_level": "unsafe-maybe",
+        })
+
+        task = await self.store.get_task(self.task_id)
+        assert task is not None
+        self.assertNotIn("native_approval_level", task.metadata)
+        self.assertEqual(
+            [b for b in self.broadcasts if b["type"] == "session_updated"],
+            [],
+        )
+        ack_kwargs = self.handler._send_ack.call_args.kwargs
+        self.assertFalse(ack_kwargs["ok"])
+        self.assertEqual(ack_kwargs["error"], "invalid_native_approval_level")
+
 
 # ═══════════════════════════════════════════════════════════════════════
 # Test 5: WSHandler — _handle_session_delete
@@ -3681,6 +3812,8 @@ class TestWSHandlerSessionDetail(unittest.IsolatedAsyncioTestCase):
         )
         task.metadata = {
             "handoff_context": "## Context\n\nFull handoff body",
+            "native_approval_level": "full-access",
+            "native_permission_scope_id": "parent-session-1",
         }
         await self.store.save_task(task)
 
@@ -3727,6 +3860,8 @@ class TestWSHandlerSessionDetail(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["handoff_context"], "## Context\n\nFull handoff body")
         self.assertEqual(payload["messages"][0]["content"], "## Global Intent Summary\n\nBuild the feature")
         self.assertEqual(payload["messages"][1]["sender"], "agent-reviewer")
+        self.assertEqual(payload["session_state"]["native_approval_level"], "full-access")
+        self.assertEqual(payload["session_state"]["native_permission_scope_id"], "parent-session-1")
 
     async def test_session_detail_reconciles_retired_legacy_escalation_card(self) -> None:
         ws = MagicMock()
@@ -5353,12 +5488,21 @@ class TestOfficeServiceExecutionIdentity(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(call.kwargs["origin_task_id"], anchor.id)
         self.assertEqual(call.kwargs["mode"], "company")
         self.assertEqual(call.kwargs["message_metadata"], {
+            "native_approval_level": "auto",
+            "native_permission_scope_id": "service-send-runtime",
             "response_to_checkpoint_id": checkpoint.checkpoint_id,
             "response_to_checkpoint_type": checkpoint.checkpoint_type,
         })
         persisted_worker = await self.store.get_task(worker.id)
         assert persisted_worker is not None
-        self.assertEqual(persisted_worker.metadata, original_worker_metadata)
+        self.assertEqual(
+            persisted_worker.metadata,
+            {
+                **original_worker_metadata,
+                "native_approval_level": "auto",
+                "native_permission_scope_id": "service-send-runtime",
+            },
+        )
 
     async def test_session_send_rejects_resuming_checkpoint_without_engine_fallback(self) -> None:
         anchor = Task(

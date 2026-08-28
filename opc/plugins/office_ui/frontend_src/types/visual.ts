@@ -1,4 +1,4 @@
-import type { AgentAnimStatus, TaskPreferredAgent } from './kanban'
+import type { AgentAnimStatus, NativeApprovalLevel, TaskPreferredAgent } from './kanban'
 
 export type RoleId = string & { readonly __brand: 'RoleId' }
 export type TemplateId = string & { readonly __brand: 'TemplateId' }
@@ -35,6 +35,7 @@ export interface VisualSnapshot {
   exec_mode?: 'task' | 'company' | 'org' | 'custom'
   company_profile?: 'corporate' | 'custom'
   task_preferred_agent?: TaskPreferredAgent
+  native_approval_default?: NativeApprovalLevel
 }
 
 export interface SavedOrgSummary {
@@ -86,8 +87,9 @@ export type SocketEnvelope =
   | { type: 'collab_sync_push'; payload: Record<string, unknown> }
   | { type: 'project_index_push'; payload: Record<string, unknown> }
   | { type: 'kanban_view_data'; payload: KanbanViewDataPayload }
-  | { type: 'session_created'; payload: { project_id: string; task_id: string; channel_id: string; session_id?: string; parent_session_id?: string; title: string; status: string; created_at: number; exec_mode?: string; company_profile?: string; org_id?: string; organization_id?: string; preferred_agent?: TaskPreferredAgent; selected_execution_agent?: TaskPreferredAgent } }
-  | { type: 'session_updated'; payload: { project_id: string; task_id: string; exec_mode?: string; company_profile?: string; org_id?: string; organization_id?: string; preferred_agent?: TaskPreferredAgent; selected_execution_agent?: TaskPreferredAgent } }
+  | { type: 'session_created'; payload: { project_id: string; task_id: string; channel_id: string; session_id?: string; parent_session_id?: string; title: string; status: string; created_at: number; exec_mode?: string; company_profile?: string; org_id?: string; organization_id?: string; preferred_agent?: TaskPreferredAgent; selected_execution_agent?: TaskPreferredAgent; native_approval_level?: NativeApprovalLevel; native_permission_scope_id?: string } }
+  | { type: 'session_updated'; payload: { project_id: string; task_id: string; exec_mode?: string; company_profile?: string; org_id?: string; organization_id?: string; preferred_agent?: TaskPreferredAgent; selected_execution_agent?: TaskPreferredAgent; native_approval_level?: NativeApprovalLevel; native_permission_scope_id?: string } }
+  | { type: 'native_permission_default_updated'; payload: { native_approval_default: NativeApprovalLevel } }
   | { type: 'session_message'; payload: Record<string, unknown> }
   | { type: 'session_title_updated'; payload: { project_id: string; task_id: string; title: string } }
   | { type: 'session_deleted'; payload: { project_id: string; task_id: string } }

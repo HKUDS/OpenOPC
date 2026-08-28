@@ -1,6 +1,9 @@
 import assert from 'node:assert/strict'
 import type { Session } from '../types/kanban'
-import { mergePartialSessionSnapshot } from './SessionStore'
+import {
+  mergePartialSessionSnapshot,
+  preserveSessionNativePermission,
+} from './SessionStore'
 
 function makeSession(taskId: string, projectId = 'default', title = taskId): Session {
   return {
@@ -63,6 +66,34 @@ assert.equal(
   merged.some(session => session.projectId === 'archive'),
   false,
   'partial project index merge stays project-scoped',
+)
+
+const persistedPermission = {
+  ...makeSession('permission-session'),
+  nativeApprovalLevel: 'full-access' as const,
+  nativePermissionScopeId: 'permission-scope',
+}
+assert.deepEqual(
+  preserveSessionNativePermission(persistedPermission, {
+    nativeApprovalLevel: undefined,
+    nativePermissionScopeId: undefined,
+  }),
+  {
+    nativeApprovalLevel: 'full-access',
+    nativePermissionScopeId: 'permission-scope',
+  },
+  'partial session payloads cannot erase persisted native permission state',
+)
+assert.deepEqual(
+  preserveSessionNativePermission(persistedPermission, {
+    nativeApprovalLevel: 'read-only',
+    nativePermissionScopeId: 'updated-scope',
+  }),
+  {
+    nativeApprovalLevel: 'read-only',
+    nativePermissionScopeId: 'updated-scope',
+  },
+  'explicit server permission updates replace the persisted session values',
 )
 
 console.log('SessionStore partial snapshot merge contract passed')

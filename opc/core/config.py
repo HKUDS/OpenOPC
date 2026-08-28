@@ -10,9 +10,13 @@ from pathlib import Path
 from typing import Any, Literal
 
 import yaml
-from pydantic import AliasChoices, BaseModel, Field, PrivateAttr, field_validator
+from pydantic import AliasChoices, BaseModel, Field, PrivateAttr, field_validator, model_validator
 
 from opc.core.company_tools import COMPANY_APPROVAL_EXEMPT_TOOL_NAMES
+from opc.core.native_permissions import (
+    NativeApprovalLevel,
+    migrate_legacy_native_approval_level,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -656,13 +660,13 @@ class WorktreeVenvConfig(BaseModel):
 
 
 class SandboxPlatformConfig(BaseModel):
-    mode: Literal["inherit", "off", "workspace-write", "elevated"] = "inherit"
+    mode: Literal["inherit", "off", "read-only", "workspace-write", "elevated"] = "inherit"
     wrapper: Literal["auto", "none", "bwrap", "sandbox-exec"] = "auto"
 
 
 class SandboxExecutionConfig(BaseModel):
     enabled: bool = False
-    default_mode: Literal["off", "workspace-write", "elevated"] = "off"
+    default_mode: Literal["off", "read-only", "workspace-write", "elevated"] = "off"
     fail_if_unavailable: bool = False
     allow_direct_fallback: bool = True
     allow_network: bool = True
@@ -1004,6 +1008,7 @@ class SystemConfig(BaseModel):
 
 
 class AutonomyConfig(BaseModel):
+    native_approval_level: NativeApprovalLevel = "auto"
     enabled: bool = True
     mode: str = "bounded"
     approval_model: str = ""
@@ -1031,14 +1036,23 @@ class AutonomyConfig(BaseModel):
     safe_command_prefixes: list[str] = Field(default_factory=lambda: [
         "ls", "pwd", "echo", "rg", "find", "git status", "git diff", "python -V",
         "python3 -V", "node -v", "npm -v", "curl", "wget", "yt-dlp", "aria2c", "ffmpeg",
-        # Standalone read-only commands. Shell control structures always route
-        # through an explicit permission checkpoint, regardless of prefix.
+        # Read-only command vocabulary. Compound commands are auto-approved
+        # only when every segment independently passes the flag audit.
         "cd", "cat", "head", "tail", "grep", "wc", "sort", "uniq", "cut", "tr",
         "stat", "file", "which", "date", "du", "df", "tree", "basename", "dirname",
         "realpath", "readlink", "uname", "nproc", "whoami", "hostname", "git log",
         "git show", "git rev-parse",
     ])
     permissions_v2: PermissionsV2Config = Field(default_factory=PermissionsV2Config)
+
+    @model_validator(mode="before")
+    @classmethod
+    def migrate_native_approval_level(cls, value: Any) -> Any:
+        if not isinstance(value, dict):
+            return value
+        migrated = dict(value)
+        migrated["native_approval_level"] = migrate_legacy_native_approval_level(value)
+        return migrated
 
 
 class SkillHubConfig(BaseModel):

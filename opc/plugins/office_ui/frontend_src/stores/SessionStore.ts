@@ -56,6 +56,16 @@ export function mergePartialSessionSnapshot(
   return merged
 }
 
+export function preserveSessionNativePermission(
+  existing: Session,
+  incoming: Partial<Session>,
+): Pick<Session, 'nativeApprovalLevel' | 'nativePermissionScopeId'> {
+  return {
+    nativeApprovalLevel: incoming.nativeApprovalLevel ?? existing.nativeApprovalLevel,
+    nativePermissionScopeId: incoming.nativePermissionScopeId ?? existing.nativePermissionScopeId,
+  }
+}
+
 type SessionAction =
   | { type: 'SET'; sessions: Session[]; reset?: boolean }
   | { type: 'ADD'; session: Session }
@@ -211,6 +221,7 @@ function sessionReducer(state: Session[], action: SessionAction): Session[] {
           updatedAt: mergeUpdatedAt(incoming, existing),
           execMode: mergeExecMode(incoming, existing),
           preferredAgent: mergeTaskAgent(incoming, existing, 'preferredAgent'),
+          ...preserveSessionNativePermission(existing, incoming),
           draftAssistantText: existing.draftAssistantText ?? incoming.draftAssistantText,
           draftUpdatedAt: existing.draftUpdatedAt ?? incoming.draftUpdatedAt,
           draftIteration: existing.draftIteration ?? incoming.draftIteration,
@@ -295,6 +306,7 @@ function sessionReducer(state: Session[], action: SessionAction): Session[] {
             updatedAt: Math.max(s.updatedAt ?? 0, nextSession.updatedAt ?? 0),
             execMode: mergeExecMode(nextSession, s),
             preferredAgent: mergeTaskAgent(nextSession, s, 'preferredAgent'),
+            ...preserveSessionNativePermission(s, nextSession),
             workItemProjectionId: nextSession.workItemProjectionId ?? s.workItemProjectionId,
             workItemTurnType: nextSession.workItemTurnType ?? s.workItemTurnType,
             companyProfile: mergeOptionalField(nextSession, s, 'companyProfile'),
@@ -352,6 +364,7 @@ function sessionReducer(state: Session[], action: SessionAction): Session[] {
               workItemGate: guarded.workItemGate ?? s.workItemGate,
               employeeAssignment: guarded.employeeAssignment ?? s.employeeAssignment,
               selectedExecutionAgent: guarded.selectedExecutionAgent ?? s.selectedExecutionAgent,
+              ...preserveSessionNativePermission(s, guarded),
               activeSubagents: guarded.activeSubagents ?? s.activeSubagents,
               permissionRequests: guarded.permissionRequests ?? s.permissionRequests,
               // Live-only runtime counters: status_snapshot/cost_update carry real

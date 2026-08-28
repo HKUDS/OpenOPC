@@ -32,6 +32,13 @@ from opc import __version__
 from opc.core.config import OPCConfig, get_opc_home, get_project_config_workspace
 from opc.core.execution_agents import EXECUTION_AGENTS
 from opc.core.interaction_protocol import owner_interaction_actor_identity
+from opc.core.native_permissions import (
+    NativeApprovalLevel,
+    native_sandbox_profile,
+    normalize_native_approval_level,
+    parse_native_approval_level,
+    tasks_in_native_permission_scope,
+)
 from opc.core.windows_ssl import (
     format_windows_sslkeylog_warning,
     pop_windows_sslkeylogfile,
@@ -98,6 +105,36 @@ def _get_config() -> OPCConfig:
     if config_dir.exists():
         return _load_config_with_workspace_trust(config_dir)
     return OPCConfig()
+
+
+def _parse_native_approval_level(value: str | None) -> NativeApprovalLevel:
+    try:
+        return parse_native_approval_level(value)
+    except ValueError as exc:
+        raise typer.BadParameter(
+            "approval level must be read-only, auto, or full-access"
+        ) from exc
+
+
+def _render_native_permissions(
+    config: OPCConfig,
+    *,
+    current: str | None = None,
+) -> None:
+    default = normalize_native_approval_level(
+        config.autonomy.native_approval_level
+    )
+    effective = normalize_native_approval_level(current, default=default)
+    sandbox = native_sandbox_profile(effective)
+    table = Table(title="OpenOPC Native Permissions", show_header=False)
+    table.add_column("Field", style="cyan", no_wrap=True)
+    table.add_column("Value")
+    table.add_row("System default", default)
+    table.add_row("Current session", effective)
+    table.add_row("Sandbox", str(sandbox["mode"]))
+    table.add_row("Network", "allowed" if sandbox["allow_network"] else "ask first")
+    console.print(table)
+    console.print("[dim]Only OpenOPC Native is controlled; external agent harness permissions remain independent.[/dim]")
 
 
 def _load_config_with_workspace_trust(config_dir: Path) -> OPCConfig:
@@ -586,6 +623,45 @@ def _escalation_callback():
 # Commands
 # ---------------------------------------------------------------------------
 
+permissions_app = typer.Typer(
+    help="Inspect or set OpenOPC Native permissions.",
+    invoke_without_command=True,
+)
+app.add_typer(permissions_app, name="permissions")
+
+
+@permissions_app.callback()
+def permissions_status(ctx: typer.Context) -> None:
+    """Show the system default OpenOPC Native permission level."""
+    if ctx.invoked_subcommand is None:
+        _render_native_permissions(_get_config())
+
+
+@permissions_app.command("set")
+def permissions_set(
+    level: str = typer.Argument(..., help="read-only, auto, or full-access"),
+) -> None:
+    """Set the default copied into newly created sessions."""
+    from opc.core.workspace_trust import save_explicit_workspace_authority_change
+
+    config = _get_config()
+    normalized = _parse_native_approval_level(level)
+    previous = config.autonomy.native_approval_level
+    config.autonomy.native_approval_level = normalized
+    try:
+        save_explicit_workspace_authority_change(
+            config,
+            get_opc_home() / "config",
+        )
+    except Exception as exc:
+        config.autonomy.native_approval_level = previous
+        console.print(
+            f"[error]Unable to save Native permissions: {escape(str(exc))}[/error]"
+        )
+        raise typer.Exit(code=2) from exc
+    console.print(f"[success]OpenOPC Native default set to {normalized}.[/success]")
+    console.print("[dim]Existing sessions keep their own level.[/dim]")
+
 @app.command()
 def chat(
     message: Optional[str] = typer.Argument(None, help="Single message to process"),
@@ -594,6 +670,7 @@ def chat(
     mode: str = typer.Option("task", "--mode", help="Execution mode: task or company"),
     agent: Optional[str] = typer.Option(None, "--agent", help="Preferred agent: native, claude_code, codex, cursor, opencode, jiuwen, jiuwenswarm"),
     company_profile: str = typer.Option("corporate", "--company-profile", help="Company profile for company mode"),
+    approval_level: Optional[str] = typer.Option(None, "--approval-level", help="OpenOPC Native permissions: read-only, auto, or full-access"),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Show detailed logs"),
     no_markdown: bool = typer.Option(False, "--no-markdown", help="Plain text output"),
 ):
@@ -603,6 +680,11 @@ def chat(
         config.llm.default_model = model
     if verbose:
         config.system.log_level = "DEBUG"
+    native_approval_level = (
+        _parse_native_approval_level(approval_level)
+        if approval_level is not None
+        else normalize_native_approval_level(config.autonomy.native_approval_level)
+    )
 
     if message:
         asyncio.run(_single_message(
@@ -613,6 +695,7 @@ def chat(
             mode=mode,
             preferred_agent=agent,
             company_profile=company_profile,
+            native_approval_level=native_approval_level,
         ))
     else:
         asyncio.run(_interactive_mode(
@@ -625,6 +708,8 @@ def chat(
             explicit_mode=_cli_option_present("--mode"),
             explicit_agent=_cli_option_present("--agent"),
             explicit_company_profile=_cli_option_present("--company-profile"),
+            native_approval_level=native_approval_level,
+            explicit_native_approval_level=_cli_option_present("--approval-level"),
         ))
 
 
@@ -641,6 +726,7 @@ def exec_command(
     json_output: bool = typer.Option(False, "--json", help="Print final JSON payload"),
     stream_json: bool = typer.Option(False, "--stream-json", help="Print newline-delimited JSON runtime events"),
     no_markdown: bool = typer.Option(False, "--no-markdown", help="Plain text output"),
+    approval_level: Optional[str] = typer.Option(None, "--approval-level", help="OpenOPC Native permissions: read-only, auto, or full-access"),
 ):
     """Run one non-interactive OPC task for scripts and CI."""
     if json_output and stream_json:
@@ -653,6 +739,11 @@ def exec_command(
     if message is None and not sys.stdin.isatty():
         message = sys.stdin.read()
     config = _get_config()
+    native_approval_level = (
+        _parse_native_approval_level(approval_level)
+        if approval_level is not None
+        else None
+    )
     try:
         asyncio.run(_exec_message(
             config=config,
@@ -667,6 +758,7 @@ def exec_command(
             json_output=json_output,
             stream_json=stream_json,
             no_markdown=no_markdown,
+            native_approval_level=native_approval_level,
         ))
     except KeyboardInterrupt as exc:
         if stream_json:
@@ -1286,6 +1378,11 @@ def status(
     console.print(f"  Max iterations: {config.system.max_agent_iterations}")
     console.print(f"  Autonomy mode: {config.autonomy.mode}")
     console.print(f"  Max auto-approve risk: {config.autonomy.max_auto_approve_risk}")
+    native_level = normalize_native_approval_level(
+        config.autonomy.native_approval_level
+    )
+    console.print(f"  Native permissions default: {native_level}")
+    console.print(f"  Native sandbox: {native_sandbox_profile(native_level)['mode']}")
 
     # Roles
     console.print("\n[bold]Organization:[/bold]")
@@ -1582,6 +1679,7 @@ async def _resolve_exec_session(
     org_id: str | None,
     session_id: str | None,
     resume: bool,
+    native_approval_level: NativeApprovalLevel | None,
 ) -> dict[str, Any]:
     from opc.plugins.office_ui.services import ServiceError
 
@@ -1596,7 +1694,15 @@ async def _resolve_exec_session(
         if not task_id:
             raise ServiceError("session_not_task_backed", "Session is not linked to a task-backed CLI/UI session", {"session_id": session_id})
         detail = await services.session.detail(project_id=project_id, task_id=task_id, session_id=session_id, limit=1)
-        return {**detail.payload, "task_id": task_id, "session_id": session_id, "restored": True}
+        payload = {**detail.payload, "task_id": task_id, "session_id": session_id, "restored": True}
+        if native_approval_level is not None:
+            updated = await services.session.update_config(
+                project_id=project_id,
+                task_id=task_id,
+                native_approval_level=native_approval_level,
+            )
+            payload.update(dict(updated.payload))
+        return payload
 
     if resume:
         starting = await services.session.resolve_starting_session(project_id=project_id)
@@ -1610,6 +1716,13 @@ async def _resolve_exec_session(
         payload["task_id"] = restored_task_id
         payload["session_id"] = restored_session_id
         payload["restored"] = True
+        if native_approval_level is not None:
+            updated = await services.session.update_config(
+                project_id=project_id,
+                task_id=restored_task_id,
+                native_approval_level=native_approval_level,
+            )
+            payload.update(dict(updated.payload))
         return payload
 
     created = await services.session.create(
@@ -1620,6 +1733,7 @@ async def _resolve_exec_session(
         preferred_agent=preferred_agent,
         org_id=org_id,
         interface="cli_exec",
+        native_approval_level=native_approval_level,
     )
     return dict(created.payload)
 
@@ -1638,6 +1752,7 @@ async def _exec_message(
     json_output: bool,
     stream_json: bool,
     no_markdown: bool,
+    native_approval_level: NativeApprovalLevel | None,
 ) -> None:
     from opc.plugins.office_ui.services import ServiceError
     from opc.plugins.office_ui.services.factory import OfficeServiceFactory
@@ -1687,6 +1802,7 @@ async def _exec_message(
                 org_id=org_id,
                 session_id=session_id,
                 resume=resume,
+                native_approval_level=native_approval_level,
             )
             task_id = str(target.get("task_id", "") or "")
             resolved_session_id = str(target.get("session_id", "") or "")
@@ -1926,9 +2042,11 @@ def session_create(
     company_profile: str = typer.Option("corporate", "--company-profile", help="corporate or custom"),
     agent: Optional[str] = typer.Option(None, "--agent", help="Preferred task-mode agent"),
     org_id: Optional[str] = typer.Option(None, "--org", "--org-id", help="Saved org id"),
+    approval_level: Optional[str] = typer.Option(None, "--approval-level", help="OpenOPC Native permissions"),
     json_output: bool = typer.Option(False, "--json", help="Print JSON"),
 ):
-    asyncio.run(_run_service_command(project, lambda svc: svc.session.create(project_id=project or "default", title=title, exec_mode=mode, company_profile=company_profile, preferred_agent=agent, org_id=org_id, interface="cli"), json_output=json_output))
+    native_level = _parse_native_approval_level(approval_level) if approval_level is not None else None
+    asyncio.run(_run_service_command(project, lambda svc: svc.session.create(project_id=project or "default", title=title, exec_mode=mode, company_profile=company_profile, preferred_agent=agent, org_id=org_id, native_approval_level=native_level, interface="cli"), json_output=json_output))
 
 
 @session_app.command("show")
@@ -1949,9 +2067,11 @@ def session_config(
     company_profile: Optional[str] = typer.Option(None, "--company-profile", help="corporate or custom"),
     agent: Optional[str] = typer.Option(None, "--agent", help="Preferred task-mode agent"),
     org_id: Optional[str] = typer.Option(None, "--org", "--org-id", help="Saved org id"),
+    approval_level: Optional[str] = typer.Option(None, "--approval-level", help="OpenOPC Native permissions"),
     json_output: bool = typer.Option(False, "--json", help="Print JSON"),
 ):
-    asyncio.run(_run_service_command(project, lambda svc: svc.session.update_config(project_id=project or "default", task_id=task_id, exec_mode=mode, company_profile=company_profile, preferred_agent=agent, org_id=org_id), json_output=json_output))
+    native_level = _parse_native_approval_level(approval_level) if approval_level is not None else None
+    asyncio.run(_run_service_command(project, lambda svc: svc.session.update_config(project_id=project or "default", task_id=task_id, exec_mode=mode, company_profile=company_profile, preferred_agent=agent, org_id=org_id, native_approval_level=native_level), json_output=json_output))
 
 
 @session_app.command("send")
@@ -2841,19 +2961,25 @@ async def _single_message(
     mode: str = "task",
     preferred_agent: str | None = None,
     company_profile: str = "corporate",
+    native_approval_level: NativeApprovalLevel = "auto",
 ) -> None:
     engine, runtime_display = _create_cli_engine(config, project)
     try:
         await engine.initialize()
         console.print(f"\n[info]Processing:[/info] {message}\n")
         runtime_display.begin_turn()
+        native_scope_id = str(uuid.uuid4())
         response = await engine.process_message(
             message,
             project_id=project,
-            session_id=str(uuid.uuid4()),
+            session_id=native_scope_id,
             mode=mode,
             company_profile=company_profile if mode == "company" else None,
             preferred_agent=preferred_agent,
+            message_metadata={
+                "native_approval_level": native_approval_level,
+                "native_permission_scope_id": native_scope_id,
+            },
         )
         await runtime_display.flush()
         if not runtime_display.has_streamed_content:
@@ -3088,6 +3214,8 @@ class _InteractiveChatState:
     company_profile: str = "corporate"
     org_id: str = ""
     preferred_agent: str | None = "native"
+    native_approval_level: NativeApprovalLevel = "auto"
+    native_permission_scope_id: str = ""
     domains: list[str] = field(default_factory=list)
     company_staffing_drafts: dict[str, dict[str, Any]] = field(default_factory=dict)
     session_to_task: dict[str, str] = field(default_factory=dict)
@@ -3341,6 +3469,7 @@ _SLASH_COMMANDS: tuple[_SlashCommandSpec, ...] = (
     _SlashCommandSpec("Chat", "/quit", "Exit interactive chat."),
     _SlashCommandSpec("Chat", "/queue list|drop|clear", "Inspect or edit queued prompts while a turn is running.", ("list", "drop", "clear")),
     _SlashCommandSpec("Context", "/status", "Show project, session, mode, agent, domains, model, and cost."),
+    _SlashCommandSpec("Context", "/permissions [read-only|auto|full-access]", "Show or change OpenOPC Native permissions for this session.", ("read-only", "auto", "full-access")),
     _SlashCommandSpec("Context", "/mode [task|company] [corporate|custom]", "Set execution mode for future messages.", ("task", "company", "corporate", "custom")),
     _SlashCommandSpec("Context", "/agent [native|codex|jiuwen|jiuwenswarm|claude_code|cursor|opencode|none]", "Set preferred external agent.", ("native", "codex", "jiuwen", "jiuwenswarm", "claude_code", "cursor", "opencode", "none")),
     _SlashCommandSpec("Context", "/domains [domain ...|clear]", "Set domain hints for future messages.", ("clear",)),
@@ -3358,7 +3487,7 @@ _SLASH_COMMANDS: tuple[_SlashCommandSpec, ...] = (
     _SlashCommandSpec("Session", "/session create [title] [--mode task|company|org] [--agent ...]", "Create a task-backed session through the shared Office service."),
     _SlashCommandSpec("Session", "/session resume <session_id>", "Resume a session in this project."),
     _SlashCommandSpec("Session", "/session show <session_id|task_id> [--limit N] [--full]", "Show session metadata and transcript."),
-    _SlashCommandSpec("Session", "/session config <task_id> [--mode ...] [--agent ...] [--org ...]", "Update session execution config through the shared Office service."),
+    _SlashCommandSpec("Session", "/session config <task_id> [--mode ...] [--agent ...] [--org ...] [--approval-level ...]", "Update session execution config through the shared Office service."),
     _SlashCommandSpec("Session", "/session send <task_id> <message>", "Send a message to a task-backed session through the shared Office service."),
     _SlashCommandSpec("Session", "/session rename <task_id|session_id> <title>", "Rename a task-backed or plain session."),
     _SlashCommandSpec("Session", "/session delete <task_id> --yes", "Hard-delete a task-backed session."),
@@ -3690,6 +3819,15 @@ def _print_context_status(state: _InteractiveChatState) -> None:
     if state.org_id:
         table.add_row("Org", state.org_id)
     table.add_row("Preferred agent", state.preferred_agent or "(system default)")
+    default_level = normalize_native_approval_level(
+        state.config.autonomy.native_approval_level
+    )
+    table.add_row("Native permissions default", default_level)
+    table.add_row("Native permissions session", state.native_approval_level)
+    table.add_row(
+        "Native sandbox",
+        str(native_sandbox_profile(state.native_approval_level)["mode"]),
+    )
     table.add_row("Domains", ", ".join(state.domains) if state.domains else "(none)")
     table.add_row("Runtime control", state.runtime_control_state or "(running/idle)")
     if state.runtime_control_task_id:
@@ -3697,7 +3835,7 @@ def _print_context_status(state: _InteractiveChatState) -> None:
     if state.runtime_control_checkpoint_id:
         table.add_row("Runtime checkpoint", state.runtime_control_checkpoint_id)
     console.print(table)
-    console.print("[dim]Use /mode, /agent, /project, /session, /stop, or /continue to inspect and control context.[/dim]")
+    console.print("[dim]Use /mode, /agent, /permissions, /project, /session, /stop, or /continue to inspect and control context.[/dim]")
 
 
 def _list_cli_project_ids(engine: Any) -> list[str]:
@@ -3814,15 +3952,16 @@ def _chat_bottom_toolbar_text(state: _InteractiveChatState, controller: ChatTurn
         f"  mode:{state.mode}{profile}"
         f"{org}"
         f"  agent:{state.preferred_agent or 'system'}"
+        f"  permissions:{state.native_approval_level}"
         f"{runtime_hint}"
         f"{busy_hint}"
-        "    /mode /agent /project /session /help"
+        "    /mode /agent /permissions /project /session /help"
     )
     return [("class:bottom-toolbar", text)]
 
 
 def _print_chat_hint() -> None:
-    console.print("[dim]Hint: /mode switches mode, /agent switches agent, /project switches project, /session switches session.[/dim]")
+    console.print("[dim]Hint: /mode and /agent select execution; /permissions controls OpenOPC Native for this session.[/dim]")
 
 
 async def _run_chat_office_service(state: _InteractiveChatState, operation: Any) -> dict[str, Any] | None:
@@ -3890,15 +4029,22 @@ async def _switch_chat_project(state: _InteractiveChatState, project_id: str, *,
     state.runtime_control_session_id = ""
     state.runtime_control_checkpoint_id = ""
     state.org_id = ""
+    state.native_permission_scope_id = ""
     _attach_cli_runtime_callbacks(state)
     console.print(f"[info]Switched to project: {project_id}[/info]")
     if not restore_session:
         state.session_id = ""
+        state.native_permission_scope_id = ""
         return
     state.session_id, restored_latest = await _resolve_starting_session_id(engine)
     if restored_latest:
+        await _restore_interactive_native_permission(state)
         console.print(f"[info]Restored recent session: {state.session_id}[/info]")
     else:
+        state.native_approval_level = normalize_native_approval_level(
+            state.config.autonomy.native_approval_level
+        )
+        state.native_permission_scope_id = state.session_id
         console.print(f"[info]Started a new session: {state.session_id}[/info]")
 
 
@@ -4151,13 +4297,162 @@ async def _resume_chat_session(state: _InteractiveChatState, session_id: str) ->
         )
         return
     state.session_id = session_id
+    await _restore_interactive_native_permission(state)
     title = getattr(target, "title", "") or "(untitled)"
     console.print(f"[info]Resumed session: {state.session_id} :: {title}[/info]")
 
 
 def _start_new_chat_session(state: _InteractiveChatState) -> None:
     state.session_id = str(uuid.uuid4())
+    state.native_permission_scope_id = state.session_id
+    state.native_approval_level = normalize_native_approval_level(
+        state.config.autonomy.native_approval_level
+    )
+    approval_engine = getattr(state.engine, "approval_engine", None)
+    native_policy = getattr(approval_engine, "native_policy", None)
+    if native_policy is not None:
+        native_policy.set_session_level(
+            state.native_permission_scope_id,
+            state.native_approval_level,
+        )
     console.print(f"[info]Started a new session: {state.session_id}[/info]")
+
+
+async def _restore_interactive_native_permission(
+    state: _InteractiveChatState,
+) -> NativeApprovalLevel:
+    """Restore one session's durable level without consulting other sessions."""
+
+    default = normalize_native_approval_level(
+        state.config.autonomy.native_approval_level
+    )
+    level: NativeApprovalLevel = default
+    permission_scope_id = state.session_id
+    store = getattr(state.engine, "store", None)
+    if store is not None and state.session_id:
+        session = await store.get_session(state.session_id)
+        session_metadata = dict(getattr(session, "metadata", {}) or {}) if session else {}
+        raw = session_metadata.get("native_approval_level")
+        permission_scope_id = str(
+            session_metadata.get("native_permission_scope_id", "")
+            or state.session_id
+        ).strip()
+        getter = getattr(store, "get_tasks", None)
+        all_tasks = await getter(
+            project_id=_current_project_id(state.engine),
+        ) if callable(getter) else []
+        selected_task = next(
+            (
+                task
+                for task in all_tasks
+                if str(getattr(task, "session_id", "") or "").strip()
+                == state.session_id
+            ),
+            None,
+        )
+        if selected_task is not None:
+            selected_metadata = dict(getattr(selected_task, "metadata", {}) or {})
+            permission_scope_id = str(
+                selected_metadata.get("native_permission_scope_id", "")
+                or selected_metadata.get("root_session_id", "")
+                or selected_metadata.get("company_runtime_root_session_id", "")
+                or getattr(selected_task, "parent_session_id", "")
+                or permission_scope_id
+            ).strip()
+        tasks = tasks_in_native_permission_scope(
+            all_tasks,
+            root_session_id=permission_scope_id or state.session_id,
+            scope_id=permission_scope_id,
+        )
+        if raw in (None, ""):
+            for task in tasks:
+                task_metadata = dict(getattr(task, "metadata", {}) or {})
+                raw = task_metadata.get("native_approval_level")
+                permission_scope_id = str(
+                    task_metadata.get("native_permission_scope_id", "")
+                    or permission_scope_id
+                ).strip()
+                if raw not in (None, ""):
+                    break
+        level = normalize_native_approval_level(raw, default=default)
+        # First restoration migrates old records and freezes the result so a
+        # later default change cannot alter this session.
+        if session is not None and (
+            session_metadata.get("native_approval_level") != level
+            or session_metadata.get("native_permission_scope_id") != permission_scope_id
+        ):
+            session.metadata = {
+                **session_metadata,
+                "native_approval_level": level,
+                "native_permission_scope_id": permission_scope_id,
+            }
+            save_session = getattr(store, "save_session", None)
+            if callable(save_session):
+                await save_session(session)
+        for task in tasks:
+            task_metadata = dict(getattr(task, "metadata", {}) or {})
+            if (
+                task_metadata.get("native_approval_level") == level
+                and task_metadata.get("native_permission_scope_id") == permission_scope_id
+            ):
+                continue
+            task.metadata = {
+                **task_metadata,
+                "native_approval_level": level,
+                "native_permission_scope_id": permission_scope_id,
+            }
+            save_task = getattr(store, "save_task", None)
+            if callable(save_task):
+                await save_task(task)
+    state.native_approval_level = level
+    state.native_permission_scope_id = permission_scope_id
+    approval_engine = getattr(state.engine, "approval_engine", None)
+    native_policy = getattr(approval_engine, "native_policy", None)
+    if native_policy is not None and permission_scope_id:
+        native_policy.set_session_level(permission_scope_id, level)
+    return level
+
+
+async def _set_interactive_native_permission(
+    state: _InteractiveChatState,
+    level: str,
+) -> NativeApprovalLevel:
+    normalized = _parse_native_approval_level(level)
+    state.native_approval_level = normalized
+    permission_scope_id = str(
+        state.native_permission_scope_id or state.session_id
+    ).strip()
+    store = getattr(state.engine, "store", None)
+    if store is not None and state.session_id:
+        session = await store.get_session(state.session_id)
+        if session is not None:
+            session.metadata = {
+                **dict(getattr(session, "metadata", {}) or {}),
+                "native_approval_level": normalized,
+                "native_permission_scope_id": permission_scope_id,
+            }
+            await store.save_session(session)
+        getter = getattr(store, "get_tasks", None)
+        all_tasks = await getter(
+            project_id=_current_project_id(state.engine),
+        ) if callable(getter) else []
+        tasks = tasks_in_native_permission_scope(
+            all_tasks,
+            root_session_id=state.session_id,
+            scope_id=permission_scope_id,
+        )
+        for task in tasks:
+            task.metadata = {
+                **dict(getattr(task, "metadata", {}) or {}),
+                "native_approval_level": normalized,
+                "native_permission_scope_id": permission_scope_id,
+            }
+            await store.save_task(task)
+    approval_engine = getattr(state.engine, "approval_engine", None)
+    native_policy = getattr(approval_engine, "native_policy", None)
+    if native_policy is not None and permission_scope_id:
+        native_policy.set_session_level(permission_scope_id, normalized)
+    return normalized
 
 
 def _render_transcript_parts(parts: list[Any]) -> str:
@@ -4586,11 +4881,19 @@ async def _handle_session_slash(state: _InteractiveChatState, args: list[str], c
                 company_profile=profile,
                 preferred_agent=agent,
                 org_id=org_id,
+                native_approval_level=state.native_approval_level,
                 interface="cli",
             ),
         )
         if payload:
             state.session_id = str(payload.get("session_id") or state.session_id)
+            state.native_approval_level = normalize_native_approval_level(
+                payload.get("native_approval_level"),
+                default=state.native_approval_level,
+            )
+            state.native_permission_scope_id = str(
+                payload.get("native_permission_scope_id") or state.session_id
+            )
             console.print(f"[success]Created session:[/success] {state.session_id} task={payload.get('task_id')}")
         return
     if subcommand == "resume":
@@ -4601,7 +4904,7 @@ async def _handle_session_slash(state: _InteractiveChatState, args: list[str], c
         return
     if subcommand == "config":
         if not rest:
-            console.print("[warning]Usage: /session config <task_id> [--mode ...] [--agent ...] [--org ...][/warning]")
+            console.print("[warning]Usage: /session config <task_id> [--mode ...] [--agent ...] [--org ...] [--approval-level ...][/warning]")
             return
         task_id = rest[0]
         opts = rest[1:]
@@ -4610,12 +4913,18 @@ async def _handle_session_slash(state: _InteractiveChatState, args: list[str], c
             opts, profile = _extract_option(opts, "--company-profile", default=None)
             opts, agent = _extract_option(opts, "--agent", default=None)
             opts, org_id = _extract_option(opts, "--org", default=None)
+            opts, approval_level = _extract_option(opts, "--approval-level", default=None)
         except ValueError as exc:
             console.print(f"[warning]{exc}[/warning]")
             return
         if opts:
-            console.print("[warning]Usage: /session config <task_id> [--mode ...] [--agent ...] [--org ...][/warning]")
+            console.print("[warning]Usage: /session config <task_id> [--mode ...] [--agent ...] [--org ...] [--approval-level ...][/warning]")
             return
+        native_level = (
+            _parse_native_approval_level(approval_level)
+            if approval_level is not None
+            else None
+        )
         payload = await _run_chat_office_service(
             state,
             lambda svc: svc.session.update_config(
@@ -4625,6 +4934,7 @@ async def _handle_session_slash(state: _InteractiveChatState, args: list[str], c
                 company_profile=profile,
                 preferred_agent=agent,
                 org_id=org_id,
+                native_approval_level=native_level,
             ),
         )
         if payload:
@@ -6992,6 +7302,29 @@ async def _handle_mode_slash(state: _InteractiveChatState, args: list[str]) -> N
         console.print(f"[info]Company profile: {state.company_profile}[/info]")
 
 
+async def _handle_permissions_slash(
+    state: _InteractiveChatState,
+    args: list[str],
+) -> None:
+    if not args:
+        _render_native_permissions(
+            state.config,
+            current=state.native_approval_level,
+        )
+        console.print("[dim]Change this session with /permissions read-only, /permissions auto, or /permissions full-access.[/dim]")
+        return
+    if len(args) != 1:
+        console.print("[warning]Usage: /permissions [read-only|auto|full-access][/warning]")
+        return
+    try:
+        level = await _set_interactive_native_permission(state, args[0])
+    except typer.BadParameter as exc:
+        console.print(f"[warning]{escape(str(exc))}[/warning]")
+        return
+    console.print(f"[success]OpenOPC Native permissions set to {level} for this session.[/success]")
+    console.print("[dim]The change takes effect at the next tool-call boundary; pending approvals are unchanged.[/dim]")
+
+
 async def _handle_agent_slash(state: _InteractiveChatState, args: list[str]) -> None:
     if not args:
         table = Table(title="Agent")
@@ -7810,6 +8143,7 @@ def _busy_slash_policy(command: str, args: list[str]) -> BusyCommandPolicy:
         "help",
         "?",
         "status",
+        "permissions",
         "cost",
         "runtime",
         "tasks",
@@ -8113,6 +8447,8 @@ async def _handle_chat_slash_command(state: _InteractiveChatState, user_input: s
         _print_interactive_cost(state.engine)
     elif command == "mode":
         await _handle_mode_slash(state, args)
+    elif command == "permissions":
+        await _handle_permissions_slash(state, args)
     elif command == "agent":
         await _handle_agent_slash(state, args)
     elif command == "domains":
@@ -8290,10 +8626,21 @@ async def _process_interactive_chat_message(
                 state,
                 handoff_identity,
             )
+            # A selected role channel resumes the root Company runtime.  Its
+            # native permission scope follows that root, never the UI child
+            # session that happened to be selected.
+            state.native_permission_scope_id = execution_session_id
             execution_mode = runtime_execution_identity.exec_mode
             execution_company_profile = runtime_execution_identity.company_profile
             execution_org_id = runtime_execution_identity.org_id
             execution_preferred_agent = runtime_execution_identity.preferred_agent
+        effective_metadata = {
+            **dict(effective_metadata or {}),
+            "native_approval_level": state.native_approval_level,
+            "native_permission_scope_id": str(
+                state.native_permission_scope_id or state.session_id
+            ),
+        }
         response = await state.engine.process_message(
             user_input,
             project_id=getattr(state.engine, "project_id", None),
@@ -8364,6 +8711,8 @@ async def _interactive_mode(
     explicit_mode: bool = False,
     explicit_agent: bool = False,
     explicit_company_profile: bool = False,
+    native_approval_level: NativeApprovalLevel = "auto",
+    explicit_native_approval_level: bool = False,
 ) -> None:
     engine, runtime_display = _create_cli_engine(config, project)
 
@@ -8382,6 +8731,7 @@ async def _interactive_mode(
         mode="company" if str(mode or "").strip().lower() == "company" else "task",
         company_profile=company_profile or _initial_company_profile(config),
         preferred_agent=_normalize_interactive_preferred_agent(preferred_agent),
+        native_approval_level=native_approval_level,
     )
     _attach_cli_runtime_callbacks(state)
     await _restore_chat_context(
@@ -8397,11 +8747,17 @@ async def _interactive_mode(
         f"Current mode: {state.mode}"
         f"{f' ({state.company_profile})' if state.mode == 'company' else ''}\n"
         f"Current agent: {state.preferred_agent or 'system'}\n"
+        f"Native permissions: {state.native_approval_level}\n"
         f"Choose a project and session to begin.",
         border_style="blue",
     ))
     try:
         await _run_interactive_startup_selector(state, explicit_project=bool(project))
+        if explicit_native_approval_level:
+            await _set_interactive_native_permission(
+                state,
+                native_approval_level,
+            )
     except KeyboardInterrupt:
         console.print("\n[warning]Interrupted.[/warning]")
         await state.engine.shutdown()

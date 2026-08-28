@@ -219,4 +219,5 @@ def create_python_tool() -> ToolDefinition:
         self_bounded_output=True,
         max_result_chars=80_000,
         company_effect_kind=COMPANY_EFFECT_OPAQUE_EXACT,
+        permission_effects=["process_execute", "workspace_write"],
     )

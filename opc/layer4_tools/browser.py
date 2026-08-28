@@ -573,6 +573,7 @@ def create_browser_tools() -> list[ToolDefinition]:
             func=browser_navigate,
             category="browser",
             company_effect_kind=COMPANY_EFFECT_NO_LOCAL_FS,
+            permission_effects=["network_access"],
         ),
         ToolDefinition(
             name="browser_snapshot",
@@ -594,6 +595,7 @@ def create_browser_tools() -> list[ToolDefinition]:
             func=browser_snapshot,
             category="browser",
             company_effect_kind=COMPANY_EFFECT_FORBIDDEN,
+            permission_effects=["network_access", "workspace_write"],
         ),
         ToolDefinition(
             name="browser_click",
@@ -608,6 +610,7 @@ def create_browser_tools() -> list[ToolDefinition]:
             func=browser_click,
             category="browser",
             company_effect_kind=COMPANY_EFFECT_NO_LOCAL_FS,
+            permission_effects=["network_access", "external_side_effect"],
         ),
         ToolDefinition(
             name="browser_type",
@@ -633,6 +636,7 @@ def create_browser_tools() -> list[ToolDefinition]:
             func=browser_type,
             category="browser",
             company_effect_kind=COMPANY_EFFECT_NO_LOCAL_FS,
+            permission_effects=["network_access", "external_side_effect"],
         ),
         ToolDefinition(
             name="browser_take_screenshot",
@@ -651,6 +655,7 @@ def create_browser_tools() -> list[ToolDefinition]:
             func=browser_take_screenshot,
             category="browser",
             company_effect_kind=COMPANY_EFFECT_FORBIDDEN,
+            permission_effects=["network_access", "workspace_write"],
         ),
         ToolDefinition(
             name="browser_wait_for",
@@ -677,6 +682,7 @@ def create_browser_tools() -> list[ToolDefinition]:
             func=browser_wait_for,
             category="browser",
             company_effect_kind=COMPANY_EFFECT_NO_LOCAL_FS,
+            permission_effects=["network_access"],
         ),
         ToolDefinition(
             name="browser_scroll",
@@ -704,6 +710,7 @@ def create_browser_tools() -> list[ToolDefinition]:
             func=browser_scroll,
             category="browser",
             company_effect_kind=COMPANY_EFFECT_NO_LOCAL_FS,
+            permission_effects=["network_access", "external_side_effect"],
         ),
         ToolDefinition(
             name="browser_select_option",
@@ -721,6 +728,7 @@ def create_browser_tools() -> list[ToolDefinition]:
             func=browser_select_option,
             category="browser",
             company_effect_kind=COMPANY_EFFECT_NO_LOCAL_FS,
+            permission_effects=["network_access", "external_side_effect"],
         ),
         ToolDefinition(
             name="browser_navigate_back",
@@ -729,6 +737,7 @@ def create_browser_tools() -> list[ToolDefinition]:
             func=browser_navigate_back,
             category="browser",
             company_effect_kind=COMPANY_EFFECT_NO_LOCAL_FS,
+            permission_effects=["network_access"],
         ),
         ToolDefinition(
             name="browser_close",
@@ -737,5 +746,6 @@ def create_browser_tools() -> list[ToolDefinition]:
             func=browser_close,
             category="browser",
             company_effect_kind=COMPANY_EFFECT_NO_LOCAL_FS,
+            permission_effects=["runtime_internal"],
         ),
     ]

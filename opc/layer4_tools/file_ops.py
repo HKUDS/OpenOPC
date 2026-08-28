@@ -1047,6 +1047,7 @@ def create_file_tools() -> list[ToolDefinition]:
             self_bounded_output=True,
             max_result_chars=80_000,
             company_effect_kind=COMPANY_EFFECT_NO_LOCAL_FS,
+            permission_effects=["local_read"],
         ),
         ToolDefinition(
             name="file_write",
@@ -1065,6 +1066,7 @@ def create_file_tools() -> list[ToolDefinition]:
             concurrency_safe=False,
             read_only=False,
             company_effect_kind=COMPANY_EFFECT_STRUCTURED_PATHS,
+            permission_effects=["workspace_write"],
         ),
         ToolDefinition(
             name="file_edit",
@@ -1084,6 +1086,7 @@ def create_file_tools() -> list[ToolDefinition]:
             concurrency_safe=False,
             read_only=False,
             company_effect_kind=COMPANY_EFFECT_STRUCTURED_PATHS,
+            permission_effects=["workspace_write"],
         ),
         ToolDefinition(
             name="apply_patch",
@@ -1100,6 +1103,7 @@ def create_file_tools() -> list[ToolDefinition]:
             concurrency_safe=False,
             read_only=False,
             company_effect_kind=COMPANY_EFFECT_STRUCTURED_PATHS,
+            permission_effects=["workspace_write"],
         ),
         ToolDefinition(
             name="grep",
@@ -1131,6 +1135,7 @@ def create_file_tools() -> list[ToolDefinition]:
             self_bounded_output=True,
             max_result_chars=80_000,
             company_effect_kind=COMPANY_EFFECT_NO_LOCAL_FS,
+            permission_effects=["local_read"],
         ),
         ToolDefinition(
             name="glob",
@@ -1151,6 +1156,7 @@ def create_file_tools() -> list[ToolDefinition]:
             concurrency_safe=True,
             read_only=True,
             company_effect_kind=COMPANY_EFFECT_NO_LOCAL_FS,
+            permission_effects=["local_read"],
         ),
         ToolDefinition(
             name="file_search",
@@ -1172,6 +1178,7 @@ def create_file_tools() -> list[ToolDefinition]:
             concurrency_safe=True,
             read_only=True,
             company_effect_kind=COMPANY_EFFECT_NO_LOCAL_FS,
+            permission_effects=["local_read"],
         ),
         ToolDefinition(
             name="list_dir",
@@ -1190,5 +1197,6 @@ def create_file_tools() -> list[ToolDefinition]:
             concurrency_safe=True,
             read_only=True,
             company_effect_kind=COMPANY_EFFECT_NO_LOCAL_FS,
+            permission_effects=["local_read"],
         ),
     ]

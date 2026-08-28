@@ -270,6 +270,7 @@ def create_web_tools() -> list[ToolDefinition]:
             func=web_search,
             category="search",
             company_effect_kind=COMPANY_EFFECT_RUNTIME_INTERNAL,
+            permission_effects=["local_read", "network_access"],
         ),
         ToolDefinition(
             name="web_fetch",
@@ -289,5 +290,6 @@ def create_web_tools() -> list[ToolDefinition]:
             self_bounded_output=True,
             max_result_chars=80_000,
             company_effect_kind=COMPANY_EFFECT_RUNTIME_INTERNAL,
+            permission_effects=["local_read", "network_access"],
         ),
     ]

@@ -256,4 +256,5 @@ def create_user_input_tool() -> ToolDefinition:
         company_effect_kind=COMPANY_EFFECT_RUNTIME_INTERNAL,
         category="interaction",
         requires_confirmation=False,
+        permission_effects=["runtime_internal"],
     )

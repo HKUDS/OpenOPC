@@ -670,6 +670,17 @@
   min-height: 0;
 }
 
+.ctx-session-chat {
+  flex: 1;
+  min-height: 0;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  contain: layout paint;
+  isolation: isolate;
+}
+
 .ctx-work-item-progress {
   flex: 0 0 84px;
   height: 84px;
@@ -727,17 +738,12 @@
 }
 
 .ctx-multi-card {
-  min-height: 0;
   display: flex;
   flex-direction: column;
   border: 1px solid var(--border);
   border-radius: 14px;
   background: color-mix(in srgb, var(--bg-elevated) 86%, var(--surface) 14%);
   overflow: hidden;
-  /* Each card has its own container context so per-card composer / pills
-     can also wrap when one column gets narrow. */
-  container-type: inline-size;
-  container-name: ctxpanel;
 }
 
 .ctx-multi-card.focused {
@@ -815,24 +821,36 @@
 }
 
 .ctx-multi-card-body {
-  flex: 1;
-  min-height: 220px;
-  overflow: hidden;
+  min-height: 96px;
+  padding: 12px;
   display: flex;
   flex-direction: column;
+  gap: 7px;
 }
 
-.ctx-multi-card-body .msg-list {
-  flex: 1;
-  min-height: 0;
+.ctx-multi-preview-sender {
+  color: var(--text-secondary);
+  font-size: 11px;
+  font-weight: 600;
 }
 
-.ctx-multi-card .msg-composer {
-  border-top: 1px solid var(--border);
-  border-radius: 0;
-  border-left: none;
-  border-right: none;
-  border-bottom: none;
+.ctx-multi-preview-text {
+  margin: 0;
+  color: var(--text);
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 4;
+  overflow: hidden;
+}
+
+.ctx-multi-preview-empty {
+  color: var(--text-secondary);
+  font-size: 12px;
+  margin: auto 0;
 }
 
 @media (max-width: 900px) {

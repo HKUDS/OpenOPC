@@ -689,6 +689,103 @@ async function runPolicyCases(page: Page, baseUrl: string): Promise<void> {
   assert.ok(await page.locator('.msg-timeline-row').count() > 0, 'an empty filtered summary must still continue history pagination')
 }
 
+async function runContextPanelLifecycleCase(page: Page, baseUrl: string): Promise<void> {
+  await page.goto(`${baseUrl}tests/context-panel-lifecycle.html`)
+  await page.waitForFunction(() => (window as typeof window & { __contextPanelFixtureReady?: boolean }).__contextPanelFixtureReady === true)
+  await page.waitForSelector('.ctx-session-chat')
+  await settle(page, 120)
+
+  assert.equal(await page.locator('.msg-list').count(), 1, 'single view must own exactly one transcript scroll root')
+  assert.equal(await page.locator('.msg-composer').count(), 1, 'single view must own exactly one composer')
+  assert.equal(await page.locator('.ctx-multi-card').count(), 0, 'single view must not retain multi-session cards')
+
+  // Alternate between populated and empty chats without leaving single view.
+  // A keyed MessageList used to force concurrent remounts here; each session
+  // update placed another root node without deleting the previous one.
+  for (let index = 0; index < 30; index += 1) {
+    await page.evaluate((taskNumber) => {
+      const fixture = (window as typeof window & {
+        __contextPanelFixture?: { selectSession: (taskId: string) => void }
+      }).__contextPanelFixture
+      fixture?.selectSession(`task-${taskNumber}`)
+    }, (index % 20) + 1)
+    await settle(page, 5)
+    assert.equal(
+      await page.locator('.ctx-session-chat > .msg-list-shell').count(),
+      1,
+      `single-view switch ${index + 1} accumulated transcript roots`,
+    )
+    assert.equal(
+      await page.locator('.ctx-session-chat > .msg-composer').count(),
+      1,
+      `single-view switch ${index + 1} accumulated composers`,
+    )
+  }
+
+  await page.evaluate(() => {
+    const fixture = (window as typeof window & {
+      __contextPanelFixture?: { toggleMultiView: () => void }
+    }).__contextPanelFixture
+    fixture?.toggleMultiView()
+  })
+  await page.waitForSelector('.ctx-multi-grid')
+  await settle(page)
+
+  assert.equal(await page.locator('.msg-list').count(), 0, 'multi view must not mount transcript scroll roots')
+  assert.equal(await page.locator('.msg-composer').count(), 0, 'multi view must not mount background composers')
+  assert.equal(await page.locator('.ctx-multi-card').count(), 4, 'twenty open tabs must be bounded to four previews')
+  assert.equal(await page.locator('.ctx-multi-grid').count(), 1, 'multi view must have one outer scroll owner')
+  const previewsContained = await page.locator('.ctx-panel').evaluate((panel) => {
+    const panelRect = panel.getBoundingClientRect()
+    return Array.from(panel.querySelectorAll<HTMLElement>('.ctx-multi-card')).every((card) => {
+      const rect = card.getBoundingClientRect()
+      return rect.left >= panelRect.left - 1 && rect.right <= panelRect.right + 1
+    })
+  })
+  assert.equal(previewsContained, true, 'preview cards must remain inside the context panel paint boundary')
+
+  for (let index = 0; index < 12; index += 1) {
+    await page.evaluate((taskNumber) => {
+      const fixture = (window as typeof window & {
+        __contextPanelFixture?: {
+          toggleMultiView: () => void
+          selectSession: (taskId: string) => void
+        }
+      }).__contextPanelFixture
+      fixture?.toggleMultiView()
+      fixture?.selectSession(`task-${taskNumber}`)
+    }, (index % 20) + 1)
+    await settle(page, 10)
+    const expectedMultiView = index % 2 === 1
+    assert.equal(
+      await page.locator('.msg-list').count(),
+      expectedMultiView ? 0 : 1,
+      `toggle ${index + 1} left an inactive transcript mounted`,
+    )
+    assert.equal(
+      await page.locator('.msg-composer').count(),
+      expectedMultiView ? 0 : 1,
+      `toggle ${index + 1} left an inactive composer mounted`,
+    )
+  }
+
+  await page.evaluate(() => {
+    const fixture = (window as typeof window & {
+      __contextPanelFixture?: {
+        toggleMultiView: () => void
+        selectSession: (taskId: string) => void
+      }
+    }).__contextPanelFixture
+    fixture?.toggleMultiView()
+    fixture?.selectSession('task-20')
+  })
+  await page.waitForSelector('[data-session-render-key="fixture-project:task-20:session:task-20"]')
+  await settle(page, 120)
+  assert.equal(await page.locator('.msg-list').count(), 1, 'stress switching must finish with one live transcript')
+  assert.equal(await page.locator('.msg-composer').count(), 1, 'stress switching must finish with one live composer')
+  assert.equal(await page.locator('.ctx-multi-card').count(), 0, 'stress switching must unmount every preview card')
+}
+
 async function main(): Promise<void> {
   let server: ViteDevServer | undefined
   let browser: Browser | undefined
@@ -722,10 +819,11 @@ async function main(): Promise<void> {
     await runHiddenPendingCase(page, baseUrl)
     await runCheckpointCase(page, baseUrl)
     await runPolicyCases(page, baseUrl)
+    await runContextPanelLifecycleCase(page, baseUrl)
 
     assert.deepEqual(pageErrors, [], `browser page errors:\n${pageErrors.join('\n')}`)
     assert.deepEqual(consoleErrors, [], `browser console errors:\n${consoleErrors.join('\n')}`)
-    console.log('message-list-scroll.spec.ts: OK (scroll writes, follow, browsing geometry/history, stable keys, checkpoints, policies)')
+    console.log('message-list-scroll.spec.ts: OK (scroll writes, follow, browsing geometry/history, stable keys, checkpoints, policies, context lifecycle)')
   } finally {
     await browser?.close()
     await server?.close()

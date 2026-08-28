@@ -530,6 +530,7 @@ opc talent hire <template_id> <role_id> -p demo
 | `opc talent` | `list`、`employees`、`import`、`hire`、`scan`、`import-selected`、`employee-detail`、`import-agent` |
 | `opc market` | `presets`、`browse`、`preview`、`apply-preset`、`export`、`install`、`list`、`uninstall --yes` |
 | `opc runtime` | `status`、`checkpoints`、`logs`、`run` |
+| `opc permissions` | 查看 Native 默认值，或用 `set read-only|auto|full-access` 设置新会话默认值 |
 | `opc channels` | `status`、`login`、`start`、`stop` |
 
 大多数服务类命令都支持 `--project/-p` 与 `--json`。
@@ -636,22 +637,36 @@ llm:
 
 ### 审批与 Agent 权限
 
-`.opc/config/system_config.yaml` 的 `autonomy` 部分控制 Agent 无需询问即可执行多少操作。关键旋钮是 `max_auto_approve_risk` — 可被自动批准的最高风险等级：
+OpenOPC Native 提供三档权限。在 `.opc/config/system_config.yaml` 中设置新会话复制的默认值：
 
 ```yaml
 autonomy:
-  max_auto_approve_risk: medium   # low | medium | high | critical
-  allow_native_tool_auto_approval: true
-  tool_first_use_approval: true   # 每个工具首次使用时总是询问
+  native_approval_level: auto   # read-only | auto | full-access
 ```
 
-每次原生工具调用在运行前都会做风险分级：已知的破坏性命令（`rm -rf`、`drop table`、force-push 等）与敏感关键词（凭据、部署等）为 `high`/`critical`，总是上报给人类；白名单中的安全前缀（`ls`、`git status` 等）为 `low`；其余为 `medium`，在自动批准前会经过 LLM 审查。
+| 等级 | 自动执行 | 需要授权 | 沙箱 |
+|---|---|---|---|
+| `read-only` | 本地读取、无副作用内部工具 | 写入、可能写入的进程、网络、外部副作用、越界访问 | 只读、断网 |
+| `auto` | 读取、工作区内修改、命令和测试 | 网络、工作区外访问/副作用、显式安全规则 | 工作区可写、断网 |
+| `full-access` | 所有已注册 Native 工具 | 不显示 Native 工具审批 | 关闭 |
 
-- `medium`（默认）：平衡 — 普通命令无提示运行；危险命令上报。
-- `low`：严格 — 不在安全白名单中的任何操作都需要审批。推荐用于共享或生产机器。
-- `high`/`critical`：宽松 — 仅用于可随时丢弃的沙箱。
+UI 的 Mode/Agent 旁有 **Permissions** 选择器，运行中的会话也能切换；从下一个工具调用开始生效，已经展示的待审批请求不会自动批准或重放。CLI 使用同一套设置：
 
-每个工具首次使用时总会提示（除非该工具在 `tool_approval_exemptions` 中），你的「始终允许」选择会累积到项目级白名单。
+```bash
+opc permissions
+opc permissions set auto
+opc chat --approval-level read-only
+opc exec --approval-level full-access "执行任务"
+opc session config <task-id> --approval-level auto
+```
+
+交互式 CLI 支持 `/permissions` 和 `/permissions read-only|auto|full-access`；`opc status` 与 `/status` 会显示实际等级和沙箱。新会话会固定创建时的默认等级。Native subagent 与 Company Mode 中的所有 Native 角色继承根会话等级，不同项目、不同会话之间互不串用。
+
+通过 UI 或 `opc permissions set` 修改默认值时，已信任工作区的指纹会原子更新。如果手工编辑 `.opc/config/*.yaml`，仍需在检查改动后执行 `opc trust add <workspace>`。
+
+需要授权时，审批卡仍支持 once/session/project/global 四种作用域；任何授权都不能绕过显式 deny。UI 中的 **Default** 只修改未来新会话。
+
+`full-access` 只跳过 Native 工具权限审批。组织审核、招聘确认、用户问答、Company WorkItem 门禁、控制器所有权、持久化副作用围栏和显式 deny 规则仍然生效。**该设置不控制 Codex、Claude Code、Jiuwen、JiuwenSwarm 或其他外部 harness；它们的审批和沙箱保持独立。** 旧版 Native 风险配置只用于首次迁移，此后以 `native_approval_level` 为准。
 
 ### 外部 Agent
 

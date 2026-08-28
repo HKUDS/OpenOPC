@@ -3,21 +3,25 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, ClassVar
+from typing import Any
 
 from opc.core.models import ExecutionCheckpoint
 
 
 # Runtime suspend/interrupt and peer/manager waits intentionally use their
 # own actor/state machines and are not owner interaction replies.
+COMPANY_ADMISSION_CHECKPOINT_TYPES: frozenset[str] = frozenset({
+    "company_staffing_selection",
+    "company_recruitment_confirmation",
+})
+
 OWNER_INTERACTION_CHECKPOINT_TYPES: frozenset[str] = frozenset({
     "tool_permission",
     "action_permission",
     "task_user_input",
     "company_work_item_gate",
     "company_delivery_feedback",
-    "company_staffing_selection",
-    "company_recruitment_confirmation",
+    *COMPANY_ADMISSION_CHECKPOINT_TYPES,
     "company_reorg_pending",
     "route_clarification",
     "company_runtime_selection",
@@ -65,11 +69,6 @@ class OriginOwnerInteractionLease:
     claim_id: str
     consumer_id: str
 
-    _COMPANY_ADMISSION_TYPES: ClassVar[frozenset[str]] = frozenset({
-        "company_staffing_selection",
-        "company_recruitment_confirmation",
-    })
-
     @property
     def complete(self) -> bool:
         return bool(
@@ -78,7 +77,7 @@ class OriginOwnerInteractionLease:
             and str(self.claim_id or "").strip()
             and str(self.consumer_id or "").strip()
             and str(self.checkpoint_type or "").strip()
-            in self._COMPANY_ADMISSION_TYPES
+            in COMPANY_ADMISSION_CHECKPOINT_TYPES
         )
 
     def to_payload(self) -> dict[str, str]:

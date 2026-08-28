@@ -1,6 +1,6 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import type { RoleWorkItemSummary, Session, TaskPreferredAgent } from '../types/kanban'
-import type { ChatMessage, CheckpointReplyMetadata, InteractionReplyReceipt, OutgoingAttachmentPayload, SessionSendMetadata } from '../types/chat'
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import type { NativeApprovalLevel, RoleWorkItemSummary, Session, TaskPreferredAgent } from '../types/kanban'
+import type { ChatMessage, CheckpointReplyMetadata, InteractionReplyReceipt, OutgoingAttachmentPayload } from '../types/chat'
 import type { AgentInfo, OrgInfoPayload, SavedOrgSummary } from '../types/visual'
 import type { CommsStatePayload, CommsMessagePayload } from '../lib/wsClient'
 import { CommsPanel } from './CommsPanel'
@@ -50,12 +50,13 @@ interface ContextPanelProps {
   childDetailMessages: ChatMessage[]
   allSessions: Session[]
   openSessions: Session[]
-  openSessionMessages: Record<string, ChatMessage[]>
-  openSessionChildren: Record<string, Session[]>
+  multiViewSessions: Session[]
+  multiSessionMessages: Record<string, ChatMessage[]>
   agents: AgentInfo[]
   childSessions: Session[]
   execMode?: string
   taskPreferredAgent: TaskPreferredAgent
+  nativeApprovalDefault: NativeApprovalLevel
   savedOrgsList?: SavedOrgSummary[] | null
   activeSavedOrg?: string | null
   onSavedOrgsList?: () => void
@@ -82,6 +83,8 @@ interface ContextPanelProps {
   onTitleChange: (taskId: string, title: string) => void
   onSessionConfigChange?: (taskId: string, execMode: string, companyProfile?: string, orgId?: string) => void
   onSessionTaskAgentChange?: (taskId: string, preferredAgent: TaskPreferredAgent) => void
+  onSessionNativeApprovalLevelChange?: (taskId: string, level: NativeApprovalLevel) => void
+  onSetNativeApprovalDefault?: (level: NativeApprovalLevel) => void
   /**
    * User asked to "continue this conversation in a different mode" from the
    * locked-mode chip popover. We expect the host to spin up a fresh chat in
@@ -108,16 +111,9 @@ interface ContextPanelProps {
 
   onComposerSend: (content: string, attachments?: OutgoingAttachmentPayload[]) => void
   onInteractionReply: (content: string, taskId?: string, metadata?: CheckpointReplyMetadata) => Promise<InteractionReplyReceipt>
-  onSessionSend?: (
-    taskId: string,
-    content: string,
-    attachments?: OutgoingAttachmentPayload[],
-    metadata?: SessionSendMetadata,
-  ) => void
   onWorkItemClick: (executionTurnId: string) => void
   onWorkItemOpenSession?: (executionTurnId: string) => void
   onMarkRead: () => void
-  onSessionMarkRead?: (taskId: string) => void
   onLoadSessionHistory?: (
     taskId: string,
     oldestMessage?: ChatMessage,
@@ -132,6 +128,20 @@ function relativeTime(ts: number): string {
   if (diff < 3_600_000) return `${Math.floor(diff / 60_000)}m`
   if (diff < 86_400_000) return `${Math.floor(diff / 3_600_000)}h`
   return `${Math.floor(diff / 86_400_000)}d`
+}
+
+export function latestSessionPreviewMessage(messages: ChatMessage[]): ChatMessage | null {
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    if (messages[index].content.trim()) return messages[index]
+  }
+  return null
+}
+
+export function sessionPreviewText(content: string, maxLength = 360): string {
+  const normalized = content.replace(/\s+/g, ' ').trim()
+  if (maxLength <= 0) return ''
+  if (normalized.length <= maxLength) return normalized
+  return `${normalized.slice(0, Math.max(0, maxLength - 1)).trimEnd()}…`
 }
 
 function sessionRuntimeLabel(session: Session, activeChildCount: number): string | null {
@@ -472,12 +482,13 @@ export function ContextPanel({
   childDetailMessages,
   allSessions,
   openSessions,
-  openSessionMessages,
-  openSessionChildren,
+  multiViewSessions,
+  multiSessionMessages,
   agents,
   childSessions,
   execMode,
   taskPreferredAgent,
+  nativeApprovalDefault,
   savedOrgsList,
   activeSavedOrg,
   onSavedOrgsList,
@@ -500,6 +511,8 @@ export function ContextPanel({
   onTitleChange,
   onSessionConfigChange,
   onSessionTaskAgentChange,
+  onSessionNativeApprovalLevelChange,
+  onSetNativeApprovalDefault,
   onContinueInNewChat,
   onStop,
   onComplete,
@@ -520,11 +533,9 @@ export function ContextPanel({
   onMaximize,
   onComposerSend,
   onInteractionReply,
-  onSessionSend,
   onWorkItemClick,
   onWorkItemOpenSession,
   onMarkRead,
-  onSessionMarkRead,
   onLoadSessionHistory,
   isSessionHistoryLoading,
 }: ContextPanelProps) {
@@ -842,7 +853,9 @@ export function ContextPanel({
             {/* Header with tabs or title */}
             <div className="ctx-header">
               {showMultiSessionGrid ? (
-                <span className="ctx-header-title">{isCompanyRuntime ? 'Open Runtime Sessions' : 'Open Sessions'}</span>
+                <span className="ctx-header-title">
+                  {isCompanyRuntime ? 'Open Runtime Sessions' : 'Open Sessions'} · {multiViewSessions.length} of {openSessions.length}
+                </span>
               ) : showTabs ? (
                 <div className="ctx-header-tabs" role="tablist" aria-label="Session view">
                   <button
@@ -927,42 +940,20 @@ export function ContextPanel({
 
               {showMultiSessionGrid && (
                 <div className="ctx-multi-grid">
-                  {openSessions.map((session) => {
-                    const sessionMessages = openSessionMessages[session.taskId] ?? []
-                    const sessionChildren = openSessionChildren[session.taskId] ?? []
-                    const sessionPeers = getConversationPeerSessions(session, allSessions)
-                    const sessionConversation = projectSessionConversation(session, [...sessionPeers, ...sessionChildren])
-                    const sessionConversationSession = getConversationSessionView(
-                      session,
-                      sessionConversation.runtimeSession,
-                      sessionConversation.timelineSessions,
-                    )
-                    const sessionWorkItemRoleSessions = getWorkItemRoleSessions(
-                      sessionConversationSession ?? session,
-                      allSessions,
-                    )
-                    const sessionRoleWorkItems = sessionConversationSession?.roleWorkItems ?? session.roleWorkItems
-                    const activeChildCount = activeAgentCountFor(sessionRoleWorkItems, sessionChildren) ?? 0
+                  {multiViewSessions.map((session) => {
+                    const sessionMessages = multiSessionMessages[session.taskId] ?? []
+                    const previewMessage = latestSessionPreviewMessage(sessionMessages)
+                    const activeChildCount = activeRoleWorkItemCount(session.roleWorkItems) ?? 0
                     const assigneeNames = session.assigneeIds
                       .map(id => agents.find(agent => agent.agent_id === id)?.name ?? id)
                       .filter(Boolean)
-                    const runtimeLabel = sessionRuntimeLabel(sessionConversationSession ?? session, activeChildCount)
-                    const sessionIsCompanyRuntime = isCompanyRuntimeSession(session, sessionChildren.length)
-                    const sessionDisplaySession = sessionConversation.displaySession ?? session
-                    const sessionProgressLog = mergeConversationProgressLog(sessionConversation.timelineSessions)
-                    const sessionMessageCount = getConversationMessageCount(sessionConversation.timelineSessions)
-                    const sessionLockedMode = isSessionConfigLocked(
-                      sessionConversationSession ?? sessionDisplaySession,
-                      Math.max(sessionMessageCount, sessionMessages.length),
-                    )
-                    const sessionHistoryLoading = sessionConversation.timelineSessions.some(
-                      (timelineSession) => isSessionHistoryLoading?.(timelineSession.taskId) ?? false,
-                    )
+                    const runtimeLabel = sessionRuntimeLabel(session, activeChildCount)
 
                     return (
                       <section
                         key={session.taskId}
                         className={`ctx-multi-card${activeSession?.taskId === session.taskId ? ' focused' : ''}`}
+                        data-session-preview-id={session.taskId}
                       >
                         <div className="ctx-multi-card-header">
                           <button
@@ -974,18 +965,6 @@ export function ContextPanel({
                             <span className="ctx-multi-card-title">{session.title}</span>
                           </button>
                           <div className="ctx-multi-card-actions">
-                            {((sessionConversationSession ?? session).canStop ?? (sessionConversationSession ?? session).status === 'running') && (sessionConversationSession ?? session).runtimeControlState !== 'suspending' && onStopTask && (
-                              <button onClick={() => onStopTask(sessionConversation.runtimeSession?.taskId ?? session.taskId)}>Stop</button>
-                            )}
-                            {(sessionConversationSession ?? session).runtimeControlState === 'suspending' && (
-                              <button disabled>Stopping...</button>
-                            )}
-                            {canShowContinue(sessionConversationSession ?? session) && onResumeTask && (
-                              <button onClick={() => onResumeTask(session.taskId)}>Continue</button>
-                            )}
-                            {(sessionConversationSession ?? session).status !== 'done' && (sessionConversationSession ?? session).status !== 'cancelled' && onCompleteTask && (
-                              <button onClick={() => onCompleteTask(session.taskId)}>Done</button>
-                            )}
                             <button onClick={() => onSelectSessionTab?.(session.taskId)}>Focus</button>
                             <button onClick={() => onCloseSessionTab?.(session.taskId)} title="Close tab">
                               &#x00D7;
@@ -1000,97 +979,17 @@ export function ContextPanel({
                           <span>{relativeTime(session.updatedAt)}</span>
                         </div>
                         <div className="ctx-multi-card-body">
-                          <MessageList
-                            key={sessionDisplaySession?.channelId ?? session.channelId}
-                            messages={sessionMessages}
-                            channelName={sessionDisplaySession?.title ?? session.title}
-                            viewKind="session"
-                            detailMode={sessionDetailLevel(sessionDisplaySession)}
-                            agentStatus={sessionIsCompanyRuntime ? undefined : (sessionConversationSession?.agentStatus ?? sessionDisplaySession?.agentStatus)}
-                            currentTool={sessionIsCompanyRuntime ? undefined : (sessionConversationSession?.currentTool ?? sessionDisplaySession?.currentTool)}
-                            toolElapsedMs={sessionIsCompanyRuntime ? undefined : (sessionConversationSession?.toolElapsedMs ?? sessionDisplaySession?.toolElapsedMs)}
-                            lastToolSummary={sessionIsCompanyRuntime ? undefined : (sessionConversationSession?.lastToolSummary ?? sessionDisplaySession?.lastToolSummary)}
-                            progressLog={sessionIsCompanyRuntime ? undefined : sessionProgressLog}
-                            draftAssistantText={sessionIsCompanyRuntime ? undefined : (sessionConversationSession?.draftAssistantText ?? sessionDisplaySession?.draftAssistantText)}
-                            draftUpdatedAt={sessionIsCompanyRuntime ? undefined : (sessionConversationSession?.draftUpdatedAt ?? sessionDisplaySession?.draftUpdatedAt)}
-                            draftIteration={sessionIsCompanyRuntime ? undefined : (sessionConversationSession?.draftIteration ?? sessionDisplaySession?.draftIteration)}
-                            draftTurnId={sessionIsCompanyRuntime ? undefined : (sessionConversationSession?.draftTurnId ?? sessionDisplaySession?.draftTurnId)}
-                            isCompanyRuntime={sessionIsCompanyRuntime}
-                            workItemLog={sessionConversationSession?.workItemLog ?? session.workItemLog}
-                            childSessions={sessionWorkItemRoleSessions}
-                            showWorkItemRuntimeCard={!sessionIsCompanyRuntime}
-                            onInteractionReply={(content, _taskId, metadata) => onInteractionReply(content, session.taskId, metadata)}
-                            onWorkItemClick={onWorkItemClick}
-                            onWorkItemOpenSession={onWorkItemOpenSession}
-                            onMarkRead={() => onSessionMarkRead?.(session.taskId)}
-                            scrollScope={session.channelId}
-                            hasOlderHistory={
-                              // Keep known cursors available during live work;
-                              // suppress only the count-based fallback.
-                              conversationHasOlderHistory(
-                                sessionConversation.timelineSessions,
-                                sessionMessages.length,
-                                sessionDetailLevel(sessionDisplaySession ?? session),
-                                !sessionConversation.timelineSessions.some(isSessionWorking),
-                              )
-                            }
-                            totalMessageCount={sessionMessageCount}
-                            onLoadOlderHistory={(oldestMessage) => {
-                              const detailLevel = sessionDetailLevel(sessionDisplaySession ?? session)
-                              const matchedSession = sessionConversation.timelineSessions.find(
-                                (timelineSession) => timelineSession.channelId === oldestMessage?.channelId,
-                              )
-                              const targetSession = (
-                                matchedSession
-                                  && sessionHasMoreForDetail(matchedSession, detailLevel) !== false
-                                  ? matchedSession
-                                  : undefined
-                              ) ?? sessionConversation.timelineSessions.find(
-                                timelineSession => sessionHasMoreForDetail(timelineSession, detailLevel) === true,
-                              ) ?? sessionDisplaySession ?? session
-                              return onLoadSessionHistory?.(
-                                targetSession.taskId,
-                                oldestMessage,
-                                detailLevel,
-                              )
-                            }}
-                            loadingOlderHistory={sessionHistoryLoading}
-                            showRuntimeProgress={sessionDetailLevel(sessionDisplaySession) === 'full'}
-                          />
-                        </div>
-                        <MessageComposer
-                          key={sessionConversationSession?.channelId ?? session.channelId}
-                          disabled={false}
-                          channelId={sessionConversationSession?.channelId ?? session.channelId}
-                          execMode={composerExecModeForSession(session, execMode)}
-                          companyProfile={session.companyProfile}
-                          taskPreferredAgent={composerTaskAgentForSession(session, sessionLockedMode, taskPreferredAgent)}
-                          agentStatus={sessionConversationSession?.agentStatus ?? sessionDisplaySession?.agentStatus}
-                          currentTool={sessionConversationSession?.currentTool ?? sessionDisplaySession?.currentTool}
-                          displayTool={sessionConversationSession?.displayTool ?? sessionDisplaySession?.displayTool}
-                          activeAgentCount={activeChildCount || undefined}
-                          runtimeControlState={(sessionConversationSession ?? sessionDisplaySession)?.runtimeControlState}
-                          canStop={(sessionConversationSession ?? sessionDisplaySession)?.canStop}
-                          savedOrgs={savedOrgsList ?? null}
-                          activeSavedOrg={activeSavedOrg ?? null}
-                          selectedOrgId={session.orgId ?? activeSavedOrg ?? null}
-                          lockedMode={sessionLockedMode}
-                          autoFocus={false}
-                          contextTokens={sessionConversationSession?.contextTokens ?? sessionDisplaySession?.contextTokens}
-                          contextWindow={sessionConversationSession?.contextWindow ?? sessionDisplaySession?.contextWindow}
-                          contextRemainingPct={sessionConversationSession?.contextRemainingPct ?? sessionDisplaySession?.contextRemainingPct ?? 100}
-                          onSend={(content, attachments) => onSessionSend?.(
-                            session.taskId,
-                            content,
-                            attachments,
+                          {previewMessage ? (
+                            <>
+                              <span className="ctx-multi-preview-sender">
+                                {previewMessage.senderName || previewMessage.sender}
+                              </span>
+                              <p className="ctx-multi-preview-text">{sessionPreviewText(previewMessage.content)}</p>
+                            </>
+                          ) : (
+                            <span className="ctx-multi-preview-empty">No messages yet</span>
                           )}
-                          onModeChange={(mode, profile, orgId) => onSessionConfigChange?.(session.taskId, mode, profile, orgId)}
-                          onTaskAgentChange={(preferredAgent) => onSessionTaskAgentChange?.(session.taskId, preferredAgent)}
-                          onContinueInNewChat={onContinueInNewChat}
-                          onSavedOrgsRefresh={onSavedOrgsList}
-                          onSavedOrgLoad={onSavedOrgLoad}
-                          onStop={() => onStopTask?.(sessionConversation.runtimeSession?.taskId ?? session.taskId)}
-                        />
+                        </div>
                       </section>
                     )
                   })}
@@ -1141,7 +1040,10 @@ export function ContextPanel({
 
               {/* Session view — Chat tab */}
               {activeSession && !isSecretary && !isActivity && !showMultiSessionGrid && panelTab === 'chat' && (
-                <>
+                <div
+                  className="ctx-session-chat"
+                  data-session-render-key={`${activeSession.projectId}:${activeSession.taskId}:${activeConversationSession?.channelId ?? channelId}`}
+                >
                   <TaskHeaderBar
                     session={activeHeaderSession ?? activeSession}
                     agents={agents}
@@ -1164,7 +1066,6 @@ export function ContextPanel({
                     </div>
                   )}
                   <MessageList
-                    key={channelId}
                     messages={messages}
                     channelName={channelName}
                     viewKind="session"
@@ -1226,6 +1127,8 @@ export function ContextPanel({
                       ),
                       taskPreferredAgent,
                     )}
+                    nativeApprovalLevel={activeSession.nativeApprovalLevel ?? nativeApprovalDefault}
+                    nativeApprovalDefault={nativeApprovalDefault}
                     agentStatus={activeConversationSession?.agentStatus ?? activeDisplaySession?.agentStatus}
                     currentTool={activeConversationSession?.currentTool ?? activeDisplaySession?.currentTool}
                     displayTool={activeConversationSession?.displayTool ?? activeDisplaySession?.displayTool}
@@ -1245,12 +1148,14 @@ export function ContextPanel({
                     onSend={onComposerSend}
                     onModeChange={(mode, profile, orgId) => onSessionConfigChange?.(activeSession.taskId, mode, profile, orgId)}
                     onTaskAgentChange={(preferredAgent) => onSessionTaskAgentChange?.(activeSession.taskId, preferredAgent)}
+                    onNativeApprovalLevelChange={(level) => onSessionNativeApprovalLevelChange?.(activeSession.taskId, level)}
+                    onSetNativeApprovalDefault={onSetNativeApprovalDefault}
                     onContinueInNewChat={onContinueInNewChat}
                     onSavedOrgsRefresh={onSavedOrgsList}
                     onSavedOrgLoad={onSavedOrgLoad}
                     onStop={onStop}
                   />
-                </>
+                </div>
               )}
 
               {/* Session view — Agents tab */}

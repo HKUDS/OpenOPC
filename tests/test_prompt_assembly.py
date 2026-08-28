@@ -28,6 +28,7 @@ def _base_prompt(prompt: str) -> str:
     addendum_headers = [
         "\n\n## Task Tracking",
         "\n\n## Company Work Item Contract",
+        "\n\n## Runtime Clock",
         "\n\n## Organization Runtime Contract",
         "\n\n## Work Item Turn: Report Generation",
         "\n\n## Kanban Review Turn",

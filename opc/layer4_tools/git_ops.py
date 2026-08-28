@@ -51,6 +51,7 @@ def create_git_tools() -> list[ToolDefinition]:
             func=git_status,
             category="code",
             company_effect_kind=COMPANY_EFFECT_FORBIDDEN,
+            permission_effects=["local_read", "process_execute"],
         ),
         ToolDefinition(
             name="git_commit",
@@ -68,6 +69,7 @@ def create_git_tools() -> list[ToolDefinition]:
             category="code",
             requires_confirmation=True,
             company_effect_kind=COMPANY_EFFECT_FORBIDDEN,
+            permission_effects=["process_execute", "workspace_write"],
         ),
         ToolDefinition(
             name="git_diff",
@@ -83,5 +85,6 @@ def create_git_tools() -> list[ToolDefinition]:
             func=git_diff,
             category="code",
             company_effect_kind=COMPANY_EFFECT_FORBIDDEN,
+            permission_effects=["local_read", "process_execute"],
         ),
     ]

@@ -11937,17 +11937,14 @@ class CompanyWorkItemExecutor:
                 and not bool((getattr(child, "metadata", {}) or {}).get("deleted_by_manager_tool", False))
                 and str(getattr(child, "work_item_id", "") or "").strip()
             ]
-        if not dependency_ids:
-            return False
-        # Intake special-case: the top-level "receive user request + dispatch"
-        # card's deliverable IS the delegation; there is nothing further
-        # for it to integrate once children return. Instead of parking it
+        # Intake special-case: the top-level card ends after it either creates
+        # child work or completes the work directly. Instead of parking it
         # in WAITING_FOR_CHILDREN (which forces a wake and an empty "turn 2"
         # where the agent has nothing to produce), we:
         #   1. Approve the intake directly — its job is done.
-        #   2. Materialize a separate delivery card, dependent on the
-        #      same children, whose job is to synthesise and hand the
-        #      final result to the user.
+        #   2. Materialize a separate delivery card, dependent on either the
+        #      delegated children or the direct intake output, whose job is to
+        #      synthesise and hand the final result to the user.
         # The delivery card is reviewed by the human user (not an upper
         # agent), so its review phase resolves to AWAITING_HUMAN.
         if (
@@ -11976,7 +11973,7 @@ class CompanyWorkItemExecutor:
                 task.metadata.pop("delegation_wait_for_work_item_ids", None)
                 await self._append_progress(
                     task,
-                    "Intake dispatched; delivery card spawned, intake approved.",
+                    "Intake completed; delivery card spawned, intake approved.",
                 )
                 # task.status will be synchronised to DONE by the phase hook
                 # once we flip the intake work item to APPROVED below.
@@ -12011,6 +12008,8 @@ class CompanyWorkItemExecutor:
                     )
                 await self.save_task(task)
                 return False  # intake does not park; it closes out
+        if not dependency_ids:
+            return False
         # A dependency only counts as pending while it can still move on its
         # own: terminal deps (APPROVED/FAILED/CANCELLED) and doomed deps
         # (transitively blocked by a terminal failure) are settled. Without
@@ -12144,14 +12143,15 @@ class CompanyWorkItemExecutor:
         dependency_ids: list[str],
         pruned_dependency_ids: list[str] | None = None,
     ) -> bool:
-        """Create the user-facing delivery work item once intake dispatches.
+        """Create the user-facing delivery work item after intake completes.
 
         Runs once per intake (idempotent via ``intake_delivery_spawned``
         flag set by the caller). The delivery card:
 
             - Inherits the intake's seat/team/role identity (same top-level
               agent owns it)
-            - Depends on every child the intake just delegated, so it
+            - Depends on every child the intake just delegated, or on the
+              intake itself when the leader completed the work directly, so it
               auto-advances WAITING_DEPENDENCIES → READY once they all
               approve (``_refresh_delegation_dependents`` already handles
               that edge)
@@ -12169,6 +12169,7 @@ class CompanyWorkItemExecutor:
         intake_work_item_id = str(
             getattr(intake_work_item, "work_item_id", "") or ""
         ).strip()
+        delivery_dependency_ids = list(dependency_ids) or [intake_work_item_id]
         delivery_digest = hashlib.sha256(
             f"{run_id}|{intake_work_item_id}|final-delivery".encode("utf-8")
         ).hexdigest()[:16]
@@ -12240,8 +12241,8 @@ class CompanyWorkItemExecutor:
             "work_kind": "delivery",
             "manager_role_id": str(getattr(intake_work_item, "manager_role_id", "") or "").strip(),
             "manager_seat_id": str(getattr(intake_work_item, "manager_seat_id", "") or "").strip(),
-            "dependency_work_item_ids": list(dependency_ids),
-            "waiting_on_work_item_ids": list(dependency_ids),
+            "dependency_work_item_ids": list(delivery_dependency_ids),
+            "waiting_on_work_item_ids": list(delivery_dependency_ids),
             "assigned_role_runtime_id": str(getattr(intake_work_item, "role_runtime_session_id", "") or intake_meta.get("assigned_role_runtime_id", "") or "").strip(),
             "contact_role_ids": list(intake_meta.get("contact_role_ids", []) or []),
             # Delivery is a terminal synthesis/handoff turn, not a second
@@ -12319,7 +12320,7 @@ class CompanyWorkItemExecutor:
         controller_context = self._controller_attempt_context_for_task(task)
         if controller_context is not None:
             progress_message = (
-                "Intake dispatched; delivery card spawned, intake approved."
+                "Intake completed; delivery card spawned, intake approved."
             )
             task.metadata = dict(task.metadata)
             task.metadata.pop("delegation_pending_work_item_ids", None)
@@ -12443,7 +12444,7 @@ class CompanyWorkItemExecutor:
                             event_type="delivery_work_item_created",
                             payload={
                                 "intake_work_item_id": intake_work_item_id,
-                                "dependency_work_item_ids": list(dependency_ids),
+                                "dependency_work_item_ids": list(delivery_dependency_ids),
                             },
                         )
                     )
@@ -12464,7 +12465,7 @@ class CompanyWorkItemExecutor:
                         event_type="delivery_work_item_created",
                         payload={
                             "intake_work_item_id": delivery_metadata["intake_work_item_id"],
-                            "dependency_work_item_ids": list(dependency_ids),
+                            "dependency_work_item_ids": list(delivery_dependency_ids),
                         },
                     )
                 )
@@ -16872,7 +16873,6 @@ class CompanyWorkItemExecutor:
         return (
             work_item_turn_type_from_metadata(combined, fallback="") == "deliver"
             or is_delivery_turn(combined)
-            or str(combined.get("review_owner_kind", "") or "").strip().lower() == "human"
         )
 
     def _is_final_human_acceptance_task(

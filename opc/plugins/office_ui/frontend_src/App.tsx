@@ -28,7 +28,7 @@ import { resolveCanonicalTurnId, terminalAssistantTurnId } from './lib/turnIdent
 import { compileProjectIdPolicy, type ProjectIdPolicy } from './lib/projectIdPolicy'
 import { loadStoredTheme, saveStoredTheme, isThemeName, themeMessageKey, THEMES, type ThemeName } from './lib/theme'
 import { unassignAgent } from './game/map/OfficeStore'
-import type { AgentAnimStatus, EmployeeAssignment, KanbanPhase, KanbanTask, RoleAggregatedStatus, RoleWorkItemSummary, Session, TaskPreferredAgent } from './types/kanban'
+import type { AgentAnimStatus, EmployeeAssignment, KanbanPhase, KanbanTask, NativeApprovalLevel, RoleAggregatedStatus, RoleWorkItemSummary, Session, TaskPreferredAgent } from './types/kanban'
 import { useI18n } from './i18n'
 
 function readOutdoorOverrideUi(): 'auto' | 'day' | 'night' {
@@ -487,6 +487,7 @@ export default function App() {
   const [globalExecMode, setGlobalExecMode] = useState<AppExecMode>('task')
   const [globalCompanyProfile, setGlobalCompanyProfile] = useState<'corporate' | 'custom'>('corporate')
   const [globalTaskPreferredAgent, setGlobalTaskPreferredAgent] = useState<TaskPreferredAgent>('native')
+  const [globalNativeApprovalDefault, setGlobalNativeApprovalDefault] = useState<NativeApprovalLevel>('auto')
   const [orgInfoData, setOrgInfoData] = useState<OrgInfoPayload | null>(null)
   const [commsState, setCommsState] = useState<import('./lib/wsClient').CommsStatePayload | null>(null)
   const [commsMessage, setCommsMessage] = useState<import('./lib/wsClient').CommsMessagePayload | null>(null)
@@ -509,6 +510,7 @@ export default function App() {
   const replayedEventIds = useRef<Set<string>>(new Set())
   const swarmAgentsRef = useRef<AgentInfo[]>([])
   const globalExecModeRef = useRef<AppExecMode>('task')
+  const globalNativeApprovalDefaultRef = useRef<NativeApprovalLevel>('auto')
   const kanbanCreateRef = useRef<((data: { title: string; description?: string; priority: null; assignee_id?: string }) => void) | null>(null)
   const chatStoreRef = useRef<ChatStoreState | null>(null)
   const boardStoreRef = useRef<BoardStoreState | null>(null)
@@ -869,6 +871,10 @@ export default function App() {
         if (data.exec_mode) setGlobalExecMode(normalizeExecMode(data.exec_mode))
         if (data.company_profile) setGlobalCompanyProfile(normalizeCompanyProfile(data.company_profile))
         if (data.task_preferred_agent) setGlobalTaskPreferredAgent(normalizeTaskPreferredAgent(data.task_preferred_agent))
+        if (data.native_approval_default) {
+          globalNativeApprovalDefaultRef.current = data.native_approval_default
+          setGlobalNativeApprovalDefault(data.native_approval_default)
+        }
 
         setUiTick((n) => n + 1)
       },
@@ -1669,6 +1675,8 @@ export default function App() {
             companyProfile: payloadCompanyProfile,
             orgId: payloadOrgId,
             preferredAgent: normalizeTaskPreferredAgent(payload.preferred_agent ?? existing?.preferredAgent),
+            nativeApprovalLevel: payload.native_approval_level ?? existing?.nativeApprovalLevel ?? globalNativeApprovalDefaultRef.current,
+            nativePermissionScopeId: payload.native_permission_scope_id ?? existing?.nativePermissionScopeId,
             title: payload.title,
             status: payload.status,
             columnId: existing?.columnId ?? 'todo',
@@ -1723,11 +1731,19 @@ export default function App() {
             ...('org_id' in payload || 'organization_id' in payload ? { orgId: orgIdForExecMode(nextExecMode, payload.org_id ?? payload.organization_id) } : {}),
             ...(payload.preferred_agent ? { preferredAgent: normalizeTaskPreferredAgent(payload.preferred_agent) } : {}),
             ...(payload.selected_execution_agent ? { selectedExecutionAgent: normalizeTaskPreferredAgent(payload.selected_execution_agent) } : {}),
+            ...(payload.native_approval_level ? { nativeApprovalLevel: payload.native_approval_level } : {}),
+            ...(payload.native_permission_scope_id ? { nativePermissionScopeId: payload.native_permission_scope_id } : {}),
           })
           if ((payload.exec_mode === 'org' || payload.exec_mode === 'custom') && (payload.org_id || payload.organization_id)) {
             setActiveSavedOrg(String(payload.org_id ?? payload.organization_id))
           }
         } catch (e) { console.error('[onSessionUpdated] Error:', e) }
+      },
+      onNativePermissionDefaultUpdated: (payload) => {
+        if (payload.native_approval_default) {
+          globalNativeApprovalDefaultRef.current = payload.native_approval_default
+          setGlobalNativeApprovalDefault(payload.native_approval_default)
+        }
       },
       onSessionMessage: (payload) => {
         try {
@@ -2292,9 +2308,24 @@ export default function App() {
       resolvedProfile,
       globalTaskPreferredAgent,
       orgIdForExecMode(normalizedMode, orgId ?? activeSavedOrg),
+      globalNativeApprovalDefault,
     )
     setActivePage('workspace')
-  }, [getActiveProjectId, beginPendingSessionCreate, globalTaskPreferredAgent, activeSavedOrg])
+  }, [getActiveProjectId, beginPendingSessionCreate, globalTaskPreferredAgent, activeSavedOrg, globalNativeApprovalDefault])
+
+  const handleSessionNativeApprovalLevelChange = useCallback((
+    taskId: string,
+    level: NativeApprovalLevel,
+  ) => {
+    // Server confirmation is authoritative.  The session_updated event is
+    // the only path that changes visible state, which also makes reconnects
+    // and rejected updates deterministic.
+    clientRef.current?.sessionUpdateNativePermission(getActiveProjectId(), taskId, level)
+  }, [getActiveProjectId])
+
+  const handleSetNativeApprovalDefault = useCallback((level: NativeApprovalLevel) => {
+    clientRef.current?.setNativePermissionDefault(level)
+  }, [])
 
   const markRuntimeControlForTask = useCallback((
     taskId: string,
@@ -2508,6 +2539,7 @@ export default function App() {
           execMode={globalExecMode}
           companyProfile={globalCompanyProfile}
           taskPreferredAgent={globalTaskPreferredAgent}
+          nativeApprovalDefault={globalNativeApprovalDefault}
           projectId={projectStore.activeProjectId}
           orgInfoData={orgInfoData}
           onNavigateToOrg={() => setActivePage('org')}
@@ -2546,6 +2578,7 @@ export default function App() {
               companyProfileForExecMode(globalExecMode, globalCompanyProfile),
               globalTaskPreferredAgent,
               orgIdForExecMode(globalExecMode, activeSavedOrg),
+              globalNativeApprovalDefault,
             )
           }}
           onSessionSend={(taskId, content, attachments, metadata) => clientRef.current?.sessionSend(getActiveProjectId(), taskId, content, attachments, metadata)}
@@ -2568,6 +2601,8 @@ export default function App() {
           onTitleChange={(taskId, title) => clientRef.current?.sessionUpdateTitle(getActiveProjectId(), taskId, title)}
           onSessionConfigChange={handleSessionModeChange}
           onSessionTaskAgentChange={handleSessionTaskAgentChange}
+          onSessionNativeApprovalLevelChange={handleSessionNativeApprovalLevelChange}
+          onSetNativeApprovalDefault={handleSetNativeApprovalDefault}
           onContinueInNewChat={handleContinueInNewChat}
           onSessionStop={handleSessionStop}
           onSessionResume={handleSessionResume}

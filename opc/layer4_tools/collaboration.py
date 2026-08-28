@@ -3435,6 +3435,7 @@ def create_collaboration_tools(
         return ToolDefinition(
             **kwargs,
             company_effect_kind=COMPANY_EFFECT_RUNTIME_INTERNAL,
+            permission_effects=["runtime_internal"],
         )
 
     return [

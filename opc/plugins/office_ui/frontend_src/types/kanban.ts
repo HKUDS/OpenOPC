@@ -1,6 +1,7 @@
 // ── Priority ────────────────────────────────────────────────────────────────
 
 export type TaskPriority = 'urgent' | 'high' | 'medium' | 'low'
+export type NativeApprovalLevel = 'read-only' | 'auto' | 'full-access'
 
 export const PRIORITY_META: Record<TaskPriority, { label: string; color: string; symbol: string }> = {
   urgent: { label: 'Urgent', color: 'var(--red)', symbol: '\u25B2\u25B2' },
@@ -283,6 +284,8 @@ export interface Session {
   companyProfile?: string
   orgId?: string
   preferredAgent?: TaskPreferredAgent
+  nativeApprovalLevel?: NativeApprovalLevel
+  nativePermissionScopeId?: string
   title: string
   status: string
   columnId: string

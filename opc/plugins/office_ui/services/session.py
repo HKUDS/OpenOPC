@@ -12,6 +12,11 @@ from typing import Any
 
 from loguru import logger
 from opc.core.models import Task, TaskStatus
+from opc.core.native_permissions import (
+    normalize_native_approval_level,
+    parse_native_approval_level,
+    tasks_in_native_permission_scope,
+)
 from opc.layer2_organization.company_runtime_identity import (
     ACTIVE_COMPANY_RUNTIME_CHECKPOINT_STATUSES,
     COMPANY_RUNTIME_CHECKPOINT_TYPES,
@@ -115,6 +120,35 @@ class SessionService:
         if assigned not in (None, "", [], {}):
             return self.normalize_preferred_agent(assigned, default="native")
         return "native"
+
+    @staticmethod
+    def resolve_task_native_permission_config(
+        task: Any | None,
+        engine: Any,
+    ) -> dict[str, str]:
+        """Return the authoritative native permission config for one session scope."""
+        metadata = dict(getattr(task, "metadata", {}) or {}) if task is not None else {}
+        engine_config = getattr(engine, "config", None)
+        default = normalize_native_approval_level(
+            getattr(getattr(engine_config, "autonomy", None), "native_approval_level", "auto")
+        )
+        return {
+            "native_approval_level": normalize_native_approval_level(
+                metadata.get("native_approval_level"), default=default,
+            ),
+            "native_permission_scope_id": str(
+                metadata.get("native_permission_scope_id", "")
+                or getattr(task, "session_id", "")
+                or getattr(task, "id", "")
+            ).strip(),
+        }
+
+    @staticmethod
+    def resolve_task_native_approval_level(task: Any | None, engine: Any) -> str:
+        return SessionService.resolve_task_native_permission_config(
+            task,
+            engine,
+        )["native_approval_level"]
 
     @staticmethod
     def _task_status_value(task: Any) -> str:
@@ -303,6 +337,7 @@ class SessionService:
         emit_board_event: bool = True,
         assignee_ids: list[str] | None = None,
         board_id: str | None = None,
+        native_approval_level: Any = None,
     ) -> ServiceResult:
         pid = self.context.normalize_project_id(project_id)
         engine = await self.context.engine_for_project(pid)
@@ -328,6 +363,27 @@ class SessionService:
 
         tid = str(task_id or uuid.uuid4())
         session_id = str(uuid.uuid4())
+        try:
+            normalized_approval_level = (
+                parse_native_approval_level(native_approval_level)
+                if native_approval_level is not None
+                else normalize_native_approval_level(
+                    getattr(
+                        getattr(getattr(engine, "config", None), "autonomy", None),
+                        "native_approval_level",
+                        "auto",
+                    )
+                )
+            )
+        except ValueError as exc:
+            raise ServiceError(
+                "invalid_native_approval_level",
+                "invalid_native_approval_level",
+                {
+                    "native_approval_level": native_approval_level,
+                    "detail": str(exc),
+                },
+            ) from exc
         channel_id = f"session:{tid}"
         self.context.session_to_task[session_id] = tid
         normalized_title = str(title or "New Chat").strip() or "New Chat"
@@ -338,6 +394,8 @@ class SessionService:
             preferred_agent=normalized_agent,
             org_id=normalized_org,
             interface=interface,
+            native_approval_level=normalized_approval_level,
+            native_permission_scope_id=session_id,
         )
 
         if getattr(engine, "memory", None):
@@ -386,6 +444,8 @@ class SessionService:
             "org_id": normalized_org,
             "preferred_agent": normalized_agent,
             "selected_execution_agent": normalized_agent,
+            "native_approval_level": normalized_approval_level,
+            "native_permission_scope_id": session_id,
             "title": normalized_title,
             "status": "pending",
             "created_at": created_at,
@@ -414,6 +474,8 @@ class SessionService:
         preferred_agent: str,
         org_id: str = "",
         interface: str = "office_ui",
+        native_approval_level: str = "auto",
+        native_permission_scope_id: str = "",
     ) -> dict[str, Any]:
         identity = canonicalize_execution_identity(
             exec_mode=exec_mode,
@@ -428,6 +490,8 @@ class SessionService:
             "company_profile": identity.company_profile,
             "preferred_agent": identity.preferred_agent,
             "interface": interface,
+            "native_approval_level": normalize_native_approval_level(native_approval_level),
+            "native_permission_scope_id": str(native_permission_scope_id or "").strip(),
         }
         if identity.is_custom_org and identity.org_id:
             metadata.update({"org_id": identity.org_id, "organization_id": identity.org_id})
@@ -475,6 +539,14 @@ class SessionService:
             session = None
         if not task and not session:
             raise ServiceError("session_not_found", "session_not_found", {"task_id": task_id, "session_id": session_id})
+        if task is not None and not str(
+            (getattr(task, "metadata", {}) or {}).get("native_approval_level", "") or ""
+        ).strip():
+            await self.persist_native_permission_config(
+                task,
+                level=self.resolve_task_native_approval_level(task, engine),
+                engine=engine,
+            )
         transcript = await store.get_session_transcript(session_id) if session_id and hasattr(store, "get_session_transcript") else []
         return ServiceResult({
             "project_id": self.context.normalize_project_id(project_id),
@@ -492,6 +564,7 @@ class SessionService:
         company_profile: Any = None,
         preferred_agent: Any = None,
         org_id: Any = None,
+        native_approval_level: Any = None,
     ) -> ServiceResult:
         engine = await self.context.engine_for_project(project_id)
         store = getattr(engine, "store", None)
@@ -502,8 +575,16 @@ class SessionService:
             raise ServiceError("task_not_found", "task_not_found", {"project_id": project_id, "task_id": task_id})
         current_exec, current_profile = self.resolve_task_session_config(task)
         current_agent = self.resolve_task_preferred_agent(task)
+        current_approval_level = self.resolve_task_native_approval_level(task, engine)
         lock_reason = await self.session_config_lock_reason(task, self.context.normalize_project_id(project_id))
-        if lock_reason:
+        permission_only = (
+            native_approval_level is not None
+            and exec_mode is None
+            and company_profile is None
+            and preferred_agent is None
+            and org_id is None
+        )
+        if lock_reason and not permission_only:
             raise ServiceError("session_config_locked", "session_config_locked", {
                 "reason": lock_reason,
                 "project_id": project_id,
@@ -513,6 +594,7 @@ class SessionService:
                 "org_id": self.resolve_task_org_id(task),
                 "preferred_agent": current_agent,
                 "selected_execution_agent": self.resolve_task_selected_execution_agent(task),
+                "native_approval_level": current_approval_level,
             })
         normalized_exec, normalized_profile, normalized_agent, normalized_org = self._normalize_requested_config(
             exec_mode=exec_mode if exec_mode is not None else current_exec,
@@ -530,12 +612,33 @@ class SessionService:
             if not normalized_org:
                 raise ServiceError("org_id_required", "org_id_required", {"project_id": project_id, "task_id": task_id})
             await self._ensure_org_loaded(normalized_org)
-        await self.persist_session_config(
+        if not permission_only:
+            await self.persist_session_config(
+                task,
+                exec_mode=normalized_exec,
+                company_profile=normalized_profile,
+                preferred_agent=normalized_agent,
+                org_id=normalized_org,
+                engine=engine,
+            )
+        try:
+            normalized_approval_level = (
+                parse_native_approval_level(native_approval_level)
+                if native_approval_level is not None
+                else current_approval_level
+            )
+        except ValueError as exc:
+            raise ServiceError(
+                "invalid_native_approval_level",
+                "invalid_native_approval_level",
+                {
+                    "native_approval_level": native_approval_level,
+                    "detail": str(exc),
+                },
+            ) from exc
+        await self.persist_native_permission_config(
             task,
-            exec_mode=normalized_exec,
-            company_profile=normalized_profile,
-            preferred_agent=normalized_agent,
-            org_id=normalized_org,
+            level=normalized_approval_level,
             engine=engine,
         )
         payload = {
@@ -546,6 +649,8 @@ class SessionService:
             "org_id": normalized_org,
             "preferred_agent": normalized_agent,
             "selected_execution_agent": self.resolve_task_selected_execution_agent(task),
+            "native_approval_level": normalized_approval_level,
+            "native_permission_scope_id": str(task.metadata.get("native_permission_scope_id", "") or ""),
         }
         return ServiceResult(payload, [ServiceEvent("session_updated", payload)])
 
@@ -622,6 +727,11 @@ class SessionService:
             raise ServiceError("org_id_required", "org_id_required", {
                 "task_id": str(getattr(task, "id", "") or ""),
             })
+        permission_config = self.resolve_task_native_permission_config(
+            task,
+            runtime_engine,
+        )
+        metadata.update(permission_config)
         metadata["exec_mode"] = identity.exec_mode
         metadata["company_profile"] = identity.company_profile
         metadata["preferred_agent"] = identity.preferred_agent
@@ -663,6 +773,8 @@ class SessionService:
                 company_profile=identity.company_profile,
                 preferred_agent=identity.preferred_agent,
                 org_id=normalized_org_id,
+                native_approval_level=permission_config["native_approval_level"],
+                native_permission_scope_id=permission_config["native_permission_scope_id"],
             )
             if not identity.is_custom_org:
                 session_metadata["org_id"] = ""
@@ -675,6 +787,63 @@ class SessionService:
                 parent_session_id=getattr(task, "parent_session_id", None),
                 metadata=session_metadata,
             )
+
+    async def persist_native_permission_config(
+        self,
+        task: Any,
+        *,
+        level: Any,
+        engine: Any,
+    ) -> str:
+        normalized = normalize_native_approval_level(
+            level,
+            default=normalize_native_approval_level(engine.config.autonomy.native_approval_level),
+        )
+        metadata = dict(getattr(task, "metadata", {}) or {})
+        scope_id = str(
+            metadata.get("native_permission_scope_id", "")
+            or getattr(task, "session_id", "")
+            or getattr(task, "id", "")
+        ).strip()
+        metadata["native_approval_level"] = normalized
+        metadata["native_permission_scope_id"] = scope_id
+        task.metadata = metadata
+        if getattr(engine, "approval_engine", None):
+            engine.approval_engine.native_policy.set_session_level(scope_id, normalized)
+        scoped_tasks = [task]
+        if getattr(engine, "store", None):
+            all_tasks = await engine.store.get_tasks(
+                project_id=getattr(task, "project_id", None) or engine.project_id or "default"
+            )
+            scoped_tasks = tasks_in_native_permission_scope(
+                all_tasks,
+                root_session_id=str(getattr(task, "session_id", "") or ""),
+                scope_id=scope_id,
+            ) or [task]
+            for candidate in scoped_tasks:
+                candidate.metadata = {
+                    **dict(getattr(candidate, "metadata", {}) or {}),
+                    "native_approval_level": normalized,
+                    "native_permission_scope_id": scope_id,
+                }
+                await engine.store.save_task(candidate)
+        if getattr(engine, "memory", None):
+            for candidate in scoped_tasks:
+                session_id = str(getattr(candidate, "session_id", "") or "").strip()
+                if not session_id:
+                    continue
+                await engine.memory.ensure_session(
+                    session_id=session_id,
+                    project_id=getattr(candidate, "project_id", None) or engine.project_id or "default",
+                    title=getattr(candidate, "title", "") or "",
+                    mode="primary" if not getattr(candidate, "parent_session_id", None) else "child",
+                    parent_session_id=getattr(candidate, "parent_session_id", None),
+                    metadata={
+                        "native_approval_level": normalized,
+                        "native_permission_scope_id": scope_id,
+                    },
+                )
+        return normalized
 
     async def send(
         self,
@@ -700,7 +869,6 @@ class SessionService:
             if getattr(engine, "memory", None):
                 await engine.memory.ensure_session(task.session_id, project_id=project_id, title=task.title, mode="primary", metadata={"source": "service"})
             await store.save_task(task)
-
         # A Task selected by the UI/CLI is only the chat channel for company
         # mode.  Resolve the durable runtime scope before choosing execution
         # configuration, session, origin, or checkpoint.  In particular, a
@@ -746,6 +914,17 @@ class SessionService:
             if company_target is not None
             else task
         ) or task
+        if not str(
+            (getattr(config_task, "metadata", {}) or {}).get(
+                "native_approval_level", ""
+            )
+            or ""
+        ).strip():
+            await self.persist_native_permission_config(
+                config_task,
+                level=self.resolve_task_native_approval_level(config_task, engine),
+                engine=engine,
+            )
         identity = self.resolve_task_identity(
             config_task,
             default_exec_mode=mode,
@@ -776,7 +955,9 @@ class SessionService:
 
         execution_session_id = str(getattr(task, "session_id", "") or "").strip()
         origin_task_id = str(getattr(task, "id", "") or "").strip() or None
-        message_metadata: dict[str, Any] | None = None
+        message_metadata: dict[str, Any] | None = (
+            self.resolve_task_native_permission_config(config_task, engine)
+        )
         if company_target is not None:
             execution_session_id = str(
                 company_target.get("runtime_session_id", "") or ""
@@ -809,12 +990,12 @@ class SessionService:
                             "checkpoint_status": checkpoint_status,
                         },
                     )
-                message_metadata = {
+                message_metadata.update({
                     "response_to_checkpoint_id": checkpoint_id,
                     "response_to_checkpoint_type": str(
                         getattr(checkpoint, "checkpoint_type", "") or ""
                     ).strip(),
-                }
+                })
 
         response = await engine.process_message(
             str(content or "").strip(),
@@ -1177,7 +1358,10 @@ class SessionService:
                 "org_id_required",
                 {"project_id": project_id, "task_id": resolved_task_id},
             )
-        message_metadata: dict[str, Any] = {"ui_force_resume": True}
+        message_metadata: dict[str, Any] = {
+            "ui_force_resume": True,
+            **self.resolve_task_native_permission_config(config_task, engine),
+        }
         if checkpoint is not None:
             message_metadata.update({
                 "response_to_checkpoint_id": str(getattr(checkpoint, "checkpoint_id", "") or ""),

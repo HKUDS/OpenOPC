@@ -68,6 +68,7 @@ def create_agent_runtime_tools() -> list[ToolDefinition]:
             read_only=False,
             runtime_managed=True,
             company_effect_kind=COMPANY_EFFECT_RUNTIME_INTERNAL,
+            permission_effects=["runtime_internal"],
         ),
         ToolDefinition(
             name="agent_wait",
@@ -90,6 +91,7 @@ def create_agent_runtime_tools() -> list[ToolDefinition]:
             read_only=True,
             runtime_managed=True,
             company_effect_kind=COMPANY_EFFECT_RUNTIME_INTERNAL,
+            permission_effects=["runtime_internal"],
         ),
         ToolDefinition(
             name="agent_send",
@@ -108,6 +110,7 @@ def create_agent_runtime_tools() -> list[ToolDefinition]:
             read_only=False,
             runtime_managed=True,
             company_effect_kind=COMPANY_EFFECT_RUNTIME_INTERNAL,
+            permission_effects=["runtime_internal"],
         ),
         ToolDefinition(
             name="agent_list",
@@ -122,5 +125,6 @@ def create_agent_runtime_tools() -> list[ToolDefinition]:
             read_only=True,
             runtime_managed=True,
             company_effect_kind=COMPANY_EFFECT_RUNTIME_INTERNAL,
+            permission_effects=["runtime_internal"],
         ),
     ]

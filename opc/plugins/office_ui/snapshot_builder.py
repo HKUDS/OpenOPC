@@ -2947,6 +2947,14 @@ async def build_snapshot(
 
     return {
         "project_id": project_id,
+        "native_approval_default": str(
+            getattr(
+                getattr(getattr(engine, "config", None), "autonomy", None),
+                "native_approval_level",
+                "auto",
+            )
+            or "auto"
+        ),
         "agents": snapshot_agents,
         "channels": {},  # Channels loaded via collab_sync, not snapshot
         "skills": {
@@ -3327,6 +3335,8 @@ async def build_project_index_sync(
             "org_id": org_id,
             "preferred_agent": preferred_agent_val,
             "selected_execution_agent": selected_execution_agent_val,
+            "native_approval_level": identity_meta.get("native_approval_level") or t_meta.get("native_approval_level") or engine.config.autonomy.native_approval_level,
+            "native_permission_scope_id": identity_meta.get("native_permission_scope_id") or t_meta.get("native_permission_scope_id") or getattr(t, "session_id", None),
             "execution_unit_kind": identity_meta.get("execution_unit_kind") or t_meta.get("execution_unit_kind"),
             "external_team_binding_id": dict(identity_meta.get("external_team_binding", {}) or t_meta.get("external_team_binding", {}) or {}).get("binding_id"),
             "external_team_boundary_role_id": dict(identity_meta.get("external_team_binding", {}) or t_meta.get("external_team_binding", {}) or {}).get("boundary_role_id"),
@@ -3932,6 +3942,8 @@ async def build_collab_sync(
             "org_id": org_id,
             "preferred_agent": preferred_agent_val,
             "selected_execution_agent": selected_execution_agent_val,
+            "native_approval_level": identity_meta.get("native_approval_level") or t_meta.get("native_approval_level") or engine.config.autonomy.native_approval_level,
+            "native_permission_scope_id": identity_meta.get("native_permission_scope_id") or t_meta.get("native_permission_scope_id") or getattr(t, "session_id", None),
             "execution_unit_kind": identity_meta.get("execution_unit_kind") or t_meta.get("execution_unit_kind"),
             "external_team_binding_id": dict(identity_meta.get("external_team_binding", {}) or t_meta.get("external_team_binding", {}) or {}).get("binding_id"),
             "external_team_boundary_role_id": dict(identity_meta.get("external_team_binding", {}) or t_meta.get("external_team_binding", {}) or {}).get("boundary_role_id"),

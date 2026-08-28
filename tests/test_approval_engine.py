@@ -64,6 +64,13 @@ class ApprovalEngineHeuristicTests(unittest.TestCase):
             memory=_MemoryStub(),
             config=AutonomyConfig(),
         )
+        sandbox_patch = patch.object(
+            self.engine.native_policy,
+            "_sandbox_available",
+            return_value=True,
+        )
+        sandbox_patch.start()
+        self.addCleanup(sandbox_patch.stop)
 
     def test_external_agent_ignores_secretary_prompt_context_for_sensitive_keywords(self) -> None:
         metadata = {
@@ -167,7 +174,7 @@ class ApprovalEngineHeuristicTests(unittest.TestCase):
             self.assertFalse(self.engine._command_has_shell_substitution(payload))
             self.assertTrue(self.engine._command_matches_safe_prefix(payload, prefixes))
 
-    def test_compound_readonly_command_never_matches_safe_prefix(self) -> None:
+    def test_compound_readonly_command_matches_only_when_every_segment_is_safe(self) -> None:
         prefixes = list(self.engine.config.safe_command_prefixes)
         payloads = [
             'ls -la /a 2>&1 && echo "---" && ls -la /b 2>/dev/null',
@@ -176,54 +183,64 @@ class ApprovalEngineHeuristicTests(unittest.TestCase):
             "grep -rn pattern src | wc -l",
         ]
         for payload in payloads:
-            self.assertFalse(
+            self.assertTrue(
                 self.engine._command_matches_safe_prefix(payload, prefixes),
-                f"compound shell command must require manual review: {payload}",
+                f"fully read-only compound command should be safe: {payload}",
             )
 
-    def test_runtime_prediction_requires_review_for_shell_structure(self) -> None:
+    def test_runtime_prediction_audits_shell_structure_by_segment(self) -> None:
         tool = SimpleNamespace(
             name="shell_exec",
             requires_confirmation=False,
             read_only=False,
+            permission_effects=("process_execute", "workspace_write"),
         )
-        cases = (
+        safe_cases = (
             "ls -la file && wc -l file",
             "ls file || wc -l file",
             "ls file; wc -l file",
             "cat file | wc -l",
-            "ls file &",
             "ls file\nwc -l file",
+        )
+        for command in safe_cases:
+            with self.subTest(safe=command):
+                decision = self.engine.predict(tool, {"command": command})
+                self.assertEqual(decision.resolution, PermissionResolution.ALLOW)
+                self.assertEqual(decision.source, "native_permission_policy")
+
+        review_cases = (
+            "ls file &",
             "ls file > listing.txt",
             "echo $(pwd)",
             "(ls file)",
         )
-        for command in cases:
-            with self.subTest(command=command):
+        for command in review_cases:
+            with self.subTest(review=command):
                 decision = self.engine.predict(tool, {"command": command})
-                self.assertEqual(decision.resolution, PermissionResolution.ASK)
-                self.assertEqual(decision.source, "shell_structure_guard")
+                self.assertEqual(decision.resolution, PermissionResolution.ALLOW)
+                self.assertEqual(decision.source, "native_permission_policy")
 
         standalone = self.engine.predict(tool, {"command": "ls -la file"})
         self.assertEqual(standalone.resolution, PermissionResolution.ALLOW)
-        self.assertEqual(standalone.source, "shell_read_only")
+        self.assertEqual(standalone.source, "native_permission_policy")
 
-        # The two exact E2E validation commands remain ordinary first-use ASK
-        # requests when no human allowlist entry exists.
+        # Auto mode treats ordinary local validation commands like any other
+        # workspace process. Shell syntax alone is not an approval boundary.
         for command in (
             "python3 -m json.tool investment_case/company_analysis.json",
             "node --check app_case/app.js",
         ):
             with self.subTest(exact_validation_command=command):
                 decision = self.engine.predict(tool, {"command": command})
-                self.assertEqual(decision.resolution, PermissionResolution.ASK)
-                self.assertEqual(decision.source, "shell_guard")
+                self.assertEqual(decision.resolution, PermissionResolution.ALLOW)
+                self.assertEqual(decision.source, "native_permission_policy")
 
     def test_denial_memory_is_exact_scoped_and_idempotent(self) -> None:
         tool = SimpleNamespace(
             name="shell_exec",
             requires_confirmation=True,
             read_only=False,
+            permission_effects=("process_execute", "workspace_write"),
         )
         workspace = "/tmp/company-case"
         compound = {
@@ -262,8 +279,8 @@ class ApprovalEngineHeuristicTests(unittest.TestCase):
             "shell_exec", compound, task=risk_task, denial_id="call-risk-1"
         )
         first_repeat = self.engine.predict(tool, compound, task=risk_task)
-        self.assertEqual(first_repeat.resolution, PermissionResolution.ASK)
-        self.assertEqual(first_repeat.source, "shell_structure_guard")
+        self.assertEqual(first_repeat.resolution, PermissionResolution.ALLOW)
+        self.assertEqual(first_repeat.source, "native_permission_policy")
 
         self.engine.record_denial(
             "shell_exec", compound, task=risk_task, denial_id="call-risk-2"
@@ -276,21 +293,25 @@ class ApprovalEngineHeuristicTests(unittest.TestCase):
         # A different exact command in the same cwd remains independently
         # reviewable, and another Task/role cannot inherit the compound denial.
         exact = self.engine.predict(tool, exact_validation, task=risk_task)
-        self.assertEqual(exact.resolution, PermissionResolution.ASK)
-        self.assertEqual(exact.source, "company_exact_tool_permission")
+        self.assertEqual(exact.resolution, PermissionResolution.ALLOW)
+        self.assertEqual(exact.source, "native_permission_policy")
         other_role = self.engine.predict(tool, compound, task=analyst_task)
-        self.assertEqual(other_role.resolution, PermissionResolution.ASK)
-        self.assertEqual(other_role.source, "shell_structure_guard")
+        self.assertEqual(other_role.resolution, PermissionResolution.ALLOW)
+        self.assertEqual(other_role.source, "native_permission_policy")
 
     def test_company_workspace_read_only_shell_skips_exact_checkpoint(self) -> None:
         tool = SimpleNamespace(
             name="shell_exec",
             requires_confirmation=True,
             read_only=False,
+            permission_effects=("process_execute", "workspace_write"),
         )
         with _workspace_tempdir() as workspace:
             report = workspace / "report.md"
             report.write_text("approved result\n", encoding="utf-8")
+            data_dir = workspace / "data"
+            data_dir.mkdir()
+            (data_dir / "one.txt").write_text("one\n", encoding="utf-8")
             outside = workspace.parent / f"outside-{uuid.uuid4().hex}.md"
             outside.write_text("private\n", encoding="utf-8")
             try:
@@ -302,6 +323,8 @@ class ApprovalEngineHeuristicTests(unittest.TestCase):
                         "execution_mode": "company_mode",
                         "work_item_role_id": "ceo",
                         "workspace_root": str(workspace),
+                        "native_approval_level": "read-only",
+                        "native_permission_scope_id": "company-read-only",
                     },
                 )
                 for command in (
@@ -309,6 +332,11 @@ class ApprovalEngineHeuristicTests(unittest.TestCase):
                     f"ls -la {workspace}",
                     f"wc -w {report}",
                     "git status --short",
+                    (
+                        f"ls -la {workspace} 2>/dev/null && echo \"---\" && "
+                        f"wc -l {report} 2>/dev/null"
+                    ),
+                    f"ls -la {data_dir} && wc -l {data_dir}/*",
                 ):
                     with self.subTest(command=command):
                         decision = self.engine.predict(
@@ -323,11 +351,11 @@ class ApprovalEngineHeuristicTests(unittest.TestCase):
                             decision.resolution,
                             PermissionResolution.ALLOW,
                         )
-                        self.assertEqual(decision.source, "shell_read_only")
+                        self.assertEqual(decision.source, "native_permission_policy")
 
                 for command in (
                     f"cat {outside}",
-                    "ls *.md",
+                    f"wc -l {workspace.parent}/*",
                     "touch report.md",
                 ):
                     with self.subTest(command=command):
@@ -345,7 +373,7 @@ class ApprovalEngineHeuristicTests(unittest.TestCase):
                         )
                         self.assertEqual(
                             decision.source,
-                            "company_exact_tool_permission",
+                            "native_permission_policy",
                         )
             finally:
                 outside.unlink(missing_ok=True)
@@ -355,6 +383,7 @@ class ApprovalEngineHeuristicTests(unittest.TestCase):
             name="shell_exec",
             requires_confirmation=False,
             read_only=False,
+            permission_effects=("process_execute", "workspace_write"),
         )
         for command in (
             "git diff --output=/tmp/diff.txt",
@@ -388,7 +417,7 @@ class ApprovalEngineHeuristicTests(unittest.TestCase):
             {"command": "git --no-pager log --no-textconv --oneline -5"},
         )
         self.assertEqual(safe.resolution, PermissionResolution.ALLOW)
-        self.assertEqual(safe.source, "shell_read_only")
+        self.assertEqual(safe.source, "native_permission_policy")
 
     def test_write_redirection_or_unsafe_segment_still_not_safe(self) -> None:
         prefixes = list(self.engine.config.safe_command_prefixes)
@@ -473,11 +502,13 @@ class ApprovalEngineHeuristicTests(unittest.TestCase):
             name="shell_exec",
             requires_confirmation=False,
             read_only=False,
+            permission_effects=("process_execute", "workspace_write"),
         )
         file_tool = SimpleNamespace(
             name="file_read",
             requires_confirmation=False,
             read_only=True,
+            permission_effects=("local_read",),
         )
 
         shell_decision = self.engine.predict(
@@ -598,7 +629,7 @@ class ApprovalAllowlistManagerTests(unittest.TestCase):
 
 
 class ApprovalEngineAllowlistTests(unittest.IsolatedAsyncioTestCase):
-    async def test_company_opaque_tools_ignore_all_broad_grants_and_offer_once_only(self) -> None:
+    async def test_legacy_company_opaque_checkpoint_offers_reusable_scopes(self) -> None:
         with _workspace_tempdir() as opc_home:
             escalation = _EscalationStub("approve_once")
             engine = ApprovalEngine(
@@ -710,7 +741,13 @@ class ApprovalEngineAllowlistTests(unittest.IsolatedAsyncioTestCase):
             for _question, options in escalation.calls:
                 self.assertEqual(
                     [option["id"] for option in options],
-                    ["approve_once", "deny"],
+                    [
+                        "approve_once",
+                        "approve_session",
+                        "always_project",
+                        "always_global",
+                        "deny",
+                    ],
                 )
             python_question = escalation.calls[1][0]
             self.assertIn("    if True:\n        value = '<tag>`literal`'", python_question)
@@ -733,7 +770,7 @@ class ApprovalEngineAllowlistTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertEqual(len(escalation.calls), 2)
 
-    async def test_configured_shell_pattern_precedes_all_auto_allow_policies(self) -> None:
+    async def test_human_grants_bypass_review_but_secretary_policy_does_not(self) -> None:
         with _workspace_tempdir() as root:
             for index, policy in enumerate(
                 ("session", "persisted", "secretary"),
@@ -787,12 +824,14 @@ class ApprovalEngineAllowlistTests(unittest.IsolatedAsyncioTestCase):
                             project_id=task.project_id,
                         )
 
+                    native_tool = SimpleNamespace(
+                        name="shell_exec",
+                        requires_confirmation=False,
+                        read_only=False,
+                        permission_effects=("process_execute", "workspace_write"),
+                    )
                     predicted = engine.predict(
-                        SimpleNamespace(
-                            name="shell_exec",
-                            requires_confirmation=False,
-                            read_only=False,
-                        ),
+                        native_tool,
                         {"command": "wc -l README.md"},
                         task=task,
                     )
@@ -804,19 +843,37 @@ class ApprovalEngineAllowlistTests(unittest.IsolatedAsyncioTestCase):
                             f"configured-pattern-{index}",
                             runtime_session_id=f"runtime-pattern-{index}",
                         ),
+                        tool=native_tool,
                     )
 
-                    self.assertEqual(predicted.resolution, PermissionResolution.ASK)
-                    self.assertEqual(predicted.source, "shell_pattern")
                     self.assertTrue(approved)
-                    self.assertEqual(decision.policy_source, "human_escalation")
-                    self.assertEqual(len(escalation.calls), 1)
-                    question, options = escalation.calls[0]
-                    self.assertIn("dangerous shell pattern", question)
-                    self.assertEqual(
-                        [option["id"] for option in options],
-                        ["approve_once", "deny"],
-                    )
+                    if policy == "session":
+                        self.assertEqual(predicted.resolution, PermissionResolution.ALLOW)
+                        self.assertEqual(predicted.source, "session_approval")
+                        self.assertEqual(decision.policy_source, "session_approval")
+                        self.assertEqual(len(escalation.calls), 0)
+                    elif policy == "persisted":
+                        self.assertEqual(predicted.resolution, PermissionResolution.ALLOW)
+                        self.assertEqual(predicted.source, "approval_allowlist")
+                        self.assertEqual(decision.policy_source, "approval_allowlist")
+                        self.assertEqual(len(escalation.calls), 0)
+                    else:
+                        self.assertEqual(predicted.resolution, PermissionResolution.ASK)
+                        self.assertEqual(predicted.source, "shell_pattern")
+                        self.assertEqual(decision.policy_source, "human_escalation")
+                        self.assertEqual(len(escalation.calls), 1)
+                        question, options = escalation.calls[0]
+                        self.assertIn("dangerous shell pattern", question)
+                        self.assertEqual(
+                            [option["id"] for option in options],
+                            [
+                                "approve_once",
+                                "approve_session",
+                                "always_project",
+                                "always_global",
+                                "deny",
+                            ],
+                        )
 
     async def test_invalid_configured_shell_pattern_async_fails_closed(self) -> None:
         config = AutonomyConfig(
@@ -1161,26 +1218,16 @@ class ApprovalEngineAllowlistTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(decision.risk_level, RiskLevel.LOW)
             self.assertEqual(len(escalation.calls), 0)
 
-    async def test_compound_readonly_command_requires_real_human_checkpoint(self) -> None:
+    async def test_compound_readonly_command_auto_approves_without_checkpoint(self) -> None:
         with _workspace_tempdir() as opc_home:
             prefs = PreferenceManager(opc_home)
             escalation = _EscalationStub("approve_once")
-            # Simulate both a legacy broad prefix grant and an explicit generic
-            # tool allow rule; neither may bypass the structural checkpoint.
-            ApprovalAllowlistManager(opc_home).add_patterns(
-                "tool", "shell_exec", ["ls"]
-            )
             engine = ApprovalEngine(
                 llm=_LLMStub(),
                 store=_StoreStub(),
                 preferences=prefs,
                 memory=_MemoryStub(),
-                # Prove the structural gate is independent of the generic
-                # first-use switch and cannot fall through to LLM auto-review.
-                config=AutonomyConfig(
-                    tool_first_use_approval=False,
-                    permissions_v2={"allow_tools": ["shell_exec"]},
-                ),
+                config=AutonomyConfig(tool_first_use_approval=False),
             )
             await _attach_durable_approval_transport(
                 self, engine, escalation, opc_home
@@ -1195,17 +1242,11 @@ class ApprovalEngineAllowlistTests(unittest.IsolatedAsyncioTestCase):
             )
 
             self.assertTrue(approved)
-            self.assertEqual(decision.policy_source, "human_escalation")
-            self.assertEqual(decision.metadata.get("human_reply"), "approve_once")
-            self.assertEqual(len(escalation.calls), 1)
-            question, options = escalation.calls[0]
-            self.assertIn("manual review required for shell control operator", question)
-            self.assertEqual(
-                [option["id"] for option in options],
-                ["approve_once", "deny"],
-            )
+            self.assertEqual(decision.policy_source, "heuristic")
+            self.assertEqual(decision.risk_level, RiskLevel.LOW)
+            self.assertEqual(len(escalation.calls), 0)
 
-    async def test_git_output_flag_requires_durable_one_shot_human_checkpoint(self) -> None:
+    async def test_git_output_flag_requires_durable_human_checkpoint(self) -> None:
         with _workspace_tempdir() as opc_home:
             prefs = PreferenceManager(opc_home)
             escalation = _EscalationStub("approve_once")
@@ -1252,7 +1293,13 @@ class ApprovalEngineAllowlistTests(unittest.IsolatedAsyncioTestCase):
                 )
                 self.assertEqual(
                     [option["id"] for option in options],
-                    ["approve_once", "deny"],
+                    [
+                        "approve_once",
+                        "approve_session",
+                        "always_project",
+                        "always_global",
+                        "deny",
+                    ],
                 )
             self.assertEqual(
                 ApprovalAllowlistManager(opc_home).list_patterns(
@@ -1586,9 +1633,9 @@ class ApprovalEngineExternalAgentAutoApproveTests(unittest.IsolatedAsyncioTestCa
             [
                 "approve_once",
                 "approve_session",
-                "deny",
                 "always_project",
                 "always_global",
+                "deny",
             ],
         )
 

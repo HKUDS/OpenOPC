@@ -131,6 +131,62 @@ class SessionContextCompressionTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(history_messages[-1]["role"], "assistant")
             self.assertIn("message 5", history_messages[-1]["content"])
 
+    async def test_resolved_staffing_prompt_is_excluded_from_agent_history(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            store = OPCStore(root / "tasks.db")
+            await store.initialize()
+            memory = MemoryManager(root, "proj1", store=store)
+            session_id = "resolved-staffing"
+
+            await memory.append_session_message(
+                session_id=session_id,
+                role="user",
+                text="调研 AI agent",
+            )
+            checkpoint_prompt = await memory.append_session_message(
+                session_id=session_id,
+                role="assistant",
+                text="Company mode has a pending manual staffing selection before execution.",
+                metadata={
+                    "kind": "top_level_reply",
+                    "owner_checkpoint_prompt_type": "company_staffing_selection",
+                    "owner_checkpoint_prompt_id": "staffing-cp",
+                },
+            )
+            assert checkpoint_prompt is not None
+            session = await store.get_session(session_id)
+            assert session is not None
+            completed_at = checkpoint_prompt.created_at.isoformat()
+            session.metadata = {
+                **dict(session.metadata or {}),
+                "recruitment_confirmation": {
+                    "completed": True,
+                    "completed_at": completed_at,
+                },
+                "recruitment_confirmation_completed": True,
+            }
+            await store.save_session(session)
+            await store.save_session_memory_snapshot(
+                SessionMemorySnapshotRecord(
+                    project_id="proj1",
+                    session_id=session_id,
+                    summary_message_id=checkpoint_prompt.message_id,
+                    source_boundary_message_id=checkpoint_prompt.message_id,
+                    summary_text="Runtime is recruiting.",
+                    memory_text="## Current State\n- Runtime is recruiting.",
+                )
+            )
+
+            history = await memory.build_session_history_messages(session_id)
+            context = await memory.build_session_prompt_context(session_id)
+
+            self.assertEqual(len(history), 1)
+            self.assertEqual(history[0]["role"], "user")
+            self.assertIn("调研 AI agent", history[0]["content"])
+            self.assertNotIn("pending manual staffing", context)
+            self.assertNotIn("Runtime is recruiting", context)
+
     async def test_build_memory_context_includes_global_project_and_session_layers(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)

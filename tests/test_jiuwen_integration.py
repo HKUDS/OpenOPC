@@ -878,11 +878,11 @@ def test_team_result_contract_validates_identity_and_maps_artifacts() -> None:
     adapter = JiuwenSwarmAdapter()
     task = Task(
         title="Team boundary",
+        linked_work_item_id="wi-1",
         metadata={
             "execution_unit_kind": "opaque_external_team",
             "execution_mode": "company_mode",
             "runtime_model": "multi_team_org",
-            "work_item_id": "wi-1",
             "claimed_work_item_attempt_seq": 2,
         },
     )

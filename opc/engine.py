@@ -69,6 +69,7 @@ from opc.core.models import (
     WorkItemExecutionStrategy,
     CompanyProfile,
 )
+from opc.core.native_permissions import normalize_native_approval_level
 from opc.database.store import (
     CompanyControllerWorkItemMutation,
     OPCStore,
@@ -91,6 +92,7 @@ from opc.core.company_controller import (
     CompanyRunControllerLeaseLost,
 )
 from opc.core.interaction_protocol import (
+    COMPANY_ADMISSION_CHECKPOINT_TYPES,
     CompanyWorkItemGateDecisionCommand,
     OriginOwnerInteractionLease,
     PreparedOwnerInteractionPublication,
@@ -749,6 +751,11 @@ class OPCEngine:
 
         if self.approval_engine:
             self.approval_engine.config = self.config.autonomy
+            native_policy = getattr(self.approval_engine, "native_policy", None)
+            if native_policy is not None and callable(
+                getattr(native_policy, "set_config", None)
+            ):
+                native_policy.set_config(self.config.autonomy)
         if self.company_executor:
             self.company_executor.work_item_timeout = self.config.system.task_mode.sub_agent_timeout_sec
         if self.adapter_registry:
@@ -2290,11 +2297,36 @@ class OPCEngine:
             allow_marker_fallback=is_company_like_mode,
         ):
             return
+        reply_metadata: dict[str, Any] = {"kind": "top_level_reply"}
+        if is_company_like_mode and self.store:
+            pending_loader = getattr(
+                self.store,
+                "get_latest_pending_checkpoint",
+                None,
+            )
+            if callable(pending_loader):
+                try:
+                    pending = await pending_loader(
+                        project_id=self.project_id or "default",
+                        session_id=session_id,
+                    )
+                except Exception:
+                    pending = None
+                checkpoint_type = str(
+                    getattr(pending, "checkpoint_type", "") or ""
+                ).strip()
+                checkpoint_id = str(
+                    getattr(pending, "checkpoint_id", "") or ""
+                ).strip()
+                if checkpoint_type in COMPANY_ADMISSION_CHECKPOINT_TYPES:
+                    reply_metadata["owner_checkpoint_prompt_type"] = checkpoint_type
+                    if checkpoint_id:
+                        reply_metadata["owner_checkpoint_prompt_id"] = checkpoint_id
         await self.memory.record_assistant_turn(
             session_id=session_id,
             content=assistant_text,
             project_id=self.project_id or "default",
-            metadata={"kind": "top_level_reply"},
+            metadata=reply_metadata,
         )
 
     async def _tool_approval_callback(
@@ -2375,6 +2407,7 @@ class OPCEngine:
             "category": tool.category,
             "requires_confirmation": tool.requires_confirmation,
             "description": tool.description,
+            "permission_effects": list(tool.permission_effects or []),
         }
         return await self.approval_engine.authorize_tool_call(
             task=task,
@@ -2383,6 +2416,7 @@ class OPCEngine:
             metadata=metadata,
             on_progress=on_progress,
             call_context=call_context,
+            tool=tool,
         )
 
     @staticmethod
@@ -2543,6 +2577,7 @@ class OPCEngine:
         domains = list(message.metadata.get("domains", []))
         company_profile = message.metadata.get("company_profile")
 
+        session_defaults = await self._load_session_execution_defaults(message.session_id)
         selection = ModeSelection(
             mode=ExecutionMode.COMPANY_MODE if mode == "company" else ExecutionMode.TASK_MODE,
             org_id=org_id,
@@ -2551,6 +2586,16 @@ class OPCEngine:
             company_profile=company_profile,
             metadata={
                 "company_preflight": str(message.metadata.get("company_preflight", "") or "").strip(),
+                "native_approval_level": str(
+                    message.metadata.get("native_approval_level", "")
+                    or session_defaults.get("native_approval_level", "")
+                    or self.config.autonomy.native_approval_level
+                ).strip(),
+                "native_permission_scope_id": str(
+                    message.metadata.get("native_permission_scope_id", "")
+                    or session_defaults.get("native_permission_scope_id", "")
+                    or message.session_id
+                ).strip(),
             },
         )
         logger.info(f"Mode: {selection.mode.value}, org_id={org_id}, agent={preferred_agent}")
@@ -2877,6 +2922,18 @@ class OPCEngine:
         )
         include_project_knowledge = self._requests_explicit_project_knowledge(original_message)
         secretary_context = ""
+        permission_metadata = {
+            "native_approval_level": str(
+                dict(getattr(decision, "metadata", {}) or {}).get(
+                    "native_approval_level", self.config.autonomy.native_approval_level,
+                )
+            ).strip(),
+            "native_permission_scope_id": str(
+                dict(getattr(decision, "metadata", {}) or {}).get(
+                    "native_permission_scope_id", session_id,
+                )
+            ).strip(),
+        }
 
         self.org_engine.configure_task_mode_tools(self._task_mode_tool_names())
         execution_role = self.org_engine.get_task_mode_role()
@@ -2966,6 +3023,7 @@ class OPCEngine:
                 "reorg_proposal_id": str(task.metadata.get("reorg_proposal_id", "") or ""),
                 "migration_status": str(task.metadata.get("migration_status", "") or ""),
                 "superseded_by_reorg": str(task.metadata.get("superseded_by_reorg", "") or ""),
+                **permission_metadata,
             })
             if current_turn_id:
                 runtime_meta = dict(task.metadata.get("runtime_v2", {}) or {})
@@ -3030,6 +3088,7 @@ class OPCEngine:
                 "execution_agent_locked": execution_agent_locked,
                 "force_native_execution": force_native_execution,
                 "task_mode_contract": "single_full_capability_main_agent",
+                **permission_metadata,
                 **({
                     "conversation_turn_id": current_turn_id,
                     "current_turn_id": current_turn_id,
@@ -3050,6 +3109,7 @@ class OPCEngine:
             task.metadata["execution_task_ids"] = task_ids
             task.metadata["origin_task_id"] = origin_task_id or task.id
             task.metadata["runtime_kind"] = "task_mode_agent_turn"
+            task.metadata.update(permission_metadata)
             task.metadata["parent_session_id"] = session_id
             if current_turn_id:
                 runtime_meta = dict(task.metadata.get("runtime_v2", {}) or {})
@@ -4270,6 +4330,18 @@ class OPCEngine:
             set_linked_work_item_id(existing, work_item.work_item_id)
             existing.session_id = session_id
             existing.metadata = dict(existing.metadata or {})
+            existing.metadata.update({
+                "native_approval_level": str(
+                    dict(getattr(decision, "metadata", {}) or {}).get(
+                        "native_approval_level", self.config.autonomy.native_approval_level,
+                    )
+                ).strip(),
+                "native_permission_scope_id": str(
+                    dict(getattr(decision, "metadata", {}) or {}).get(
+                        "native_permission_scope_id", parent_session_id,
+                    )
+                ).strip(),
+            })
             existing_origin_interaction = dict(
                 existing.metadata.get("origin_owner_interaction", {}) or {}
             )
@@ -4492,6 +4564,16 @@ class OPCEngine:
                     (delegation_playbook or {}).get("recruitment_role_agent_overrides", {}) or {}
                 ),
                 "runtime_topology": copy.deepcopy(runtime_topology),
+                "native_approval_level": str(
+                    dict(getattr(decision, "metadata", {}) or {}).get(
+                        "native_approval_level", self.config.autonomy.native_approval_level,
+                    )
+                ).strip(),
+                "native_permission_scope_id": str(
+                    dict(getattr(decision, "metadata", {}) or {}).get(
+                        "native_permission_scope_id", parent_session_id,
+                    )
+                ).strip(),
                 **owner_execution_copy,
                 **runtime_identity_metadata,
                 "work_item_projection_ref": work_item_projection_ref,
@@ -4647,6 +4729,14 @@ class OPCEngine:
                 "shared_role_session": True,
                 "shared_role_id": role_id,
                 "company_runtime_root_session_id": parent_session_id,
+                "native_approval_level": str(
+                    (task.metadata or {}).get("native_approval_level", "")
+                    or self.config.autonomy.native_approval_level
+                ).strip(),
+                "native_permission_scope_id": str(
+                    (task.metadata or {}).get("native_permission_scope_id", "")
+                    or parent_session_id
+                ).strip(),
             },
         )
         return task
@@ -5844,8 +5934,13 @@ class OPCEngine:
         session = await self.store.get_session(session_id)
         if not session:
             return {}
-        defaults = session.metadata.get("execution_defaults", {})
-        return dict(defaults) if isinstance(defaults, dict) else {}
+        metadata = dict(session.metadata or {})
+        defaults = metadata.get("execution_defaults", {})
+        resolved = dict(defaults) if isinstance(defaults, dict) else {}
+        for key in ("native_approval_level", "native_permission_scope_id"):
+            if key not in resolved and metadata.get(key) not in (None, ""):
+                resolved[key] = metadata[key]
+        return resolved
 
     async def _remember_session_execution_defaults(
         self,
@@ -5870,6 +5965,16 @@ class OPCEngine:
         metadata = dict(session.metadata)
         previous = metadata.get("execution_defaults", {})
         previous_defaults = dict(previous) if isinstance(previous, dict) else {}
+        decision_metadata = dict(getattr(decision, "metadata", {}) or {})
+        native_approval_level = normalize_native_approval_level(
+            decision_metadata.get("native_approval_level"),
+            default=normalize_native_approval_level(
+                self.config.autonomy.native_approval_level
+            ),
+        )
+        native_permission_scope_id = str(
+            decision_metadata.get("native_permission_scope_id", "") or session_id
+        ).strip()
         metadata["execution_defaults"] = {
             **previous_defaults,
             "mode": decision.mode.value,
@@ -5879,8 +5984,12 @@ class OPCEngine:
             "workspace_root": workspace_root or previous_defaults.get("workspace_root", ""),
             "comms_workspace_root": comms_workspace_root or previous_defaults.get("comms_workspace_root", ""),
             "comms_root": comms_root or previous_defaults.get("comms_root", ""),
+            "native_approval_level": native_approval_level,
+            "native_permission_scope_id": native_permission_scope_id,
             "updated_at": datetime.now().isoformat(),
         }
+        metadata["native_approval_level"] = native_approval_level
+        metadata["native_permission_scope_id"] = native_permission_scope_id
         session.metadata = metadata
         session.updated_at = datetime.now()
         await self.store.save_session(session)
@@ -5942,6 +6051,20 @@ class OPCEngine:
             "comms_workspace_root": str(workspace_contract.get("comms_workspace_root", "") or "").strip(),
             "comms_root": str(workspace_contract.get("comms_root", "") or "").strip(),
             "origin_task_id": str(origin_task_id).strip(),
+            "native_approval_level": normalize_native_approval_level(
+                dict(getattr(decision, "metadata", {}) or {}).get(
+                    "native_approval_level"
+                ),
+                default=normalize_native_approval_level(
+                    self.config.autonomy.native_approval_level
+                ),
+            ),
+            "native_permission_scope_id": str(
+                dict(getattr(decision, "metadata", {}) or {}).get(
+                    "native_permission_scope_id", ""
+                )
+                or session_id
+            ).strip(),
         })
         if exec_mode != "org":
             metadata.pop("org_id", None)

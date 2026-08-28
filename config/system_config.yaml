@@ -133,6 +133,8 @@ system:
   - modify database schema
 
 autonomy:
+  # OpenOPC Native only: read-only, auto, or full-access.
+  native_approval_level: auto
   enabled: true
   mode: bounded
   approval_model: ''

@@ -18264,6 +18264,7 @@ class OPCStore:
         execution_envelope: dict[str, Any],
         execution_identity: dict[str, Any],
         permit: dict[str, Any],
+        auto_approved: bool = False,
     ) -> CompanyOpaqueToolEffectReceipt:
         """Consume one exact human permit at the opaque effect boundary."""
 
@@ -18567,70 +18568,85 @@ class OPCStore:
                 effect_metadata,
             )
             current = dict(permits.get(fingerprint, {}) or {})
-            checkpoint_id = str(current.get("checkpoint_id", "") or "").strip()
-            checkpoint = await self._select_execution_checkpoint(
-                checkpoint_id,
-                project_id=clean_project_id,
-                checkpoint_type="tool_permission",
-                db=transaction_db,
-            )
-            if checkpoint is None:
-                return await _deny(
-                    "invalid_permit",
-                    "exact ToolCall checkpoint is unavailable",
+            if auto_approved:
+                permit_matches = bool(
+                    normalized_permit.get("approved") is True
+                    and str(normalized_permit.get("decision", "") or "")
+                    == "native_policy_allow"
+                    and str(normalized_permit.get("state", "") or "") == "executing"
+                    and str(normalized_permit.get("id", "") or "") == clean_tool_call_id
+                    and str(normalized_permit.get("function", "") or "") == clean_tool_name
+                    and dict(normalized_permit.get("arguments", {}) or {}) == normalized_arguments
+                    and dict(normalized_permit.get("execution_envelope", {}) or {})
+                    == normalized_execution_envelope
+                    and dict(normalized_permit.get("execution_identity", {}) or {})
+                    == normalized_execution_identity
                 )
-            claim_id = str(current.get("claim_id", "") or "").strip()
-            consumer_id = str(current.get("consumer_id", "") or "").strip()
-            interaction = self._execution_checkpoint_interaction(
-                dict(checkpoint.payload or {})
-            )
-            claim = dict(interaction.get("claim", {}) or {})
-            execution = dict(interaction.get("execution", {}) or {})
-            try:
-                claim_expiry = datetime.fromisoformat(
-                    str(claim.get("lease_expires_at", "") or "")
-                )
-                expiry_checked_at = (
-                    checked_at
-                    if claim_expiry.tzinfo is None
-                    else checked_at.astimezone(claim_expiry.tzinfo)
-                )
-                claim_is_live = claim_expiry > expiry_checked_at
-            except (TypeError, ValueError):
-                claim_is_live = False
-            permit_matches = (
-                bool(current)
-                and current == normalized_permit
-                and current.get("approved") is True
-                and str(current.get("decision", "") or "").strip()
-                == "approve_once"
-                and str(current.get("state", "") or "").strip() == "executing"
-                and str(recorded_runtime_id or "").strip() == runtime_session_id
-                and str(checkpoint.status or "").strip() == "consuming"
-                and claim_is_live
-                and str(claim.get("claim_id", "") or "").strip() == claim_id
-                and str(claim.get("consumer_id", "") or "").strip()
-                == consumer_id
-                and str(execution.get("state", "") or "").strip() == "executing"
-                and str(execution.get("claim_id", "") or "").strip() == claim_id
-                and str(execution.get("consumer_id", "") or "").strip()
-                == consumer_id
-                and self._exact_tool_permit_matches_checkpoint(
-                    current,
-                    checkpoint,
-                    task_id=clean_task_id,
+            else:
+                checkpoint_id = str(current.get("checkpoint_id", "") or "").strip()
+                checkpoint = await self._select_execution_checkpoint(
+                    checkpoint_id,
                     project_id=clean_project_id,
-                    runtime_session_id=runtime_session_id,
-                    fingerprint=fingerprint,
-                    tool_call_id=clean_tool_call_id,
-                    tool_name=clean_tool_name,
-                    arguments=normalized_arguments,
-                    execution_envelope=normalized_execution_envelope,
-                    execution_identity=normalized_execution_identity,
-                    claim_id=claim_id,
-                    consumer_id=consumer_id,
+                    checkpoint_type="tool_permission",
+                    db=transaction_db,
                 )
-            )
+                if checkpoint is None:
+                    return await _deny(
+                        "invalid_permit",
+                        "exact ToolCall checkpoint is unavailable",
+                    )
+                claim_id = str(current.get("claim_id", "") or "").strip()
+                consumer_id = str(current.get("consumer_id", "") or "").strip()
+                interaction = self._execution_checkpoint_interaction(
+                    dict(checkpoint.payload or {})
+                )
+                claim = dict(interaction.get("claim", {}) or {})
+                execution = dict(interaction.get("execution", {}) or {})
+                try:
+                    claim_expiry = datetime.fromisoformat(
+                        str(claim.get("lease_expires_at", "") or "")
+                    )
+                    expiry_checked_at = (
+                        checked_at
+                        if claim_expiry.tzinfo is None
+                        else checked_at.astimezone(claim_expiry.tzinfo)
+                    )
+                    claim_is_live = claim_expiry > expiry_checked_at
+                except (TypeError, ValueError):
+                    claim_is_live = False
+                permit_matches = (
+                    bool(current)
+                    and current == normalized_permit
+                    and current.get("approved") is True
+                    and str(current.get("decision", "") or "").strip()
+                    == "approve_once"
+                    and str(current.get("state", "") or "").strip() == "executing"
+                    and str(recorded_runtime_id or "").strip() == runtime_session_id
+                    and str(checkpoint.status or "").strip() == "consuming"
+                    and claim_is_live
+                    and str(claim.get("claim_id", "") or "").strip() == claim_id
+                    and str(claim.get("consumer_id", "") or "").strip()
+                    == consumer_id
+                    and str(execution.get("state", "") or "").strip() == "executing"
+                    and str(execution.get("claim_id", "") or "").strip() == claim_id
+                    and str(execution.get("consumer_id", "") or "").strip()
+                    == consumer_id
+                    and self._exact_tool_permit_matches_checkpoint(
+                        current,
+                        checkpoint,
+                        task_id=clean_task_id,
+                        project_id=clean_project_id,
+                        runtime_session_id=runtime_session_id,
+                        fingerprint=fingerprint,
+                        tool_call_id=clean_tool_call_id,
+                        tool_name=clean_tool_name,
+                        arguments=normalized_arguments,
+                        execution_envelope=normalized_execution_envelope,
+                        execution_identity=normalized_execution_identity,
+                        claim_id=claim_id,
+                        consumer_id=consumer_id,
+                    )
+                )
             if not permit_matches:
                 return await _deny(
                     "invalid_permit",

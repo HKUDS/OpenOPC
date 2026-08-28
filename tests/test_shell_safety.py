@@ -173,12 +173,23 @@ class ReadOnlyClassifierTests(unittest.TestCase):
         self.assertFalse(is_read_only_shell_command("wget https://x", [])[0])
 
     def test_compound_and_control_flow(self) -> None:
-        self._assert_unsafe("for i in 1 2 3; do echo $i; done")
+        self._assert_safe("for i in 1 2 3; do echo $i; done")
         self._assert_unsafe("for i in 1 2 3; do rm $i; done")
-        self._assert_unsafe("if grep -q x f; then echo y; fi")
+        self._assert_safe("if grep -q x f; then echo y; fi")
         self._assert_unsafe("cd /x && rm -rf y")
 
-    def test_any_active_shell_structure_requires_manual_review(self) -> None:
+    def test_compound_read_only_segments_are_safe(self) -> None:
+        for command in (
+            "ls -la file && wc -l file",
+            "ls file || wc -l file",
+            "ls file; wc -l file",
+            "cat file | wc -l",
+            "ls missing 2>/dev/null",
+        ):
+            with self.subTest(command=command):
+                self._assert_safe(command)
+
+    def test_active_shell_structure_is_detected_before_risk_analysis(self) -> None:
         cases = {
             "and-list": "ls -la file && wc -l file",
             "or-list": "ls file || wc -l file",
@@ -199,6 +210,18 @@ class ReadOnlyClassifierTests(unittest.TestCase):
             with self.subTest(label=label):
                 review, reason = shell_structure_requires_review(command)
                 self.assertTrue(review, reason)
+
+        for command in (
+            "ls file &",
+            "ls file > listing.txt",
+            "ls file >> listing.txt",
+            "wc -l < file",
+            "echo $(pwd)",
+            "echo `pwd`",
+            "(ls file)",
+            "diff <(cat a) <(cat b)",
+        ):
+            with self.subTest(unsafe=command):
                 self._assert_unsafe(command)
 
     def test_quoted_or_escaped_shell_metacharacters_remain_literal(self) -> None:
@@ -246,15 +269,25 @@ class ReadOnlyClassifierTests(unittest.TestCase):
             outside.mkdir()
             report = workspace / "report.md"
             report.write_text("result\n", encoding="utf-8")
+            data_dir = workspace / "data"
+            data_dir.mkdir()
+            (data_dir / "one.txt").write_text("one\n", encoding="utf-8")
+            (data_dir / "two.txt").write_text("two\n", encoding="utf-8")
             outside_report = outside / "secret.md"
             outside_report.write_text("secret\n", encoding="utf-8")
             (workspace / "outside-link").symlink_to(outside_report)
+            (data_dir / "outside-link").symlink_to(outside_report)
 
             for command in (
                 "pwd",
                 f"ls -la {workspace}",
                 f"wc -w {report}",
                 "git status --short",
+                (
+                    f"ls -la {workspace} 2>/dev/null && echo \"---\" && "
+                    f"wc -l {report} 2>/dev/null"
+                ),
+                f"ls -la {data_dir} && wc -l {data_dir}/*.txt",
             ):
                 with self.subTest(command=command):
                     safe, reason = is_workspace_scoped_read_only_shell_command(
@@ -271,7 +304,8 @@ class ReadOnlyClassifierTests(unittest.TestCase):
                 "cat $HOME/.ssh/config",
                 "grep -f/etc/passwd needle report.md",
                 f"git -C {outside} status --short",
-                "ls *.md",
+                f"wc -l {outside}/*",
+                f"wc -l {data_dir}/*",
                 "touch report.md",
             ):
                 with self.subTest(command=command):

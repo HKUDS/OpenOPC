@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type ReactElement } from 'react'
+import React, { useCallback, useEffect, useMemo, useRef, useState, type ReactElement } from 'react'
 import {
   IconArrowRight,
   IconBuilding,
@@ -12,7 +12,7 @@ import {
   IconUserRound,
 } from './SvgIcons'
 import type { OutgoingAttachmentPayload } from '../types/chat'
-import type { TaskPreferredAgent } from '../types/kanban'
+import type { NativeApprovalLevel, TaskPreferredAgent } from '../types/kanban'
 import type { SavedOrgSummary } from '../types/visual'
 import { getContextUsageMetrics } from '../lib/contextUsage'
 import { TASK_AGENT_LABELS } from '../lib/externalAgents'
@@ -182,6 +182,8 @@ interface MessageComposerProps {
   execMode?: string
   companyProfile?: string
   taskPreferredAgent?: TaskPreferredAgent
+  nativeApprovalLevel?: NativeApprovalLevel
+  nativeApprovalDefault?: NativeApprovalLevel
   agentStatus?: string
   currentTool?: string
   displayTool?: string
@@ -205,6 +207,8 @@ interface MessageComposerProps {
   onSend: (content: string, attachments?: OutgoingAttachmentPayload[]) => void
   onModeChange?: (mode: ComposerExecMode, profile?: ComposerCompanyProfile, orgId?: string) => void
   onTaskAgentChange?: (preferredAgent: TaskPreferredAgent) => void
+  onNativeApprovalLevelChange?: (level: NativeApprovalLevel) => void
+  onSetNativeApprovalDefault?: (level: NativeApprovalLevel) => void
   onSavedOrgsRefresh?: () => void
   onSavedOrgLoad?: (name: string) => void
   onStop?: () => void
@@ -240,6 +244,8 @@ export function MessageComposer({
   execMode,
   companyProfile,
   taskPreferredAgent = 'native',
+  nativeApprovalLevel,
+  nativeApprovalDefault,
   agentStatus,
   currentTool,
   displayTool,
@@ -257,6 +263,8 @@ export function MessageComposer({
   onSend,
   onModeChange,
   onTaskAgentChange,
+  onNativeApprovalLevelChange,
+  onSetNativeApprovalDefault,
   onSavedOrgsRefresh,
   onSavedOrgLoad,
   onStop,
@@ -786,6 +794,52 @@ export function MessageComposer({
                       </span>
                     ) : (
                       <span className="composer-mode" data-kind="agent">{TASK_AGENT_LABELS[taskPreferredAgent]}</span>
+                    )}
+                  </>
+                )}
+                {nativeApprovalLevel && (
+                  <>
+                    <span className="composer-config-divider" aria-hidden="true" />
+                    <label
+                      className="composer-mode-inline"
+                      data-kind="permissions"
+                      title={nativeApprovalLevel === 'read-only'
+                        ? 'OpenOPC Native can read locally; writes, network, and side effects ask first.'
+                        : nativeApprovalLevel === 'full-access'
+                          ? 'OpenOPC Native tools run without approval prompts or a sandbox.'
+                          : 'OpenOPC Native can edit this workspace; network and outside access ask first.'}
+                    >
+                      <span className="composer-mode-inline-label">Permissions</span>
+                      <span className="composer-mode-select-wrap">
+                        <select
+                          className="composer-mode-select"
+                          data-danger={nativeApprovalLevel === 'full-access' ? 'true' : undefined}
+                          value={nativeApprovalLevel}
+                          onChange={(event) => onNativeApprovalLevelChange?.(
+                            event.target.value as NativeApprovalLevel,
+                          )}
+                          disabled={!onNativeApprovalLevelChange}
+                          aria-label="OpenOPC Native permissions"
+                        >
+                          <option value="read-only">Read-only</option>
+                          <option value="auto">Auto</option>
+                          <option value="full-access">Full access</option>
+                        </select>
+                      </span>
+                    </label>
+                    {onSetNativeApprovalDefault && (
+                      <button
+                        type="button"
+                        className="composer-permission-default-btn"
+                        data-active={nativeApprovalDefault === nativeApprovalLevel ? 'true' : undefined}
+                        onClick={() => onSetNativeApprovalDefault(nativeApprovalLevel)}
+                        disabled={nativeApprovalDefault === nativeApprovalLevel}
+                        title={nativeApprovalDefault === nativeApprovalLevel
+                          ? 'This is already the default for new chats.'
+                          : 'Use this OpenOPC Native permission level for new chats.'}
+                      >
+                        Default
+                      </button>
                     )}
                   </>
                 )}

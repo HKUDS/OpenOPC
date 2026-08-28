@@ -79,11 +79,7 @@ def _is_final_human_acceptance(metadata: Mapping[str, Any]) -> bool:
         return False
     if str(metadata.get("feedback_scope", "") or "").strip().lower() != "final":
         return False
-    return bool(
-        is_delivery_turn(metadata)
-        or str(metadata.get("review_owner_kind", "") or "").strip().lower()
-        == "human"
-    )
+    return is_delivery_turn(metadata)
 
 
 @dataclass(frozen=True)
@@ -131,11 +127,7 @@ def plan_company_work_item_done_routing(
         or (attention_id and attention_id == work_item_id)
     )
     manager_reviewable = is_manager_reviewable_turn(work_kind) if work_kind else True
-    is_delivery = bool(
-        is_delivery_turn(task_metadata)
-        or str(task_metadata.get("review_owner_kind", "") or "").strip().lower()
-        == "human"
-    )
+    is_delivery = is_delivery_turn(task_metadata)
     manager_context: dict[str, str] = {}
     if (
         not manager_reviewable
@@ -181,21 +173,6 @@ def plan_company_work_item_done_routing(
         ).strip()
         if not board_mutated and manager_role and manager_role != "owner":
             manager_reviewable = True
-        elif not board_mutated and manager_role in {"", "owner"}:
-            # A top-seat manager that completes the company outcome directly
-            # has no organizational manager to review it.  Treat that output
-            # as the authoritative delivery and route it to the owner instead
-            # of silently auto-approving an unreviewed result.
-            task_metadata.update(
-                {
-                    "authoritative_output": True,
-                    "user_visible": True,
-                    "feedback_scope": "final",
-                    "review_owner_kind": "human",
-                    "requires_user_feedback": True,
-                }
-            )
-            is_delivery = True
 
     final_human_acceptance = bool(
         str(task_metadata.get("execution_mode", "") or "").strip()

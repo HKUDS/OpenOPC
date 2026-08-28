@@ -857,6 +857,11 @@ class SpawnDeliveryCardTests(unittest.IsolatedAsyncioTestCase):
         items = await self.store.list_delegation_work_items("r")
         delivery = [wi for wi in items if wi.kind == "delivery"]
         self.assertEqual(len(delivery), 1)
+        self.assertEqual(delivery[0].phase, Phase.WAITING_DEPENDENCIES)
+        self.assertEqual(
+            delivery[0].metadata.get("dependency_work_item_ids"),
+            ["intake-policy"],
+        )
         self.assertTrue(delivery[0].metadata.get("requires_user_feedback"))
 
     async def test_spawn_delivery_card_ignores_root_policy_feedback_false(self) -> None:

@@ -65,6 +65,7 @@ def create_todo_tools() -> list[ToolDefinition]:
         read_only=False,
         runtime_managed=True,
         company_effect_kind=COMPANY_EFFECT_RUNTIME_INTERNAL,
+        permission_effects=["runtime_internal"],
     )
 
     todo_read = ToolDefinition(
@@ -80,6 +81,7 @@ def create_todo_tools() -> list[ToolDefinition]:
         read_only=True,
         runtime_managed=True,
         company_effect_kind=COMPANY_EFFECT_RUNTIME_INTERNAL,
+        permission_effects=["runtime_internal"],
     )
 
     return [todo_write, todo_read]

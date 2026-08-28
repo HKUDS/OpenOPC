@@ -672,6 +672,8 @@ export function mapBackendSession(raw: any): Session {
     companyProfile: isTaskModeRuntime ? undefined : (raw.company_profile ?? raw.companyProfile),
     orgId: isTaskModeRuntime ? undefined : (raw.org_id ?? raw.organization_id ?? raw.orgId ?? raw.organizationId),
     preferredAgent: raw.preferred_agent ?? raw.preferredAgent,
+    nativeApprovalLevel: raw.native_approval_level ?? raw.nativeApprovalLevel,
+    nativePermissionScopeId: raw.native_permission_scope_id ?? raw.nativePermissionScopeId,
     // Company Mode metadata
     workItemProjectionId: isTaskModeRuntime ? undefined : rawProjectionId,
     workItemTurnType: isTaskModeRuntime ? undefined : (raw.work_item_turn_type ?? raw.workItemTurnType),

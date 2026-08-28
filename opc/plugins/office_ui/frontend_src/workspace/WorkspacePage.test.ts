@@ -2,6 +2,12 @@ import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import type { Session } from '../types/kanban'
+import {
+  MULTI_SESSION_PREVIEW_LIMIT,
+  resolveWorkspaceBoardId,
+  selectMultiViewSessions,
+} from './WorkspacePage'
 
 const here = dirname(fileURLToPath(import.meta.url))
 const src = readFileSync(join(here, 'WorkspacePage.tsx'), 'utf8')
@@ -45,21 +51,20 @@ assert.match(src, /const \{ markRead \} = chatStore/, 'workspace must consume th
 assert.doesNotMatch(src, /chatStore\.markRead/, 'workspace mark-read callbacks must not depend on the aggregate chatStore object')
 assert.equal(
   [...src.matchAll(/\bmarkRead\(/g)].length,
-  2,
-  'markRead must only be invoked by the active viewport and per-session viewport callbacks',
+  1,
+  'only the single active transcript viewport may mark chat channels as read',
 )
 assert.match(
   src,
   /const handleMarkRead = useCallback\(\(\) => \{\s*for \(const visibleChannelId of visibleChannelIds\) \{\s*markRead\(visibleChannelId\)\s*\}\s*\}, \[visibleChannelIds, markRead\]\)/,
   'the active transcript viewport must mark every channel represented by the visible company timeline',
 )
-assert.match(
-  src,
-  /const handleMarkSessionRead = useCallback\(\(taskId: string\) => \{[\s\S]*?if \(session\) markRead\(session\.channelId\)[\s\S]*?\}, \[sessions, markRead\]\)/,
-  'each multi-session transcript viewport callback must own its channel markRead',
-)
 assert.match(src, /onMarkRead=\{handleMarkRead\}/, 'the active viewport must receive the markRead callback')
-assert.match(src, /onSessionMarkRead=\{handleMarkSessionRead\}/, 'multi-session viewports must receive their scoped markRead callback')
+assert.doesNotMatch(
+  src,
+  /handleMarkSessionRead|onSessionMarkRead/,
+  'multi-session previews must not create transcript read side effects',
+)
 assert.match(
   src,
   /const outgoing = metadata\?\.ui_message_id\s*\?\s*metadata\s*:\s*\{ \.\.\.\(metadata \?\? \{\}\), ui_message_id: makeOptimisticUserMessageId\(\) \}/,
@@ -111,4 +116,117 @@ assert.match(
   'company root and child history requests must use summary detail independently',
 )
 
-console.log('WorkspacePage.test.ts: OK (composer, mark-read, and history wiring)')
+function previewSession(taskId: string): Session {
+  return {
+    projectId: 'project-a',
+    taskId,
+    channelId: `session:${taskId}`,
+    title: taskId,
+    status: 'pending',
+    columnId: 'todo',
+    assigneeIds: [],
+    priority: null,
+    tags: [],
+    progressLog: [],
+    createdAt: 1,
+    updatedAt: 1,
+    messageCount: 0,
+    mode: 'primary',
+  }
+}
+
+const manyOpenSessions = Array.from({ length: 20 }, (_, index) => previewSession(`task-${index + 1}`))
+const selectedPreviews = selectMultiViewSessions(manyOpenSessions, 'task-2')
+assert.equal(selectedPreviews.length, MULTI_SESSION_PREVIEW_LIMIT, 'multi view must remain bounded as tabs accumulate')
+assert.equal(selectedPreviews.at(-1)?.taskId, 'task-2', 'the active session must always remain visible in multi view')
+assert.deepEqual(
+  selectedPreviews.slice(0, -1).map(session => session.taskId),
+  ['task-18', 'task-19', 'task-20'],
+  'remaining preview slots should contain the most recently opened sessions',
+)
+assert.deepEqual(selectMultiViewSessions(manyOpenSessions, null, 0), [], 'a zero preview limit must mount nothing')
+assert.deepEqual(
+  selectMultiViewSessions(manyOpenSessions, 'task-2', 1).map(session => session.taskId),
+  ['task-2'],
+  'a one-card limit must contain only the active session',
+)
+
+const sessionBoardIds = ['session-1', 'session-2', 'session-3']
+assert.equal(
+  resolveWorkspaceBoardId({
+    boardIds: sessionBoardIds,
+    sessionScopedBoardIds: sessionBoardIds,
+    activeSessionBoardId: 'session-2',
+    activeTaskBoardId: null,
+    currentActiveBoardId: 'session-1',
+  }),
+  'session-2',
+  'selecting another chat must switch away from the previous chat board',
+)
+assert.equal(
+  resolveWorkspaceBoardId({
+    boardIds: sessionBoardIds,
+    sessionScopedBoardIds: sessionBoardIds,
+    activeSessionBoardId: 'session-3',
+    activeTaskBoardId: null,
+    currentActiveBoardId: 'session-1',
+  }),
+  'session-3',
+  'task-mode and company-mode chats use the same canonical session-board identity',
+)
+assert.equal(
+  resolveWorkspaceBoardId({
+    boardIds: ['session-1'],
+    sessionScopedBoardIds: ['session-1'],
+    activeSessionBoardId: 'session-pending',
+    activeTaskBoardId: null,
+    currentActiveBoardId: 'session-1',
+  }),
+  null,
+  'a session whose board has not arrived must never inherit another chat board',
+)
+assert.equal(
+  resolveWorkspaceBoardId({
+    boardIds: ['project-board'],
+    sessionScopedBoardIds: [],
+    activeSessionBoardId: 'task-1',
+    activeTaskBoardId: null,
+    currentActiveBoardId: null,
+  }),
+  'project-board',
+  'ordinary project-wide task boards retain their existing fallback',
+)
+assert.equal(
+  resolveWorkspaceBoardId({
+    boardIds: sessionBoardIds,
+    sessionScopedBoardIds: sessionBoardIds,
+    activeSessionBoardId: 'session-1',
+    activeTaskBoardId: 'session-2',
+    currentActiveBoardId: 'session-1',
+  }),
+  'session-2',
+  'an explicitly opened work-item detail keeps its owning board selected',
+)
+
+assert.match(
+  src,
+  /if \(!multiSessionView\) return \{\}/,
+  'inactive tabs must not project or load messages while single view is active',
+)
+assert.match(
+  src,
+  /setOpenSessionIds\(\[\]\)[\s\S]*?setMultiSessionView\(false\)[\s\S]*?setChildDetailTaskId\(null\)/,
+  'project switches must clear project-scoped navigation and view state atomically',
+)
+assert.doesNotMatch(
+  src,
+  /const isCompanyMode = execMode/,
+  'existing chat and board isolation must not depend on the global new-chat default mode',
+)
+assert.match(
+  src,
+  /<AgentStatusBar agents=\{agents\} tasks=\{activeBoardTasks\}/,
+  'agent status rollups must be scoped to the active chat board',
+)
+
+console.log('WorkspacePage.test.ts: OK (single transcript lifecycle, composer, mark-read, and history wiring)')

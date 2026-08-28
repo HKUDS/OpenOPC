@@ -1138,7 +1138,11 @@ class CliSlashCommandTests(unittest.TestCase):
         self.assertEqual(engine.calls[-1]["company_profile"], "corporate")
         self.assertEqual(engine.calls[-1]["preferred_agent"], "codex")
         self.assertEqual(engine.calls[-1]["session_id"], "sess-1")
-        self.assertEqual(engine.calls[-1]["message_metadata"], {"company_preflight": "manual"})
+        self.assertEqual(engine.calls[-1]["message_metadata"], {
+            "company_preflight": "manual",
+            "native_approval_level": "auto",
+            "native_permission_scope_id": "sess-1",
+        })
 
     def test_process_message_prints_final_response_while_hiding_external_detail(self) -> None:
         console = Console(record=True, force_terminal=False, width=160)
@@ -1265,7 +1269,11 @@ class CliSlashCommandTests(unittest.TestCase):
 
         self.assertEqual(engine.calls[-1]["content"], "Resume the existing runtime.")
         self.assertEqual(engine.calls[-1]["session_id"], "sess-1")
-        self.assertEqual(engine.calls[-1]["message_metadata"], {"ui_force_resume": True})
+        self.assertEqual(engine.calls[-1]["message_metadata"], {
+            "ui_force_resume": True,
+            "native_approval_level": "auto",
+            "native_permission_scope_id": "sess-1",
+        })
 
     def test_continue_slash_uses_task_org_identity_not_global_mode(self) -> None:
         store = self._Store()
@@ -1305,6 +1313,8 @@ class CliSlashCommandTests(unittest.TestCase):
             "ui_force_resume": True,
             "response_to_checkpoint_id": "cp-org-interrupted",
             "response_to_checkpoint_type": "company_runtime_interrupted",
+            "native_approval_level": "auto",
+            "native_permission_scope_id": "sess-1",
         })
 
     def test_company_continue_requires_a_durable_runtime_checkpoint(self) -> None:
@@ -1352,6 +1362,8 @@ class CliSlashCommandTests(unittest.TestCase):
             "ui_force_resume": True,
             "response_to_checkpoint_id": "cp-interrupted",
             "response_to_checkpoint_type": "company_runtime_interrupted",
+            "native_approval_level": "auto",
+            "native_permission_scope_id": "sess-1",
         })
         self.assertEqual(state.runtime_control_checkpoint_id, "cp-interrupted")
 
@@ -1438,6 +1450,8 @@ class CliSlashCommandTests(unittest.TestCase):
         self.assertEqual(call["message_metadata"], {
             "response_to_checkpoint_id": "cp-child-interrupted",
             "response_to_checkpoint_type": "company_runtime_interrupted",
+            "native_approval_level": "auto",
+            "native_permission_scope_id": "sess-1",
         })
 
     def test_plain_message_during_resuming_checkpoint_fails_closed(self) -> None:
@@ -1647,6 +1661,8 @@ class CliSlashCommandTests(unittest.TestCase):
             "ui_force_resume": True,
             "response_to_checkpoint_id": "cp-company",
             "response_to_checkpoint_type": "company_runtime_suspended",
+            "native_approval_level": "auto",
+            "native_permission_scope_id": "sess-company",
         })
 
     def test_session_service_continue_preserves_custom_org_id(self) -> None:
@@ -1720,6 +1736,8 @@ class CliSlashCommandTests(unittest.TestCase):
             "ui_force_resume": True,
             "response_to_checkpoint_id": "cp-org",
             "response_to_checkpoint_type": "company_runtime_interrupted",
+            "native_approval_level": "auto",
+            "native_permission_scope_id": "sess-org",
         })
 
     def test_queue_slash_lists_and_drops_queued_prompts(self) -> None:
