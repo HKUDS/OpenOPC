@@ -52,7 +52,7 @@ class JiuwenAdapter(ExternalAgentAdapter):
     agent_type = "jiuwen"
     default_command = "jiuwenswarm"
     default_provider_mode = "code.normal"
-    display_name = "Jiuwen"
+    display_name = "JiuwenSwarm-single"
 
     def __init__(self, config=None) -> None:
         if config is None:
@@ -814,7 +814,7 @@ class JiuwenAdapter(ExternalAgentAdapter):
         if event_type == "chat.error" or (
             event_type == "chat.final" and str(payload.get("event_type") or "") == "team.error"
         ):
-            return self._payload_text(payload) or "Jiuwen runtime failed"
+            return self._payload_text(payload) or "JiuwenSwarm-single runtime failed"
         return None
 
     def parse_approval_request(
@@ -886,7 +886,7 @@ class JiuwenAdapter(ExternalAgentAdapter):
 
     async def execute(self, task: Task, workspace_path: str) -> TaskResult:
         if not await self.is_available():
-            return TaskResult(status=TaskStatus.FAILED, content="Jiuwen transport is unavailable")
+            return TaskResult(status=TaskStatus.FAILED, content="JiuwenSwarm-single transport is unavailable")
         cmd, metadata = self.build_invocation(task, workspace_path=workspace_path)
         try:
             self._process = await self.start_process(
@@ -915,9 +915,9 @@ class JiuwenAdapter(ExternalAgentAdapter):
         except asyncio.TimeoutError:
             if self._process and self._process.returncode is None:
                 self._process.kill()
-            return TaskResult(status=TaskStatus.FAILED, content="Jiuwen timed out", artifacts=metadata)
+            return TaskResult(status=TaskStatus.FAILED, content="JiuwenSwarm-single timed out", artifacts=metadata)
         except Exception as exc:
-            return TaskResult(status=TaskStatus.FAILED, content=f"Jiuwen error: {exc}", artifacts=metadata)
+            return TaskResult(status=TaskStatus.FAILED, content=f"JiuwenSwarm-single error: {exc}", artifacts=metadata)
         finally:
             self._process = None
 
@@ -934,7 +934,7 @@ class JiuwenSwarmAdapter(JiuwenAdapter):
 
     agent_type = "jiuwenswarm"
     default_provider_mode = "team"
-    display_name = "JiuwenSwarm Team"
+    display_name = "JiuwenSwarm-team"
 
     def execution_unit_kind(self) -> str:
         return "opaque_external_team"
@@ -1027,7 +1027,7 @@ class JiuwenSwarmAdapter(JiuwenAdapter):
                     if checks and all(item == "pass" for item in check_verdicts)
                     else ""
                 ),
-                "summary": "Verification evidence supplied by JiuwenSwarm Team.",
+                "summary": "Verification evidence supplied by JiuwenSwarm-team.",
                 "checks": checks,
             }
         if isinstance(value, str):
@@ -1086,7 +1086,7 @@ class JiuwenSwarmAdapter(JiuwenAdapter):
         return {
             "status": "provided",
             "verdict": verdict,
-            "summary": str(evidence.get("summary") or "JiuwenSwarm Team verification evidence.").strip(),
+            "summary": str(evidence.get("summary") or "JiuwenSwarm-team verification evidence.").strip(),
             "checks": checks,
             "raw_output": str(evidence.get("raw_output") or "").strip(),
         }
@@ -1166,7 +1166,7 @@ class JiuwenSwarmAdapter(JiuwenAdapter):
         envelope = self._team_result_envelope(output)
         if not envelope:
             return (
-                "JiuwenSwarm Team completed without the required OpenOPC output envelope "
+                "JiuwenSwarm-team completed without the required OpenOPC output envelope "
                 "(attempt_id, deliverables, handoff, open_questions, risks, status, summary, "
                 "verification, work_item_id)"
             )
@@ -1174,7 +1174,7 @@ class JiuwenSwarmAdapter(JiuwenAdapter):
         actual_work_item_id = str(envelope.get("work_item_id") or "").strip()
         if expected_work_item_id and actual_work_item_id != expected_work_item_id:
             return (
-                "JiuwenSwarm Team output envelope work_item_id mismatch: "
+                "JiuwenSwarm-team output envelope work_item_id mismatch: "
                 f"expected {expected_work_item_id!r}, got {actual_work_item_id!r}"
             )
         expected_attempt_id = str(
@@ -1184,19 +1184,19 @@ class JiuwenSwarmAdapter(JiuwenAdapter):
         ).strip()
         actual_attempt_id = str(envelope.get("attempt_id") or "").strip()
         if not actual_attempt_id:
-            return "JiuwenSwarm Team output envelope attempt_id must not be empty"
+            return "JiuwenSwarm-team output envelope attempt_id must not be empty"
         if expected_attempt_id and actual_attempt_id != expected_attempt_id:
             return (
-                "JiuwenSwarm Team output envelope attempt_id mismatch: "
+                "JiuwenSwarm-team output envelope attempt_id mismatch: "
                 f"expected {expected_attempt_id!r}, got {actual_attempt_id!r}"
             )
         status = str(envelope.get("status") or "").strip().lower()
         if status not in {"complete", "completed", "done", "success", "partial", "blocked", "failed"}:
-            return f"JiuwenSwarm Team output envelope has unsupported status {status!r}"
+            return f"JiuwenSwarm-team output envelope has unsupported status {status!r}"
         if status in {"blocked", "failed"}:
-            return f"JiuwenSwarm Team reported terminal status {status!r}: {str(envelope.get('summary') or '').strip()}"
+            return f"JiuwenSwarm-team reported terminal status {status!r}: {str(envelope.get('summary') or '').strip()}"
         if not str(envelope.get("summary") or "").strip():
-            return "JiuwenSwarm Team output envelope summary must not be empty"
+            return "JiuwenSwarm-team output envelope summary must not be empty"
         # Semantically plural fields are normalized at the transport boundary:
         # a single object/string is one item, and JSON null is an empty list.
         # Jiuwen teams use both structured evidence and concise prose, and may
@@ -1205,12 +1205,12 @@ class JiuwenSwarmAdapter(JiuwenAdapter):
         # the transport shape and must not retry a completed provider run for a
         # representational difference.
         if not isinstance(envelope.get("verification"), (dict, list, str, type(None))):
-            return "JiuwenSwarm Team output envelope verification must be an object, list, string, or null"
+            return "JiuwenSwarm-team output envelope verification must be an object, list, string, or null"
         # A terminal boundary may have nobody left to hand off to.  Jiuwen emits
         # JSON null in that case, while some teams use a list of handoff notes.
         # Both shapes are already understood by the WorkItem capture path (empty
         # values are omitted), so validation must not reject an otherwise valid
         # completed result and trigger a duplicate provider run.
         if not isinstance(envelope.get("handoff"), (dict, list, str, type(None))):
-            return "JiuwenSwarm Team output envelope handoff must be an object, list, string, or null"
+            return "JiuwenSwarm-team output envelope handoff must be an object, list, string, or null"
         return None

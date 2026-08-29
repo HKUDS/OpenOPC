@@ -23,7 +23,7 @@
 
 ## News
 
-- **Aug 26, 2026 — Jiuwen and JiuwenSwarm integration:** Use Jiuwen as a single agent or JiuwenSwarm as one opaque Team in both Task and Company modes. [Setup and role behavior](#jiuwen-integration).
+- **Aug 26, 2026 — JiuwenSwarm integration:** Use JiuwenSwarm-single as a single agent or JiuwenSwarm-team as one opaque Team in both Task and Company modes — a self-organizing swarm that plugs into your org seamlessly. [Setup and role behavior](#jiuwen-integration).
 - **Jul 14, 2026 — More resilient company runs:** Company-mode sessions now recover and resume more seamlessly while preserving agent identity, shared role context, delegation, and review progress.
 - **Jul 13, 2026 — Smoother Office UI:** Faster live updates and chat scrolling improve long-running projects.
 - **Jul 8, 2026 — Smarter approvals:** Session grants persist, low-risk actions flow automatically, and deferred decisions stay available.
@@ -37,7 +37,7 @@
 - [Office UI Guide](#office-ui-guide)
 - [CLI Guide](#cli-guide)
 - [Configuration](#configuration)
-- [Jiuwen / JiuwenSwarm](#jiuwen-integration)
+- [JiuwenSwarm](#jiuwen-integration)
 - [Ecosystem And Sharing](#ecosystem-and-sharing)
 - [Roadmap](#roadmap)
 - [Acknowledgements](#acknowledgements)
@@ -553,16 +553,16 @@ Project-local `.opc/config` files can select local executables, remote endpoints
 
 <a id="jiuwen-integration"></a>
 <details>
-<summary><strong>Jiuwen / JiuwenSwarm — setup and role behavior</strong></summary>
+<summary><strong>JiuwenSwarm setup and role behavior</strong> — <a href="https://github.com/openJiuwen-ai/jiuwenswarm">JiuwenSwarm</a></summary>
 
 OpenOPC exposes two choices in both Task and Company modes:
 
-- **Jiuwen** is a single external agent, like Codex or Claude Code. It handles only the selected task or role.
-- **JiuwenSwarm Team** is one opaque external Team. OpenOPC works with the Team as a whole and does not manage its internal agents.
+- **JiuwenSwarm-single** is a single external agent, like Codex or Claude Code. It handles only the selected task or role. Its compatible OpenOPC agent ID is `jiuwen`.
+- **JiuwenSwarm-team** is one opaque external Team. OpenOPC works with the Team as a whole and does not manage its internal agents. Its compatible OpenOPC agent ID is `jiuwenswarm`.
 
 ### Setup
 
-Jiuwen reads `~/.jiuwenswarm/config/.env`; it does not automatically read OpenOPC's `.opc/config/llm_config.yaml`. You may reuse the same provider credentials, but the model name must support Jiuwen agent requests. For example, Volcengine Ark Agent Plan uses:
+JiuwenSwarm reads `~/.jiuwenswarm/config/.env`; it does not automatically read OpenOPC's `.opc/config/llm_config.yaml`. You may reuse the same provider credentials, but the model name must support JiuwenSwarm agent requests. For example, Volcengine Ark Agent Plan uses:
 
 ```dotenv
 API_BASE="https://ark.cn-beijing.volces.com/api/plan/v3"
@@ -583,19 +583,19 @@ opc exec --mode task --agent jiuwen "Handle this task"
 opc exec --mode task --agent jiuwenswarm "Have one Team handle this task"
 ```
 
-The default Gateway URL is `ws://127.0.0.1:19001/tui`. Change `gateway_url` in `.opc/config/agent_config.yaml` only when Jiuwen runs elsewhere.
+The default Gateway URL is `ws://127.0.0.1:19001/tui`. Change `gateway_url` in `.opc/config/agent_config.yaml` only when JiuwenSwarm runs elsewhere.
 
 ### Role selection in Company Mode
 
 Choose the execution agent in Staffing / Recruitment Review, or under **Company → Org → role → Runtime**.
 
-- Select **Jiuwen** on CTO: only CTO uses Jiuwen. CTO's subordinates remain separate OpenOPC roles and keep their own staffing and agent choices.
-- Select **JiuwenSwarm Team** on CTO: CTO and every role below CTO become one Team. The roles remain visible in the org chart, but descendant controls are locked and OpenOPC does not recruit or assign employees inside that subtree. CEO delegates to the CTO Team boundary and receives one Team result.
-- Select **JiuwenSwarm Team** on CEO: CEO and the entire company subtree become one Team. Descendants cannot select separate agents or create nested Teams.
+- Select **JiuwenSwarm-single** on CTO: only CTO uses JiuwenSwarm-single. CTO's subordinates remain separate OpenOPC roles and keep their own staffing and agent choices.
+- Select **JiuwenSwarm-team** on CTO: CTO and every role below CTO become one Team. The roles remain visible in the org chart, but descendant controls are locked and OpenOPC does not recruit or assign employees inside that subtree. CEO delegates to the CTO Team boundary and receives one Team result.
+- Select **JiuwenSwarm-team** on CEO: CEO and the entire company subtree become one Team. Descendants cannot select separate agents or create nested Teams.
 - Select Teams on several peer managers, such as COO, CTO, and CMO: they become separate Teams coordinated and reviewed by their parent manager.
 - Select no Team: normal Company staffing and per-role execution continue unchanged.
 
-The parent manager receives a capability summary compiled from the covered roles, skills, tools, and deliverables. Jiuwen decides how work is divided internally.
+The parent manager receives a capability summary compiled from the covered roles, skills, tools, and deliverables. JiuwenSwarm-team decides how work is divided internally.
 
 </details>
 
@@ -667,7 +667,7 @@ Changing the default through the UI or `opc permissions set` atomically refreshe
 
 When a call asks, approval cards retain once/session/project/global scopes; no grant can override an explicit deny. **Default** in the UI changes only future sessions.
 
-`full-access` bypasses only Native tool permission prompts. Organization reviews, hiring decisions, user questions, Company WorkItem gates, controller ownership, durable effect fences, and explicit deny rules remain active. **This setting does not control Codex, Claude Code, Jiuwen, JiuwenSwarm, or any other external harness; their approval and sandbox settings remain independent.** Legacy Native risk settings are read once for migration, then `native_approval_level` is authoritative.
+`full-access` bypasses only Native tool permission prompts. Organization reviews, hiring decisions, user questions, Company WorkItem gates, controller ownership, durable effect fences, and explicit deny rules remain active. **This setting does not control Codex, Claude Code, JiuwenSwarm-single, JiuwenSwarm-team, or any other external harness; their approval and sandbox settings remain independent.** Legacy Native risk settings are read once for migration, then `native_approval_level` is authoritative.
 
 ### External Agents
 
@@ -677,7 +677,7 @@ Task Mode can explicitly select an execution agent:
 opc chat -p demo --mode task --agent codex "Implement the change"
 ```
 
-Available values are `native`, `codex`, `claude_code`, `cursor`, `opencode`, `jiuwen`, and `jiuwenswarm`. See [Jiuwen / JiuwenSwarm setup and role behavior](#jiuwen-integration).
+Available values are `native`, `codex`, `claude_code`, `cursor`, `opencode`, `jiuwen` (JiuwenSwarm-single), and `jiuwenswarm` (JiuwenSwarm-team). See [JiuwenSwarm setup and role behavior](#jiuwen-integration).
 
 ### Feishu Connection
 

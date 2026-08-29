@@ -313,7 +313,7 @@ export const StaffingSelectionPanel = React.memo(function StaffingSelectionPanel
               <div className="ckpt-proposal-header">
                 <span className="ckpt-role-name">{roleId}</span>
                 <span className={`ckpt-badge ckpt-badge-${externallyStaffed ? 'external-team' : selected.kind}`}>
-                  {externallyStaffed ? 'JiuwenSwarm Team' : selected.kind}
+                  {externallyStaffed ? 'JiuwenSwarm-team' : selected.kind}
                 </span>
               </div>
               {role.role_label && role.role_label !== roleId && (

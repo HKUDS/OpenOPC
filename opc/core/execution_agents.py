@@ -24,6 +24,15 @@ EXECUTION_AGENTS: frozenset[str] = frozenset({
     NATIVE_EXECUTION_AGENT,
     *EXTERNAL_EXECUTION_AGENTS,
 })
+EXECUTION_AGENT_LABELS: dict[str, str] = {
+    "native": "OpenOPC Native",
+    "codex": "Codex",
+    "claude_code": "Claude Code",
+    "cursor": "Cursor",
+    "opencode": "OpenCode",
+    "jiuwen": "JiuwenSwarm-single",
+    "jiuwenswarm": "JiuwenSwarm-team",
+}
 
 
 def normalize_execution_agent(value: Any, default: str | None = None) -> str | None:
@@ -36,3 +45,11 @@ def normalize_execution_agent(value: Any, default: str | None = None) -> str | N
     if fallback in EXECUTION_AGENTS:
         return fallback
     return None
+
+
+def execution_agent_label(value: Any) -> str:
+    """Return the stable user-facing label without changing the wire identity."""
+
+    raw = str(value or "").strip()
+    normalized = normalize_execution_agent(raw)
+    return EXECUTION_AGENT_LABELS.get(normalized or "", raw)

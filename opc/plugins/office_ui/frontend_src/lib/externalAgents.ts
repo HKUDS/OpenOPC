@@ -7,8 +7,8 @@ export const TASK_AGENT_LABELS: Record<TaskPreferredAgent, string> = {
   claude_code: 'Claude Code',
   cursor: 'Cursor',
   opencode: 'OpenCode',
-  jiuwen: 'Jiuwen',
-  jiuwenswarm: 'JiuwenSwarm Team',
+  jiuwen: 'JiuwenSwarm-single',
+  jiuwenswarm: 'JiuwenSwarm-team',
 }
 
 export const TASK_AGENT_OPTIONS: TaskPreferredAgent[] = [

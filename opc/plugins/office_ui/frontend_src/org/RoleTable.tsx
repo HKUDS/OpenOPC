@@ -191,7 +191,7 @@ export function RoleTable({
             <span className="rt-team-agent" title={r.externalTeamBoundary
               ? 'This role and its descendants execute as one opaque team.'
               : `Covered by the team at ${r.externalTeamBoundaryRoleId ?? 'the boundary role'}`}>
-              {r.externalTeamBoundary ? 'JiuwenSwarm Team' : `Covered by ${r.externalTeamBoundaryRoleId ?? 'team'}`}
+              {r.externalTeamBoundary ? 'JiuwenSwarm-team' : `Covered by ${r.externalTeamBoundaryRoleId ?? 'team'}`}
             </span>
           )
         }

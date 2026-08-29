@@ -219,8 +219,10 @@ class CliInitProjectTests(unittest.TestCase):
             self.assertEqual(init_result.exit_code, 0, init_result.output)
             self.assertEqual(status_result.exit_code, 0, status_result.output)
             self.assertIn("External agent preflight", init_result.output)
-            for agent in ("codex", "claude_code", "cursor", "opencode"):
-                self.assertIn(agent, status_result.output)
+            for agent_label in ("Codex", "Claude Code", "Cursor", "OpenCode"):
+                self.assertIn(agent_label, status_result.output)
+            self.assertIn("JiuwenSwarm-single", status_result.output)
+            self.assertIn("JiuwenSwarm-team", status_result.output)
             self.assertIn("writable", status_result.output)
 
     def test_init_provisions_external_agent_surfaces_and_trust_rules(self) -> None:
@@ -1086,7 +1088,7 @@ class CliSlashCommandTests(unittest.TestCase):
         self.assertIn("project:demo", toolbar)
         self.assertIn("session:sess-1", toolbar)
         self.assertIn("mode:task", toolbar)
-        self.assertIn("agent:native", toolbar)
+        self.assertIn("agent:OpenOPC Native", toolbar)
         self.assertIn("/project", toolbar)
 
     def test_startup_selector_chooses_session_instead_of_auto_restoring(self) -> None:

@@ -30,7 +30,7 @@ from rich.theme import Theme
 
 from opc import __version__
 from opc.core.config import OPCConfig, get_opc_home, get_project_config_workspace
-from opc.core.execution_agents import EXECUTION_AGENTS
+from opc.core.execution_agents import EXECUTION_AGENTS, execution_agent_label
 from opc.core.interaction_protocol import owner_interaction_actor_identity
 from opc.core.native_permissions import (
     NativeApprovalLevel,
@@ -668,7 +668,7 @@ def chat(
     project: Optional[str] = typer.Option(None, "--project", "-p", help="Project ID to work in"),
     model: Optional[str] = typer.Option(None, "--model", "-m", help="Override default LLM model"),
     mode: str = typer.Option("task", "--mode", help="Execution mode: task or company"),
-    agent: Optional[str] = typer.Option(None, "--agent", help="Preferred agent: native, claude_code, codex, cursor, opencode, jiuwen, jiuwenswarm"),
+    agent: Optional[str] = typer.Option(None, "--agent", help="Preferred agent ID; jiuwen = JiuwenSwarm-single, jiuwenswarm = JiuwenSwarm-team"),
     company_profile: str = typer.Option("corporate", "--company-profile", help="Company profile for company mode"),
     approval_level: Optional[str] = typer.Option(None, "--approval-level", help="OpenOPC Native permissions: read-only, auto, or full-access"),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Show detailed logs"),
@@ -719,7 +719,7 @@ def exec_command(
     project: Optional[str] = typer.Option(None, "--project", "-p", help="Project ID to work in"),
     mode: str = typer.Option("task", "--mode", help="Execution mode: task, company, or org"),
     company_profile: str = typer.Option("corporate", "--company-profile", help="Company profile for company mode"),
-    agent: Optional[str] = typer.Option(None, "--agent", help="Preferred agent: native, claude_code, codex, cursor, opencode, jiuwen, jiuwenswarm"),
+    agent: Optional[str] = typer.Option(None, "--agent", help="Preferred agent ID; jiuwen = JiuwenSwarm-single, jiuwenswarm = JiuwenSwarm-team"),
     org_id: Optional[str] = typer.Option(None, "--org", "--org-id", help="Saved org id for org/custom mode"),
     session_id: Optional[str] = typer.Option(None, "--session-id", help="Existing task-backed session id to reuse"),
     resume: bool = typer.Option(False, "--resume", help="Resume the latest task-backed session in the project"),
@@ -958,7 +958,10 @@ def _run_init_external_agent_preflight(
         f"collab surfaces and workspace permissions checked."
     )
     for item in failures:
-        console.print(f"  [warning]- {item.agent}: {'; '.join(item.issues[:2])}[/warning]")
+        console.print(
+            f"  [warning]- {execution_agent_label(item.agent)}: "
+            f"{'; '.join(item.issues[:2])}[/warning]"
+        )
 
 
 def _render_external_agent_detection(config: OPCConfig) -> None:
@@ -976,9 +979,9 @@ def _render_external_agent_detection(config: OPCConfig) -> None:
             command = agent_config.command
             found = shutil.which(command)
         if found:
-            console.print(f"  - {agent_name}: [success]found[/success] ({found})")
+            console.print(f"  - {execution_agent_label(agent_name)}: [success]found[/success] ({found})")
         else:
-            console.print(f"  - {agent_name}: [warning]not found[/warning] (command={command})")
+            console.print(f"  - {execution_agent_label(agent_name)}: [warning]not found[/warning] (command={command})")
 
 
 def _render_external_agent_preflight_table(results: list[Any]) -> None:
@@ -1014,7 +1017,7 @@ def _render_external_agent_preflight_table(results: list[Any]) -> None:
         if item.warnings:
             notes.extend(item.warnings[:2])
         table.add_row(
-            item.agent,
+            execution_agent_label(item.agent),
             binary,
             mode,
             str(getattr(item, "stdin_policy", "") or "-"),
@@ -1394,7 +1397,7 @@ def status(
     console.print("\n[bold]External Agents:[/bold]")
     for name, agent_config in config.agents.agents.items():
         status_str = "[success]enabled[/success]" if agent_config.enabled else "[warning]disabled[/warning]"
-        console.print(f"  - {name}: {status_str}")
+        console.print(f"  - {execution_agent_label(name)}: {status_str}")
 
     if not config.agents.agents:
         console.print("  (none configured)")
@@ -2276,7 +2279,7 @@ def external_agents_list(json_output: bool = typer.Option(False, "--json")):
     for profile in profiles:
         capabilities = dict(profile.get("capabilities", {}) or {})
         table.add_row(
-            str(profile.get("agent") or ""),
+            execution_agent_label(profile.get("agent")),
             "yes" if profile.get("available") else "no",
             str(profile.get("execution_unit_kind") or "external_agent"),
             "yes" if capabilities.get("task_mode") else "no",
@@ -3471,7 +3474,7 @@ _SLASH_COMMANDS: tuple[_SlashCommandSpec, ...] = (
     _SlashCommandSpec("Context", "/status", "Show project, session, mode, agent, domains, model, and cost."),
     _SlashCommandSpec("Context", "/permissions [read-only|auto|full-access]", "Show or change OpenOPC Native permissions for this session.", ("read-only", "auto", "full-access")),
     _SlashCommandSpec("Context", "/mode [task|company] [corporate|custom]", "Set execution mode for future messages.", ("task", "company", "corporate", "custom")),
-    _SlashCommandSpec("Context", "/agent [native|codex|jiuwen|jiuwenswarm|claude_code|cursor|opencode|none]", "Set preferred external agent.", ("native", "codex", "jiuwen", "jiuwenswarm", "claude_code", "cursor", "opencode", "none")),
+    _SlashCommandSpec("Context", "/agent [native|codex|jiuwen|jiuwenswarm|claude_code|cursor|opencode|none]", "Set preferred agent; jiuwen = JiuwenSwarm-single, jiuwenswarm = JiuwenSwarm-team.", ("native", "codex", "jiuwen", "jiuwenswarm", "claude_code", "cursor", "opencode", "none")),
     _SlashCommandSpec("Context", "/domains [domain ...|clear]", "Set domain hints for future messages.", ("clear",)),
     _SlashCommandSpec("Project", "/project", "Show current project, known projects, and switch/create/delete usage.", ("list", "switch", "create", "rename", "delete")),
     _SlashCommandSpec("Project", "/project list", "List known projects."),
@@ -3818,7 +3821,12 @@ def _print_context_status(state: _InteractiveChatState) -> None:
     table.add_row("Company profile", state.company_profile if state.mode == "company" else "(inactive)")
     if state.org_id:
         table.add_row("Org", state.org_id)
-    table.add_row("Preferred agent", state.preferred_agent or "(system default)")
+    table.add_row(
+        "Preferred agent",
+        execution_agent_label(state.preferred_agent)
+        if state.preferred_agent
+        else "(system default)",
+    )
     default_level = normalize_native_approval_level(
         state.config.autonomy.native_approval_level
     )
@@ -3951,7 +3959,7 @@ def _chat_bottom_toolbar_text(state: _InteractiveChatState, controller: ChatTurn
         f"  session:{_session_short_id(state.session_id)}"
         f"  mode:{state.mode}{profile}"
         f"{org}"
-        f"  agent:{state.preferred_agent or 'system'}"
+        f"  agent:{execution_agent_label(state.preferred_agent) if state.preferred_agent else 'system'}"
         f"  permissions:{state.native_approval_level}"
         f"{runtime_hint}"
         f"{busy_hint}"
@@ -4169,7 +4177,8 @@ async def _run_interactive_startup_selector(state: _InteractiveChatState, *, exp
     profile = f" company_profile={state.company_profile}" if state.mode == "company" else ""
     console.print(
         f"[success]Ready:[/success] project={_current_project_id(state.engine)} "
-        f"session={state.session_id} mode={state.mode}{profile} agent={state.preferred_agent or 'system'}"
+        f"session={state.session_id} mode={state.mode}{profile} "
+        f"agent={execution_agent_label(state.preferred_agent) if state.preferred_agent else 'system'}"
     )
     _print_chat_hint()
 
@@ -7332,10 +7341,15 @@ async def _handle_agent_slash(state: _InteractiveChatState, args: list[str]) -> 
         table.add_column("Current", justify="center")
         table.add_column("Command")
         for agent in ["native", "codex", "jiuwen", "jiuwenswarm", "claude_code", "cursor", "opencode"]:
-            table.add_row(agent, "*" if state.preferred_agent == agent else "", f"/agent {agent}")
+            table.add_row(execution_agent_label(agent), "*" if state.preferred_agent == agent else "", f"/agent {agent}")
         table.add_row("system default", "*" if state.preferred_agent is None else "", "/agent none")
         console.print(table)
-        console.print(f"[info]Preferred agent: {state.preferred_agent or '(system default)'}[/info]")
+        preferred_label = (
+            execution_agent_label(state.preferred_agent)
+            if state.preferred_agent
+            else "(system default)"
+        )
+        console.print(f"[info]Preferred agent: {preferred_label}[/info]")
         return
     command = args[0].strip().lower()
     if command in {"list", "ls"}:
@@ -7442,7 +7456,7 @@ async def _handle_agent_slash(state: _InteractiveChatState, args: list[str]) -> 
         return
     state.preferred_agent = agent
     await _persist_chat_context(state)
-    console.print(f"[success]Preferred agent set to {agent}[/success]")
+    console.print(f"[success]Preferred agent set to {execution_agent_label(agent)}[/success]")
 
 
 def _handle_domains_slash(state: _InteractiveChatState, args: list[str]) -> None:
@@ -7554,7 +7568,7 @@ def _company_staffing_agent_choices(state: _InteractiveChatState) -> list[dict[s
     return [
         {
             "agent": agent,
-            "label": f"{agent} ({'available' if agent in available else 'unavailable'})",
+            "label": f"{execution_agent_label(agent)} ({'available' if agent in available else 'unavailable'})",
             "available": agent in available,
             "search": agent.replace("_", " "),
         }
@@ -8746,7 +8760,7 @@ async def _interactive_mode(
         f"Model: {config.llm.default_model}\n"
         f"Current mode: {state.mode}"
         f"{f' ({state.company_profile})' if state.mode == 'company' else ''}\n"
-        f"Current agent: {state.preferred_agent or 'system'}\n"
+        f"Current agent: {execution_agent_label(state.preferred_agent) if state.preferred_agent else 'system'}\n"
         f"Native permissions: {state.native_approval_level}\n"
         f"Choose a project and session to begin.",
         border_style="blue",

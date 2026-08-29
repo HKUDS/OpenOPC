@@ -382,7 +382,7 @@ export function WorkItemProgressCard({
         roleKey: summary.roleKey,
         executionTurnId: latest.executionTurnId || fallbackExecutionTurnId,
         title: opaqueTeamRow
-          ? `${summary.roleName || summary.roleId} · JiuwenSwarm Team`
+          ? `${summary.roleName || summary.roleId} · JiuwenSwarm-team`
           : (summary.roleName || summary.roleId),
         status: aggregatedStatus,
         statusLabel: labelForColumnId(aggregatedColumnId),

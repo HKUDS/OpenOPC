@@ -10,7 +10,11 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from opc.core.config import ExternalAgentConfig, ExternalTeamBindingConfig, OPCConfig
-from opc.core.execution_agents import EXECUTION_AGENTS, normalize_execution_agent
+from opc.core.execution_agents import (
+    EXECUTION_AGENTS,
+    execution_agent_label,
+    normalize_execution_agent,
+)
 from opc.core.models import (
     DelegationWorkItem,
     ExecutionMode,
@@ -74,6 +78,15 @@ def test_default_config_exposes_both_jiuwen_execution_units() -> None:
     assert team.capabilities()["opaque_team"] is True
     assert normal.agent_isolation_home_slug() == "jiuwen"
     assert team.agent_isolation_home_slug() == "jiuwenswarm"
+
+
+def test_jiuwen_execution_units_have_stable_user_facing_names() -> None:
+    assert execution_agent_label("jiuwen") == "JiuwenSwarm-single"
+    assert execution_agent_label("jiuwenswarm") == "JiuwenSwarm-team"
+    assert execution_agent_label("JIUWENSWARM") == "JiuwenSwarm-team"
+    config = OPCConfig()
+    assert JiuwenAdapter(config=config.agents.agents["jiuwen"]).display_name == "JiuwenSwarm-single"
+    assert JiuwenSwarmAdapter(config=config.agents.agents["jiuwenswarm"]).display_name == "JiuwenSwarm-team"
 
 
 @pytest.mark.parametrize(

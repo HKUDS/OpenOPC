@@ -54,7 +54,7 @@ export const StructureCanvasNode = memo(function StructureCanvasNode({ data }: {
           <span className="oc-canvas-node-name">{data.name}</span>
           {data.externalTeamLabel && (
             <span className="oc-canvas-node-team" title={data.externalTeamLabel}>
-              {data.externalTeamBoundary ? 'JiuwenSwarm Team' : data.externalTeamLabel}
+              {data.externalTeamBoundary ? 'JiuwenSwarm-team' : data.externalTeamLabel}
             </span>
           )}
           <div className="oc-canvas-node-meta">

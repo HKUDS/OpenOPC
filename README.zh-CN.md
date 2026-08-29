@@ -23,7 +23,7 @@
 
 ## 新闻
 
-- **2026 年 8 月 26 日 — 接入 Jiuwen 与 JiuwenSwarm：** Task 与 Company 模式均可将 Jiuwen 用作单 Agent，或将 JiuwenSwarm 用作一个不透明 Team。[查看配置与角色规则](#jiuwen-integration)。
+- **2026 年 8 月 26 日 — 接入 JiuwenSwarm：** 在 Task 与 Company 模式下，可将 JiuwenSwarm-single 用作单 Agent，或将 JiuwenSwarm-team 用作一个不透明 Team——一支自组织蜂群，无缝接入你的组织。[查看配置与角色规则](#jiuwen-integration)。
 - **2026 年 7 月 14 日 — Company 运行更可靠：** Company 会话可更顺畅地恢复和继续，同时保留 Agent 身份、角色上下文、委派与审核进度。
 - **2026 年 7 月 13 日 — Office UI 更流畅：** 实时更新和聊天滚动性能提升，长时间运行的项目更顺畅。
 - **2026 年 7 月 8 日 — 审批更智能：** 会话授权可持续生效，低风险操作自动流转，待处理决策可随时继续。
@@ -37,7 +37,7 @@
 - [Office UI 指南](#office-ui-指南)
 - [CLI 指南](#cli-指南)
 - [配置](#配置)
-- [Jiuwen / JiuwenSwarm](#jiuwen-integration)
+- [JiuwenSwarm](#jiuwen-integration)
 - [生态与分享](#生态与分享)
 - [路线图](#路线图)
 - [致谢](#致谢)
@@ -553,16 +553,16 @@ opc session create "Research sprint" -p demo --mode org --org hku_research_lab
 
 <a id="jiuwen-integration"></a>
 <details>
-<summary><strong>Jiuwen / JiuwenSwarm — 配置与角色规则</strong></summary>
+<summary><strong>JiuwenSwarm 配置与角色规则</strong> — <a href="https://github.com/openJiuwen-ai/jiuwenswarm">JiuwenSwarm</a></summary>
 
 Task 和 Company 模式都提供两个选项：
 
-- **Jiuwen** 是普通单 Agent，和 Codex、Claude Code 一样，只处理选中的任务或角色。
-- **JiuwenSwarm Team** 是一个不透明的外部 Team。OpenOPC 只与整个 Team 协作，不管理 Jiuwen 内部的 Agent。
+- **JiuwenSwarm-single** 是普通单 Agent，和 Codex、Claude Code 一样，只处理选中的任务或角色；兼容的 OpenOPC Agent ID 为 `jiuwen`。
+- **JiuwenSwarm-team** 是一个不透明的外部 Team。OpenOPC 只与整个 Team 协作，不管理其内部 Agent；兼容的 OpenOPC Agent ID 为 `jiuwenswarm`。
 
 ### 配置
 
-Jiuwen 读取 `~/.jiuwenswarm/config/.env`，不会自动读取 OpenOPC 的 `.opc/config/llm_config.yaml`。可以复用同一套提供方凭据，但模型名必须支持 Jiuwen 的 Agent 请求。例如火山方舟 Agent Plan 使用：
+JiuwenSwarm 读取 `~/.jiuwenswarm/config/.env`，不会自动读取 OpenOPC 的 `.opc/config/llm_config.yaml`。可以复用同一套提供方凭据，但模型名必须支持 JiuwenSwarm 的 Agent 请求。例如火山方舟 Agent Plan 使用：
 
 ```dotenv
 API_BASE="https://ark.cn-beijing.volces.com/api/plan/v3"
@@ -583,19 +583,19 @@ opc exec --mode task --agent jiuwen "完成这个任务"
 opc exec --mode task --agent jiuwenswarm "由一个 Team 完成这个任务"
 ```
 
-默认 Gateway 地址是 `ws://127.0.0.1:19001/tui`。只有 Jiuwen 运行在其他地址时，才需要修改 `.opc/config/agent_config.yaml` 中的 `gateway_url`。
+默认 Gateway 地址是 `ws://127.0.0.1:19001/tui`。只有 JiuwenSwarm 运行在其他地址时，才需要修改 `.opc/config/agent_config.yaml` 中的 `gateway_url`。
 
 ### Company 模式的角色选择
 
 可以在 Staffing / Recruitment Review 中选择执行 Agent，也可以进入 **Company → Org → 角色 → Runtime** 设置。
 
-- CTO 选择 **Jiuwen**：只有 CTO 使用 Jiuwen；CTO 的下级仍是独立的 OpenOPC 角色，继续单独招聘和选择 Agent。
-- CTO 选择 **JiuwenSwarm Team**：CTO 及其所有下级合并为一个 Team。组织图仍显示这些角色，但下级选项会锁定，OpenOPC 不再为该子树招聘或分配员工。CEO 只向 CTO Team 边界派单，并接收一份 Team 结果。
-- CEO 选择 **JiuwenSwarm Team**：CEO 和整个公司子树合并为一个 Team；下级不能再单独选择 Agent，也不会创建嵌套 Team。
+- CTO 选择 **JiuwenSwarm-single**：只有 CTO 使用 JiuwenSwarm-single；CTO 的下级仍是独立的 OpenOPC 角色，继续单独招聘和选择 Agent。
+- CTO 选择 **JiuwenSwarm-team**：CTO 及其所有下级合并为一个 Team。组织图仍显示这些角色，但下级选项会锁定，OpenOPC 不再为该子树招聘或分配员工。CEO 只向 CTO Team 边界派单，并接收一份 Team 结果。
+- CEO 选择 **JiuwenSwarm-team**：CEO 和整个公司子树合并为一个 Team；下级不能再单独选择 Agent，也不会创建嵌套 Team。
 - COO、CTO、CMO 等同级管理者分别选择 Team：它们会成为多个独立 Team，由共同的上级协调和审核。
 - 不选择 Team：保持普通 Company 模式，照常招聘并按角色执行。
 
-上级会收到根据覆盖角色、Skill、工具和交付物动态生成的能力摘要；Jiuwen 自行安排 Team 内部如何分工。
+上级会收到根据覆盖角色、Skill、工具和交付物动态生成的能力摘要；JiuwenSwarm-team 自行安排 Team 内部如何分工。
 
 </details>
 
@@ -666,7 +666,7 @@ opc session config <task-id> --approval-level auto
 
 需要授权时，审批卡仍支持 once/session/project/global 四种作用域；任何授权都不能绕过显式 deny。UI 中的 **Default** 只修改未来新会话。
 
-`full-access` 只跳过 Native 工具权限审批。组织审核、招聘确认、用户问答、Company WorkItem 门禁、控制器所有权、持久化副作用围栏和显式 deny 规则仍然生效。**该设置不控制 Codex、Claude Code、Jiuwen、JiuwenSwarm 或其他外部 harness；它们的审批和沙箱保持独立。** 旧版 Native 风险配置只用于首次迁移，此后以 `native_approval_level` 为准。
+`full-access` 只跳过 Native 工具权限审批。组织审核、招聘确认、用户问答、Company WorkItem 门禁、控制器所有权、持久化副作用围栏和显式 deny 规则仍然生效。**该设置不控制 Codex、Claude Code、JiuwenSwarm-single、JiuwenSwarm-team 或其他外部 harness；它们的审批和沙箱保持独立。** 旧版 Native 风险配置只用于首次迁移，此后以 `native_approval_level` 为准。
 
 ### 外部 Agent
 
@@ -676,7 +676,7 @@ Task 模式可以显式选择执行 Agent：
 opc chat -p demo --mode task --agent codex "Implement the change"
 ```
 
-可用值有 `native`、`codex`、`claude_code`、`cursor`、`opencode`、`jiuwen` 与 `jiuwenswarm`。参见 [Jiuwen / JiuwenSwarm 配置与角色规则](#jiuwen-integration)。
+可用值有 `native`、`codex`、`claude_code`、`cursor`、`opencode`、`jiuwen`（JiuwenSwarm-single）与 `jiuwenswarm`（JiuwenSwarm-team）。参见 [JiuwenSwarm 配置与角色规则](#jiuwen-integration)。
 
 ### 飞书接入
 

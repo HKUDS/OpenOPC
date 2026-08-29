@@ -129,7 +129,7 @@ function StructureCanvasInner({ roles, employees, sessionRecruitmentByRole, sele
         employeeNames: recruitedNamesByRole(r.role_id),
         isOwner: false, isSelected: false, isDropTarget: false,
         externalTeamLabel: r.covered_by_external_team
-          ? (r.external_team_boundary ? 'JiuwenSwarm Team' : `via ${r.external_team_boundary_role_id ?? 'team boundary'}`)
+          ? (r.external_team_boundary ? 'JiuwenSwarm-team' : `via ${r.external_team_boundary_role_id ?? 'team boundary'}`)
           : undefined,
         externalTeamBoundary: !!r.external_team_boundary,
       },
@@ -168,7 +168,7 @@ function StructureCanvasInner({ roles, employees, sessionRecruitmentByRole, sele
           isSelected: role.role_id === selectedRoleId,
           isDropTarget: role.role_id === dropTargetId,
           externalTeamLabel: role.covered_by_external_team
-            ? (role.external_team_boundary ? 'JiuwenSwarm Team' : `via ${role.external_team_boundary_role_id ?? 'team boundary'}`)
+            ? (role.external_team_boundary ? 'JiuwenSwarm-team' : `via ${role.external_team_boundary_role_id ?? 'team boundary'}`)
             : undefined,
           externalTeamBoundary: !!role.external_team_boundary,
         },

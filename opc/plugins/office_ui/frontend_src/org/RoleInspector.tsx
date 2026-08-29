@@ -364,7 +364,7 @@ export function RoleInspector({
                 />
                 <span>
                   <b>This role and descendants</b>
-                  <small>One opaque JiuwenSwarm Team; no covered roles are recruited separately.</small>
+                  <small>One opaque JiuwenSwarm-team; no covered roles are recruited separately.</small>
                 </span>
               </label>
             </div>
@@ -372,7 +372,7 @@ export function RoleInspector({
 
           {isCoveredDescendant && (
             <div className="ri-team-notice">
-              This role is covered by the JiuwenSwarm Team at <code>{role.external_team_boundary_role_id}</code>.
+              This role is covered by the JiuwenSwarm-team at <code>{role.external_team_boundary_role_id}</code>.
               Its staffing and executor are inherited from that boundary.
             </div>
           )}
@@ -380,11 +380,11 @@ export function RoleInspector({
           {isExternalTeamBoundary && (
             <div className="ri-team-card">
               <div className="ri-team-card-title">
-                <span>JiuwenSwarm Team</span>
+                <span>JiuwenSwarm-team</span>
                 <code>{role.external_team_binding_id}</code>
               </div>
               <div className="ri-team-card-copy">
-                OPC dispatches to <code>{role.role_id}</code>; Jiuwen manages its internal leader and members.
+                OPC dispatches to <code>{role.role_id}</code>; JiuwenSwarm-team manages its internal leader and members.
               </div>
               <div className="ri-team-covered-list">
                 {coveredRoles.map(item => (
@@ -437,7 +437,7 @@ export function RoleInspector({
               >
                 <option value="">(any)</option>
                 {extAgent === 'jiuwenswarm' && (
-                  <option value="jiuwenswarm">JiuwenSwarm Team (select Team scope above)</option>
+                  <option value="jiuwenswarm">JiuwenSwarm-team (select Team scope above)</option>
                 )}
                 {EXTERNAL_AGENTS.map(a => <option key={a} value={a}>{executionAgentLabel(a)}</option>)}
               </select>
@@ -449,7 +449,7 @@ export function RoleInspector({
           {!isExternalTeamBoundary && readOnly && !isCoveredDescendant && (
             <div className="ri-team-notice">
               Corporate role structure is fixed. Choose its single-role executor in the Company staffing step,
-              or bind this entire subtree to JiuwenSwarm here.
+              or bind this entire subtree to JiuwenSwarm-team here.
             </div>
           )}
         </InspectorGroup>

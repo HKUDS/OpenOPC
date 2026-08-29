@@ -315,7 +315,7 @@ export function TeamView({
 
       {!isCustomMode && (
         <div className="team-readonly-strip">
-          Corporate role structure is fixed. Execution scope can still bind a role subtree to one JiuwenSwarm Team.
+          Corporate role structure is fixed. Execution scope can still bind a role subtree to one JiuwenSwarm-team.
         </div>
       )}
 
@@ -381,9 +381,9 @@ export function TeamView({
                 </div>
                 {externallyCovered ? (
                   <div className="team-roster-external">
-                    <b>{r.external_team_boundary ? 'JiuwenSwarm Team boundary' : 'Covered by external team'}</b>
+                    <b>{r.external_team_boundary ? 'JiuwenSwarm-team boundary' : 'Covered by external team'}</b>
                     <span>{r.external_team_boundary
-                      ? 'No separate role recruitment; Jiuwen manages internal staffing.'
+                      ? 'No separate role recruitment; JiuwenSwarm-team manages internal staffing.'
                       : `Inherited from ${r.external_team_boundary_role_id ?? 'team boundary'}.`}</span>
                   </div>
                 ) : emps.length > 0 ? emps.map(e => (

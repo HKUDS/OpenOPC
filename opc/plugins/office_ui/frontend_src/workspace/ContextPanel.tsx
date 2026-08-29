@@ -15,6 +15,7 @@ import { IconTimeline, IconHandoff, IconTool } from '../chat/SvgIcons'
 import { isSessionWorking } from '../lib/sessionRuntime'
 import { getWorkItemRoleLabel } from '../lib/workItemIdentity'
 import { getLinkedRuntimeTaskId } from '../lib/workItemRuntimeIds'
+import { executionAgentLabel } from '../lib/externalAgents'
 import { TaskDetailView } from './TaskDetailView'
 import {
   getConversationPeerSessions,
@@ -400,7 +401,7 @@ function InfoTabView({
           {employeeLabel && <Fact label="Employee" value={employeeLabel} />}
           {task.selectedExecutionAgent && (
             <Fact label="Execution agent" value={
-              <span className="ctx-info-mono">{task.selectedExecutionAgent}</span>
+              <span className="ctx-info-mono">{executionAgentLabel(task.selectedExecutionAgent)}</span>
             } />
           )}
         </div>

@@ -1697,7 +1697,7 @@ class OPCEngine:
             summary = "No employees or talent templates are available. Approving will use role-only fallback execution."
         if external_team_count:
             summary += (
-                f" {external_team_count} external JiuwenSwarm team"
+                f" {external_team_count} external JiuwenSwarm-team"
                 f"{'s are' if external_team_count != 1 else ' is'} already staffed internally; "
                 "covered roles require no separate hires."
             )
@@ -19675,7 +19675,7 @@ class OPCEngine:
                     reply_metadata,
                 )
             except ValueError as exc:
-                return f"Could not apply JiuwenSwarm Team staffing: {exc}"
+                return f"Could not apply JiuwenSwarm-team staffing: {exc}"
             await self._publish_external_team_bindings_changed(compiled_teams)
             _, role_agent_overrides = self._filter_staffing_for_external_teams(
                 compiled_teams,
@@ -19726,7 +19726,7 @@ class OPCEngine:
                 reply_metadata,
             )
         except ValueError as exc:
-            return f"Could not apply JiuwenSwarm Team staffing: {exc}"
+            return f"Could not apply JiuwenSwarm-team staffing: {exc}"
         await self._publish_external_team_bindings_changed(compiled_teams)
         opaque_team_role_ids, role_agent_overrides = self._filter_staffing_for_external_teams(
             compiled_teams,
@@ -19935,7 +19935,7 @@ class OPCEngine:
                     role_agent_overrides=role_agent_overrides,
                 )
             except ValueError as exc:
-                return f"Could not apply JiuwenSwarm Team staffing: {exc}"
+                return f"Could not apply JiuwenSwarm-team staffing: {exc}"
             await self._publish_external_team_bindings_changed(compiled_teams)
             opaque_team_role_ids, role_agent_overrides = self._filter_staffing_for_external_teams(
                 compiled_teams,
