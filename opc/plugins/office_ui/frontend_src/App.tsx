@@ -1,14 +1,9 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
-import ReactMarkdown from 'react-markdown'
-import remarkGfm from 'remark-gfm'
 import { VisualSocketClient } from './lib/wsClient'
-import { PhaserGame } from './game/PhaserGame'
 import { GameBridge } from './game/GameBridge'
 import { CollisionEditor } from './components/CollisionEditor'
 import { registerTestRunner } from './game/test/eventTestRunner'
-import { getOffices, type OfficeConfig } from './game/map/OfficeStore'
-import { getOfficeDeskSeats } from './game/map/InteractionZones'
-import type { AgentInfo, EmployeeDetailPayload, OrgCreateMemberInput, OrgSavedCreatePayload, OrgEmployee, OrgInfoPayload, OrgRole, ReorgProposalInfo, SavedOrgSummary, SocketStatus, TalentTemplate, VisualEvent, VisualSnapshot } from './types/visual'
+import type { AgentInfo, EmployeeDetailPayload, OrgCreateMemberInput, OrgSavedCreatePayload, OrgEmployee, OrgInfoPayload, OrgRole, ReorgProposalInfo, SavedOrgSummary, SocketStatus, TalentTemplate, VisualSnapshot } from './types/visual'
 import { useBoardStore, type BoardStoreState } from './kanban/BoardStore'
 import { WorkspacePage } from './workspace/WorkspacePage'
 import { useChatStore, type ChatStoreState } from './chat/ChatStore'
@@ -30,6 +25,9 @@ import { loadStoredTheme, saveStoredTheme, isThemeName, themeMessageKey, THEMES,
 import { unassignAgent } from './game/map/OfficeStore'
 import type { AgentAnimStatus, EmployeeAssignment, KanbanPhase, KanbanTask, NativeApprovalLevel, RoleAggregatedStatus, RoleWorkItemSummary, Session, TaskPreferredAgent } from './types/kanban'
 import { useI18n } from './i18n'
+import { OfficePage } from './office/OfficePage'
+import { EventTimelineStore } from './devtools/EventTimelineStore'
+import { DevToolsOverlay } from './devtools/DevToolsOverlay'
 
 function readOutdoorOverrideUi(): 'auto' | 'day' | 'night' {
   try {
@@ -117,12 +115,6 @@ function normalizeTaskPreferredAgent(value?: string): TaskPreferredAgent {
     return normalized
   }
   return 'native'
-}
-
-function truncateJson(data: unknown, maxLen = 120): string {
-  const s = JSON.stringify(data) ?? ''
-  if (s.length <= maxLen) return s
-  return s.slice(0, maxLen) + '\u2026'
 }
 
 function mapAgentPayload(raw: Record<string, unknown>, previous?: AgentInfo): AgentInfo {
@@ -453,10 +445,11 @@ function MaybeExecutionPanel({ taskId, sessions, agents, onClose }: {
 }
 
 export default function App() {
-  const { locale, setLocale, t, translateMaybe } = useI18n()
+  const { locale, setLocale, t } = useI18n()
   const bridgeRef = useRef(new GameBridge())
   useMemo(() => registerTestRunner(bridgeRef.current), [])
   const clientRef = useRef<VisualSocketClient | null>(null)
+  const [eventTimeline] = useState(() => new EventTimelineStore(MAX_LOG_ITEMS))
 
   const initialUrl = defaultWsUrl()
 
@@ -465,21 +458,16 @@ export default function App() {
   const [status, setStatus] = useState<SocketStatus>('disconnected')
   const [statusDetail, setStatusDetail] = useState('')
   const [snapshot, setSnapshot] = useState<VisualSnapshot | null>(null)
-  const [events, setEvents] = useState<VisualEvent[]>([])
-  const [uiTick, setUiTick] = useState(0)
-  const [selectedAgentId, setSelectedAgentId] = useState<string | null>(null)
   const [projectIdPolicy, setProjectIdPolicy] = useState<ProjectIdPolicy | null>(null)
   const [theme, setTheme] = useState<ThemeName>(loadStoredTheme)
-  const [showSubagents, setShowSubagents] = useState(true)
   const [sidebarCollapsed, setSidebarCollapsed] = useState(() => {
     try { return localStorage.getItem('opc_office_sidebar_collapsed') === '1' } catch { return false }
   })
-  const toggleSidebar = () => setSidebarCollapsed(v => {
+  const toggleSidebar = useCallback(() => setSidebarCollapsed(v => {
     const next = !v
     try { localStorage.setItem('opc_office_sidebar_collapsed', next ? '1' : '0') } catch { /* private mode */ }
     return next
-  })
-  const [eventTypeFilter, setEventTypeFilter] = useState('all')
+  }), [])
   const [activePage, setActivePage] = useState<AppPage>('workspace')
   const [swarmAgents, setSwarmAgents] = useState<AgentInfo[]>([])
   const [showDevTools, setShowDevTools] = useState(false)
@@ -530,7 +518,6 @@ export default function App() {
   const [hiringTemplateId, setHiringTemplateId] = useState<string | null>(null)
   const [toastMessage, setToastMessage] = useState<string | null>(null)
   const [toastType, setToastType] = useState<'success' | 'error'>('success')
-  const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null)
   const [deletingAgentId, setDeletingAgentId] = useState<string | null>(null)
   const [executionPanelTaskId, setExecutionPanelTaskId] = useState<string | null>(null)
   const [outdoorOverride, setOutdoorOverride] = useState<'auto' | 'day' | 'night'>(() => readOutdoorOverrideUi())
@@ -770,17 +757,6 @@ export default function App() {
     globalExecModeRef.current = globalExecMode
   }, [globalExecMode])
 
-  // Listen for agent selection from Phaser
-  useEffect(() => {
-    const bridge = bridgeRef.current
-    const handler = (agentId: string) => {
-      setSelectedAgentId(agentId)
-      setUiTick(n => n + 1)
-    }
-    bridge.on('agentSelected', handler)
-    return () => { bridge.off('agentSelected', handler) }
-  }, [])
-
   // ── Runtime-delta coalescing ────────────────────────────────────────
   // assistant_delta / thinking_delta arrive at token frequency; writing each
   // one straight into the stores re-renders the whole app once per token.
@@ -827,26 +803,13 @@ export default function App() {
     }, 80)
   }, [flushPendingDeltas])
 
-  // uiTick only feeds the office-page visual memos (cards/offices/seats).
-  // A trailing 300ms throttle caps their refresh cost regardless of the
-  // websocket event rate; the office view is cosmetic, so ≤300ms staleness
-  // is invisible.
-  const uiTickTimerRef = useRef<number | null>(null)
-  const bumpUiTickThrottled = useCallback(() => {
-    if (uiTickTimerRef.current !== null) return
-    uiTickTimerRef.current = window.setTimeout(() => {
-      uiTickTimerRef.current = null
-      setUiTick(n => n + 1)
-    }, 300)
-  }, [])
-
   useEffect(() => {
     const client = new VisualSocketClient(wsUrl, {
       onSnapshot: (data) => {
         if (!payloadMatchesCurrentSwitch(data as unknown as Record<string, unknown>)) return
         setSnapshot(data)
         const timeline = data.timeline.slice(-MAX_LOG_ITEMS)
-        setEvents(timeline)
+        eventTimeline.replace(timeline)
 
         const ids = new Set<string>()
         for (const evt of timeline) ids.add(evt.event_id)
@@ -876,7 +839,6 @@ export default function App() {
           setGlobalNativeApprovalDefault(data.native_approval_default)
         }
 
-        setUiTick((n) => n + 1)
       },
       onEvent: (evt) => {
         try {
@@ -885,7 +847,7 @@ export default function App() {
             replayedEventIds.current.delete(evt.event_id)
             return
           }
-          setEvents((prev) => [...prev.slice(-MAX_LOG_ITEMS + 1), evt])
+          eventTimeline.append(evt)
 
           // Push event to Phaser
           bridgeRef.current.pushEvent(evt)
@@ -1043,7 +1005,6 @@ export default function App() {
             }
           }
 
-          bumpUiTickThrottled()
         } catch (e) { console.error('[onEvent] Error:', e, evt) }
       },
       onAck: (payload) => {
@@ -1061,7 +1022,6 @@ export default function App() {
             }
             setStatusDetail(String(payload.error ?? 'request_failed'))
             setDeletingAgentId(null)
-            setConfirmDeleteId(null)
             showToast(String(payload.error ?? 'Request failed'), 'error')
           }
           // Employee deployed to office
@@ -1143,12 +1103,11 @@ export default function App() {
             for (const agent of nextAgents) {
               bridgeRef.current.ensureAgent(agent.agent_id, agent.name, agent.office_id, agent.appearance?.palette, agent.appearance?.desk_id)
             }
-            setUiTick((n) => n + 1)
+            bridgeRef.current.emit('officeChanged')
           }
           if (payload.ok && (payload.agent_id || payload.deleted)) {
             if (payload.deleted) {
               setDeletingAgentId(null)
-              setConfirmDeleteId(null)
               showToast('Agent removed')
             }
             if (payload.agent_id && !payload.deleted) {
@@ -2042,10 +2001,6 @@ export default function App() {
         deltaFlushTimerRef.current = null
       }
       pendingDeltaFlushRef.current.clear()
-      if (uiTickTimerRef.current !== null) {
-        window.clearTimeout(uiTickTimerRef.current)
-        uiTickTimerRef.current = null
-      }
     }
   }, [wsUrl])
 
@@ -2126,7 +2081,7 @@ export default function App() {
         const names = agentIds.map(id => swarmAgents.find(a => a.agent_id === id)?.name ?? id)
         notifyTaskAssigned(chatStore, task, names)
       }
-      setUiTick(n => n + 1)
+      bridgeRef.current.emit('officeChanged')
     },
     [boardStore.tasks, chatStore, swarmAgents, getActiveProjectId]
   )
@@ -2138,71 +2093,16 @@ export default function App() {
     return { totalAgents, totalSkills }
   }, [snapshot])
 
-  const cards = useMemo(() => {
-    const all = bridgeRef.current.getCharacterCards()
-    const visible = showSubagents ? all : all.filter((c) => !c.isSubagent)
-    return visible.slice().sort((a, b) => a.displayName.localeCompare(b.displayName))
-  }, [showSubagents, uiTick])
-
-  const offices = useMemo(() => getOffices(), [uiTick])
   const officeMap = useMemo(() => {
-    const m: Record<string, string> = {}
-    for (const c of cards) { if (c.officeId) m[c.id] = c.officeId }
-    return m
-  }, [cards])
+    const result: Record<string, string> = {}
+    for (const agent of swarmAgents) {
+      if (agent.office_id) result[agent.agent_id] = agent.office_id
+    }
+    return result
+  }, [swarmAgents])
 
   // Board initialization is driven entirely by collab_sync from backend (#7)
   // No local ensureDefaultBoards — avoids column ID mismatch with backend IDs
-
-  const [editingOfficeName, setEditingOfficeName] = useState<string | null>(null)
-  const [officeNameDraft, setOfficeNameDraft] = useState('')
-
-  const handleRenameOffice = (officeId: string) => {
-    if (officeNameDraft.trim()) {
-      bridgeRef.current.renameOffice(officeId, officeNameDraft.trim())
-      setUiTick(t => t + 1)
-    }
-    setEditingOfficeName(null)
-  }
-
-  const handleAssignAgent = (officeId: string, agentId: string) => {
-    bridgeRef.current.assignAgentToOffice(agentId, officeId)
-    // Sync office assignment to backend
-    clientRef.current?.moveAgent(agentId, officeId)
-    setUiTick(t => t + 1)
-  }
-
-  const handleChangeSeat = (agentId: string, seatId: string) => {
-    bridgeRef.current.changeAgentSeat(agentId, seatId)
-    setUiTick(t => t + 1)
-  }
-
-  const selectedCard = cards.find((c) => c.id === selectedAgentId) ?? null
-
-  const selectedAgentSeats = useMemo(() => {
-    if (!selectedCard) return []
-    return bridgeRef.current.getSeatsForOffice(selectedCard.officeId)
-  }, [selectedCard?.officeId, uiTick]) // eslint-disable-line react-hooks/exhaustive-deps
-
-  const evolutionPhases = useMemo(() => {
-    const recent = events.slice(-40)
-    return {
-      trace: recent.some((e) => e.type === 'tool_start' || e.type === 'tool_done'),
-      reflect: recent.some((e) => e.type === 'reflect_start' || e.type === 'reflect_done'),
-      synthesize: recent.some((e) => e.type === 'skill_synthesized'),
-    }
-  }, [events])
-
-  const eventTypes = useMemo(() => {
-    const uniq = Array.from(new Set(events.map((evt) => evt.type)))
-    return ['all', ...uniq]
-  }, [events])
-
-  const filteredEvents = useMemo(() => {
-    const list = eventTypeFilter === 'all' ? events : events.filter((evt) => evt.type === eventTypeFilter)
-    return list.slice().reverse()
-  }, [eventTypeFilter, events])
-
 
   const applyWsUrl = () => {
     const next = wsUrlInput.trim()
@@ -2210,9 +2110,20 @@ export default function App() {
     setWsUrl(next)
   }
 
-  const selectAgent = useCallback((agentId: string) => {
-    setSelectedAgentId(agentId)
-    setUiTick((n) => n + 1)
+  const handleMoveOfficeAgent = useCallback((agentId: string, officeId: string) => {
+    setSwarmAgents(previous => {
+      const next = previous.map(agent => (
+        agent.agent_id === agentId ? { ...agent, office_id: officeId } : agent
+      ))
+      swarmAgentsRef.current = next
+      return next
+    })
+    clientRef.current?.moveAgent(agentId, officeId)
+  }, [])
+
+  const handleDeleteOfficeAgent = useCallback((agentId: string) => {
+    setDeletingAgentId(agentId)
+    clientRef.current?.deleteAgent(agentId)
   }, [])
 
   const handleSessionModeChange = useCallback((taskId: string, mode: string, profile?: string, orgId?: string) => {
@@ -2738,254 +2649,29 @@ export default function App() {
         </div>
       )}
 
-      {/* Main Grid */}
-      <main className={`main-grid${activePage !== 'office' ? ' hidden' : ''}${sidebarCollapsed ? ' sidebar-collapsed' : ''}`}>
-        {/* Phaser Game Canvas */}
-        <section className="canvas-wrap">
-          <PhaserGame bridge={bridgeRef.current} active={activePage === 'office'} />
-          <button className="canvas-float-btn" onClick={() => setShowSubagents((v) => !v)} title={showSubagents ? t('office.hideSubagents') : t('office.showSubagents')}>
-            {showSubagents ? '👥' : '👤'}
-          </button>
-          <button
-            className="sidebar-collapse-btn"
-            onClick={toggleSidebar}
-            title={sidebarCollapsed ? t('office.showSidePanel') : t('office.hideSidePanel')}
-            aria-label={sidebarCollapsed ? t('office.showSidePanel') : t('office.hideSidePanel')}
-          >
-            <span className="collapse-glyph">{sidebarCollapsed ? '❮' : '❯'}</span>
-          </button>
-        </section>
-
-        {/* Sidebar */}
-        <aside className="sidebar">
-          <div className="sidebar-body">
-            {/* Team Panel */}
-              <div className="team-panel">
-                {/* Mode info — team building is in Org tab */}
-                <div className="mode-info-bar">
-                  <span className="mode-badge">{globalExecMode === 'company' ? `${globalExecMode}/${globalCompanyProfile}` : globalModeLabel}</span>
-                  {isOrgMode ? (
-                    <span className="mode-hint">{t('office.modeHint.org')}</span>
-                  ) : (
-                    <span className="mode-hint">{t('office.modeHint.switch')}</span>
-                  )}
-                </div>
-
-                <div className="section-label">{t('office.offices')} <span className="count-badge">{offices.length}</span></div>
-                <div className="office-cards">
-                  {offices.map((office) => {
-                    const deskCount = getOfficeDeskSeats(office.id).length
-                    const assignedCards = cards.filter(c => c.officeId === office.id)
-                    const otherAgents = cards.filter(c => c.officeId !== office.id && !c.isSubagent)
-                    return (
-                      <div key={office.id} className="office-card" onClick={() => bridgeRef.current.panToOffice(office.id)}>
-                        <div className="office-card-header">
-                          {editingOfficeName === office.id ? (
-                            <input
-                              className="office-name-input"
-                              value={officeNameDraft}
-                              onChange={e => setOfficeNameDraft(e.target.value)}
-                              onBlur={() => handleRenameOffice(office.id)}
-                              onKeyDown={e => { if (e.key === 'Enter') handleRenameOffice(office.id); if (e.key === 'Escape') setEditingOfficeName(null) }}
-                              autoFocus
-                              onClick={e => e.stopPropagation()}
-                            />
-                          ) : (
-                            <>
-                              <span className="office-name">{office.name}</span>
-                              <button className="office-edit-btn" title={t('office.rename')} onClick={(e) => { e.stopPropagation(); setEditingOfficeName(office.id); setOfficeNameDraft(office.name) }}>✎</button>
-                            </>
-                          )}
-                          <span className="office-capacity">{assignedCards.length}/{deskCount}</span>
-                        </div>
-                        <div className="office-agents">
-                          {assignedCards.map(c => (
-                            <span key={c.id} className="office-agent-chip" title={`${c.displayName} — ${c.seatId ?? t('office.noSeat')}`} onClick={(e) => { e.stopPropagation(); selectAgent(c.id) }}>
-                              {c.displayName.slice(0, 8)}
-                            </span>
-                          ))}
-                          {isOrgMode && assignedCards.length < deskCount && otherAgents.length > 0 && (
-                            <select
-                              className="assign-dropdown"
-                              value=""
-                              onClick={e => e.stopPropagation()}
-                              onChange={e => { if (e.target.value) handleAssignAgent(office.id, e.target.value) }}
-                            >
-                              <option value="">{t('office.moveHere')}</option>
-                              {otherAgents.map(a => (
-                                <option key={a.id} value={a.id}>{a.displayName} ({offices.find(o => o.id === (cards.find(cc => cc.id === a.id)?.officeId))?.name ?? '?'})</option>
-                              ))}
-                            </select>
-                          )}
-                        </div>
-                      </div>
-                    )
-                  })}
-                </div>
-
-                <div className="section-label">{t('office.activeAgents')} <span className="count-badge">{swarmAgents.length}</span></div>
-                <div className="agent-list">
-                  {swarmAgents.map((agent) => (
-                    <div key={agent.agent_id} className={`agent-row ${selectedAgentId === agent.agent_id ? 'selected' : ''}`}>
-                      <button className="agent-row-main" onClick={() => selectAgent(agent.agent_id)}>
-                        <span className={`dot ${agent.status}`} />
-                        <div className="agent-info">
-                          <span className="agent-name">{agent.name}</span>
-                          <span className="agent-spec">{agent.specialties.slice(0, 2).join(' · ') || t('common.general')}</span>
-                        </div>
-                      </button>
-                      {isOrgMode && (
-                        deletingAgentId === agent.agent_id
-                          ? <span className="agent-del" style={{ pointerEvents: 'none' }}><span className="spinner-inline" /></span>
-                          : confirmDeleteId === agent.agent_id
-                            ? <span className="del-confirm">
-                                <span className="del-confirm-label">{t('office.deleteQuestion')}</span>
-                                <button className="del-confirm-yes" onClick={() => { setDeletingAgentId(agent.agent_id); setConfirmDeleteId(null); clientRef.current?.deleteAgent(agent.agent_id) }}>{t('common.yes')}</button>
-                                <button className="del-confirm-no" onClick={() => setConfirmDeleteId(null)}>{t('common.no')}</button>
-                              </span>
-                            : <button className="agent-del" title={t('office.removeAgent', { name: agent.name })} onClick={() => setConfirmDeleteId(agent.agent_id)}>×</button>
-                      )}
-                    </div>
-                  ))}
-                  {swarmAgents.length === 0 && (
-                    <div className="empty-state">{t('office.emptyAgents')}</div>
-                  )}
-                </div>
-
-                {selectedCard && (
-                    <div className="agent-detail">
-                      <div className="agent-detail-name">{selectedCard.displayName}</div>
-                    <div className="agent-detail-row"><span className="detail-label">{t('common.state')}</span><span className="detail-value">{translateMaybe('agent.status', selectedCard.state) || selectedCard.state}</span></div>
-                    <div className="agent-detail-row"><span className="detail-label">{t('common.tool')}</span><span className="detail-value">{selectedCard.currentTool ?? '—'}</span></div>
-                    <div className="agent-detail-row"><span className="detail-label">{t('common.task')}</span><span className="detail-value">{selectedCard.taskSummary ?? '—'}</span></div>
-                    <div className="agent-detail-row">
-                      <span className="detail-label">{t('app.page.office')}</span>
-                      <select
-                        className="detail-select"
-                        value={selectedCard.officeId}
-                        onChange={e => { handleAssignAgent(e.target.value, selectedCard.id) }}
-                        disabled={!isOrgMode}
-                      >
-                        {offices.map(o => <option key={o.id} value={o.id}>{o.name}</option>)}
-                      </select>
-                    </div>
-                    <div className="agent-detail-row">
-                      <span className="detail-label">{t('common.seat')}</span>
-                      <select
-                        className="detail-select"
-                        value={selectedCard.seatId ?? ''}
-                        onChange={e => { if (e.target.value) handleChangeSeat(selectedCard.id, e.target.value) }}
-                        disabled={!isOrgMode}
-                      >
-                        <option value="">—</option>
-                        {selectedAgentSeats.map(s => {
-                          const label = s.id.replace(/^office-\d+-/, '').replace('-', ' ').replace(/\b\w/g, ch => ch.toUpperCase())
-                          const taken = s.assigned && s.assignedTo !== selectedCard.id
-                          return (
-                            <option key={s.id} value={s.id} disabled={taken}>
-                              {label}{taken ? ` (${s.assignedTo})` : s.assignedTo === selectedCard.id ? ' ✓' : ''}
-                            </option>
-                          )
-                        })}
-                      </select>
-                    </div>
-                  </div>
-                )}
-
-                {cards.length > swarmAgents.length && (
-                  <>
-                    <div className="section-label">
-                      {t('office.characters')}
-                      <button className="inline-btn" onClick={() => setShowSubagents((v) => !v)}>{showSubagents ? t('office.hideSub') : t('office.showSub')}</button>
-                    </div>
-                    <div className="agent-list">
-                      {cards.filter((c) => !swarmAgents.some((a) => a.agent_id === c.id)).map((card) => (
-                        <button key={card.id} className={`agent-row-simple ${selectedAgentId === card.id ? 'selected' : ''}`} onClick={() => selectAgent(card.id)}>
-                          {card.isSubagent && <span className="sub-badge">SUB</span>}
-                          <span className="agent-name">{card.displayName}</span>
-                          <span className="agent-spec">{card.state}{card.currentTool ? ` · ${card.currentTool}` : ''}</span>
-                        </button>
-                      ))}
-                    </div>
-                  </>
-                )}
-              </div>
-          </div>
-        </aside>
-      </main>
-
-      {/* Developer Tools Overlay */}
-      {showDevTools && (
-        <div className="dev-overlay">
-          <div className="dev-header">
-            <span className="dev-title">{t('dev.tools')}</span>
-            <button className="icon-btn" onClick={() => setShowDevTools(false)}>✕</button>
-          </div>
-          <div className="dev-group">
-            <div className="dev-label">{t('dev.connection')}</div>
-            <div className="input-row">
-              <input value={wsUrlInput} onChange={(e) => setWsUrlInput(e.target.value)} placeholder="ws://..." />
-              <button className="send-btn" onClick={applyWsUrl}>↩</button>
-            </div>
-          </div>
-          <div className="dev-group">
-            <div className="dev-label">{t('dev.evolution')}</div>
-            <div className="evo-pipeline">
-              {(['Trace', 'Reflect', 'Synthesize', 'Practice', 'Lifecycle'] as const).map((phase, i) => {
-                const key = phase.toLowerCase() as keyof typeof evolutionPhases
-                const active = key in evolutionPhases ? evolutionPhases[key as 'trace' | 'reflect' | 'synthesize'] : false
-                const phaseLabelKey = `dev.phase.${key}` as Parameters<typeof t>[0]
-                return (
-                  <div key={phase} className="evo-phase-group">
-                    {i > 0 && <div className="evo-connector" />}
-                    <div className={`evo-node ${active ? 'active' : ''}`}>
-                      <div className="evo-dot" />
-                      <span className="evo-label">{t(phaseLabelKey)}</span>
-                    </div>
-                  </div>
-                )
-              })}
-            </div>
-            <div className="list">
-              {(snapshot?.skills.recent ?? []).slice(-6).reverse().map((item, idx) => (
-                <div className="list-row" key={`${item.skill_name}-${item.timestamp}-${idx}`}>
-                  <span>{item.skill_name}</span>
-                  <span className="muted mono">{item.version}</span>
-                </div>
-              ))}
-            </div>
-          </div>
-          <div className="dev-group">
-            <div className="dev-label">
-              {t('dev.events')}
-              <select className="inline-select" value={eventTypeFilter} onChange={(e) => setEventTypeFilter(e.target.value)}>
-                {eventTypes.map((type) => <option key={type} value={type}>{type}</option>)}
-              </select>
-            </div>
-            <div className="event-log">
-              {filteredEvents.slice(0, 30).map((evt) => (
-                <div key={evt.event_id} className="log-row">
-                  <span className="log-time">{new Date(evt.timestamp * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })}</span>
-                  <span className="log-type">{evt.type}</span>
-                  <span className="log-agent">{evt.agent_id}</span>
-                  <span className="log-data">{truncateJson(evt.data)}</span>
-                </div>
-              ))}
-            </div>
-          </div>
-          {Object.keys(snapshot?.channels ?? {}).length > 0 && (
-            <div className="dev-group">
-              <div className="dev-label">{t('dev.channels')}</div>
-              {Object.entries(snapshot?.channels ?? {}).map(([name, info]) => (
-                <div className="list-row" key={name}>
-                  <span>{name}</span>
-                  <span className="muted">{String((info as { last_type?: string }).last_type ?? 'idle')}</span>
-                </div>
-              ))}
-            </div>
-          )}
-        </div>
-      )}
+      <OfficePage
+        bridge={bridgeRef.current}
+        active={activePage === 'office'}
+        sidebarCollapsed={sidebarCollapsed}
+        onToggleSidebar={toggleSidebar}
+        agents={swarmAgents}
+        execMode={globalExecMode}
+        companyProfile={globalCompanyProfile}
+        modeLabel={globalModeLabel}
+        isOrgMode={isOrgMode}
+        deletingAgentId={deletingAgentId}
+        onMoveAgent={handleMoveOfficeAgent}
+        onDeleteAgent={handleDeleteOfficeAgent}
+      />
+      <DevToolsOverlay
+        open={showDevTools}
+        store={eventTimeline}
+        snapshot={snapshot}
+        wsUrlInput={wsUrlInput}
+        onWsUrlInputChange={setWsUrlInput}
+        onApplyWsUrl={applyWsUrl}
+        onClose={() => setShowDevTools(false)}
+      />
       {toastMessage && <div className={toastType === 'error' ? 'toast-error' : 'toast-success'}>{toastMessage}</div>}
       {/* ── Global Execution Panel (accessible from any page) ── */}
       <MaybeExecutionPanel
