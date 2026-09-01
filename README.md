@@ -23,6 +23,7 @@
 
 ## News
 
+- **Sep 1, 2026 — A more responsive Office UI:** Office and developer-tool rendering are now isolated from high-frequency runtime events, reducing unnecessary full-app updates and keeping Workspace and Org views smoother during long-running sessions.
 - **Aug 26, 2026 — JiuwenSwarm integration:** Use JiuwenSwarm-single as a single agent or JiuwenSwarm-team as one opaque Team in both Task and Company modes — a self-organizing swarm that plugs into your org seamlessly. [Setup and role behavior](#jiuwen-integration).
 - **Jul 14, 2026 — More resilient company runs:** Company-mode sessions now recover and resume more seamlessly while preserving agent identity, shared role context, delegation, and review progress.
 - **Jul 13, 2026 — Smoother Office UI:** Faster live updates and chat scrolling improve long-running projects.

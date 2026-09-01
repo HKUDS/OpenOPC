@@ -23,6 +23,7 @@
 
 ## 新闻
 
+- **2026 年 9 月 1 日 — Office UI 响应更轻快：** Office 与开发工具的渲染现已和高频运行事件隔离，减少不必要的整页更新，让长时间运行时的 Workspace 与 Org 页面更流畅。
 - **2026 年 8 月 26 日 — 接入 JiuwenSwarm：** 在 Task 与 Company 模式下，可将 JiuwenSwarm-single 用作单 Agent，或将 JiuwenSwarm-team 用作一个不透明 Team——一支自组织蜂群，无缝接入你的组织。[查看配置与角色规则](#jiuwen-integration)。
 - **2026 年 7 月 14 日 — Company 运行更可靠：** Company 会话可更顺畅地恢复和继续，同时保留 Agent 身份、角色上下文、委派与审核进度。
 - **2026 年 7 月 13 日 — Office UI 更流畅：** 实时更新和聊天滚动性能提升，长时间运行的项目更顺畅。
