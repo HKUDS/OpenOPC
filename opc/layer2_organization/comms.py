@@ -55,7 +55,11 @@ from typing import Any, Iterable
 
 from opc.core.file_lock import exclusive_file_lock
 from opc.layer4_tools.output_budget import clip_text
-from opc.layer4_tools.workspace_fs import SecureWorkspace, WorkspaceBoundaryError
+from opc.layer4_tools.workspace_fs import (
+    RUNTIME_INTERNAL_WORKSPACE_COMPONENT,
+    SecureWorkspace,
+    WorkspaceBoundaryError,
+)
 
 try:
     import yaml  # type: ignore
@@ -67,7 +71,7 @@ except Exception:  # pragma: no cover - yaml is in core deps but stay defensive
 # Constants
 # ──────────────────────────────────────────────────────────────────────
 
-COMMS_ROOT_NAME = ".opc-comms"
+COMMS_ROOT_NAME = RUNTIME_INTERNAL_WORKSPACE_COMPONENT
 INBOX_DIRNAME = "inbox"
 MEETINGS_DIRNAME = "meetings"
 SHARED_DIRNAME = "_shared"

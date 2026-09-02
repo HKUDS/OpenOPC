@@ -11,7 +11,11 @@ from opc.layer3_agent.company_workspace_fence import (
     CompanyWorkspaceFenceError,
     capture_company_workspace,
 )
-from opc.layer4_tools.workspace_fs import SecureWorkspace, WorkspaceBoundaryError
+from opc.layer4_tools.workspace_fs import (
+    RUNTIME_INTERNAL_WORKSPACE_COMPONENT,
+    SecureWorkspace,
+    WorkspaceBoundaryError,
+)
 
 
 def test_secure_workspace_roundtrip_uses_platform_backend() -> None:
@@ -107,6 +111,32 @@ def test_workspace_fence_rejects_hardlinks() -> None:
             pytest.skip(f"hardlinks unavailable: {exc}")
         with pytest.raises(CompanyWorkspaceFenceError, match="multiply-linked"):
             capture_company_workspace(root)
+
+
+def test_workspace_fence_excludes_runtime_internal_comms() -> None:
+    with tempfile.TemporaryDirectory() as temp_dir:
+        root = Path(temp_dir)
+        source = root / "source.txt"
+        source.write_text("attested", encoding="utf-8")
+        runtime_file = (
+            root
+            / RUNTIME_INTERNAL_WORKSPACE_COMPONENT
+            / "project"
+            / "session"
+            / "README.md"
+        )
+        runtime_file.parent.mkdir(parents=True)
+        runtime_file.write_text("runtime-owned", encoding="utf-8")
+
+        snapshot = capture_company_workspace(root)
+
+        assert "source.txt" in snapshot.files
+        assert RUNTIME_INTERNAL_WORKSPACE_COMPONENT in snapshot.ignored_roots
+        assert not any(
+            path == RUNTIME_INTERNAL_WORKSPACE_COMPONENT
+            or path.startswith(f"{RUNTIME_INTERNAL_WORKSPACE_COMPONENT}/")
+            for path in snapshot.files
+        )
 
 
 def test_workspace_fence_rejects_link_root() -> None:

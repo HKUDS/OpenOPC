@@ -26,7 +26,7 @@ from opc.layer4_tools.workspace_fs import (
     WorkspaceEntry,
     WorkspacePath,
     _INTERNAL_TEMP_PREFIX,
-    _RUNTIME_INTERNAL_COMPONENT,
+    RUNTIME_INTERNAL_WORKSPACE_COMPONENT,
     _absolute_normalized,
     _relative_parts,
     _reserved_internal_component,
@@ -537,7 +537,7 @@ class WindowsSecureWorkspace:
                 "Path belongs to the runtime-internal workspace namespace."
             )
         if (
-            any(part == _RUNTIME_INTERNAL_COMPONENT for part in parts)
+            any(part == RUNTIME_INTERNAL_WORKSPACE_COMPONENT for part in parts)
             and not allow_runtime_internal_read
         ):
             raise WorkspaceBoundaryError(
@@ -600,7 +600,7 @@ class WindowsSecureWorkspace:
         return self._fd_for_handle(handle, os.O_RDONLY)
 
     def ensure_runtime_directory(self, target: WorkspacePath) -> None:
-        if _RUNTIME_INTERNAL_COMPONENT not in target.parts:
+        if RUNTIME_INTERNAL_WORKSPACE_COMPONENT not in target.parts:
             raise WorkspaceBoundaryError(
                 "Runtime directory must stay inside the internal workspace namespace."
             )
@@ -861,7 +861,7 @@ class WindowsSecureWorkspace:
         *,
         create_dirs: bool,
     ) -> int:
-        if _RUNTIME_INTERNAL_COMPONENT not in target.parts:
+        if RUNTIME_INTERNAL_WORKSPACE_COMPONENT not in target.parts:
             raise WorkspaceBoundaryError(
                 "Runtime output must stay inside the internal workspace namespace."
             )
@@ -912,7 +912,7 @@ class WindowsSecureWorkspace:
         *,
         create: bool,
     ) -> Iterator[int]:
-        if _RUNTIME_INTERNAL_COMPONENT not in target.parts:
+        if RUNTIME_INTERNAL_WORKSPACE_COMPONENT not in target.parts:
             raise WorkspaceBoundaryError(
                 "Runtime append must stay inside the internal workspace namespace."
             )

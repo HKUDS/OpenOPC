@@ -10,11 +10,21 @@ from pathlib import Path
 from typing import Any
 
 from opc.core.models import Task
-from opc.layer4_tools.workspace_fs import SecureWorkspace, WorkspaceBoundaryError
+from opc.layer4_tools.workspace_fs import (
+    RUNTIME_INTERNAL_WORKSPACE_COMPONENT,
+    SecureWorkspace,
+    WorkspaceBoundaryError,
+)
 
 
 _IGNORED_TOP_LEVEL = frozenset(
-    {".git", ".agent_teams", ".jiuwenswarm", ".opc-attachments"}
+    {
+        ".git",
+        ".agent_teams",
+        ".jiuwenswarm",
+        ".opc-attachments",
+        RUNTIME_INTERNAL_WORKSPACE_COMPONENT,
+    }
 )
 _MAX_FILES = 50_000
 _MAX_HASH_BYTES = 32 * 1024 * 1024

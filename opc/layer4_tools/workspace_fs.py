@@ -25,12 +25,15 @@ class WorkspaceBoundaryError(PermissionError):
 
 
 _INTERNAL_TEMP_PREFIX = ".opc-write-"
-_RUNTIME_INTERNAL_COMPONENT = ".opc-comms"
+RUNTIME_INTERNAL_WORKSPACE_COMPONENT = ".opc-comms"
 
 
 def _reserved_internal_component(name: str) -> bool:
     normalized = str(name or "")
-    return normalized.startswith(_INTERNAL_TEMP_PREFIX) or normalized == _RUNTIME_INTERNAL_COMPONENT
+    return (
+        normalized.startswith(_INTERNAL_TEMP_PREFIX)
+        or normalized == RUNTIME_INTERNAL_WORKSPACE_COMPONENT
+    )
 
 
 def is_model_reserved_workspace_path(path: str) -> bool:
@@ -259,7 +262,7 @@ class SecureWorkspace:
                 "Path belongs to the runtime-internal workspace namespace."
             )
         if (
-            any(part == _RUNTIME_INTERNAL_COMPONENT for part in parts)
+            any(part == RUNTIME_INTERNAL_WORKSPACE_COMPONENT for part in parts)
             and not allow_runtime_internal_read
         ):
             raise WorkspaceBoundaryError(
@@ -312,7 +315,7 @@ class SecureWorkspace:
     def ensure_runtime_directory(self, target: WorkspacePath) -> None:
         """Create a runtime-internal directory tree through pinned dirfds."""
 
-        if _RUNTIME_INTERNAL_COMPONENT not in target.parts:
+        if RUNTIME_INTERNAL_WORKSPACE_COMPONENT not in target.parts:
             raise WorkspaceBoundaryError(
                 "Runtime directory must stay inside the internal workspace namespace."
             )
@@ -545,7 +548,7 @@ class SecureWorkspace:
         into an alias for an attacker-controlled location.
         """
 
-        if _RUNTIME_INTERNAL_COMPONENT not in target.parts:
+        if RUNTIME_INTERNAL_WORKSPACE_COMPONENT not in target.parts:
             raise WorkspaceBoundaryError(
                 "Runtime output must stay inside the internal workspace namespace."
             )
@@ -626,7 +629,7 @@ class SecureWorkspace:
     ) -> Iterator[int]:
         """Open one runtime file for append and reject parent-name swaps."""
 
-        if _RUNTIME_INTERNAL_COMPONENT not in target.parts:
+        if RUNTIME_INTERNAL_WORKSPACE_COMPONENT not in target.parts:
             raise WorkspaceBoundaryError(
                 "Runtime append must stay inside the internal workspace namespace."
             )

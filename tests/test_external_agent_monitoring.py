@@ -4986,6 +4986,93 @@ class ExternalAgentMonitoringTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(Path(env["OPC_PROJECT_MEMORY_PATH"]).name, "proj1.md")
             await store.close()
 
+    async def test_company_external_preflight_with_runtime_comms_reaches_provider_launch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            runtime_readme = (
+                root
+                / file_comms.COMMS_ROOT_NAME
+                / "proj1"
+                / "root-session"
+                / "README.md"
+            )
+            runtime_readme.parent.mkdir(parents=True)
+            runtime_readme.write_text("OpenOPC runtime state", encoding="utf-8")
+            source = root / "source.txt"
+            source.write_text("attest this file", encoding="utf-8")
+
+            store = _SessionStoreStub()
+            adapter = _CollabSurfaceScriptAdapter("pass\n")
+            broker = ExternalAgentBroker(store, _ApprovalStub())
+            fake_home = root / "agent-home"
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            fake_cli = fake_bin / "opc-collab"
+
+            class _RpcServerStub:
+                client_env: dict[str, str] = {}
+
+                async def close(self) -> None:
+                    return None
+
+            class _ProviderLaunchReached(RuntimeError):
+                pass
+
+            async def _inline_to_thread(function, *args, **kwargs):
+                return function(*args, **kwargs)
+
+            task = Task(
+                id="company-external-runtime-comms",
+                title="Company external work",
+                project_id="proj1",
+                session_id="work-item-session",
+                parent_session_id="root-session",
+                assigned_to="cto",
+                assigned_external_agent="script_agent",
+                metadata={
+                    "mode": "company",
+                    "execution_mode": ExecutionMode.COMPANY_MODE.value,
+                    "runtime_model": "multi_team_org",
+                    "work_item_projection_id": "cto-execute",
+                    "work_item_role_id": "cto",
+                    "work_item_turn_type": "execute",
+                    "selected_execution_agent": "script_agent",
+                    "execution_agent_locked": True,
+                    "external_company_execution_allowed": True,
+                    "external_company_execution_fence": "validated_workspace",
+                    "execution_unit_kind": "opaque_external_team",
+                    "force_native_execution": False,
+                    "workspace_root": tmpdir,
+                    "comms_workspace_root": tmpdir,
+                    "comms_root": str(root / file_comms.COMMS_ROOT_NAME),
+                },
+            )
+            set_linked_work_item_id(task, "wi-cto-execute")
+
+            with patch(
+                "opc.layer3_agent.external_broker.install_collab_surface",
+                return_value=(fake_home, fake_bin),
+            ), patch(
+                "opc.layer3_agent.external_broker.opc_collab_executable",
+                return_value=fake_cli,
+            ), patch(
+                "opc.layer3_agent.external_broker.start_collaboration_rpc_server",
+                new=AsyncMock(return_value=_RpcServerStub()),
+            ), patch(
+                "opc.layer3_agent.external_broker.asyncio.to_thread",
+                side_effect=_inline_to_thread,
+            ):
+                with patch.object(
+                    adapter,
+                    "start_process",
+                    new=AsyncMock(side_effect=_ProviderLaunchReached),
+                ) as start_process:
+                    with self.assertRaises(_ProviderLaunchReached):
+                        await broker.run(adapter, task, tmpdir)
+
+            start_process.assert_awaited_once()
+            await store.close()
+
     async def test_collab_cli_dispatch_rejects_removed_send_dm_and_read_inbox_args(self) -> None:
         from opc.layer4_tools.collaboration_dispatch import dispatch_collaboration_tool
 
