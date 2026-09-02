@@ -51,7 +51,8 @@ system:
       # finished turn). Disabled by default: it adds latency/cost and is low
       # value for non-code work; company mode already has the manager-review
       # gate as the quality check. Set to true to re-enable for both task and
-      # company mode. See opc/layer3_agent/runtime_v2/runtime.py.
+      # company mode. This tracked file is the `opc init` source template and
+      # is packaged as `opc/config_templates`. See runtime_v2/runtime.py.
       enabled: false
       min_todos_for_verification: 3
       require_on_code_edits: true

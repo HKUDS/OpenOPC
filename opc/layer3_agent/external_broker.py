@@ -1789,7 +1789,26 @@ class ExternalAgentBroker:
             normalized_output,
             task,
         )
+        output_retry_strategy = ""
         if output_validation_error and not state["fatal_reason"]:
+            retry_strategy = getattr(
+                adapter,
+                "result_validation_retry_strategy",
+                None,
+            )
+            if callable(retry_strategy):
+                output_retry_strategy = str(
+                    retry_strategy(
+                        output_validation_error,
+                        normalized_output,
+                        task,
+                    )
+                    or ""
+                ).strip()
+            if output_retry_strategy:
+                metadata["external_retry_strategy"] = output_retry_strategy
+                metadata["output_validation_error"] = output_validation_error
+                metadata["retry_output_excerpt"] = normalized_output[-12_000:]
             state["fatal_reason"] = output_validation_error
         raw_log_path = self._write_external_raw_log(
             task=task,
@@ -1839,11 +1858,15 @@ class ExternalAgentBroker:
             base_artifacts=artifacts,
         )
         terminal_status = (
-            "done"
-            if not state["timed_out"]
-            and not state["fatal_reason"]
-            and return_code == 0
-            else "failed"
+            "needs_output_repair"
+            if output_retry_strategy
+            else (
+                "done"
+                if not state["timed_out"]
+                and not state["fatal_reason"]
+                and return_code == 0
+                else "failed"
+            )
         )
         terminal_save = asyncio.create_task(self._save_runtime_session(
             adapter=adapter,
@@ -2867,6 +2890,19 @@ class ExternalAgentBroker:
         provider_session_id = str(
             (result.artifacts or {}).get("provider_session_id") or ""
         ).strip()
+        retry_strategy = str(
+            (result.artifacts or {}).get("external_retry_strategy", "") or ""
+        ).strip()
+        repairable_output_failure = bool(
+            result.status == TaskStatus.FAILED
+            and retry_strategy
+            and (resume_session_id or provider_session_id)
+        )
+        persisted_status = (
+            "needs_output_repair"
+            if repairable_output_failure
+            else result.status.value
+        )
         session = ExternalSession(
             agent_type=adapter.agent_type,
             project_id=task.project_id,
@@ -2875,7 +2911,7 @@ class ExternalAgentBroker:
             task_id=task.id,
             workspace_path=workspace_path,
             run_mode=adapter.config.run_mode,
-            status=result.status.value,
+            status=persisted_status,
             metadata={
                 "command": metadata.get("command", ""),
                 "model": metadata.get("model", "(cli default)"),
@@ -2904,6 +2940,11 @@ class ExternalAgentBroker:
                 "provider_session_id": provider_session_id,
                 "runtime_session_id": self._resolve_runtime_session_id(adapter, task, metadata),
                 "failure_reason": result.content if result.status != TaskStatus.DONE else "",
+                "external_retry_strategy": retry_strategy,
+                "output_validation_error": str(
+                    (result.artifacts or {}).get("output_validation_error", "")
+                    or ""
+                ).strip(),
                 "last_activity_at": str((result.artifacts or {}).get("last_activity_at", "")),
                 "activity_count": int((result.artifacts or {}).get("activity_count", 0) or 0),
                 "last_output": str((result.artifacts or {}).get("last_output", "") or ""),
@@ -2987,6 +3028,7 @@ class ExternalAgentBroker:
         elif (
             role_session_id
             and result.status in self._SESSION_INVALIDATING_RESULT_STATUSES
+            and not repairable_output_failure
             and hasattr(self.store, "get_role_session_adapter_state")
             and hasattr(self.store, "update_role_session_adapter_state")
         ):
@@ -3044,7 +3086,10 @@ class ExternalAgentBroker:
                 logger.opt(exception=True).debug(
                     "Failed to clear provider-stream role state after terminal failure"
                 )
-        if result.status in self._SESSION_INVALIDATING_RESULT_STATUSES:
+        if (
+            result.status in self._SESSION_INVALIDATING_RESULT_STATUSES
+            and not repairable_output_failure
+        ):
             failed_token = str(
                 resume_session_id
                 or provider_session_id

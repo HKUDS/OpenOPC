@@ -64,8 +64,14 @@ def _acquire_single_instance_lock(opc_home: Path) -> Any | None:
     try:
         lock_file_descriptor(lock_file.fileno(), blocking=False)
     except OSError:
-        lock_file.seek(0)
-        holder_pid = lock_file.read().strip() or "unknown"
+        holder_pid = "unknown"
+        if os.name != "nt":
+            # POSIX locks are advisory, so the holder metadata remains
+            # readable. Windows byte-range locks are mandatory and reading
+            # the locked range would replace the intended SystemExit with a
+            # PermissionError.
+            lock_file.seek(0)
+            holder_pid = lock_file.read().strip() or holder_pid
         lock_file.close()
         raise SystemExit(
             f"Another office-UI server (pid {holder_pid}) is already running against "

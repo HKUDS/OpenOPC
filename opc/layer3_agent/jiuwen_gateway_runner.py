@@ -31,6 +31,15 @@ _INTERRUPT_RESUME_SOURCES = frozenset(
 )
 
 
+def _configure_utf8_stdio() -> None:
+    """Use the broker's UTF-8 JSONL contract on every host platform."""
+
+    for stream in (sys.stdin, sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            reconfigure(encoding="utf-8", errors="strict")
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--gateway-url", default="")
@@ -372,6 +381,7 @@ async def _main(args: argparse.Namespace) -> int:
 
 
 def main() -> None:
+    _configure_utf8_stdio()
     args = _parser().parse_args()
     try:
         raise SystemExit(asyncio.run(_main(args)))

@@ -989,6 +989,25 @@ def test_team_result_contract_validates_identity_and_maps_artifacts() -> None:
     assert "attempt_id mismatch" in str(
         adapter.validate_result_output(_team_envelope(attempt_id="3"), task)
     )
+    missing_envelope_error = str(
+        adapter.validate_result_output("ordinary team prose", task)
+    )
+    assert adapter.result_validation_retry_strategy(
+        missing_envelope_error,
+        "ordinary team prose",
+        task,
+    ) == "repair_output_envelope"
+    terminal_error = str(
+        adapter.validate_result_output(
+            _team_envelope(status="failed", summary="provider could not finish"),
+            task,
+        )
+    )
+    assert adapter.result_validation_retry_strategy(
+        terminal_error,
+        _team_envelope(status="failed"),
+        task,
+    ) == ""
     task.metadata["execution_mode"] = "task_mode"
     task.metadata["runtime_model"] = "single_agent"
     assert adapter.validate_result_output("ordinary task-mode team answer", task) is None

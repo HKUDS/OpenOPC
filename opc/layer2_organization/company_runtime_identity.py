@@ -26,6 +26,7 @@ ACTIVE_COMPANY_RUNTIME_CHECKPOINT_STATUSES: frozenset[str] = frozenset({
 })
 RUNTIME_AUXILIARY_KINDS: frozenset[str] = frozenset({
     "meeting_turn",
+    "native_subagent",
     "role_prompt",
 })
 

@@ -1999,6 +1999,68 @@ class ContextAssembler:
     def build_recovery_context(self, task: Task) -> str:
         parts: list[str] = []
         collaboration_enabled = company_collaboration_enabled_for_task(task)
+        retry_feedback = task.context_snapshot.get("retry_feedback")
+        if isinstance(retry_feedback, dict) and retry_feedback:
+            retry_number = int(retry_feedback.get("retry_number", 0) or 0)
+            max_retries = int(retry_feedback.get("max_retries", 0) or 0)
+            attempt_number = int(
+                retry_feedback.get("next_attempt_number", retry_number + 1)
+                or retry_number + 1
+            )
+            lines = [
+                "## Retry Feedback (MANDATORY)",
+                f"Retry {retry_number} of {max_retries}; execution attempt {attempt_number}.",
+                f"Strategy: {str(retry_feedback.get('strategy', '') or 'retry_task').strip()}",
+                "",
+                "### Exact Previous Failure",
+                clip_text(
+                    retry_feedback.get("failure_reason", ""),
+                    limit=4_000,
+                    marker="retry failure truncated",
+                ).text,
+                "",
+                "### Required Action",
+                str(retry_feedback.get("instruction", "") or "").strip(),
+            ]
+            provider_session_id = str(
+                retry_feedback.get("provider_session_id", "") or ""
+            ).strip()
+            if provider_session_id:
+                lines.extend(
+                    [
+                        "",
+                        f"Continue provider session: `{provider_session_id}`",
+                    ]
+                )
+            artifact_paths = [
+                str(item).strip()
+                for item in list(retry_feedback.get("artifact_paths", []) or [])
+                if str(item).strip()
+            ]
+            if artifact_paths:
+                lines.extend(["", "Existing artifacts:"])
+                lines.extend(f"- `{path}`" for path in artifact_paths[:24])
+            raw_output_log_path = str(
+                retry_feedback.get("raw_output_log_path", "") or ""
+            ).strip()
+            if raw_output_log_path:
+                lines.extend(["", f"Raw output log: `{raw_output_log_path}`"])
+            previous_output = str(
+                retry_feedback.get("previous_output", "") or ""
+            ).strip()
+            if previous_output:
+                lines.extend(
+                    [
+                        "",
+                        "### Previous Provider Output",
+                        clip_text(
+                            previous_output,
+                            limit=12_000,
+                            marker="previous output truncated",
+                        ).text,
+                    ]
+                )
+            parts.append("\n".join(lines).strip())
         supplied = str(task.context_snapshot.get("user_supplied_input", "")).strip()
         self_evolution_retry = str(
             task.context_snapshot.get("self_evolution_patch_retry_feedback", "")

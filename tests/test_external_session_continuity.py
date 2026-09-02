@@ -309,6 +309,60 @@ class BrokerPersistWritesRoleStateTests(unittest.IsolatedAsyncioTestCase):
             "provider_terminal_failure",
         )
 
+    async def test_output_repair_failure_keeps_live_provider_session(self) -> None:
+        token = "thread-output-repair"
+        await self.store.update_role_session_adapter_state(
+            self.role_session_id,
+            "codex",
+            {"resume_session_id": token, "last_task_id": "task-repair"},
+        )
+        adapter = _MiniAdapter(agent_type="codex")
+        adapter.config.session_mode = "resume"
+        adapter.config.session_id = token
+        task = self._task(task_id="task-repair")
+        task.metadata.update(
+            {
+                "external_resume_session_id": token,
+                "external_resume_session_scope_id": "sess-a",
+                "external_resume_agent_type": "codex",
+            }
+        )
+
+        await self.broker._persist_session(
+            adapter=adapter,
+            task=task,
+            workspace_path="/tmp/ws",
+            metadata={
+                "command": "codex exec resume",
+                "model": "(cli default)",
+                "resume_session_id": token,
+            },
+            result=TaskResult(
+                status=TaskStatus.FAILED,
+                content="missing required output envelope",
+                artifacts={
+                    "resume_session_id": token,
+                    "external_retry_strategy": "repair_output_envelope",
+                    "output_validation_error": "missing required output envelope",
+                },
+            ),
+        )
+
+        entry = await self.store.get_role_session_adapter_state(
+            self.role_session_id,
+            "codex",
+        )
+        session = await self.store.get_external_session(
+            "codex",
+            "proj1",
+            opc_session_id=self.role_session_id,
+            task_id="task-repair",
+        )
+        self.assertIsNotNone(entry)
+        self.assertEqual(entry["resume_session_id"], token)
+        self.assertEqual(task.metadata["external_resume_session_id"], token)
+        self.assertEqual(session.status, "needs_output_repair")
+
     async def test_awaiting_human_park_keeps_role_token_and_task_metadata(self) -> None:
         # An approval park is not a terminal failure: the run resumes the
         # same provider thread once the human approves, so neither the role

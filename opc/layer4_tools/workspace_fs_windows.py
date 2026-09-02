@@ -76,7 +76,7 @@ _FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
 _FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000
 _OPEN_EXISTING = 3
 _OBJ_CASE_INSENSITIVE = 0x00000040
-_FILE_RENAME_INFO_CLASS = 3
+_FILE_RENAME_INFORMATION_CLASS = 10
 _FILE_DISPOSITION_INFO_CLASS = 4
 _FILE_DIRECTORY_INFORMATION_CLASS = 1
 _STATUS_NO_MORE_FILES = 0x80000006
@@ -199,6 +199,12 @@ if os.name == "nt":  # pragma: win32 cover
         wintypes.DWORD,
     ]
     _kernel32.GetFinalPathNameByHandleW.restype = wintypes.DWORD
+    _kernel32.GetLongPathNameW.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.LPWSTR,
+        wintypes.DWORD,
+    ]
+    _kernel32.GetLongPathNameW.restype = wintypes.DWORD
     _kernel32.SetFileInformationByHandle.argtypes = [
         wintypes.HANDLE,
         ctypes.c_int,
@@ -235,6 +241,14 @@ if os.name == "nt":  # pragma: win32 cover
         wintypes.BOOLEAN,
     ]
     _ntdll.NtQueryDirectoryFile.restype = _NTSTATUS
+    _ntdll.NtSetInformationFile.argtypes = [
+        wintypes.HANDLE,
+        ctypes.POINTER(_IO_STATUS_BLOCK),
+        wintypes.LPVOID,
+        wintypes.ULONG,
+        ctypes.c_int,
+    ]
+    _ntdll.NtSetInformationFile.restype = _NTSTATUS
     _ntdll.RtlNtStatusToDosError.argtypes = [_NTSTATUS]
     _ntdll.RtlNtStatusToDosError.restype = wintypes.ULONG
 
@@ -410,6 +424,20 @@ class WindowsSecureWorkspace:
                 return _extended_path_to_dos(buffer.value)
             size = result + 1
 
+    @staticmethod
+    def _long_path(path: str) -> str:
+        """Expand DOS 8.3 aliases without resolving links or junctions."""
+
+        size = 512
+        while True:
+            buffer = ctypes.create_unicode_buffer(size)
+            result = int(_kernel32.GetLongPathNameW(path, buffer, size))
+            if result == 0:
+                raise ctypes.WinError(ctypes.get_last_error(), path)
+            if result < size:
+                return buffer.value
+            size = result + 1
+
     @classmethod
     def _open_absolute_root(cls, path: Path) -> int:
         requested = str(path)
@@ -436,7 +464,7 @@ class WindowsSecureWorkspace:
         try:
             cls._validate_handle(raw_handle, path, directory=True)
             opened = os.path.normcase(os.path.normpath(cls._final_path(raw_handle)))
-            expected = os.path.normcase(os.path.normpath(requested))
+            expected = os.path.normcase(os.path.normpath(cls._long_path(requested)))
             if opened != expected:
                 raise WorkspaceBoundaryError(
                     "Workspace root resolves through a reparse point or mount boundary: "
@@ -732,13 +760,18 @@ class WindowsSecureWorkspace:
             encoded,
             len(encoded),
         )
-        if not _kernel32.SetFileInformationByHandle(
-            wintypes.HANDLE(source_handle),
-            _FILE_RENAME_INFO_CLASS,
-            buffer,
-            size,
-        ):
-            raise ctypes.WinError(ctypes.get_last_error(), target_name)
+        io_status = _IO_STATUS_BLOCK()
+        status = int(
+            _ntdll.NtSetInformationFile(
+                wintypes.HANDLE(source_handle),
+                ctypes.byref(io_status),
+                buffer,
+                size,
+                _FILE_RENAME_INFORMATION_CLASS,
+            )
+        )
+        if status < 0:
+            cls._raise_status(status, target_name)
 
     @classmethod
     def _set_delete(cls, handle: int) -> None:
@@ -918,7 +951,10 @@ class WindowsSecureWorkspace:
             )
         with self._open_parent(target) as (parent, name):
             expected_parent = self._identity(parent)
-            flags = os.O_WRONLY | os.O_APPEND | (os.O_CREAT if create else 0)
+            # LockFileEx requires a handle with read or write-data access;
+            # FILE_APPEND_DATA alone is insufficient on Windows even though
+            # the CRT descriptor can append successfully.
+            flags = os.O_RDWR | os.O_APPEND | (os.O_CREAT if create else 0)
             handle = self._open_file_handle(parent, name, flags=flags)
             fd = self._fd_for_handle(handle, flags)
             try:

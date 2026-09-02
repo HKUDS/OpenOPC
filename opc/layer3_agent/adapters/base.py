@@ -345,6 +345,19 @@ class ExternalAgentAdapter(abc.ABC):
         _ = task
         return None
 
+    def result_validation_retry_strategy(
+        self,
+        validation_error: str,
+        output: str,
+        task: Task,
+    ) -> str:
+        """Return a targeted retry strategy for a provider-success result."""
+
+        _ = validation_error
+        _ = output
+        _ = task
+        return ""
+
     def extract_structured_result_fields(self, output: str) -> dict[str, Any]:
         payload: dict[str, Any] = {}
         for candidate in self._iter_json_object_candidates(output):

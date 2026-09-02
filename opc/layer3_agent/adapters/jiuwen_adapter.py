@@ -1136,6 +1136,27 @@ class JiuwenSwarmAdapter(JiuwenAdapter):
             structured["verification_evidence"] = verification
         return structured
 
+    def result_validation_retry_strategy(
+        self,
+        validation_error: str,
+        output: str,
+        task: Task,
+    ) -> str:
+        _ = output
+        metadata = dict(task.metadata or {})
+        if (
+            not str(validation_error or "").strip()
+            or str(metadata.get("execution_unit_kind", "") or "").strip()
+            != "opaque_external_team"
+        ):
+            return ""
+        # A provider-declared blocked/failed outcome is a business result, not
+        # a formatting defect. Every other Team-envelope validation error can
+        # be corrected in the existing Jiuwen session without repeating work.
+        if "reported terminal status" in validation_error.lower():
+            return ""
+        return "repair_output_envelope"
+
     def validate_result_output(self, output: str, task: Task) -> str | None:
         metadata = dict(task.metadata or {})
         company_mode = bool(

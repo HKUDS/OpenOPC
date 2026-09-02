@@ -51,6 +51,16 @@ def _workspace_tempdir() -> Path:
 
 
 class RuntimeConfigEnforcementTests(unittest.IsolatedAsyncioTestCase):
+    def test_shipped_init_template_disables_native_verifier(self) -> None:
+        template_path = Path(__file__).resolve().parents[1] / "config" / "system_config.yaml"
+        persisted = yaml.safe_load(template_path.read_text(encoding="utf-8"))
+        loaded = OPCConfig.load(template_path.parent, trusted_source=True)
+
+        self.assertFalse(
+            persisted["system"]["native_runtime"]["verification_policy"]["enabled"]
+        )
+        self.assertFalse(loaded.system.native_runtime.verification_policy.enabled)
+
     def test_native_verifier_is_opt_in_and_roundtrips_disabled_by_default(self) -> None:
         config = OPCConfig()
 

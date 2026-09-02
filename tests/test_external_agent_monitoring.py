@@ -5745,6 +5745,133 @@ class ExternalAgentMonitoringTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.content, "second result")
         self.assertEqual(result.artifacts["source"], "retry")
 
+    async def test_execute_task_honors_full_retry_budget(self) -> None:
+        engine = OPCEngine()
+
+        class _RetryStore:
+            def __init__(self) -> None:
+                self.saved: list[Task] = []
+
+            async def get_task(self, task_id: str) -> Task:
+                return Task(
+                    id=task_id,
+                    title="retry task",
+                    project_id="proj1",
+                    status=TaskStatus.PENDING,
+                )
+
+            async def save_task(self, task: Task) -> None:
+                self.saved.append(task)
+
+        task = Task(id="retry-budget", title="retry task", project_id="proj1")
+        task.max_retries = 3
+        attempts = 0
+
+        async def _run_task_once(_task: Task) -> TaskResult:
+            nonlocal attempts
+            attempts += 1
+            return TaskResult(
+                status=TaskStatus.FAILED,
+                content=f"failure-{attempts}",
+                artifacts={},
+            )
+
+        engine.store = _RetryStore()
+        engine.memory = None
+        engine._run_task_once = _run_task_once  # type: ignore[method-assign]
+        engine._attempt_capability_recovery = AsyncMock()
+
+        result = await engine._execute_task(task)
+
+        self.assertEqual(result.content, "failure-4")
+        self.assertEqual(attempts, 4)
+        self.assertEqual(task.retry_count, 3)
+        self.assertEqual(engine._attempt_capability_recovery.await_count, 3)
+
+    async def test_retry_feedback_preserves_exact_failure_and_prior_output(self) -> None:
+        engine = OPCEngine()
+        engine.capability_manager = None
+        task = Task(
+            id="retry-feedback",
+            title="External team task",
+            project_id="proj1",
+            retry_count=1,
+            max_retries=3,
+        )
+        result = TaskResult(
+            status=TaskStatus.FAILED,
+            content="missing required OpenOPC output envelope",
+            artifacts={
+                "external_retry_strategy": "repair_output_envelope",
+                "retry_output_excerpt": "previous substantive result",
+                "resume_session_id": "provider-session-1",
+                "raw_output_log_path": "D:/workspace/raw.log",
+                "company_workspace_attestation": {
+                    "artifact_manifest": [
+                        {"path": "report.md", "kind": "file"},
+                        {"path": ".opc/external_logs/raw.log", "kind": "file"},
+                    ]
+                },
+            },
+        )
+
+        await engine._attempt_capability_recovery(task, result)
+        recovery = ContextAssembler(memory=SimpleNamespace()).build_recovery_context(task)
+
+        self.assertIn("Retry 1 of 3; execution attempt 2", recovery)
+        self.assertIn("missing required OpenOPC output envelope", recovery)
+        self.assertIn("repair_output_envelope", recovery)
+        self.assertIn("Do not repeat the underlying task", recovery)
+        self.assertIn("previous substantive result", recovery)
+        self.assertIn("provider-session-1", recovery)
+        self.assertIn("report.md", recovery)
+        self.assertNotIn("- `.opc/external_logs/raw.log`", recovery)
+        self.assertNotIn("capability_recovery", task.context_snapshot)
+
+    async def test_broker_marks_validation_failure_as_resumable_output_repair(self) -> None:
+        class _RepairableOutputAdapter(_ScriptAdapter):
+            def extract_resume_session_id(self, output: str) -> str | None:
+                _ = output
+                return "provider-session-repair"
+
+            def validate_result_output(self, output: str, task: Task) -> str | None:
+                _ = output
+                _ = task
+                return "missing required OpenOPC output envelope"
+
+            def result_validation_retry_strategy(
+                self,
+                validation_error: str,
+                output: str,
+                task: Task,
+            ) -> str:
+                _ = validation_error
+                _ = output
+                _ = task
+                return "repair_output_envelope"
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = _SessionStoreStub()
+            broker = ExternalAgentBroker(store, _ApprovalStub())
+            adapter = _RepairableOutputAdapter("print('substantive result')")
+            adapter.config.run_mode = "interactive"
+            task = Task(id="output-repair", title="repair", project_id="proj1")
+
+            result = await broker.run(adapter, task, tmpdir)
+
+        self.assertEqual(result.status, TaskStatus.FAILED)
+        self.assertEqual(
+            result.artifacts["external_retry_strategy"],
+            "repair_output_envelope",
+        )
+        self.assertEqual(
+            result.artifacts["output_validation_error"],
+            "missing required OpenOPC output envelope",
+        )
+        self.assertIn("substantive result", result.artifacts["retry_output_excerpt"])
+        self.assertEqual(result.artifacts["resume_session_id"], "provider-session-repair")
+        self.assertEqual(store.sessions[-1].status, "needs_output_repair")
+
 
 if __name__ == "__main__":
     unittest.main()

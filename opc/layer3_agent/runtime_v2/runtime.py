@@ -276,6 +276,7 @@ class NativeRuntimeV2:
             child_agent_factory=self.child_agent_factory,
             event_bus=self.event_bus,
             store=getattr(self.memory_manager, "store", None),
+            memory_manager=self.memory_manager,
             runtime_session_id=runtime_session_id,
         )
         hook_bus = self._build_tool_hook_bus(

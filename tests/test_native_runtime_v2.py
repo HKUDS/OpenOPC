@@ -14,6 +14,7 @@ from opc.core.models import PermissionScope, RiskLevel, Task, TaskResult, TaskSt
 from opc.database.store import OPCStore
 from opc.engine import OPCEngine
 from opc.layer2_organization.approval import ApprovalEngine
+from opc.layer2_organization.company_runtime_identity import is_runtime_auxiliary_task
 from opc.layer3_agent.runtime_v2.permissions import RuntimePermissionAdapter
 from opc.layer3_agent.runtime_v2.runtime import NativeRuntimeV2
 from opc.layer3_agent.runtime_v2.streaming_tool_executor import StreamingToolExecutor
@@ -173,6 +174,20 @@ class _SubagentStore:
 
     async def save_task(self, task: Task) -> None:
         self.saved_tasks.append(task)
+
+
+class _SubagentMemory:
+    def __init__(self) -> None:
+        self.sessions: list[dict[str, object]] = []
+
+    async def ensure_session(self, session_id: str, project_id: str, **kwargs):
+        self.sessions.append(
+            {
+                "session_id": session_id,
+                "project_id": project_id,
+                **kwargs,
+            }
+        )
 
 
 def _verification_enabled_config() -> OPCConfig:
@@ -2445,9 +2460,11 @@ class SubagentManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(executed_ids), 2)
         self.assertEqual(len(set(executed_ids)), 2)
         self.assertEqual(
-            [task.id for task in store.saved_tasks],
+            [task.id for task in store.saved_tasks[::2]],
             executed_ids,
         )
+        self.assertEqual(len(store.saved_tasks), 4)
+        self.assertTrue(all(task.status == TaskStatus.DONE for task in store.saved_tasks))
 
     async def test_background_subagent_receives_message_and_wait_returns_result(self) -> None:
         async def execute_with_message(child_task: Task) -> TaskResult:
@@ -2698,6 +2715,87 @@ class SubagentManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(captured["task_metadata"]["skip_verification"])
         self.assertFalse(captured["task_metadata"]["work_item_verification_required"])
         self.assertNotIn("_fork_allowed_tools", captured["task_metadata"])
+
+    async def test_company_subagent_has_hidden_child_identity_and_durable_result(self) -> None:
+        store = _SubagentStore()
+        memory = _SubagentMemory()
+        captured: dict[str, Task] = {}
+
+        class _ChildAgent:
+            async def execute(self, child_task: Task) -> TaskResult:
+                captured["task"] = child_task
+                return TaskResult(
+                    status=TaskStatus.DONE,
+                    content="verified",
+                    artifacts={"verdict": "pass"},
+                )
+
+        parent = Task(
+            id="company-parent",
+            session_id="company-session",
+            project_id="proj1",
+            metadata={
+                "execution_mode": "company_mode",
+                "delegation_run_id": "company-run",
+                "work_item_runtime": True,
+                "work_item_projection_id": "corporate::intake::ceo",
+                "work_item_turn_type": "intake",
+                "shared_role_session": True,
+                "shared_role_id": "ceo",
+                "user_visible": True,
+                "authoritative_output": True,
+                "derived_work_item_projection": {"phase": "in_progress"},
+                "_runtime_v2_user_seeded": True,
+                "company_run_controller_owner_token": "owner",
+                "company_run_controller_lease_generation": 1,
+                "claimed_work_item_attempt_seq": 1,
+            },
+        )
+        manager = SubagentManager(
+            parent_task=parent,
+            config=OPCConfig(),
+            child_agent_factory=lambda *args: _ChildAgent(),
+            store=store,
+            memory_manager=memory,
+            runtime_session_id="rt-company-verifier",
+        )
+
+        result = await manager.spawn(
+            profile="verify",
+            prompt="Verify the parent work",
+            background=False,
+            isolation="shared",
+            name="verifier",
+        )
+
+        child = captured["task"]
+        self.assertTrue(result["success"])
+        self.assertEqual(child.parent_session_id, parent.session_id)
+        self.assertEqual(child.metadata["runtime_kind"], "native_subagent")
+        self.assertTrue(is_runtime_auxiliary_task(child))
+        self.assertFalse(child.metadata["user_visible"])
+        self.assertFalse(child.metadata["shared_role_session"])
+        for key in (
+            "shared_role_id",
+            "work_item_projection_id",
+            "work_item_turn_type",
+            "derived_work_item_projection",
+            "authoritative_output",
+            "_runtime_v2_user_seeded",
+        ):
+            self.assertNotIn(key, child.metadata)
+        self.assertEqual(len(memory.sessions), 1)
+        self.assertEqual(memory.sessions[0]["mode"], "child")
+        self.assertEqual(
+            memory.sessions[0]["parent_session_id"],
+            parent.session_id,
+        )
+        self.assertEqual(len(store.saved_tasks), 2)
+        self.assertEqual(store.saved_tasks[-1].status, TaskStatus.DONE)
+        self.assertEqual(
+            store.saved_tasks[-1].result,
+            {"content": "verified", "artifacts": {"verdict": "pass"}},
+        )
 
 
 class ProviderFingerprintTests(unittest.TestCase):

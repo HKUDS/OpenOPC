@@ -11876,7 +11876,12 @@ class OPCEngine:
                     or metadata.get("resume_session_id", "")
                     or ""
                 ).strip()
-                if session_token and result.status == TaskStatus.DONE:
+                retry_strategy = str(
+                    result.artifacts.get("external_retry_strategy", "") or ""
+                ).strip()
+                if session_token and (
+                    result.status == TaskStatus.DONE or retry_strategy
+                ):
                     task.metadata = dict(task.metadata)
                     task.metadata["external_resume_session_id"] = session_token
                     task.metadata["external_resume_session_scope_id"] = task_session_scope_id(task)
@@ -12142,7 +12147,7 @@ class OPCEngine:
         elif result.status == TaskStatus.AWAITING_PEER:
             await self._save_peer_pause_checkpoint(task, result)
 
-        if result.status == TaskStatus.FAILED and task.retry_count < task.max_retries:
+        while result.status == TaskStatus.FAILED and task.retry_count < task.max_retries:
             task.retry_count += 1
             await self._attempt_capability_recovery(task, result)
             task.status = TaskStatus.PENDING
@@ -12238,15 +12243,70 @@ class OPCEngine:
         return result
 
     async def _attempt_capability_recovery(self, task: Task, result: TaskResult) -> None:
+        artifacts = dict(result.artifacts or {})
+        retry_strategy = str(
+            artifacts.get("external_retry_strategy", "") or ""
+        ).strip()
+        attestation = dict(
+            artifacts.get("company_workspace_attestation", {}) or {}
+        )
+        artifact_paths = [
+            str(item.get("path", "") or "").strip()
+            for item in list(attestation.get("artifact_manifest", []) or [])
+            if isinstance(item, dict)
+            and str(item.get("path", "") or "").strip()
+            and not str(item.get("path", "") or "").strip().startswith(".opc/")
+        ]
+        if retry_strategy == "repair_output_envelope":
+            instruction = (
+                "Do not repeat the underlying task or redo tool work. Reuse the "
+                "previous provider output and existing artifacts, then return exactly "
+                "one corrected JSON object that satisfies the Runtime Contract."
+            )
+        else:
+            instruction = (
+                "Correct the exact failure below before continuing the task. Do not "
+                "repeat successful work unless the failure requires it."
+            )
+        task.context_snapshot = dict(task.context_snapshot)
+        task.context_snapshot["retry_feedback"] = {
+            "retry_number": int(task.retry_count or 0),
+            "max_retries": int(task.max_retries or 0),
+            "next_attempt_number": int(task.retry_count or 0) + 1,
+            "failure_reason": str(result.content or "").strip()[:4_000],
+            "strategy": retry_strategy or "retry_task",
+            "instruction": instruction,
+            "previous_output": str(
+                artifacts.get("retry_output_excerpt", "") or ""
+            ).strip()[-12_000:],
+            "provider_session_id": str(
+                artifacts.get("resume_session_id")
+                or artifacts.get("provider_session_id")
+                or ""
+            ).strip(),
+            "raw_output_log_path": str(
+                artifacts.get("raw_output_log_path", "") or ""
+            ).strip(),
+            "artifact_paths": artifact_paths[:24],
+        }
+        task.context_snapshot.pop("capability_recovery", None)
+        if retry_strategy == "repair_output_envelope":
+            if self.on_progress:
+                await self.on_progress(
+                    "[Retry] Reusing the provider session to repair the output envelope."
+                )
+            return
         if not self.capability_manager or not self.config.capabilities.enable_recovery:
             return
         query = task.description or task.title
         if result.content:
             query = f"{query}\n\nFailure context:\n{result.content}"
-        recovery_context, candidates = await self.capability_manager.build_recovery_context(query, domains=task.tags)
+        recovery_context, _ = await self.capability_manager.build_recovery_context(
+            query,
+            domains=task.tags,
+        )
         if not recovery_context:
             return
-        task.context_snapshot = dict(task.context_snapshot)
         task.context_snapshot["capability_recovery"] = recovery_context
         if self.on_progress:
             await self.on_progress("[CapabilityRecovery] Attached local skill recovery context and retrying.")

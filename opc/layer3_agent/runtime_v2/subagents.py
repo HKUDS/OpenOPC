@@ -19,6 +19,25 @@ from opc.layer3_agent.runtime_v2.worktree import cleanup_worktree, create_worktr
 ChildAgentFactory = Callable[..., Any]
 
 
+_NON_INHERITED_CHILD_IDENTITY_KEYS = frozenset(
+    {
+        "shared_role_session",
+        "shared_role_id",
+        "work_item_projection_id",
+        "work_item_turn_type",
+        "derived_work_item_projection",
+        "authoritative_output",
+        "feedback_scope",
+        "requires_user_feedback",
+        "review_owner_kind",
+        "_runtime_v2_user_seeded",
+        "_runtime_v2_attempt_user_seed_key",
+        "_runtime_v2_attempt_user_seed_required",
+        "_runtime_v2_attempt_user_seed_revision",
+    }
+)
+
+
 @dataclass
 class SubagentState:
     agent_id: str
@@ -57,6 +76,7 @@ class SubagentManager:
         child_agent_factory: ChildAgentFactory | None,
         event_bus: Any = None,
         store: Any = None,
+        memory_manager: Any = None,
         runtime_session_id: str = "",
     ) -> None:
         self.parent_task = parent_task
@@ -64,6 +84,7 @@ class SubagentManager:
         self.child_agent_factory = child_agent_factory
         self.event_bus = event_bus
         self.store = store
+        self.memory_manager = memory_manager
         self.runtime_session_id = runtime_session_id
         self.states: dict[str, SubagentState] = {}
         self.agent_names: dict[str, str] = {}
@@ -167,6 +188,10 @@ class SubagentManager:
         )
 
         async def _execute_turn(turn_prompt: str) -> None:
+            child: Task | None = None
+            company_managed_child = False
+            child_persisted = False
+            save_child = getattr(self.store, "save_task", None)
             try:
                 state.status = "running"
                 state.update_event.set()
@@ -174,7 +199,6 @@ class SubagentManager:
                 child = self._build_child_task(state, turn_prompt)
                 child.metadata["_permission_bridge_runtime_session_id"] = self.runtime_session_id
                 setattr(child, "_runtime_permission_bridge", self._build_permission_bridge(state, child))
-                save_child = getattr(self.store, "save_task", None)
                 company_managed_child = bool(
                     str(child.metadata.get("delegation_run_id", "") or "").strip()
                     or str(child.metadata.get("execution_mode", "") or "").strip()
@@ -186,6 +210,7 @@ class SubagentManager:
                     # permits.  Persist every resident turn's fresh child ID
                     # before any handler can perform an effect.
                     await save_child(child)
+                    child_persisted = True
                 elif company_managed_child:
                     raise RuntimeError(
                         "company native subagent has no durable Task Store"
@@ -196,8 +221,15 @@ class SubagentManager:
                     prompt_addendum=self._profile_prompt(profile, mode=effective_mode),
                     state=state,
                 )
+                await self._ensure_child_session(child)
                 setattr(child, "_runtime_inbox_queue", state.inbox)
                 result = await child_agent.execute(child)
+                if child_persisted and callable(save_child):
+                    self._apply_result_to_child_task(child, result)
+                    # Keep the subagent run in `running` until its Task result
+                    # is durable; the company Store validates that exact
+                    # parent chain on every child write.
+                    await save_child(child)
                 state.task_result = result
                 state.latest_result = result.content
                 terminal_status = result.status.value
@@ -226,11 +258,29 @@ class SubagentManager:
                         summary=result.content or f"{state.name or state.agent_id} is idle",
                     )
             except Exception as exc:  # pragma: no cover - defensive
-                state.latest_result = str(exc)
+                failure_content = str(exc)
+                failed_result = TaskResult(
+                    status=TaskStatus.FAILED,
+                    content=failure_content,
+                )
+                if child_persisted and child is not None and callable(save_child):
+                    self._apply_result_to_child_task(child, failed_result)
+                    try:
+                        await save_child(child)
+                    except Exception as persist_exc:
+                        failure_content = (
+                            f"{failure_content}; failed to persist native subagent result: "
+                            f"{persist_exc}"
+                        )
+                        failed_result = TaskResult(
+                            status=TaskStatus.FAILED,
+                            content=failure_content,
+                        )
+                state.latest_result = failure_content
                 state.last_notification_kind = "error"
-                state.task_result = TaskResult(status=TaskStatus.FAILED, content=str(exc))
+                state.task_result = failed_result
                 state.status = "idle" if state.resident else TaskStatus.FAILED.value
-                await self._save_state(state, state.status, {"error": str(exc), "notification_kind": state.last_notification_kind})
+                await self._save_state(state, state.status, {"error": failure_content, "notification_kind": state.last_notification_kind})
                 await self._emit(
                     "subagent_completed",
                     state,
@@ -240,14 +290,14 @@ class SubagentManager:
                         "resident_status": state.status,
                         "accepts_followups": bool(state.resident),
                         "pending_messages_count": state.pending_messages_count,
-                        "content_preview": str(exc)[:500],
+                        "content_preview": failure_content[:500],
                     },
                 )
                 if state.resident:
                     await self._emit_worker_notification(
                         state,
                         notification_kind="error",
-                        summary=str(exc),
+                        summary=failure_content,
                     )
             finally:
                 state.update_event.set()
@@ -366,7 +416,16 @@ class SubagentManager:
     def _build_child_task(self, state: SubagentState, prompt: str) -> Task:
         parent = self.parent_task or Task()
         metadata = dict(parent.metadata or {})
+        for key in _NON_INHERITED_CHILD_IDENTITY_KEYS:
+            metadata.pop(key, None)
         metadata.pop("_fork_allowed_tools", None)
+        metadata["runtime_kind"] = "native_subagent"
+        metadata["runtime_auxiliary_task"] = True
+        metadata["runtime_auxiliary_kind"] = "native_subagent"
+        metadata["user_visible"] = False
+        metadata["shared_role_session"] = False
+        if parent.session_id:
+            metadata["parent_session_id"] = parent.session_id
         metadata["_native_runtime_depth"] = int(metadata.get("_native_runtime_depth", 0) or 0) + 1
         metadata["subagent_profile"] = state.profile
         metadata["_subagent_name"] = state.name
@@ -408,6 +467,38 @@ class SubagentManager:
             tags=list(parent.tags),
             metadata=metadata,
         )
+
+    async def _ensure_child_session(self, child: Task) -> None:
+        ensure_session = getattr(self.memory_manager, "ensure_session", None)
+        if not callable(ensure_session) or not child.session_id:
+            return
+        await ensure_session(
+            child.session_id,
+            project_id=child.project_id,
+            title=child.title,
+            mode="child",
+            parent_session_id=child.parent_session_id,
+            metadata={
+                "runtime_kind": "native_subagent",
+                "user_visible": False,
+                "shared_role_session": False,
+                "subagent_profile": str(
+                    child.metadata.get("subagent_profile", "") or ""
+                ).strip(),
+                "subagent_name": str(
+                    child.metadata.get("_subagent_name", "") or ""
+                ).strip(),
+                "source_task_id": str(child.parent_id or "").strip(),
+            },
+        )
+
+    @staticmethod
+    def _apply_result_to_child_task(child: Task, result: TaskResult) -> None:
+        child.status = result.status
+        child.result = {
+            "content": result.content,
+            "artifacts": dict(result.artifacts or {}),
+        }
 
     def _resolve_allowed_tools(self, profile: str, mode: str = "default") -> list[str]:
         profiles = self.config.agents.native_subagents or {}
