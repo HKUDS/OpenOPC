@@ -451,6 +451,11 @@ def _probe_help_flags(
     result: ExternalAgentPreflightResult,
 ) -> None:
     args = _HELP_COMMANDS.get(agent_name, ("--help",))
+    if launch_cmd and str(launch_cmd[0] or "") != str(binary or ""):
+        # launch_cmd begins with an interpreter or wrapper other than the
+        # probed binary (for example ``python -m <module>``); its --help can
+        # never advertise the harness flags, so skip the flag check.
+        return
     try:
         proc = subprocess.run(
             [binary, *args],

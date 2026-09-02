@@ -19,6 +19,8 @@ EXTERNAL_EXECUTION_AGENTS: frozenset[str] = frozenset({
     "opencode",
     "jiuwen",
     "jiuwenswarm",
+    "dsh",
+    "dshswarm",
 })
 EXECUTION_AGENTS: frozenset[str] = frozenset({
     NATIVE_EXECUTION_AGENT,
@@ -32,6 +34,8 @@ EXECUTION_AGENT_LABELS: dict[str, str] = {
     "opencode": "OpenCode",
     "jiuwen": "JiuwenSwarm-single",
     "jiuwenswarm": "JiuwenSwarm-team",
+    "dsh": "DeepSeek Harness",
+    "dshswarm": "DeepSeek Harness Team",
 }
 
 

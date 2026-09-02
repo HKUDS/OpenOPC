@@ -12,6 +12,7 @@ from opc.layer3_agent.adapters.cursor_adapter import CursorAdapter
 from opc.layer3_agent.adapters.codex_adapter import CodexAdapter
 from opc.layer3_agent.adapters.opencode_adapter import OpenCodeAdapter
 from opc.layer3_agent.adapters.jiuwen_adapter import JiuwenAdapter, JiuwenSwarmAdapter
+from opc.layer3_agent.adapters.dsh_adapter import DshAdapter, DshSwarmAdapter
 
 
 ADAPTER_CLASSES: dict[str, type[ExternalAgentAdapter]] = {
@@ -21,6 +22,8 @@ ADAPTER_CLASSES: dict[str, type[ExternalAgentAdapter]] = {
     "opencode": OpenCodeAdapter,
     "jiuwen": JiuwenAdapter,
     "jiuwenswarm": JiuwenSwarmAdapter,
+    "dsh": DshAdapter,
+    "dshswarm": DshSwarmAdapter,
 }
 
 if frozenset(ADAPTER_CLASSES) != EXTERNAL_EXECUTION_AGENTS:
