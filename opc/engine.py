@@ -18923,7 +18923,18 @@ class OPCEngine:
                 team_instance_id=team_instance_id,
             )
         seat_id = str(root_seat.get("seat_id", "") or "").strip()
-        assignment = dict(assignments.get(root_role_id, {}) or root_seat.get("employee_assignment", {}) or {})
+        # The runtime topology seat is the canonical owner of the employee
+        # assignment.  Task materialization re-stamps
+        # ``metadata.employee_assignment`` from that seat (by seat_id), and
+        # its invariant guard rejects any non-empty value that differs from
+        # the persisted one.  Persist the seat value (task-derived
+        # assignments only as fallback) so the materialization stamp is a
+        # value no-op instead of a fatal "metadata changed before commit".
+        assignment = dict(
+            root_seat.get("employee_assignment", {})
+            or assignments.get(root_role_id, {})
+            or {}
+        )
         work_item_id = f"self-evolution::{checkpoint.checkpoint_id}"
         projection_id = f"self_evolution::{checkpoint.checkpoint_id[:8]}::{root_role_id}"
         delivery_summary = str(
@@ -19222,21 +19233,6 @@ class OPCEngine:
             else None
         )
         try:
-            if controller_admission is not None:
-                # The final-delivery controller is deliberately released while
-                # waiting for owner feedback.  Self-evolution is a new company
-                # runtime pass, so every write performed before scheduler
-                # bootstrap must already carry its newly admitted generation.
-                for task in tasks:
-                    task.metadata = dict(task.metadata or {})
-                    task.metadata["company_run_controller_owner_token"] = (
-                        controller_admission.owner_token
-                    )
-                    task.metadata["company_run_controller_lease_generation"] = (
-                        controller_admission.generation
-                    )
-                await self.store.save_task(waiting_task)
-
             root_work_item = await self._create_company_self_evolution_root_work_item(
                 checkpoint=checkpoint,
                 waiting_task=waiting_task,
@@ -19272,6 +19268,7 @@ class OPCEngine:
             )
             run_id = str(getattr(root_work_item, "run_id", "") or "").strip()
             deadline_hit = False
+            pass_failure: str | None = None
             try:
                 execute_kwargs: dict[str, Any] = {}
                 if controller_admission is not None:
@@ -19286,12 +19283,30 @@ class OPCEngine:
             except asyncio.TimeoutError:
                 deadline_hit = True
                 await self._settle_self_evolution_deadline(run_id)
+            except CompanyRunControllerLeaseLost:
+                # Another controller owns the run; do not cancel its items or
+                # close the review from here.  The owner settles this pass.
+                raise
+            except Exception as exc:
+                # Never strand a ready Self-Evolution Review card on the board:
+                # cancel this pass's non-terminal items, record the failure,
+                # and close the review so the delivery can settle visibly.
+                logger.opt(exception=True).warning(
+                    "self-evolution pass failed (checkpoint={} run={}): {}",
+                    checkpoint.checkpoint_id,
+                    run_id,
+                    exc,
+                )
+                await self._settle_self_evolution_deadline(run_id)
+                pass_failure = f"{type(exc).__name__}: {exc}"
             result = await self._collect_company_self_evolution_result(
                 checkpoint_id=checkpoint.checkpoint_id,
                 run_id=run_id,
             )
             if deadline_hit:
                 result.setdefault("errors", []).append({"error": "self_evolution_deadline"})
+            if pass_failure:
+                result.setdefault("errors", []).append({"error": "self_evolution_pass_failed", "detail": pass_failure})
 
             waiting_task.metadata = dict(waiting_task.metadata or {})
             review_record = {
@@ -19302,6 +19317,8 @@ class OPCEngine:
                 "recorded_count": len(result.get("recorded", [])),
                 "error_count": len(result.get("errors", [])),
             }
+            if pass_failure:
+                review_record["pass_failed"] = pass_failure
             history = list(waiting_task.metadata.get("self_evolution_reviews", []) or [])
             history.append(review_record)
             task_metadata_updates = {
@@ -19310,10 +19327,18 @@ class OPCEngine:
                 "latest_self_evolution_review": review_record,
                 "self_evolution_reviews": history[-20:],
             }
+            if pass_failure:
+                task_metadata_updates["self_evolution_review_failed"] = True
+                task_metadata_updates["self_evolution_review_failed_at"] = review_record["completed_at"]
+                task_metadata_updates["self_evolution_review_failed_error"] = pass_failure
             await self._terminalize_company_delivery_feedback_checkpoint(
                 checkpoint,
                 status="resolved",
-                resolution="self_evolution_review_completed",
+                resolution=(
+                    "self_evolution_review_failed"
+                    if pass_failure
+                    else "self_evolution_review_completed"
+                ),
                 payload_updates={
                     **payload,
                     "self_evolution_review": review_record,
@@ -19328,6 +19353,13 @@ class OPCEngine:
                     f"Self-evolution hit its {int(self._SELF_EVOLUTION_RUN_TIMEOUT_SEC // 60)}-minute "
                     f"time budget and was closed with {recorded_count} recorded update(s); "
                     "the remaining reflection work was cancelled."
+                )
+            if pass_failure:
+                return (
+                    "Self-evolution could not run because the reflection pass failed "
+                    f"({pass_failure}). The delivery review was closed and the pending "
+                    "Self-Evolution Review card was cancelled; no employee experience "
+                    "update was recorded."
                 )
             if recorded_count:
                 return f"Self-evolution completed. Recorded {recorded_count} employee experience update(s)."
