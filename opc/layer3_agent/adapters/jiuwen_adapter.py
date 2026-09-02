@@ -8,7 +8,6 @@ execution unit; internal teammates never leak into OpenOPC's org or Kanban.
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import importlib.util
 import json
 import os
@@ -19,7 +18,6 @@ import time
 import uuid
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
 
 from opc.core.config import ExternalAgentConfig
 from opc.core.models import AgentStatus, Task, TaskResult, TaskStatus
@@ -28,6 +26,10 @@ from opc.layer3_agent.adapters.base import (
     ExternalAgentAdapter,
     ExternalAgentStdinPolicy,
     ExternalApprovalRequest,
+)
+from opc.layer3_agent.jiuwen_gateway import (
+    probe_jiuwen_gateway,
+    resolve_jiuwen_gateway_url,
 )
 
 
@@ -108,27 +110,15 @@ class JiuwenAdapter(ExternalAgentAdapter):
             return False
         if self._transport() != "gateway":
             return True
-        raw_url = str(
-            os.environ.get("JIUWENSWARM_GATEWAY_URL")
-            or getattr(self.config, "gateway_url", "")
-            or "ws://127.0.0.1:19001/tui"
-        ).strip()
-        parsed = urlparse(raw_url)
-        host = parsed.hostname
-        port = parsed.port or (443 if parsed.scheme == "wss" else 80)
-        if not host:
-            return False
-        try:
-            _reader, writer = await asyncio.wait_for(
-                asyncio.open_connection(host, port),
-                timeout=0.75,
-            )
-        except (OSError, asyncio.TimeoutError, ValueError):
-            return False
-        writer.close()
-        with contextlib.suppress(Exception):
-            await writer.wait_closed()
-        return True
+        gateway_url = resolve_jiuwen_gateway_url(
+            str(getattr(self.config, "gateway_url", "") or "")
+        )
+        issue = await asyncio.to_thread(
+            probe_jiuwen_gateway,
+            gateway_url,
+            timeout=0.75,
+        )
+        return not issue
 
     async def get_status(self) -> AgentStatus:
         if self._process and self._process.returncode is None:
@@ -198,11 +188,9 @@ class JiuwenAdapter(ExternalAgentAdapter):
                 "--project-dir",
                 project_dir,
             ]
-            gateway_url = str(
-                os.environ.get("JIUWENSWARM_GATEWAY_URL")
-                or getattr(self.config, "gateway_url", "")
-                or ""
-            ).strip()
+            gateway_url = resolve_jiuwen_gateway_url(
+                str(getattr(self.config, "gateway_url", "") or "")
+            )
             if gateway_url:
                 cmd.extend(["--gateway-url", gateway_url])
             for trusted_dir in trusted_dirs:
@@ -227,11 +215,9 @@ class JiuwenAdapter(ExternalAgentAdapter):
                 project_dir,
                 "--jsonl",
             ]
-            gateway_url = str(
-                os.environ.get("JIUWENSWARM_GATEWAY_URL")
-                or getattr(self.config, "gateway_url", "")
-                or ""
-            ).strip()
+            gateway_url = resolve_jiuwen_gateway_url(
+                str(getattr(self.config, "gateway_url", "") or "")
+            )
             if gateway_url:
                 cmd.extend(["--gateway-url", gateway_url])
             for trusted_dir in trusted_dirs:

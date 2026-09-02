@@ -17,6 +17,7 @@ external_agents:
     enabled: true
     command: jiuwenswarm
     transport: gateway
+    # The default also discovers a custom port persisted by JiuwenSwarm.
     gateway_url: ws://127.0.0.1:19001/tui
     provider_mode: code.normal
     run_mode: interactive
@@ -29,6 +30,7 @@ external_agents:
     enabled: true
     command: jiuwenswarm
     transport: gateway
+    # The default also discovers a custom port persisted by JiuwenSwarm.
     gateway_url: ws://127.0.0.1:19001/tui
     provider_mode: team
     run_mode: interactive

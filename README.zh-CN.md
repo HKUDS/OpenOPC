@@ -572,10 +572,15 @@ MODEL_NAME="ark-code-latest"
 MODEL_PROVIDER="OpenAI"
 ```
 
-安装适配器、启动 Gateway，并检查两个选项：
+JiuwenSwarm 需要 Python 3.11–3.13。安装 JiuwenSwarm 和 OpenOPC Gateway
+适配器，初始化 Jiuwen，然后检查两个选项。
+
+macOS / Linux：
 
 ```bash
-pip install -e '.[jiuwen]'
+python -m pip install jiuwenswarm
+python -m pip install -e ".[jiuwen]"
+jiuwenswarm-init
 chmod 600 ~/.jiuwenswarm/config/.env
 jiuwenswarm-start --restart default
 opc agents preflight jiuwen
@@ -584,7 +589,28 @@ opc exec --mode task --agent jiuwen "完成这个任务"
 opc exec --mode task --agent jiuwenswarm "由一个 Team 完成这个任务"
 ```
 
-默认 Gateway 地址是 `ws://127.0.0.1:19001/tui`。只有 JiuwenSwarm 运行在其他地址时，才需要修改 `.opc/config/agent_config.yaml` 中的 `gateway_url`。
+Windows PowerShell / 命令提示符（不执行 `chmod`）：
+
+```powershell
+py -3.12 -m pip install jiuwenswarm
+py -3.12 -m pip install -e ".[jiuwen]"
+jiuwenswarm-init
+jiuwenswarm-start --restart default
+opc agents preflight jiuwen
+opc agents preflight jiuwenswarm
+```
+
+Windows 的 Jiuwen 配置通常位于 `%USERPROFILE%\.jiuwenswarm\config\.env`，
+macOS/Linux 位于 `~/.jiuwenswarm/config/.env`。OpenOPC 会读取 Jiuwen 保存的
+自定义 Gateway 端口，确保两端使用同一地址。只有有意使用远程或自定义地址时，
+才设置 `JIUWENSWARM_GATEWAY_URL` 或修改
+`.opc/config/agent_config.yaml` 中的非默认 `gateway_url`。
+
+Windows、macOS 和 Linux 均支持在 Task/Company 模式下使用
+JiuwenSwarm-single 与 JiuwenSwarm-team。Company 通讯在所有平台使用同一安全
+边界：macOS/Linux 使用 POSIX 目录句柄，Windows 使用原生句柄相对访问并拒绝
+symlink、junction 等 reparse point。Windows 工作区必须位于本地磁盘；无法提供
+同等边界保证的 UNC/网络共享会安全失败。
 
 ### Company 模式的角色选择
 

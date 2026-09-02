@@ -7,6 +7,10 @@ OpenOPC 提供两个独立的外部执行 Agent：
 
 二者均支持 Task Mode 与 Company Mode。推荐使用 Gateway 传输，因为它支持流式事件、会话恢复、用户问答/审批以及中断；`transport: cli` 是无交互 JSONL 回退方式。
 
+支持的运行环境：Windows 10/11、macOS 与 Linux。JiuwenSwarm 需要 Python
+3.11–3.13。OpenOPC 不修改 Jiuwen 内部 harness；跨平台适配只发生在 OpenOPC
+的 Gateway、Company 通讯和工作区边界。
+
 ## API 配置
 
 Jiuwen 使用 `~/.jiuwenswarm/config/.env`，不会自动读取 OpenOPC 的 `.opc/config/llm_config.yaml`。可以复用同一个 API key 和 endpoint，但需要使用 Jiuwen/提供方支持的 Agent 模型名。例如火山方舟 Agent Plan 的配置为：
@@ -18,31 +22,61 @@ MODEL_NAME="ark-code-latest"
 MODEL_PROVIDER="OpenAI"
 ```
 
-`openai/minimax-m3` 等普通补全模型名即使能被 OpenOPC 直接调用，也可能不支持 Agent Plan 请求；在上述 endpoint 下应使用 Plan 路由名 `ark-code-latest`。配置后运行：
+`openai/minimax-m3` 等普通补全模型名即使能被 OpenOPC 直接调用，也可能不支持 Agent Plan 请求；在上述 endpoint 下应使用 Plan 路由名 `ark-code-latest`。
+
+macOS/Linux 配置后运行：
 
 ```bash
 chmod 600 ~/.jiuwenswarm/config/.env
 jiuwenswarm-start --restart default
 ```
 
+Windows 的配置文件位于 `%USERPROFILE%\.jiuwenswarm\config\.env`，不需要也
+不能执行 `chmod`。
+
 ## 安装与检查
 
-按照 JiuwenSwarm 官方说明完成模型与运行时配置，然后启动其 Gateway：
+macOS/Linux：
 
 ```bash
+python -m pip install jiuwenswarm
+python -m pip install -e ".[jiuwen]"
+jiuwenswarm-init
 jiuwenswarm-start
-```
-
-为 OpenOPC 安装 Gateway 客户端依赖并检查连接：
-
-```bash
-pip install -e '.[jiuwen]'
 opc agents list
 opc agents preflight jiuwen
 opc agents preflight jiuwenswarm
 ```
 
-默认 Gateway 地址为 `ws://127.0.0.1:19001/tui`。可以在 `.opc/config/agent_config.yaml` 的 `gateway_url` 中修改，或设置 `JIUWENSWARM_GATEWAY_URL`。
+Windows PowerShell / 命令提示符：
+
+```powershell
+py -3.12 -m pip install jiuwenswarm
+py -3.12 -m pip install -e ".[jiuwen]"
+jiuwenswarm-init
+jiuwenswarm-start
+opc agents list
+opc agents preflight jiuwen
+opc agents preflight jiuwenswarm
+```
+
+默认 Gateway 地址为 `ws://127.0.0.1:19001/tui`。OpenOPC 会读取
+`~/.jiuwenswarm/config/.env`（Windows 为
+`%USERPROFILE%\.jiuwenswarm\config\.env`）中 Jiuwen 保存的自定义端口。可以用
+`.opc/config/agent_config.yaml` 的非默认 `gateway_url` 或
+`JIUWENSWARM_GATEWAY_URL` 显式覆盖。`opc agents preflight` 会完成真正的
+WebSocket 握手，而不只是检查端口是否打开。
+
+## 跨平台工作区边界
+
+- macOS/Linux 使用固定 POSIX 目录句柄与 `O_NOFOLLOW`。
+- Windows 使用固定原生目录句柄和 handle-relative 文件操作，拒绝 symlink、
+  junction、其他 reparse point、ADS 和设备名。
+- Company 的消息、共享记忆、会议记录和 artifact 文件证明都使用同一边界。
+- Windows 工作区需位于本地磁盘；UNC/网络共享无法提供相同保证，因此会明确
+  报错并安全停止。
+- Windows 的会议写入和 UI 单实例保护使用 `LockFileEx`；macOS/Linux 使用
+  `flock`。
 
 ## Task Mode
 

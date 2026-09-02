@@ -20,6 +20,7 @@ import aiosqlite
 from loguru import logger
 
 from opc.core.config import OPCConfig, get_opc_home
+from opc.core.file_lock import lock_file_descriptor
 from opc.core.workspace_trust import WorkspaceTrustRequired
 from opc.engine import OPCEngine
 from opc.plugins.office_ui.agent_store import AgentStore
@@ -54,19 +55,14 @@ def _acquire_single_instance_lock(opc_home: Path) -> Any | None:
 
     Two server processes writing the same ui_state.db contend for the sqlite
     write lock and surface as 'database is locked' failures mid-run. The lock
-    is advisory (flock), scoped to this OPC home, and released automatically
-    when the process exits — including on crash/SIGKILL, so a stale lock file
-    can never block a fresh start.
+    is advisory (flock on POSIX, LockFileEx on Windows), scoped to this OPC
+    home, and released automatically when the process exits — including on a
+    crash, so a stale lock file can never block a fresh start.
     """
-    try:
-        import fcntl
-    except ImportError:
-        return None  # Non-POSIX platform: no flock available, skip the guard.
-
     lock_path = opc_home / "office_ui.lock"
     lock_file = open(lock_path, "a+", encoding="utf-8")
     try:
-        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        lock_file_descriptor(lock_file.fileno(), blocking=False)
     except OSError:
         lock_file.seek(0)
         holder_pid = lock_file.read().strip() or "unknown"

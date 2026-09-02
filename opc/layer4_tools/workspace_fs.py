@@ -62,6 +62,13 @@ class WorkspaceEntry:
 
 
 def _secure_primitives_available() -> bool:
+    if os.name == "nt":
+        try:
+            from opc.layer4_tools.workspace_fs_windows import windows_backend_available
+
+            return windows_backend_available()
+        except (ImportError, OSError):
+            return False
     required_dir_fd = (os.open, os.mkdir, os.stat, os.unlink, os.rename)
     return bool(
         os.name == "posix"
@@ -144,6 +151,20 @@ def _relative_parts(root: Path, candidate: Path) -> tuple[str, ...]:
 
 class SecureWorkspace:
     """A pinned workspace directory used for one complete tool effect."""
+
+    def __new__(cls, workspace_root: str, output_root: str) -> SecureWorkspace:
+        # Windows does not expose Python's ``dir_fd``/``O_NOFOLLOW`` surface.
+        # Select the native handle-relative implementation at the capability
+        # boundary instead of weakening every caller with path-based fallbacks.
+        if (
+            cls is SecureWorkspace
+            and os.name == "nt"
+            and _secure_primitives_available()
+        ):
+            from opc.layer4_tools.workspace_fs_windows import WindowsSecureWorkspace
+
+            return WindowsSecureWorkspace(workspace_root, output_root)  # type: ignore[return-value]
+        return super().__new__(cls)
 
     def __init__(self, workspace_root: str, output_root: str) -> None:
         self.root = _absolute_normalized(workspace_root)
@@ -321,7 +342,7 @@ class SecureWorkspace:
             )
 
     @staticmethod
-    def _read_fd(fd: int) -> str:
+    def _read_bytes_fd(fd: int) -> bytes:
         os.lseek(fd, 0, os.SEEK_SET)
         chunks: list[bytes] = []
         while True:
@@ -329,7 +350,11 @@ class SecureWorkspace:
             if not chunk:
                 break
             chunks.append(chunk)
-        return b"".join(chunks).decode("utf-8", errors="replace")
+        return b"".join(chunks)
+
+    @classmethod
+    def _read_fd(cls, fd: int) -> str:
+        return cls._read_bytes_fd(fd).decode("utf-8", errors="replace")
 
     @staticmethod
     def _write_fd(fd: int, content: str) -> int:
@@ -449,6 +474,13 @@ class SecureWorkspace:
         fd = self._open_file(target, os.O_RDONLY)
         try:
             return self._read_fd(fd)
+        finally:
+            os.close(fd)
+
+    def read_bytes(self, target: WorkspacePath) -> bytes:
+        fd = self._open_file(target, os.O_RDONLY)
+        try:
+            return self._read_bytes_fd(fd)
         finally:
             os.close(fd)
 

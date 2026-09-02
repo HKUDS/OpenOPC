@@ -409,6 +409,19 @@ class ExternalAgentBroker:
             return result
         if os.name == "nt":
             result["method"] = "taskkill_tree"
+            ctrl_break = getattr(signal, "CTRL_BREAK_EVENT", None)
+            if ctrl_break is not None:
+                try:
+                    proc.send_signal(ctrl_break)
+                    result["graceful_signal"] = "CTRL_BREAK_EVENT"
+                    result["method"] = "ctrl_break"
+                    await asyncio.wait_for(proc.wait(), timeout=1.5)
+                except (AttributeError, OSError, ProcessLookupError, asyncio.TimeoutError):
+                    result["method"] = "ctrl_break_then_taskkill"
+                else:
+                    result["returncode_after"] = proc.returncode
+                    result["ok"] = proc.returncode is not None
+                    return result
             try:
                 killer = subprocess.run(
                     ["taskkill", "/PID", str(proc.pid), "/T", "/F"],

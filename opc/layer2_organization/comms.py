@@ -53,13 +53,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
+from opc.core.file_lock import exclusive_file_lock
 from opc.layer4_tools.output_budget import clip_text
 from opc.layer4_tools.workspace_fs import SecureWorkspace, WorkspaceBoundaryError
-
-try:
-    import fcntl  # POSIX only — used for transcript append locking
-except Exception:  # pragma: no cover - Windows fallback
-    fcntl = None  # type: ignore
 
 try:
     import yaml  # type: ignore
@@ -1047,11 +1043,8 @@ def append_to_transcript(
 ) -> MeetingEntry:
     """Atomically append one line to a meeting transcript.
 
-    Uses `fcntl.flock(LOCK_EX)` on POSIX so concurrent participants
-    can append safely without losing entries. On Windows the call
-    falls back to a best-effort write — `os.O_APPEND` itself is
-    atomic for short writes on most filesystems anyway, but the
-    explicit lock makes the guarantee unconditional on POSIX.
+    Uses a process-level exclusive lock (`flock` on POSIX and `LockFileEx`
+    on Windows) so concurrent participants cannot lose entries.
 
     Each entry is rendered as a markdown block with a frontmatter-ish
     metadata header so the transcript is both human-readable and
@@ -1080,7 +1073,7 @@ def append_to_transcript(
         f"{body}\n"
     )
 
-    # Append with exclusive lock when fcntl is available.
+    # Append while holding the platform's process-level exclusive lock.
     workspace, absolute = _runtime_workspace_path(transcript_path)
     with workspace:
         target = workspace.resolve(
@@ -1089,18 +1082,9 @@ def append_to_transcript(
             allow_runtime_internal_read=True,
         )
         with workspace.open_runtime_append(target, create=True) as fd:
-            if fcntl is not None:
-                try:
-                    fcntl.flock(fd, fcntl.LOCK_EX)
-                except OSError:
-                    pass
-            try:
+            with exclusive_file_lock(fd):
                 os.write(fd, block.encode("utf-8"))
                 os.fsync(fd)
-            finally:
-                if fcntl is not None:
-                    with contextlib.suppress(OSError):
-                        fcntl.flock(fd, fcntl.LOCK_UN)
 
     return MeetingEntry(
         entry_id=entry_id,

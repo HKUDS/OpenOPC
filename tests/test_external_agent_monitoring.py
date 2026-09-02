@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 import os
+import signal
 import subprocess
 from datetime import datetime
 from pathlib import Path
@@ -1076,6 +1077,36 @@ class ExternalAgentMonitoringTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result["ok"])
         self.assertFalse(proc.terminated)
         self.assertFalse(proc.killed)
+
+    async def test_windows_process_cleanup_gives_gateway_bridge_ctrl_break_grace(self) -> None:
+        class _Proc:
+            pid = 456
+            returncode = None
+
+            def __init__(self) -> None:
+                self.signals: list[int] = []
+
+            def send_signal(self, value: int) -> None:
+                self.signals.append(value)
+                self.returncode = 130
+
+            async def wait(self) -> int:
+                return int(self.returncode or 0)
+
+        proc = _Proc()
+        with patch("opc.layer3_agent.external_broker.os.name", "nt"), patch.object(
+            signal,
+            "CTRL_BREAK_EVENT",
+            1,
+            create=True,
+        ), patch("opc.layer3_agent.external_broker.subprocess.run") as run_mock:
+            result = await ExternalAgentBroker._terminate_process(proc)  # type: ignore[arg-type]
+
+        self.assertEqual(proc.signals, [1])
+        self.assertEqual(result["method"], "ctrl_break")
+        self.assertEqual(result["returncode_after"], 130)
+        self.assertTrue(result["ok"])
+        run_mock.assert_not_called()
 
     async def test_cancelled_broker_run_kills_child_process(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

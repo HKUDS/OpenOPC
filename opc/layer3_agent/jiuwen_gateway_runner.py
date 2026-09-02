@@ -12,12 +12,13 @@ import argparse
 import asyncio
 import contextlib
 import json
-import os
 import signal
 import sys
 import uuid
 from pathlib import Path
 from typing import Any
+
+from opc.layer3_agent.jiuwen_gateway import resolve_jiuwen_gateway_url
 
 
 _INTERRUPT_RESUME_SOURCES = frozenset(
@@ -44,12 +45,7 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def _gateway_url(configured: str) -> str:
-    value = str(configured or os.environ.get("JIUWENSWARM_GATEWAY_URL") or "").strip()
-    if value:
-        return value
-    host = os.environ.get("GATEWAY_HOST", "127.0.0.1")
-    port = os.environ.get("GATEWAY_PORT", "19001")
-    return f"ws://{host}:{port}/tui"
+    return resolve_jiuwen_gateway_url(configured)
 
 
 def _emit(frame: dict[str, Any]) -> None:
@@ -170,6 +166,54 @@ async def _interrupt(ws: Any, session_id: str) -> None:
         )
 
 
+def _install_cancel_handlers(
+    loop: asyncio.AbstractEventLoop,
+    cancelled: asyncio.Event,
+) -> list[tuple[str, Any, Any]]:
+    """Install POSIX loop handlers or the Windows synchronous equivalent."""
+
+    installed: list[tuple[str, Any, Any]] = []
+
+    def _cancel(*_: object) -> None:
+        loop.call_soon_threadsafe(cancelled.set)
+
+    candidates = {
+        candidate
+        for candidate in (
+            getattr(signal, "SIGINT", None),
+            getattr(signal, "SIGTERM", None),
+            getattr(signal, "SIGBREAK", None),
+        )
+        if candidate is not None
+    }
+    for candidate in candidates:
+        try:
+            loop.add_signal_handler(candidate, _cancel)
+        except (NotImplementedError, RuntimeError, ValueError):
+            try:
+                previous = signal.getsignal(candidate)
+                signal.signal(candidate, _cancel)
+            except (OSError, RuntimeError, ValueError):
+                continue
+            installed.append(("sync", candidate, previous))
+        else:
+            installed.append(("loop", candidate, None))
+    return installed
+
+
+def _remove_cancel_handlers(
+    loop: asyncio.AbstractEventLoop,
+    installed: list[tuple[str, Any, Any]],
+) -> None:
+    for kind, candidate, previous in reversed(installed):
+        if kind == "loop":
+            with contextlib.suppress(NotImplementedError, RuntimeError, ValueError):
+                loop.remove_signal_handler(candidate)
+        else:
+            with contextlib.suppress(OSError, RuntimeError, ValueError):
+                signal.signal(candidate, previous)
+
+
 async def _main(args: argparse.Namespace) -> int:
     initial = await _stdin_json()
     prompt = str(initial.get("prompt") or initial.get("content") or "").strip()
@@ -192,11 +236,7 @@ async def _main(args: argparse.Namespace) -> int:
 
     cancelled = asyncio.Event()
     loop = asyncio.get_running_loop()
-    for sig in (getattr(signal, "SIGINT", None), getattr(signal, "SIGTERM", None)):
-        if sig is None:
-            continue
-        with contextlib.suppress(NotImplementedError, RuntimeError, ValueError):
-            loop.add_signal_handler(sig, cancelled.set)
+    cancel_handlers = _install_cancel_handlers(loop, cancelled)
 
     try:
         raw_ack = await asyncio.wait_for(ws.recv(), timeout=10.0)
@@ -326,6 +366,7 @@ async def _main(args: argparse.Namespace) -> int:
         _emit({"type": "event", "event": "chat.error", "payload": {"error": str(exc)}})
         return 1
     finally:
+        _remove_cancel_handlers(loop, cancel_handlers)
         with contextlib.suppress(Exception):
             await ws.close()
 

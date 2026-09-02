@@ -572,10 +572,15 @@ MODEL_NAME="ark-code-latest"
 MODEL_PROVIDER="OpenAI"
 ```
 
-Install the adapter, start the Gateway, and verify both choices:
+JiuwenSwarm requires Python 3.11–3.13. Install JiuwenSwarm and the OpenOPC
+Gateway adapter, initialize Jiuwen, then verify both choices.
+
+macOS / Linux:
 
 ```bash
-pip install -e '.[jiuwen]'
+python -m pip install jiuwenswarm
+python -m pip install -e ".[jiuwen]"
+jiuwenswarm-init
 chmod 600 ~/.jiuwenswarm/config/.env
 jiuwenswarm-start --restart default
 opc agents preflight jiuwen
@@ -584,7 +589,30 @@ opc exec --mode task --agent jiuwen "Handle this task"
 opc exec --mode task --agent jiuwenswarm "Have one Team handle this task"
 ```
 
-The default Gateway URL is `ws://127.0.0.1:19001/tui`. Change `gateway_url` in `.opc/config/agent_config.yaml` only when JiuwenSwarm runs elsewhere.
+Windows PowerShell / Command Prompt (no `chmod` step):
+
+```powershell
+py -3.12 -m pip install jiuwenswarm
+py -3.12 -m pip install -e ".[jiuwen]"
+jiuwenswarm-init
+jiuwenswarm-start --restart default
+opc agents preflight jiuwen
+opc agents preflight jiuwenswarm
+```
+
+On Windows the Jiuwen configuration is normally stored under
+`%USERPROFILE%\.jiuwenswarm\config\.env`; on macOS/Linux it is under
+`~/.jiuwenswarm/config/.env`. OpenOPC reads Jiuwen's persisted custom Gateway
+port, so both sides continue to use the same endpoint. Set
+`JIUWENSWARM_GATEWAY_URL` or a non-default `gateway_url` in
+`.opc/config/agent_config.yaml` only for an intentional remote/custom endpoint.
+
+OpenOPC supports JiuwenSwarm-single and JiuwenSwarm-team in both Task and
+Company modes on Windows, macOS, and Linux. Company communication uses the
+same protected workspace boundary on every platform: POSIX directory handles
+on macOS/Linux and native handle-relative, reparse-point-safe access on
+Windows. Windows workspaces must be local; UNC/network-share workspaces fail
+closed because they cannot provide the same boundary guarantees.
 
 ### Role selection in Company Mode
 
