@@ -20,15 +20,39 @@ NON_RESUMABLE_EXTERNAL_SESSION_STATUSES: frozenset[str] = frozenset({
     "startup_timeout",
 })
 
+# Agent types whose provider keeps the full session transcript on disk and can
+# replay it regardless of how the *launching run* ended.  Claude Code writes
+# every session to ``~/.claude/projects/<cwd>/<session-id>.jsonl`` and
+# ``--resume <id>`` restores it even after the spawning process failed, was
+# cancelled, or timed out — so a bad run outcome must not invalidate the
+# resume token and silently drop the whole conversation context.  Agents not
+# listed here keep the conservative status gate above.
+DURABLE_TRANSCRIPT_AGENT_TYPES: frozenset[str] = frozenset({
+    "claude_code",
+})
 
-def external_session_status_allows_resume(status: Any) -> bool:
+
+def agent_resume_survives_run_failure(agent_type: Any) -> bool:
+    return (
+        str(agent_type or "").strip().lower() in DURABLE_TRANSCRIPT_AGENT_TYPES
+    )
+
+
+def external_session_status_allows_resume(
+    status: Any,
+    *,
+    agent_type: Any = None,
+) -> bool:
+    if agent_resume_survives_run_failure(agent_type):
+        return True
     status = str(status or "").strip().lower()
     return status not in NON_RESUMABLE_EXTERNAL_SESSION_STATUSES
 
 
 def external_session_allows_resume(session: Any | None) -> bool:
     return session is not None and external_session_status_allows_resume(
-        getattr(session, "status", "")
+        getattr(session, "status", ""),
+        agent_type=getattr(session, "agent_type", None),
     )
 
 

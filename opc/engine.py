@@ -7678,7 +7678,8 @@ class OPCEngine:
                 has_resumable_external_session = bool(
                     gate_external_session
                 ) and external_session_status_allows_resume(
-                    gate_external_session.get("status")
+                    gate_external_session.get("status"),
+                    agent_type=gate_external_session.get("agent_type"),
                 )
                 if not has_resumable_external_session:
                     # The pin is a preference, not a fact: this work item has
@@ -7794,14 +7795,15 @@ class OPCEngine:
             task.metadata.pop("external_resume_checkpoint_session_updated_at", None)
             task.metadata.pop("external_resume_checkpoint_session_status", None)
             if isinstance(external_session, dict):
-                token_allowed = external_session_status_allows_resume(
-                    external_session.get("status")
-                )
                 agent_type = str(
                     external_session.get("agent_type")
                     or task.assigned_external_agent
                     or ""
                 ).strip()
+                token_allowed = external_session_status_allows_resume(
+                    external_session.get("status"),
+                    agent_type=agent_type,
+                )
                 assigned_agent_type = str(task.assigned_external_agent or "").strip()
                 token_candidates = [
                     str(external_session.get("resume_session_id") or "").strip(),
@@ -8213,7 +8215,7 @@ class OPCEngine:
             key=lambda session: _timestamp(getattr(session, "updated_at", None)),
         )
         latest_status = str(getattr(latest, "status", "") or "").strip().lower()
-        if external_session_status_allows_resume(latest_status):
+        if external_session_status_allows_resume(latest_status, agent_type=agent_type):
             return False
         latest_timestamp = _timestamp(getattr(latest, "updated_at", None))
         checkpoint_timestamp = _timestamp(checkpoint_updated_at)

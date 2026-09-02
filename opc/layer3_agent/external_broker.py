@@ -37,6 +37,8 @@ from opc.layer2_organization.work_item_identity import projection_id_for_task, t
 from opc.layer2_organization.work_item_links import linked_work_item_id_for_task, set_linked_work_item_id
 from opc.layer3_agent.adapters.base import ExternalAgentAdapter
 from opc.layer3_agent.external_session_identity import (
+    NON_RESUMABLE_EXTERNAL_SESSION_STATUSES,
+    agent_resume_survives_run_failure,
     external_session_allows_resume,
     external_session_matches_provider_token,
     is_provider_session_token,
@@ -310,6 +312,13 @@ class ExternalAgentBroker:
             return False
         status = str(getattr(selected, "status", "") or "").strip().lower()
         if status in {"done", "suspended"}:
+            return True
+        if (
+            agent_resume_survives_run_failure(adapter.agent_type)
+            and status in NON_RESUMABLE_EXTERNAL_SESSION_STATUSES
+        ):
+            # The run outcome is terminal-but-failed, yet this provider keeps
+            # its transcript on disk — the token still resumes the thread.
             return True
         # The newest row is alive but not finalized (running / awaiting_human /
         # awaiting_peer). An approval or peer park is not evidence the thread
@@ -2987,6 +2996,7 @@ class ExternalAgentBroker:
         elif (
             role_session_id
             and result.status in self._SESSION_INVALIDATING_RESULT_STATUSES
+            and not agent_resume_survives_run_failure(adapter.agent_type)
             and hasattr(self.store, "get_role_session_adapter_state")
             and hasattr(self.store, "update_role_session_adapter_state")
         ):
@@ -3044,7 +3054,10 @@ class ExternalAgentBroker:
                 logger.opt(exception=True).debug(
                     "Failed to clear provider-stream role state after terminal failure"
                 )
-        if result.status in self._SESSION_INVALIDATING_RESULT_STATUSES:
+        if (
+            result.status in self._SESSION_INVALIDATING_RESULT_STATUSES
+            and not agent_resume_survives_run_failure(adapter.agent_type)
+        ):
             failed_token = str(
                 resume_session_id
                 or provider_session_id
