@@ -2355,6 +2355,7 @@ class ApprovalEngine:
         task: Task,
         action_name: str,
         metadata: dict[str, Any],
+        sandbox_override: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         call_context = dict(metadata.get("tool_call", {}) or {})
         arguments = dict(metadata.get("arguments", {}) or {})
@@ -2378,6 +2379,7 @@ class ApprovalEngine:
                 task,
                 action_name,
                 arguments,
+                sandbox_override=sandbox_override,
             ).envelope
             execution_identity = company_opaque_execution_identity(task)
         fingerprint = exact_tool_call_fingerprint(
@@ -2418,6 +2420,9 @@ class ApprovalEngine:
             task=task,
             action_name=action_name,
             metadata=metadata,
+            sandbox_override=dict(
+                dict(decision.metadata or {}).get("sandbox_override", {}) or {}
+            ),
         )
         non_replayable_action = bool(metadata.get("non_replayable_action", False))
         checkpoint_type = (

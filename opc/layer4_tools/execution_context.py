@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextvars
 import os
 import shutil
 import sys
@@ -10,6 +11,23 @@ from typing import Any
 
 from opc.core.config import OPCConfig
 from opc.core.native_permissions import native_sandbox_profile, normalize_native_approval_level
+
+
+_EXECUTION_CONTEXT_OVERRIDE: contextvars.ContextVar[dict[str, Any] | None] = (
+    contextvars.ContextVar("opc_tool_execution_context_override", default=None)
+)
+
+
+def install_execution_context_override(
+    override: dict[str, Any],
+) -> contextvars.Token:
+    """Install a coroutine-local override for one tool invocation."""
+
+    return _EXECUTION_CONTEXT_OVERRIDE.set(dict(override or {}))
+
+
+def reset_execution_context_override(token: contextvars.Token) -> None:
+    _EXECUTION_CONTEXT_OVERRIDE.reset(token)
 
 
 def platform_key() -> str:
@@ -95,7 +113,11 @@ def ensure_task_execution_context(task: Any, config: OPCConfig | None = None) ->
     return context
 
 
-def resolve_task_execution_context(task: Any = None) -> dict[str, Any]:
+def resolve_task_execution_context(
+    task: Any = None,
+    *,
+    override: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     if task is None:
         return {}
     metadata = getattr(task, "metadata", {}) or {}
@@ -132,6 +154,13 @@ def resolve_task_execution_context(task: Any = None) -> dict[str, Any]:
             existing = dict(context.get("inherited_env_vars", {}) or {})
             existing.update(env_vars)
             context["inherited_env_vars"] = existing
+
+    active_override = _EXECUTION_CONTEXT_OVERRIDE.get()
+    for values in (active_override, override):
+        if not values:
+            continue
+        for key, value in values.items():
+            context[str(key)] = dict(value) if isinstance(value, dict) else value
 
     return context
 

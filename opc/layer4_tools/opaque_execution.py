@@ -13,7 +13,7 @@ import hashlib
 import json
 import os
 import shutil
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -533,6 +533,8 @@ def build_company_opaque_execution_plan(
     task: Any,
     tool_name: str,
     arguments: Mapping[str, Any] | None,
+    *,
+    sandbox_override: Mapping[str, Any] | None = None,
 ) -> OpaqueExecutionPlan:
     """Resolve the exact launch that approval and the handler must share."""
 
@@ -542,7 +544,16 @@ def build_company_opaque_execution_plan(
             f"unsupported opaque company tool {name!r}"
         )
     normalized_arguments = _json_normalize(dict(arguments or {}))
-    context = _json_normalize(resolve_task_execution_context(task))
+    context = _json_normalize(
+        resolve_task_execution_context(
+            task,
+            override=(
+                {"sandbox": dict(sandbox_override)}
+                if sandbox_override
+                else None
+            ),
+        )
+    )
     roots = _resolved_roots(task, context)
     cwd = _resolved_cwd(normalized_arguments, roots=roots)
     inherited_env = dict(context.get("inherited_env_vars", {}) or {})
@@ -720,6 +731,72 @@ def build_company_opaque_execution_plan(
         effective_command=effective_command,
         active_prefix=active_prefix,
         preparation_error=preparation_error,
+    )
+
+
+def company_opaque_execution_plan_for_permit(
+    task: Any,
+    tool_name: str,
+    arguments: Mapping[str, Any] | None,
+    *,
+    permit_envelope: Mapping[str, Any] | None,
+    sandbox_override: Mapping[str, Any] | None = None,
+) -> OpaqueExecutionPlan:
+    """Rebuild a plan from its frozen permit, or from current policy pre-permit."""
+
+    frozen = _json_normalize(dict(permit_envelope or {}))
+    if frozen:
+        sandbox_override = dict(
+            dict(frozen.get("execution_context", {}) or {}).get("sandbox", {})
+            or {}
+        ) or None
+    return build_company_opaque_execution_plan(
+        task,
+        tool_name,
+        arguments,
+        sandbox_override=sandbox_override,
+    )
+
+
+def activate_approved_opaque_execution_plan(
+    plan: OpaqueExecutionPlan,
+    *,
+    sandbox_override: Mapping[str, Any] | None,
+) -> OpaqueExecutionPlan:
+    """Make an explicitly approved missing-wrapper launch executable.
+
+    When a sandbox wrapper is unavailable, the frozen envelope already
+    contains the exact direct argv shown to the owner.  Approval may therefore
+    clear only that policy preparation error; executable, argv, cwd,
+    environment, and the durable envelope remain unchanged.
+    """
+
+    override = _json_normalize(dict(sandbox_override or {}))
+    resolution = dict(plan.sandbox or {})
+    if (
+        not plan.preparation_error
+        or not plan.preparation_error.startswith("Sandbox mode `")
+        or bool(resolution.get("available", True))
+        or str(resolution.get("effective_mode", "") or "").strip().lower()
+        != "off"
+        or str(override.get("mode", "") or "").strip().lower()
+        not in {"off", "elevated"}
+        or not bool(override.get("allow_direct_fallback", False))
+    ):
+        return plan
+    context = dict(plan.context or {})
+    context["sandbox"] = override
+    effective_resolution = {
+        **resolution,
+        "effective_mode": "off",
+        "effective_wrapper": "none",
+        "fallback_used": True,
+    }
+    return replace(
+        plan,
+        context_json=_canonical_json(context),
+        sandbox_json=_canonical_json(effective_resolution),
+        preparation_error="",
     )
 
 

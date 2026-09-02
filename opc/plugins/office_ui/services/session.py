@@ -2,11 +2,9 @@
 
 from __future__ import annotations
 
-import asyncio
 import shutil
 import time
 import uuid
-from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -797,7 +795,7 @@ class SessionService:
     ) -> str:
         normalized = normalize_native_approval_level(
             level,
-            default=normalize_native_approval_level(engine.config.autonomy.native_approval_level),
+            default=self.resolve_task_native_approval_level(task, engine),
         )
         metadata = dict(getattr(task, "metadata", {}) or {})
         scope_id = str(
@@ -811,22 +809,28 @@ class SessionService:
         if getattr(engine, "approval_engine", None):
             engine.approval_engine.native_policy.set_session_level(scope_id, normalized)
         scoped_tasks = [task]
-        if getattr(engine, "store", None):
-            all_tasks = await engine.store.get_tasks(
-                project_id=getattr(task, "project_id", None) or engine.project_id or "default"
+        store = getattr(engine, "store", None)
+        get_tasks = getattr(store, "get_tasks", None)
+        if callable(get_tasks):
+            all_tasks = await get_tasks(
+                project_id=getattr(task, "project_id", None)
+                or getattr(engine, "project_id", None)
+                or "default"
             )
             scoped_tasks = tasks_in_native_permission_scope(
                 all_tasks,
                 root_session_id=str(getattr(task, "session_id", "") or ""),
                 scope_id=scope_id,
             ) or [task]
+        save_task = getattr(store, "save_task", None)
+        if callable(save_task):
             for candidate in scoped_tasks:
                 candidate.metadata = {
                     **dict(getattr(candidate, "metadata", {}) or {}),
                     "native_approval_level": normalized,
                     "native_permission_scope_id": scope_id,
                 }
-                await engine.store.save_task(candidate)
+                await save_task(candidate)
         if getattr(engine, "memory", None):
             for candidate in scoped_tasks:
                 session_id = str(getattr(candidate, "session_id", "") or "").strip()

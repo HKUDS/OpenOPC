@@ -11,7 +11,7 @@ import asyncio
 import unittest
 from datetime import datetime
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 from opc.plugins.office_ui.ws_handler import WSHandler
 
@@ -555,6 +555,37 @@ async def _case_live_rootless_card_ignores_event_child_actor() -> None:
     assert card["metadata"]["interaction_requester_session_id"] == "root-session"
 
 
+async def _case_collab_sync_replays_durable_owner_interactions_after_snapshot() -> None:
+    engine = SimpleNamespace()
+    handler = object.__new__(WSHandler)
+    handler._exec_mode = "company"
+    handler.agent_store = object()
+    handler.chat_store = object()
+    handler.event_adapter = object()
+    handler._engine_for_request = AsyncMock(return_value=(engine, "p1"))
+    order: list[str] = []
+
+    class Socket:
+        async def send_json(self, payload):
+            assert payload["type"] == "ack"
+            order.append("snapshot")
+
+    async def replay(*_args, **kwargs):
+        assert kwargs == {"engine": engine, "project_id": "p1"}
+        order.append("checkpoint")
+
+    handler._send_owner_interaction_baseline_for_client = AsyncMock(
+        side_effect=replay
+    )
+    with patch(
+        "opc.plugins.office_ui.ws_handler.build_collab_sync",
+        new=AsyncMock(return_value={"messages": []}),
+    ):
+        await handler._handle_collab_sync(Socket(), {"project_id": "p1"})
+
+    assert order == ["snapshot", "checkpoint"]
+
+
 class OfficeInteractionReplyTests(unittest.IsolatedAsyncioTestCase):
     async def test_interaction_reply_acks_while_conversation_lock_is_held(self) -> None:
         await _case_interaction_reply_acks_while_conversation_lock_is_held()
@@ -594,6 +625,9 @@ class OfficeInteractionReplyTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_live_rootless_card_ignores_event_child_actor(self) -> None:
         await _case_live_rootless_card_ignores_event_child_actor()
+
+    async def test_collab_sync_replays_durable_owner_interactions_after_snapshot(self) -> None:
+        await _case_collab_sync_replays_durable_owner_interactions_after_snapshot()
 
 
 def test_legacy_office_approval_paths_are_removed() -> None:

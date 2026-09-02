@@ -191,11 +191,13 @@ class CompanyArtifactOwnershipTests(unittest.IsolatedAsyncioTestCase):
         arguments: dict[str, object],
         runtime_session_id: str,
         decision: str = "approve_once",
+        sandbox_override: dict[str, object] | None = None,
     ) -> dict[str, object]:
         execution_envelope = build_company_opaque_execution_plan(
             task,
             tool_name,
             arguments,
+            sandbox_override=sandbox_override,
         ).envelope
         execution_identity = company_opaque_execution_identity(task)
         fingerprint = exact_tool_call_fingerprint(
@@ -1691,6 +1693,225 @@ class CompanyArtifactOwnershipTests(unittest.IsolatedAsyncioTestCase):
 
         observed = await asyncio.gather(observe(first), observe(second))
         self.assertEqual(observed, ["printf first", "printf second"])
+
+    async def test_approved_sandbox_fallback_keeps_exact_company_envelope(self) -> None:
+        self.owner_task.metadata["_execution_context"] = {
+            "workspace_root": str(self.root),
+            "output_root": str(self.root),
+            "comms_root": str(self.root / ".opc-comms"),
+            "sandbox": {
+                "platform": "linux",
+                "enabled": True,
+                "mode": "workspace-write",
+                "wrapper": "auto",
+                "fail_if_unavailable": True,
+                "allow_direct_fallback": False,
+                "allow_network": False,
+            },
+        }
+        await self.store.save_task(self.owner_task)
+        override = {
+            "platform": "linux",
+            "enabled": False,
+            "mode": "off",
+            "wrapper": "none",
+            "fail_if_unavailable": False,
+            "allow_direct_fallback": True,
+            "allow_network": True,
+            "grant_scope": "once",
+        }
+
+        def wrap(args, *, cwd, context):
+            _ = cwd
+            sandbox = dict(context.get("sandbox", {}) or {})
+            if str(sandbox.get("mode", "") or "") != "off":
+                raise RuntimeError(
+                    "Sandbox mode `workspace-write` is unavailable on linux "
+                    "and direct fallback is disabled."
+                )
+            return list(args), {
+                "platform": "linux",
+                "requested_mode": "off",
+                "effective_mode": "off",
+                "effective_wrapper": "none",
+                "available": True,
+                "fallback_used": False,
+            }
+
+        observed: list[dict[str, object]] = []
+        with patch(
+            "opc.layer4_tools.opaque_execution.wrap_command_for_context",
+            side_effect=wrap,
+        ):
+            for legacy in (False, True):
+                call_id = f"call-approved-fallback-{int(legacy)}"
+                arguments = {"command": f"printf approved-{int(legacy)}"}
+                runtime_session_id = "rt-approved-fallback"
+                planned = build_company_opaque_execution_plan(
+                    self.owner_task,
+                    "shell_exec",
+                    arguments,
+                )
+                execution_identity = company_opaque_execution_identity(
+                    self.owner_task
+                )
+                planned_fingerprint = exact_tool_call_fingerprint(
+                    tool_call_id=call_id,
+                    tool_name="shell_exec",
+                    arguments=arguments,
+                    runtime_session_id=runtime_session_id,
+                    execution_envelope=planned.envelope,
+                    execution_identity=execution_identity,
+                )
+                identity = {
+                    "project_id": "project-1",
+                    "delegation_run_id": "run-1",
+                    "work_item_id": "wi-owner",
+                    "runtime_task_id": self.owner_task.id,
+                    "claimed_work_item_attempt_seq": int(
+                        self.owner_task.metadata["claimed_work_item_attempt_seq"]
+                    ),
+                    "company_opaque_fingerprint": planned_fingerprint,
+                    "company_opaque_execution_envelope_digest": (
+                        opaque_execution_envelope_digest(planned.envelope)
+                    ),
+                }
+                await self.store.save_runtime_tool_call(
+                    runtime_session_id=runtime_session_id,
+                    tool_call_id=call_id,
+                    tool_name="shell_exec",
+                    arguments=arguments,
+                    task_id=self.owner_task.id,
+                    session_id=self.owner_task.session_id,
+                    metadata=identity,
+                )
+                permit = await self._executing_permit(
+                    self.owner_task,
+                    call_id=call_id,
+                    tool_name="shell_exec",
+                    arguments=arguments,
+                    runtime_session_id=runtime_session_id,
+                    sandbox_override=None if legacy else override,
+                )
+
+                async def effect() -> dict[str, object]:
+                    plan = current_opaque_execution_plan("shell_exec")
+                    assert plan is not None
+                    observed.append({
+                        "preparation_error": plan.preparation_error,
+                        "argv": list(plan.argv),
+                        "sandbox": plan.context.get("sandbox", {}),
+                    })
+                    return {"success": True}
+
+                result = await RuntimeCompanyControllerToolFence(
+                    store=self.store
+                ).run(
+                    task=self.owner_task,
+                    tool_name="shell_exec",
+                    arguments=arguments,
+                    tool_call={
+                        "id": call_id,
+                        "_approval_permit": permit,
+                        "_sandbox_override": override,
+                    },
+                    effect=effect,
+                )
+                self.assertTrue(result["success"], result)
+                completed = (
+                    await self.store.persist_runtime_tool_result_and_finish_permission(
+                        runtime_session_id=runtime_session_id,
+                        tool_name="shell_exec",
+                        payload={
+                            "success": True,
+                            "result": {"success": True, "exit_code": 0},
+                        },
+                        tool_call_id=call_id,
+                        task_id=self.owner_task.id,
+                        session_id=self.owner_task.session_id,
+                        message_id=f"message-{call_id}",
+                        metadata=identity,
+                        fingerprint=str(permit["fingerprint"]),
+                        checkpoint_id=str(permit["checkpoint_id"]),
+                        project_id="project-1",
+                        checkpoint_type="tool_permission",
+                        claim_id=str(permit["claim_id"]),
+                        consumer_id=str(permit["consumer_id"]),
+                    )
+                )
+                self.assertTrue(completed.applied, completed)
+
+        self.assertEqual(len(observed), 2)
+        for item in observed:
+            self.assertEqual(item["preparation_error"], "")
+            self.assertEqual(item["sandbox"]["mode"], "off")
+        self.assertEqual(
+            self.owner_task.metadata["_execution_context"]["sandbox"]["mode"],
+            "workspace-write",
+        )
+        with patch(
+            "opc.layer4_tools.opaque_execution.wrap_command_for_context",
+            side_effect=wrap,
+        ):
+            verified = await self.store.company_automated_verification_evidence(
+                self.owner_task,
+                ["printf approved-0", "printf approved-1"],
+            )
+        self.assertTrue(verified["verified"], verified)
+        results = await self.store.list_runtime_tool_results(
+            "rt-approved-fallback"
+        )
+        self.assertEqual(
+            [
+                item["metadata"]["company_opaque_execution_sandbox"]["mode"]
+                for item in results
+            ],
+            ["off", "workspace-write"],
+        )
+
+    async def test_reusable_native_grant_uses_its_exact_company_sandbox(self) -> None:
+        self.owner_task.metadata["_execution_context"] = {
+            "workspace_root": str(self.root),
+            "output_root": str(self.root),
+            "sandbox": {"mode": "workspace-write", "allow_network": False},
+        }
+        await self.store.save_task(self.owner_task)
+        override = {
+            "mode": "workspace-write",
+            "allow_network": True,
+            "grant_scope": "persisted",
+        }
+        observed: list[dict[str, object]] = []
+
+        async def effect() -> dict[str, object]:
+            plan = current_opaque_execution_plan("shell_exec")
+            assert plan is not None
+            observed.append(dict(plan.context.get("sandbox", {}) or {}))
+            return {"success": True}
+
+        result = await RuntimeCompanyControllerToolFence(store=self.store).run(
+            task=self.owner_task,
+            tool_name="shell_exec",
+            arguments={"command": "printf reusable-grant"},
+            tool_call={
+                "id": "call-reusable-grant",
+                "_runtime_session_id": "rt-reusable-grant",
+                "_native_permission_auto_sign": {
+                    "level": "auto",
+                    "policy_source": "session_approval",
+                    "scope_id": "root-session",
+                },
+                "_sandbox_override": override,
+            },
+            effect=effect,
+        )
+
+        self.assertTrue(result["success"], result)
+        self.assertEqual(observed, [override])
+        self.assertEqual(
+            self.owner_task.metadata["_execution_context"]["sandbox"],
+            {"mode": "workspace-write", "allow_network": False},
+        )
 
     def test_opaque_payload_limit_fails_closed(self) -> None:
         with self.assertRaises(OpaqueExecutionEnvelopeError):

@@ -18538,25 +18538,6 @@ class OPCStore:
                     "invalid_identity",
                     "opaque ToolCall execution identity differs from its durable Task chain",
                 )
-            try:
-                durable_execution_envelope = (
-                    build_company_opaque_execution_plan(
-                        durable_effect_task,
-                        clean_tool_name,
-                        normalized_arguments,
-                    ).envelope
-                )
-            except (OpaqueExecutionEnvelopeError, TypeError, ValueError):
-                return await _deny(
-                    "invalid_envelope",
-                    "opaque ToolCall durable launch envelope cannot be resolved",
-                )
-            if durable_execution_envelope != normalized_execution_envelope:
-                return await _deny(
-                    "invalid_envelope",
-                    "opaque ToolCall launch envelope differs from durable Task state",
-                )
-
             (
                 _,
                 _,
@@ -18651,6 +18632,35 @@ class OPCStore:
                 return await _deny(
                     "invalid_permit",
                     "opaque ToolCall lacks its exact executing human permit",
+                )
+            # The permit is created inside the runtime after model-supplied
+            # policy markers have been removed.  Human permits have also
+            # matched their durable checkpoint above.  Reconstruct from that
+            # frozen sandbox so reusable grants and one-shot approvals execute
+            # exactly the envelope authorized by the native policy.
+            sandbox_override = dict(
+                dict(
+                    normalized_execution_envelope.get("execution_context", {})
+                    or {}
+                ).get("sandbox", {})
+                or {}
+            ) or None
+            try:
+                durable_execution_envelope = build_company_opaque_execution_plan(
+                    durable_effect_task,
+                    clean_tool_name,
+                    normalized_arguments,
+                    sandbox_override=sandbox_override,
+                ).envelope
+            except (OpaqueExecutionEnvelopeError, TypeError, ValueError):
+                return await _deny(
+                    "invalid_envelope",
+                    "opaque ToolCall durable launch envelope cannot be resolved",
+                )
+            if durable_execution_envelope != normalized_execution_envelope:
+                return await _deny(
+                    "invalid_envelope",
+                    "opaque ToolCall launch envelope differs from durable Task state",
                 )
             async with transaction_db.execute(
                 """SELECT 1 FROM runtime_tool_results
@@ -19030,7 +19040,7 @@ class OPCStore:
                         execution_identity = company_opaque_execution_identity(
                             durable_task
                         )
-                        expected_fingerprint = exact_tool_call_fingerprint(
+                        planned_fingerprint = exact_tool_call_fingerprint(
                             tool_call_id=call["tool_call_id"],
                             tool_name="shell_exec",
                             arguments=dict(call["arguments"] or {}),
@@ -19038,7 +19048,7 @@ class OPCStore:
                             execution_envelope=plan.envelope,
                             execution_identity=execution_identity,
                         )
-                        expected_envelope_digest = (
+                        planned_envelope_digest = (
                             opaque_execution_envelope_digest(plan.envelope)
                         )
                     except (
@@ -19057,28 +19067,55 @@ class OPCStore:
                             )
                             or ""
                         ).strip()
-                        == expected_fingerprint
+                        == planned_fingerprint
                         and str(
                             call_metadata.get(
                                 "company_opaque_execution_envelope_digest", ""
                             )
                             or ""
                         ).strip()
-                        == expected_envelope_digest
+                        == planned_envelope_digest
                         and str(
                             dict(call["arguments"] or {}).get("command", "")
                             or ""
                         ).strip()
                         == command
-                        and (
-                            call["tool_call_id"],
-                            expected_fingerprint,
-                        )
-                        in fence_records
                     ):
                         continue
                     for result in results:
                         result_metadata = dict(result["metadata"] or {})
+                        try:
+                            executed_plan = build_company_opaque_execution_plan(
+                                durable_task,
+                                "shell_exec",
+                                dict(call["arguments"] or {}),
+                                sandbox_override=dict(
+                                    result_metadata.get(
+                                        "company_opaque_execution_sandbox", {}
+                                    )
+                                    or {}
+                                )
+                                or None,
+                            )
+                            executed_fingerprint = exact_tool_call_fingerprint(
+                                tool_call_id=call["tool_call_id"],
+                                tool_name="shell_exec",
+                                arguments=dict(call["arguments"] or {}),
+                                runtime_session_id=runtime_session_id,
+                                execution_envelope=executed_plan.envelope,
+                                execution_identity=execution_identity,
+                            )
+                            executed_envelope_digest = (
+                                opaque_execution_envelope_digest(
+                                    executed_plan.envelope
+                                )
+                            )
+                        except (
+                            OpaqueExecutionEnvelopeError,
+                            TypeError,
+                            ValueError,
+                        ):
+                            continue
                         if not (
                             result["tool_call_id"] == call["tool_call_id"]
                             and result["task_id"] == call["task_id"]
@@ -19092,14 +19129,19 @@ class OPCStore:
                                 )
                                 or ""
                             ).strip()
-                            == expected_fingerprint
+                            == executed_fingerprint
                             and str(
                                 result_metadata.get(
                                     "company_opaque_execution_envelope_digest", ""
                                 )
                                 or ""
                             ).strip()
-                            == expected_envelope_digest
+                            == executed_envelope_digest
+                            and (
+                                call["tool_call_id"],
+                                executed_fingerprint,
+                            )
+                            in fence_records
                             and _result_passed(result["payload"])
                         ):
                             continue
@@ -19108,7 +19150,7 @@ class OPCStore:
                                 result["created_at"],
                                 dict(result["payload"].get("result", {}) or {}),
                                 call["tool_call_id"],
-                                expected_fingerprint,
+                                executed_fingerprint,
                             )
                         )
                 if not candidates:
@@ -31319,6 +31361,28 @@ class OPCStore:
                     outcome="conflict", checkpoint=checkpoint
                 )
 
+            durable_result_metadata = json.loads(
+                _json_dumps(dict(metadata or {}))
+            )
+            execution_envelope = dict(
+                permit.get("execution_envelope", {}) or {}
+            )
+            if tool_name in {"shell_exec", "python_exec"} and execution_envelope:
+                durable_result_metadata.update(
+                    {
+                        "company_opaque_fingerprint": fingerprint,
+                        "company_opaque_execution_envelope_digest": (
+                            opaque_execution_envelope_digest(execution_envelope)
+                        ),
+                        "company_opaque_execution_sandbox": dict(
+                            dict(
+                                execution_envelope.get("execution_context", {})
+                                or {}
+                            ).get("sandbox", {})
+                            or {}
+                        ),
+                    }
+                )
             await self._db.execute(
                 """INSERT OR REPLACE INTO runtime_tool_results
                    (result_record_id, runtime_session_id, task_id, session_id,
@@ -31333,7 +31397,7 @@ class OPCStore:
                     tool_call_id,
                     tool_name,
                     _json_dumps(payload or {}),
-                    _json_dumps(metadata or {}),
+                    _json_dumps(durable_result_metadata),
                     now.isoformat(),
                 ),
             )

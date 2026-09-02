@@ -19,6 +19,10 @@ from opc.layer3_agent.runtime_v2.permissions import RuntimePermissionAdapter
 from opc.layer3_agent.runtime_v2.runtime import NativeRuntimeV2
 from opc.layer3_agent.runtime_v2.streaming_tool_executor import StreamingToolExecutor
 from opc.layer3_agent.runtime_v2.subagents import SubagentManager, SubagentState
+from opc.layer3_agent.runtime_v2.tool_hooks import (
+    RuntimeToolHookBus,
+    RuntimeToolHookContext,
+)
 from opc.layer3_agent.runtime_v2.tool_planner import ToolPlanner
 from opc.layer4_tools.agent_runtime import create_agent_runtime_tools
 from opc.layer4_tools.registry import (
@@ -2252,6 +2256,41 @@ class PermissionPolicyGrantTests(unittest.IsolatedAsyncioTestCase):
 
 
 class StreamingToolExecutorTests(unittest.IsolatedAsyncioTestCase):
+    async def test_permission_hook_propagates_only_trusted_sandbox_override(self) -> None:
+        runtime = NativeRuntimeV2(
+            llm=_StubLLM(),
+            tool_registry=ToolRegistry(),
+            config=OPCConfig(),
+        )
+        trusted = {"mode": "off", "allow_direct_fallback": True}
+        context = RuntimeToolHookContext(
+            phase="pre",
+            tool_name="shell_exec",
+            call={
+                "id": "call-trusted-override",
+                "_sandbox_override": {"mode": "model-supplied"},
+            },
+            task=Task(id="trusted-override-task"),
+            predicted_permission=SimpleNamespace(
+                resolution=PermissionResolution.ALLOW,
+                metadata={"sandbox_override": trusted},
+                source="session_approval",
+            ),
+        )
+
+        result = await runtime._approval_pre_hook(
+            context,
+            permission_resolver=RuntimePermissionAdapter(),
+            runtime_session_id="rt-trusted-override",
+        )
+
+        self.assertIsNone(result)
+        self.assertEqual(context.call["_sandbox_override"], trusted)
+        self.assertEqual(
+            context.state["metadata"]["native_execution_sandbox_override"],
+            trusted,
+        )
+
     async def test_executor_emits_permission_requested_for_ask_flow(self) -> None:
         registry = ToolRegistry()
 
@@ -2288,6 +2327,77 @@ class StreamingToolExecutorTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("elapsed_ms", completed_payload)
         self.assertIn("result_summary", completed_payload)
 
+    async def test_tool_started_is_emitted_only_after_permission_hook_resolves(self) -> None:
+        registry = ToolRegistry()
+        executed: list[str] = []
+
+        async def shell_tool(command: str) -> dict[str, str]:
+            executed.append(command)
+            return {"stdout": command}
+
+        registry.register(ToolDefinition(
+            name="shell_exec",
+            description="shell",
+            parameters={"type": "object", "properties": {}},
+            func=shell_tool,
+            requires_confirmation=True,
+            concurrency_safe=False,
+            read_only=False,
+        ))
+        events: list[tuple[str, dict[str, object]]] = []
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        hook_bus = RuntimeToolHookBus()
+
+        async def permission_hook(_context):
+            entered.set()
+            await release.wait()
+            return {
+                "approval": {
+                    "action": "auto_approve",
+                    "human_reply": "approve_once",
+                }
+            }
+
+        hook_bus.register_pre_hook("permission", permission_hook)
+        executor = StreamingToolExecutor(
+            registry=registry,
+            planner=ToolPlanner(registry),
+            permission_resolver=_policy_adapter(),
+            hook_bus=hook_bus,
+            emit_event=lambda event_type, payload: _async_append(
+                events, event_type, payload
+            ),
+        )
+        running = asyncio.create_task(executor.execute([
+            {
+                "id": "call-waiting",
+                "function": "shell_exec",
+                "arguments": {"command": "printf ready"},
+            },
+        ]))
+        await asyncio.wait_for(entered.wait(), timeout=1)
+        self.assertIn("permission_requested", [name for name, _ in events])
+        self.assertNotIn("tool_started", [name for name, _ in events])
+        self.assertEqual(executed, [])
+
+        release.set()
+        await asyncio.wait_for(running, timeout=1)
+        event_types = [name for name, _ in events]
+        self.assertLess(
+            event_types.index("permission_requested"),
+            event_types.index("permission_resolved"),
+        )
+        self.assertLess(
+            event_types.index("permission_resolved"),
+            event_types.index("tool_started"),
+        )
+        self.assertLess(
+            event_types.index("tool_started"),
+            event_types.index("tool_completed"),
+        )
+        self.assertEqual(executed, ["printf ready"])
+
     async def test_executor_short_circuits_denied_preflight(self) -> None:
         registry = ToolRegistry()
         executed: list[str] = []
@@ -2317,6 +2427,7 @@ class StreamingToolExecutorTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(results[0]["result"]["success"])
         self.assertEqual(executed, [])
         self.assertTrue(any(name == "permission_requested" for name, _ in events))
+        self.assertFalse(any(name == "tool_started" for name, _ in events))
 
     async def test_executor_never_silently_escalates_sandbox(self) -> None:
         registry = ToolRegistry()

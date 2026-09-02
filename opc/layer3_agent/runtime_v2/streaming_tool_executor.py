@@ -19,6 +19,10 @@ from opc.layer3_agent.runtime_v2.tool_hooks import (
     RuntimeToolHookContext,
 )
 from opc.layer3_agent.runtime_v2.tool_planner import ToolBatch, ToolPlanner
+from opc.layer4_tools.execution_context import (
+    install_execution_context_override,
+    reset_execution_context_override,
+)
 from opc.layer4_tools.registry import ToolRegistry
 
 
@@ -170,8 +174,10 @@ class StreamingToolExecutor:
             execution_context = dict(task.metadata.get("_execution_context", {}) or {})
             execution_context["sandbox"] = sandbox
             task.metadata["_execution_context"] = execution_context
-        started_at_ms = _now_ms()
-        started_at_monotonic = time.monotonic()
+        request_started_at_ms = _now_ms()
+        request_started_at_monotonic = time.monotonic()
+        execution_started_at_ms: int | None = None
+        execution_started_at_monotonic: float | None = None
         if self.emit_event:
             await self.emit_event(
                 "permission_predicted",
@@ -185,7 +191,7 @@ class StreamingToolExecutor:
                     "risk_level": predicted.risk_level.value,
                     "rationale": predicted.rationale,
                     "source": predicted.source,
-                    "started_at_ms": started_at_ms,
+                    "started_at_ms": request_started_at_ms,
                 },
             )
         if self.emit_event and predicted.resolution != PermissionResolution.ALLOW:
@@ -203,19 +209,6 @@ class StreamingToolExecutor:
                     "source": predicted.source,
                 },
             )
-        if self.emit_event:
-            await self.emit_event(
-                "tool_started",
-                {
-                    "batch_id": batch_id,
-                    "tool_call_id": call.get("id", ""),
-                    "tool_name": tool_name,
-                    "arguments": arguments,
-                    "predicted_permission": predicted.resolution.value,
-                    "started_at_ms": started_at_ms,
-                },
-            )
-
         if batch_state is not None and self.converge_on_parallel_failure and batch_state["cascade_event"].is_set():
             return await self._build_converged_result(call, batch_state, batch_id=batch_id)
 
@@ -253,6 +246,39 @@ class StreamingToolExecutor:
             }
             decision = self.permission_resolver.decision_from_result(tool_name, arguments, result)
         else:
+            decision = self.permission_resolver.decision_from_result(
+                tool_name,
+                arguments,
+                {"approval": dict(hook_context.state.get("approval", {}) or {})},
+            )
+            if self.emit_event:
+                await self.emit_event(
+                    "permission_resolved",
+                    {
+                        "batch_id": batch_id,
+                        "tool_call_id": call.get("id", ""),
+                        "tool_name": tool_name,
+                        "arguments": arguments,
+                        "resolution": decision.resolution.value,
+                        "scope": decision.scope.value,
+                        "rationale": decision.rationale,
+                    },
+                )
+            execution_started_at_ms = _now_ms()
+            tool_started_monotonic = time.monotonic()
+            execution_started_at_monotonic = tool_started_monotonic
+            if self.emit_event:
+                await self.emit_event(
+                    "tool_started",
+                    {
+                        "batch_id": batch_id,
+                        "tool_call_id": call.get("id", ""),
+                        "tool_name": tool_name,
+                        "arguments": arguments,
+                        "predicted_permission": predicted.resolution.value,
+                        "started_at_ms": execution_started_at_ms,
+                    },
+                )
             last_progress: dict[str, str] = {"stream": "", "text": ""}
             last_progress_at = {"value": time.monotonic()}
             heartbeat_active = {"value": True}
@@ -275,7 +301,7 @@ class StreamingToolExecutor:
                                 "phase": "running",
                                 "message": f"{tool_name} still running",
                                 "heartbeat": True,
-                                "elapsed_ms": int((now - started_at_monotonic) * 1000),
+                                "elapsed_ms": int((now - tool_started_monotonic) * 1000),
                             },
                         )
 
@@ -306,7 +332,7 @@ class StreamingToolExecutor:
                             "tool_call_id": call.get("id", ""),
                             "tool_name": tool_name,
                             "stream": stream_name,
-                            "elapsed_ms": int((last_progress_at["value"] - started_at_monotonic) * 1000),
+                            "elapsed_ms": int((last_progress_at["value"] - tool_started_monotonic) * 1000),
                             **payload,
                         },
                     )
@@ -350,7 +376,7 @@ class StreamingToolExecutor:
                     hook_context = await self.hook_bus.run_failure_hooks(hook_context)
                     result = dict(hook_context.result or result)
             decision = self.permission_resolver.decision_from_result(tool_name, arguments, result)
-        if self.emit_event:
+        if self.emit_event and execution_started_at_ms is None:
             await self.emit_event(
                 "permission_resolved",
                 {
@@ -363,15 +389,26 @@ class StreamingToolExecutor:
                     "rationale": decision.rationale,
                 },
             )
+        if self.emit_event:
+            completed_started_at_ms = (
+                execution_started_at_ms or request_started_at_ms
+            )
+            completed_started_at_monotonic = (
+                execution_started_at_monotonic
+                if execution_started_at_monotonic is not None
+                else request_started_at_monotonic
+            )
             await self.emit_event(
                 "tool_completed",
                 {
                     "batch_id": batch_id,
                     "tool_call_id": call.get("id", ""),
                     "tool_name": tool_name,
-                    "started_at_ms": started_at_ms,
+                    "started_at_ms": completed_started_at_ms,
                     "completed_at_ms": _now_ms(),
-                    "elapsed_ms": int((time.monotonic() - started_at_monotonic) * 1000),
+                    "elapsed_ms": int(
+                        (time.monotonic() - completed_started_at_monotonic) * 1000
+                    ),
                     "success": bool(result.get("success", True)),
                     "result_summary": _result_summary(result),
                     "result_preview": json.dumps(result, ensure_ascii=False, default=str)[:800],
@@ -429,14 +466,16 @@ class StreamingToolExecutor:
                 skip_approval=True,
             )
 
-        original_context: dict[str, Any] | None = None
         sandbox_override = dict((call or {}).get("_sandbox_override", {}) or {})
-        if task is not None and sandbox_override:
-            task.metadata = dict(getattr(task, "metadata", {}) or {})
-            original_context = dict(task.metadata.get("_execution_context", {}) or {})
-            elevated_context = dict(original_context)
-            elevated_context["sandbox"] = sandbox_override
-            task.metadata["_execution_context"] = elevated_context
+        override_token = None
+        # Company shell/Python handlers consume the immutable plan installed by
+        # the controller fence. Other native tools resolve this coroutine-local
+        # context directly. Never mutate the shared Task: parallel calls may
+        # carry different one-shot grants.
+        if task is not None and sandbox_override and not is_company_runtime_task(task):
+            override_token = install_execution_context_override(
+                {"sandbox": sandbox_override}
+            )
         try:
             return await self.controller_tool_fence.run(
                 task=task,
@@ -450,8 +489,8 @@ class StreamingToolExecutor:
                 effect=_effect,
             )
         finally:
-            if task is not None and original_context is not None:
-                task.metadata["_execution_context"] = original_context
+            if override_token is not None:
+                reset_execution_context_override(override_token)
 
     async def _build_converged_result(
         self,

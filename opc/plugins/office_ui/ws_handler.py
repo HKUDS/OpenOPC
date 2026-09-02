@@ -3308,6 +3308,15 @@ class WSHandler:
         if data.get("view_generation") is not None:
             result["view_generation"] = data.get("view_generation")
         await ws.send_json({"type": "ack", "payload": result})
+        # The full sync replaces the client's persisted ChatStore snapshot.
+        # Owner-interaction cards are durable ExecutionCheckpoints rather than
+        # chat rows, so replay them after every replacement, not only after a
+        # websocket reconnect or a kanban push.
+        await self._send_owner_interaction_baseline_for_client(
+            ws,
+            engine=engine,
+            project_id=project_id,
+        )
 
     async def _handle_project_index(self, ws: Any, data: dict) -> None:
         engine, project_id = await self._engine_for_request(data)

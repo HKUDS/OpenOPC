@@ -14,9 +14,10 @@ from opc.layer4_tools.file_ops import (
     file_mutation_paths,
 )
 from opc.layer4_tools.opaque_execution import (
+    activate_approved_opaque_execution_plan,
     OpaqueExecutionEnvelopeError,
     OpaqueExecutionPlan,
-    build_company_opaque_execution_plan,
+    company_opaque_execution_plan_for_permit,
     company_opaque_execution_identity,
     exact_tool_call_fingerprint,
     install_opaque_execution_plan,
@@ -517,12 +518,23 @@ class RuntimeCompanyControllerToolFence:
                 },
             }
         execution_plan: OpaqueExecutionPlan | None = None
+        normalized_tool_call = dict(tool_call or {})
+        sandbox_override = dict(
+            normalized_tool_call.get("_sandbox_override", {}) or {}
+        )
         if normalized_tool_name in {"shell_exec", "python_exec"}:
             try:
-                execution_plan = build_company_opaque_execution_plan(
+                permit = dict(
+                    normalized_tool_call.get("_approval_permit", {}) or {}
+                )
+                execution_plan = company_opaque_execution_plan_for_permit(
                     task,
                     normalized_tool_name,
                     normalized_arguments,
+                    permit_envelope=dict(
+                        permit.get("execution_envelope", {}) or {}
+                    ),
+                    sandbox_override=sandbox_override,
                 )
             except (OpaqueExecutionEnvelopeError, TypeError, ValueError) as exc:
                 return {
@@ -538,11 +550,16 @@ class RuntimeCompanyControllerToolFence:
             task=task,
             tool_name=normalized_tool_name,
             arguments=normalized_arguments,
-            tool_call=dict(tool_call or {}),
+            tool_call=normalized_tool_call,
             execution_plan=execution_plan,
         )
         if opaque_block is not None:
             return opaque_block
+        if execution_plan is not None and sandbox_override:
+            execution_plan = activate_approved_opaque_execution_plan(
+                execution_plan,
+                sandbox_override=sandbox_override,
+            )
         ownership_block = await self._claim_file_mutation(
             credential=credential,
             task=task,

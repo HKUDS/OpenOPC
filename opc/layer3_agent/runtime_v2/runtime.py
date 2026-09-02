@@ -44,7 +44,9 @@ from opc.layer3_agent.prompt_harness.artifacts import build_runtime_artifact_rec
 from opc.layer3_agent.prompt_harness.types import RuntimeArtifact
 from opc.layer4_tools.execution_context import ensure_task_execution_context
 from opc.layer4_tools.opaque_execution import (
+    OpaqueExecutionEnvelopeError,
     build_company_opaque_execution_plan,
+    company_opaque_execution_plan_for_permit,
     company_opaque_execution_identity,
     exact_tool_call_fingerprint,
     opaque_execution_envelope_digest,
@@ -1574,12 +1576,24 @@ class NativeRuntimeV2:
         # ToolCall schema.  Always discard any incoming look-alike value
         # before attaching policy state computed in this process.
         context.call.pop("_native_permission_auto_sign", None)
+        context.call.pop("_sandbox_override", None)
         context.call["_runtime_session_id"] = str(runtime_session_id or "")
+
+        def _apply_sandbox_override(value: Any) -> None:
+            if not isinstance(value, dict) or not value:
+                return
+            sandbox_override = dict(value)
+            context.call["_sandbox_override"] = sandbox_override
+            context.state.setdefault("metadata", {})[
+                "native_execution_sandbox_override"
+            ] = sandbox_override
+
         if (
             predicted is not None
             and getattr(predicted, "resolution", None) == PermissionResolution.ALLOW
         ):
             predicted_metadata = dict(getattr(predicted, "metadata", {}) or {})
+            _apply_sandbox_override(predicted_metadata.get("sandbox_override"))
             level = str(predicted_metadata.get("native_approval_level", "") or "")
             # Company shell/Python effects retain the controller-owned exact
             # effect fence even when the native permission policy allows the
@@ -1636,14 +1650,24 @@ class NativeRuntimeV2:
             permit_fingerprint = str(permit.get("fingerprint", "") or "").strip()
             execution_envelope: dict[str, Any] = {}
             execution_identity: dict[str, Any] = {}
+            sandbox_override = dict(
+                dict(getattr(predicted, "metadata", {}) or {}).get(
+                    "sandbox_override", {},
+                )
+                or {}
+            )
             if (
                 context.tool_name in {"shell_exec", "python_exec"}
                 and is_company_runtime_task(context.task)
             ):
-                execution_envelope = build_company_opaque_execution_plan(
+                execution_envelope = company_opaque_execution_plan_for_permit(
                     context.task,
                     context.tool_name,
                     context.arguments,
+                    permit_envelope=dict(
+                        permit.get("execution_envelope", {}) or {}
+                    ),
+                    sandbox_override=sandbox_override,
                 ).envelope
                 execution_identity = company_opaque_execution_identity(
                     context.task
@@ -1682,14 +1706,7 @@ class NativeRuntimeV2:
                 )
                 if canonical_permit:
                     context.call["_approval_permit"] = canonical_permit
-                sandbox_override = dict(
-                    dict(getattr(predicted, "metadata", {}) or {}).get(
-                        "sandbox_override", {},
-                    )
-                    or {}
-                )
-                if sandbox_override:
-                    context.call["_sandbox_override"] = sandbox_override
+                _apply_sandbox_override(sandbox_override)
                 return {
                     "approval": {
                         "action": "auto_approve",
@@ -1747,8 +1764,8 @@ class NativeRuntimeV2:
             **dict(getattr(decision, "metadata", {}) or {}),
         }
         sandbox_override = approval_payload.get("sandbox_override")
-        if allowed and isinstance(sandbox_override, dict):
-            context.call["_sandbox_override"] = dict(sandbox_override)
+        if allowed:
+            _apply_sandbox_override(sandbox_override)
         approval_checkpoint_id = str(
             approval_payload.get("approval_checkpoint_id", "") or ""
         ).strip()
@@ -4302,23 +4319,64 @@ class NativeRuntimeV2:
                 "source": str(getattr(decision, "source", "") or ""),
             },
         }
+        tool_name = str(call.get("function", "") or "")
         permit = self._approved_resume_tool_call(
             task,
             tool_call_id=str(call.get("id", "") or ""),
         )
-        if permit:
+        execution_envelope = dict(
+            permit.get("execution_envelope", {}) or {}
+        )
+        execution_fingerprint = str(
+            permit.get("fingerprint", "") or ""
+        ).strip()
+        if (
+            not execution_envelope
+            and is_company_runtime_task(task)
+            and tool_name in {"shell_exec", "python_exec"}
+        ):
+            try:
+                plan = build_company_opaque_execution_plan(
+                    task,
+                    tool_name,
+                    dict(call.get("arguments", {}) or {}),
+                    sandbox_override=dict(
+                        dict(hook_metadata or {}).get(
+                            "native_execution_sandbox_override", {}
+                        )
+                        or {}
+                    )
+                    or None,
+                )
+                execution_envelope = plan.envelope
+                execution_fingerprint = exact_tool_call_fingerprint(
+                    tool_call_id=str(call.get("id", "") or ""),
+                    tool_name=tool_name,
+                    arguments=dict(call.get("arguments", {}) or {}),
+                    runtime_session_id=runtime_session_id,
+                    execution_envelope=execution_envelope,
+                    execution_identity=company_opaque_execution_identity(task),
+                )
+            except (OpaqueExecutionEnvelopeError, TypeError, ValueError):
+                pass
+        if execution_envelope and execution_fingerprint:
             result_metadata.update(
                 {
-                    "company_opaque_fingerprint": str(
-                        permit.get("fingerprint", "") or ""
-                    ).strip(),
+                    "company_opaque_fingerprint": execution_fingerprint,
                     "company_opaque_execution_envelope_digest": (
                         opaque_execution_envelope_digest(
-                            dict(permit.get("execution_envelope", {}) or {})
+                            execution_envelope
                         )
+                    ),
+                    "company_opaque_execution_sandbox": dict(
+                        dict(
+                            execution_envelope.get("execution_context", {}) or {}
+                        ).get("sandbox", {})
+                        or {}
                     ),
                 }
             )
+        if permit:
             coordinator = self.interaction_coordinator
             if coordinator is None:
                 raise RuntimeError(
