@@ -216,23 +216,37 @@ async def _serve_spa_fallback(request: aiohttp.web.Request) -> aiohttp.web.Respo
 
 def _make_attachment_handler(engine: OPCEngine):
     """Factory that returns an HTTP handler for serving stored attachments."""
-    import mimetypes as _mt
 
-    async def _handle(request: aiohttp.web.Request) -> aiohttp.web.Response:
+    def _is_safe_component(part: str) -> bool:
+        return bool(part) and "/" not in part and "\\" not in part and ".." not in part
+
+    async def _handle(request: aiohttp.web.Request) -> aiohttp.web.StreamResponse:
         attachment_id = request.match_info["attachment_id"]
         filename = request.match_info["filename"]
-        att_store = getattr(engine, "attachment_store", None)
-        if not att_store:
-            return aiohttp.web.Response(status=503, text="Attachment store not available")
-        file_path = att_store.base_dir / attachment_id / filename
-        if not file_path.is_file():
-            return aiohttp.web.Response(status=404, text="Not found")
-        # Path-traversal guard
-        if not _is_under_path(file_path.resolve(), att_store.base_dir.resolve()):
+        if not (_is_safe_component(attachment_id) and _is_safe_component(filename)):
             return aiohttp.web.Response(status=403, text="Forbidden")
-        ct, _ = _mt.guess_type(filename)
-        headers = {"Cache-Control": "public, max-age=86400"}
-        return aiohttp.web.FileResponse(file_path, headers=headers)
+
+        # Attachments are written by the per-project engine that handled the
+        # upload (projects/{pid}/attachments/...), so the file may live under
+        # any project's dir — not only the root engine's active one.
+        candidates: list[Path] = []
+        att_store = getattr(engine, "attachment_store", None)
+        if att_store:
+            candidates.append(att_store.base_dir / attachment_id / filename)
+        projects_root = Path(engine.opc_home) / "projects"
+        if projects_root.is_dir():
+            for project_dir in sorted(projects_root.iterdir()):
+                candidates.append(project_dir / "attachments" / attachment_id / filename)
+
+        for file_path in candidates:
+            if not file_path.is_file():
+                continue
+            attachments_root = file_path.parent.parent
+            if not _is_under_path(file_path.resolve(), attachments_root.resolve()):
+                continue
+            headers = {"Cache-Control": "public, max-age=86400"}
+            return aiohttp.web.FileResponse(file_path, headers=headers)
+        return aiohttp.web.Response(status=404, text="Not found")
 
     return _handle
 
