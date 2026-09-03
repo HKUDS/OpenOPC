@@ -23,6 +23,7 @@
 
 ## News
 
+- **Sep 3, 2026 — JiuwenSwarm compatibility update:** Setup now uses the verified JiuwenSwarm `0.2.4b4` and openJiuwen `0.1.16` versions.
 - **Sep 1, 2026 — A more responsive Office UI:** Office and developer-tool rendering are now isolated from high-frequency runtime events, reducing unnecessary full-app updates and keeping Workspace and Org views smoother during long-running sessions.
 - **Aug 26, 2026 — JiuwenSwarm integration:** Use JiuwenSwarm-single as a single agent or JiuwenSwarm-team as one opaque Team in both Task and Company modes — a self-organizing swarm that plugs into your org seamlessly. [Setup and role behavior](#jiuwen-integration).
 - **Jul 14, 2026 — More resilient company runs:** Company-mode sessions now recover and resume more seamlessly while preserving agent identity, shared role context, delegation, and review progress.
@@ -572,17 +573,20 @@ MODEL_NAME="ark-code-latest"
 MODEL_PROVIDER="OpenAI"
 ```
 
-JiuwenSwarm requires Python 3.11–3.13. Install JiuwenSwarm and the OpenOPC
-Gateway adapter, initialize Jiuwen, then verify both choices.
+JiuwenSwarm requires Python 3.11–3.13. Install the verified JiuwenSwarm
+`0.2.4b4` / openJiuwen `0.1.16` combination and the OpenOPC Gateway adapter
+from the OpenOPC repository root.
 
 macOS / Linux:
 
 ```bash
-python -m pip install jiuwenswarm
 python -m pip install -e ".[jiuwen]"
+uv tool install --force --python 3.12 \
+  --overrides docs/jiuwen-openjiuwen-overrides.txt \
+  "https://github.com/openJiuwen-ai/jiuwenswarm/archive/ec305b70bf4a82f3603ea1a7b3ddc212386662df.tar.gz"
 jiuwenswarm-init
 chmod 600 ~/.jiuwenswarm/config/.env
-jiuwenswarm-start --restart default
+jiuwenswarm-start app
 opc agents preflight jiuwen
 opc agents preflight jiuwenswarm
 opc exec --mode task --agent jiuwen "Handle this task"
@@ -592,13 +596,18 @@ opc exec --mode task --agent jiuwenswarm "Have one Team handle this task"
 Windows PowerShell / Command Prompt (no `chmod` step):
 
 ```powershell
-py -3.12 -m pip install jiuwenswarm
 py -3.12 -m pip install -e ".[jiuwen]"
+uv tool install --force --python 3.12 `
+  --overrides docs/jiuwen-openjiuwen-overrides.txt `
+  "https://github.com/openJiuwen-ai/jiuwenswarm/archive/ec305b70bf4a82f3603ea1a7b3ddc212386662df.tar.gz"
 jiuwenswarm-init
-jiuwenswarm-start --restart default
+jiuwenswarm-start app
 opc agents preflight jiuwen
 opc agents preflight jiuwenswarm
 ```
+
+`jiuwenswarm-start app` stays in the foreground; keep that terminal open while
+using OpenOPC.
 
 On Windows the Jiuwen configuration is normally stored under
 `%USERPROFILE%\.jiuwenswarm\config\.env`; on macOS/Linux it is under

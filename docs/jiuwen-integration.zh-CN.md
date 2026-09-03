@@ -28,7 +28,7 @@ macOS/Linux 配置后运行：
 
 ```bash
 chmod 600 ~/.jiuwenswarm/config/.env
-jiuwenswarm-start --restart default
+jiuwenswarm-start app
 ```
 
 Windows 的配置文件位于 `%USERPROFILE%\.jiuwenswarm\config\.env`，不需要也
@@ -36,13 +36,19 @@ Windows 的配置文件位于 `%USERPROFILE%\.jiuwenswarm\config\.env`，不需�
 
 ## 安装与检查
 
+在 OpenOPC 仓库根目录安装 OpenOPC Gateway extra，以及验证通过的
+JiuwenSwarm `0.2.4b4` / openJiuwen `0.1.16` 组合。
+
 macOS/Linux：
 
 ```bash
-python -m pip install jiuwenswarm
 python -m pip install -e ".[jiuwen]"
+uv tool install --force --python 3.12 \
+  --overrides docs/jiuwen-openjiuwen-overrides.txt \
+  "https://github.com/openJiuwen-ai/jiuwenswarm/archive/ec305b70bf4a82f3603ea1a7b3ddc212386662df.tar.gz"
 jiuwenswarm-init
-jiuwenswarm-start
+chmod 600 ~/.jiuwenswarm/config/.env
+jiuwenswarm-start app
 opc agents list
 opc agents preflight jiuwen
 opc agents preflight jiuwenswarm
@@ -51,14 +57,18 @@ opc agents preflight jiuwenswarm
 Windows PowerShell / 命令提示符：
 
 ```powershell
-py -3.12 -m pip install jiuwenswarm
 py -3.12 -m pip install -e ".[jiuwen]"
+uv tool install --force --python 3.12 `
+  --overrides docs/jiuwen-openjiuwen-overrides.txt `
+  "https://github.com/openJiuwen-ai/jiuwenswarm/archive/ec305b70bf4a82f3603ea1a7b3ddc212386662df.tar.gz"
 jiuwenswarm-init
-jiuwenswarm-start
+jiuwenswarm-start app
 opc agents list
 opc agents preflight jiuwen
 opc agents preflight jiuwenswarm
 ```
+
+`jiuwenswarm-start app` 是前台服务命令，运行 OpenOPC 时应保持该终端开启。
 
 默认 Gateway 地址为 `ws://127.0.0.1:19001/tui`。OpenOPC 会读取
 `~/.jiuwenswarm/config/.env`（Windows 为
