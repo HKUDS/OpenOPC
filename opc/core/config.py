@@ -379,7 +379,8 @@ class ExternalAgentConfig(BaseModel):
     # Optional provider-specific transport/runtime settings.  They are kept
     # on the shared external-agent model so project-local YAML can configure
     # Jiuwen without importing Jiuwen/OpenJiuwen into the OpenOPC process.
-    transport: Literal["cli", "gateway"] = "cli"
+    # ``acp`` is the dsh ACP-wrapper transport (approval bridge + progress).
+    transport: Literal["cli", "gateway", "acp"] = "cli"
     gateway_url: str = ""
     provider_mode: str = ""
     project_dir: str = ""
@@ -388,7 +389,7 @@ class ExternalAgentConfig(BaseModel):
 
 
 class AgentsConfig(BaseModel):
-    preferred_order: list[str] = Field(default_factory=lambda: ["claude_code", "cursor", "codex", "opencode", "jiuwen", "jiuwenswarm"])
+    preferred_order: list[str] = Field(default_factory=lambda: ["claude_code", "cursor", "codex", "opencode", "jiuwen", "jiuwenswarm", "dsh"])
     agents: dict[str, ExternalAgentConfig] = Field(default_factory=lambda: {
         "claude_code": ExternalAgentConfig(command="claude", run_mode="interactive", approval_mode="full-auto"),
         "cursor": ExternalAgentConfig(command="cursor-agent", run_mode="interactive", approval_mode="full-auto"),
@@ -419,6 +420,12 @@ class AgentsConfig(BaseModel):
             provider_mode="team",
             interactive_timeout_seconds=21600,
         ),
+        # ``dsh`` is the DeepSeek Harness agent driven through the ACP wrapper
+        # (approval bridge + progress + resume); ``transport: cli`` falls back
+        # to the one-shot headless CLI.
+        "dsh": ExternalAgentConfig(command="dsh", run_mode="batch", transport="acp"),
+        # ``dshswarm`` is the same runtime as one opaque execution team.
+        "dshswarm": ExternalAgentConfig(command="dsh", run_mode="batch", transport="acp"),
     })
     native_subagents: dict[str, "NativeSubagentProfileConfig"] = Field(default_factory=dict)
 

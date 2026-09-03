@@ -6,6 +6,7 @@ external_agents:
     - opencode
     - jiuwen
     - jiuwenswarm
+    - dsh
 
   # model_flag, new_session_flag, resume_session_flag depend on your CLI version.
   # Leave empty for CLI defaults, or set explicitly for deterministic behavior.
@@ -94,6 +95,28 @@ external_agents:
     run_mode: interactive
     interactive_timeout_seconds: 21600
     approval_mode: full-auto
+    extra_args: []
+
+  # dsh is the DeepSeek Harness agent, driven through the ACP wrapper
+  # (approval bridge + progress + resume). `transport: cli` falls back to the
+  # one-shot headless CLI. It needs `dsh` on PATH and the harness credentials
+  # resolvable from $DSH_HOME/.credentials.yaml or env.
+  dsh:
+    enabled: true
+    command: dsh
+    transport: acp
+
+  # dshswarm runs the same dsh runtime as one opaque execution team.
+  dshswarm:
+    enabled: true
+    command: dsh
+    transport: acp
+    model: ""
+    session_mode: auto
+    session_id: ""
+    run_mode: batch
+    interactive_timeout_seconds: 21600
+    approval_mode: auto
     extra_args: []
 
 native_subagents:
