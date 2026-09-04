@@ -23,6 +23,7 @@
 
 ## 新闻
 
+- **2026 年 9 月 3 日 — JiuwenSwarm 兼容性更新：** 安装配置现已使用验证通过的 JiuwenSwarm `0.2.4b4` 与 openJiuwen `0.1.16`。
 - **2026 年 9 月 1 日 — Office UI 响应更轻快：** Office 与开发工具的渲染现已和高频运行事件隔离，减少不必要的整页更新，让长时间运行时的 Workspace 与 Org 页面更流畅。
 - **2026 年 8 月 26 日 — 接入 JiuwenSwarm：** 在 Task 与 Company 模式下，可将 JiuwenSwarm-single 用作单 Agent，或将 JiuwenSwarm-team 用作一个不透明 Team——一支自组织蜂群，无缝接入你的组织。[查看配置与角色规则](#jiuwen-integration)。
 - **2026 年 7 月 14 日 — Company 运行更可靠：** Company 会话可更顺畅地恢复和继续，同时保留 Agent 身份、角色上下文、委派与审核进度。
@@ -572,17 +573,20 @@ MODEL_NAME="ark-code-latest"
 MODEL_PROVIDER="OpenAI"
 ```
 
-JiuwenSwarm 需要 Python 3.11–3.13。安装 JiuwenSwarm 和 OpenOPC Gateway
-适配器，初始化 Jiuwen，然后检查两个选项。
+JiuwenSwarm 需要 Python 3.11–3.13。请从 OpenOPC 仓库根目录安装验证通过的
+JiuwenSwarm `0.2.4b4` / openJiuwen `0.1.16` 组合以及 OpenOPC Gateway
+适配器。
 
 macOS / Linux：
 
 ```bash
-python -m pip install jiuwenswarm
 python -m pip install -e ".[jiuwen]"
+uv tool install --force --python 3.12 \
+  --overrides docs/jiuwen-openjiuwen-overrides.txt \
+  "https://github.com/openJiuwen-ai/jiuwenswarm/archive/ec305b70bf4a82f3603ea1a7b3ddc212386662df.tar.gz"
 jiuwenswarm-init
 chmod 600 ~/.jiuwenswarm/config/.env
-jiuwenswarm-start --restart default
+jiuwenswarm-start app
 opc agents preflight jiuwen
 opc agents preflight jiuwenswarm
 opc exec --mode task --agent jiuwen "完成这个任务"
@@ -592,13 +596,17 @@ opc exec --mode task --agent jiuwenswarm "由一个 Team 完成这个任务"
 Windows PowerShell / 命令提示符（不执行 `chmod`）：
 
 ```powershell
-py -3.12 -m pip install jiuwenswarm
 py -3.12 -m pip install -e ".[jiuwen]"
+uv tool install --force --python 3.12 `
+  --overrides docs/jiuwen-openjiuwen-overrides.txt `
+  "https://github.com/openJiuwen-ai/jiuwenswarm/archive/ec305b70bf4a82f3603ea1a7b3ddc212386662df.tar.gz"
 jiuwenswarm-init
-jiuwenswarm-start --restart default
+jiuwenswarm-start app
 opc agents preflight jiuwen
 opc agents preflight jiuwenswarm
 ```
+
+`jiuwenswarm-start app` 是前台服务命令，运行 OpenOPC 时应保持该终端开启。
 
 Windows 的 Jiuwen 配置通常位于 `%USERPROFILE%\.jiuwenswarm\config\.env`，
 macOS/Linux 位于 `~/.jiuwenswarm/config/.env`。OpenOPC 会读取 Jiuwen 保存的
