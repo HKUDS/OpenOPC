@@ -6,6 +6,7 @@
 
 import type { ChatChannel, ChatMessage, ChannelType } from '../types/chat'
 import type { KanbanBoard, KanbanColumn, KanbanPhase, KanbanTask, TaskPriority, AgentAnimStatus, ProgressEntry, Session, SessionMode, Project, EmployeeAssignment, RoleAggregatedStatus, RoleWorkItemActivitySection, RoleWorkItemRow, RoleWorkItemSummary, WorkItemGate, WorkItemProgressEntry } from '../types/kanban'
+import { normalizeExternalTeamSummary } from '../stores/ExternalTeamActivityStore'
 import { normalizeProgressLog, normalizeWorkItemLog } from './progressLog'
 import { canonicalizeSessionExecutionIdentity } from './sessionIdentity'
 
@@ -552,6 +553,7 @@ function mapBackendRoleWorkItemRow(raw: any): RoleWorkItemRow {
     executionUnitKind: raw.execution_unit_kind ?? raw.executionUnitKind ?? undefined,
     externalTeamBindingId: raw.external_team_binding_id ?? raw.externalTeamBindingId ?? undefined,
     coveredRoleIds: raw.covered_role_ids ?? raw.coveredRoleIds ?? undefined,
+    externalTeamSummary: normalizeExternalTeamSummary(raw.external_team_summary ?? raw.externalTeamSummary),
     createdAt: normalizeEpochMs(raw.created_at ?? raw.createdAt),
     updatedAt: normalizeEpochMs(raw.updated_at ?? raw.updatedAt),
     executionTurnId: raw.execution_turn_id ?? raw.executionTurnId ?? undefined,
@@ -686,6 +688,7 @@ export function mapBackendSession(raw: any): Session {
     externalTeamBindingId: raw.external_team_binding_id ?? raw.externalTeamBindingId,
     externalTeamBoundaryRoleId: raw.external_team_boundary_role_id ?? raw.externalTeamBoundaryRoleId,
     coveredRoleIds: raw.covered_role_ids ?? raw.coveredRoleIds,
+    externalTeamSummary: normalizeExternalTeamSummary(raw.external_team_summary ?? raw.externalTeamSummary),
     externalCompanyExecutionFence: raw.external_company_execution_fence ?? raw.externalCompanyExecutionFence,
     originChannel: raw.origin_channel ?? raw.originChannel,
     originTaskId: raw.origin_task_id ?? raw.originTaskId ?? raw.task_id ?? raw.taskId,

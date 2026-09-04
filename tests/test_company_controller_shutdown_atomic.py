@@ -2298,6 +2298,180 @@ async def test_failed_typed_handoff_atomically_restores_pending_holds(
 
 
 @_async_test
+async def test_suspended_followup_reopens_task_and_work_item_under_resume_fence(
+    tmp_path: Path,
+) -> None:
+    store1, store2, engine, _registry, owner, generation1 = (
+        await _seed_owned_scope(tmp_path)
+    )
+    try:
+        await store1.update_delegation_work_item(
+            "work-item-1",
+            phase=Phase.AWAITING_MANAGER_REVIEW,
+        )
+        review_task = await store1.get_task("task-1")
+        assert review_task is not None
+        review_task.status = TaskStatus.AWAITING_MANAGER_REVIEW
+        review_task.execution_lock = False
+        review_task.execution_locked_at = None
+        await store1.save_task(review_task)
+
+        prepared = await engine.prepare_active_company_runtimes_for_shutdown()
+        checkpoint_id = prepared[0]["checkpoint_id"]
+        await _expire_lease(
+            store1,
+            owner_token=owner,
+            generation=generation1,
+        )
+        takeover = await store2.acquire_delegation_run_controller_lease(
+            "run-1",
+            project_id="project-a",
+            root_session_id="root-session",
+            owner_token="owner-b",
+            lease_seconds=60,
+        )
+        assert takeover.acquired
+        receipt = await store1.resume_company_runtime_scope_for_controller(
+            run_id="run-1",
+            project_id="project-a",
+            root_session_id="root-session",
+            owner_token="owner-b",
+            generation=takeover.generation,
+            checkpoint_id=checkpoint_id,
+            checkpoint_types=["company_runtime_interrupted"],
+            expected_checkpoint_statuses=["pending"],
+            task_ids=["task-1"],
+        )
+        assert receipt.applied
+
+        resumed_task = await store1.get_task("task-1")
+        resumed_item = await store1.get_delegation_work_item("work-item-1")
+        assert resumed_task is not None and resumed_item is not None
+        assert "company_run_controller_owner_token" not in resumed_task.metadata
+        assert "claimed_work_item_attempt_seq" not in resumed_task.metadata
+        assert resumed_item.phase == Phase.AWAITING_MANAGER_REVIEW
+
+        resume_engine = OPCEngine(
+            project_id="project-a",
+            active_task_run_registry=ActiveTaskRunRegistry(),
+            owns_active_task_run_registry=True,
+        )
+        resume_engine.store = store1
+        admission = SimpleNamespace(
+            run_id="run-1",
+            project_id="project-a",
+            root_session_id="root-session",
+            owner_token="owner-b",
+            generation=takeover.generation,
+            released=False,
+        )
+        await resume_engine._prepare_company_followup_target(
+            resumed_task,
+            "Continue the same run.",
+            controller_admission=admission,
+            resume_checkpoint_id=checkpoint_id,
+        )
+
+        refreshed_task = await store2.get_task("task-1")
+        refreshed_item = await store2.get_delegation_work_item("work-item-1")
+        refreshed_role = await store2.get_delegation_role_session(
+            "role-session-1"
+        )
+        assert refreshed_task is not None
+        assert refreshed_item is not None
+        assert refreshed_role is not None
+        assert refreshed_task.status == TaskStatus.PENDING
+        assert (
+            refreshed_task.context_snapshot["user_supplied_input"]
+            == "Continue the same run."
+        )
+        assert refreshed_item.phase == Phase.READY_FOR_REWORK
+        assert (
+            refreshed_item.metadata["latest_user_directive"]
+            == "Continue the same run."
+        )
+        assert refreshed_role.status == "idle"
+        assert refreshed_role.focused_work_item_id == ""
+    finally:
+        await store2.close()
+        await store1.close()
+
+
+@_async_test
+async def test_resume_clears_hold_from_terminal_work_item_before_projection(
+    tmp_path: Path,
+) -> None:
+    store1, store2, engine, _registry, owner, generation1 = (
+        await _seed_owned_scope(tmp_path)
+    )
+    try:
+        prepared = await engine.prepare_active_company_runtimes_for_shutdown()
+        assert len(prepared) == 1
+        checkpoint_id = prepared[0]["checkpoint_id"]
+
+        # A review can settle while the surrounding run remains suspended.
+        # The terminal WorkItem must keep its result, but its transport hold
+        # cannot survive into the resumed Task projection.
+        await store1.update_delegation_work_item(
+            "work-item-1",
+            phase=Phase.APPROVED,
+        )
+        held_item = await store1.get_delegation_work_item("work-item-1")
+        assert held_item is not None
+        assert held_item.metadata["dispatch_hold"] == "company_runtime_suspended"
+
+        await _expire_lease(
+            store1,
+            owner_token=owner,
+            generation=generation1,
+        )
+        takeover = await store2.acquire_delegation_run_controller_lease(
+            "run-1",
+            project_id="project-a",
+            root_session_id="root-session",
+            owner_token="owner-b",
+            lease_seconds=60,
+        )
+        assert takeover.acquired
+        resumed = await store2.resume_company_runtime_scope_for_controller(
+            run_id="run-1",
+            project_id="project-a",
+            root_session_id="root-session",
+            owner_token="owner-b",
+            generation=takeover.generation,
+            checkpoint_id=checkpoint_id,
+            checkpoint_types=["company_runtime_interrupted"],
+            expected_checkpoint_statuses=["pending"],
+            task_ids=["task-1"],
+        )
+        assert resumed.applied
+
+        resumed_task = await store1.get_task("task-1")
+        resumed_item = await store1.get_delegation_work_item("work-item-1")
+        assert resumed_task is not None and resumed_item is not None
+        assert resumed_task.status == TaskStatus.DONE
+        assert resumed_item.phase == Phase.APPROVED
+        assert "dispatch_hold" not in resumed_item.metadata
+        assert resumed_item.claimed_by_role_runtime_session_id == ""
+        assert resumed_item.claimed_by_seat_id == ""
+
+        projection = await store1.save_company_runtime_resume_projection_for_controller(
+            resumed_task,
+            run_id="run-1",
+            project_id="project-a",
+            root_session_id="root-session",
+            owner_token="owner-b",
+            generation=takeover.generation,
+            checkpoint_id=checkpoint_id,
+            checkpoint_types=["company_runtime_interrupted"],
+        )
+        assert projection.applied
+    finally:
+        await store2.close()
+        await store1.close()
+
+
+@_async_test
 async def test_takeover_after_atomic_resume_fences_task_projection_tail(
     tmp_path: Path,
 ) -> None:

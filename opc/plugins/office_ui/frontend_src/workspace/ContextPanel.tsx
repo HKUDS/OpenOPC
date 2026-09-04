@@ -11,6 +11,8 @@ import { MarkdownBody, MessageList } from '../chat/MessageList'
 import { MessageComposer } from '../chat/MessageComposer'
 import { AgentWorkPanel } from '../chat/AgentWorkPanel'
 import { WorkItemProgressCard } from '../chat/WorkItemProgressCard'
+import { ExternalTeamSummaryCard } from '../chat/ExternalTeamSummaryCard'
+import type { ExternalTeamActivityRecord } from '../stores/ExternalTeamActivityStore'
 import { IconTimeline, IconHandoff, IconTool } from '../chat/SvgIcons'
 import { isSessionWorking } from '../lib/sessionRuntime'
 import { getWorkItemRoleLabel } from '../lib/workItemIdentity'
@@ -103,6 +105,7 @@ interface ContextPanelProps {
   onCloseTaskDetail?: () => void
   onOpenChildDetail?: (taskId: string) => void
   onOpenExecutionPanel?: (taskId: string) => void
+  getExternalTeamActivity?: (taskId: string, invocationId?: string) => ExternalTeamActivityRecord | undefined
   onSelectSessionTab?: (taskId: string) => void
   onCloseSessionTab?: (taskId: string) => void
   onToggleMultiSessionView?: () => void
@@ -526,6 +529,7 @@ export function ContextPanel({
   onCloseTaskDetail,
   onOpenChildDetail,
   onOpenExecutionPanel,
+  getExternalTeamActivity,
   onSelectSessionTab,
   onCloseSessionTab,
   onToggleMultiSessionView,
@@ -1063,8 +1067,19 @@ export function ContextPanel({
                         childSessions={activeWorkItemRoleSessions}
                         isCompanyRuntime={isCompanyRuntime}
                         onWorkItemClick={onWorkItemClick}
+                        getExternalTeamActivity={getExternalTeamActivity}
                       />
                     </div>
+                  )}
+                  {!isCompanyRuntime && (
+                    <ExternalTeamSummaryCard
+                      session={activeConversationSession ?? activeDisplaySession ?? activeSession}
+                      record={getExternalTeamActivity?.(
+                        (activeConversationSession ?? activeDisplaySession ?? activeSession).executionTurnId || activeSession.taskId,
+                        (activeConversationSession ?? activeDisplaySession ?? activeSession).externalTeamSummary?.externalInvocationId,
+                      )}
+                      onOpen={onOpenExecutionPanel}
+                    />
                   )}
                   <MessageList
                     messages={messages}

@@ -1,3 +1,5 @@
+import type { ExternalTeamActivitySummary } from './externalTeamActivity'
+
 // ── Priority ────────────────────────────────────────────────────────────────
 
 export type TaskPriority = 'urgent' | 'high' | 'medium' | 'low'
@@ -325,6 +327,8 @@ export interface Session {
   externalTeamBindingId?: string
   externalTeamBoundaryRoleId?: string
   coveredRoleIds?: string[]
+  /** Read-only provider telemetry; never participates in WorkItem state. */
+  externalTeamSummary?: ExternalTeamActivitySummary
   externalCompanyExecutionFence?: string
   originChannel?: string
   originTaskId?: string
@@ -433,6 +437,8 @@ export interface RoleWorkItemRow {
   executionUnitKind?: string
   externalTeamBindingId?: string
   coveredRoleIds?: string[]
+  /** Read-only provider telemetry; never participates in WorkItem state. */
+  externalTeamSummary?: ExternalTeamActivitySummary
   /** Epoch milliseconds; sourced from ``WorkItem.created_at``. */
   createdAt: number
   /** Epoch milliseconds; sourced from ``WorkItem.updated_at`` (last phase

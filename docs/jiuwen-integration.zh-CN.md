@@ -136,6 +136,26 @@ opc org team-unbind --org corporate --role cto
 CMO、COO 或自定义组织角色使用相同方式。重叠子树绑定会被拒绝，以避免同一个角色同时归属两个外部 Team。
 删除 Team 边界角色会同步移除对应绑定；会造成 Team 子树重叠的组织层级修改会被拒绝。解绑后相关角色恢复普通招聘和执行选择。
 
+## Team Activity（只读遥测）
+
+JiuwenSwarm-team 发出官方 `team.member.*`、`team.task.*`、
+`team.message.*`、`team.runtime_ready`、`team.completed` 和 `team.error`
+事件时，Office UI 会在原有单一 Team 节点下显示内部活动摘要。点击节点打开同一个
+Team Activity 抽屉：
+
+![JiuwenSwarm Team Activity 只读抽屉](assets/jiuwen-team-activity.png)
+
+- **概览**只显示 Jiuwen 实际创建的 leader 和成员；组织中的覆盖角色单独展示。
+- **任务**按 Jiuwen 报告的状态显示只读内部 Kanban；只在官方事件提供依赖时显示依赖。
+- **时间线**显示成员、任务、消息、错误与重试，长消息先显示摘要再展开。
+- **产出**分别显示成员输出和 leader 汇总；没有结构化输出时回到普通 Runtime Activity 查看原始执行记录。
+
+OpenOPC 不解析 `todo_create`、`task_tool`、`covered_role_ids` 或自然语言来猜测成员。
+内部遥测按 `project_id + task_id + external_invocation_id` 隔离并异步持久化，刷新、
+重连或切换会话后仍能恢复；没有结构化遥测的旧运行会明确显示不可用。该数据链路不写入
+AgentStore、组织树、WorkItemStore 或主 Kanban，也不参与工单状态、审核、权限、恢复和
+调度。它只复用现有 `/tui` 流，不修改 Jiuwen harness、不建立第二条控制连接。
+
 ## 运行契约与安全
 
 - Gateway Team 模式以 `chat.processing_status(is_processing=false)` 或错误事件作为外层终止信号；内部 `chat.final` 和成员完成事件仅作为进度。

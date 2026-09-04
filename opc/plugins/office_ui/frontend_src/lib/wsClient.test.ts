@@ -31,6 +31,21 @@ const flushPromises = async () => {
 
 const client = new VisualSocketClient('ws://unit.test', {})
 
+client.externalTeamActivityGet('project-a', 'runtime-task-a', {
+  externalInvocationId: 'invocation-a',
+  beforeCreatedAt: '2026-09-03T10:00:00Z',
+  beforeEventId: 'event-a',
+  viewGeneration: 7,
+})
+const teamActivityEnvelope = JSON.parse(
+  (client as unknown as TestSocketClient).pendingQueue.pop() ?? '{}',
+) as Record<string, unknown>
+assert.equal(teamActivityEnvelope.type, 'external_team_activity_get')
+assert.equal(teamActivityEnvelope.project_id, 'project-a')
+assert.equal(teamActivityEnvelope.task_id, 'runtime-task-a')
+assert.equal(teamActivityEnvelope.external_invocation_id, 'invocation-a')
+assert.equal(teamActivityEnvelope.view_generation, 7)
+
 // The organization page reads proposal/checkpoint projections, but decisions
 // use the same interaction_reply API as chat cards. There is no second
 // reorg_decide transport.

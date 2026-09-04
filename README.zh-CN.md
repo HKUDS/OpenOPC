@@ -624,6 +624,19 @@ symlink、junction 等 reparse point。Windows 工作区必须位于本地磁盘
 
 上级会收到根据覆盖角色、Skill、工具和交付物动态生成的能力摘要；JiuwenSwarm-team 自行安排 Team 内部如何分工。
 
+### Team Activity（只读）
+
+当 JiuwenSwarm-team 发出官方 Team 事件时，**Execution Progress** 仍只显示一个组织节点和一个 OpenOPC WorkItem 执行器。第二行会概括实际观察到的内部运行，例如 `3 members · 2 active · Leader synthesizing`。点击该节点可打开 **Team Activity**：
+
+<img src="docs/assets/jiuwen-team-activity.png" alt="只读的 JiuwenSwarm Team Activity 抽屉，显示 leader 和三个实际创建的内部成员" width="100%">
+
+- **概览**显示 leader 和 Jiuwen 实际创建的内部成员；OpenOPC 覆盖角色单独列出，绝不会被推测为成员。
+- **任务**是只读的内部 Kanban；**时间线**显示官方成员、任务、消息、重试、完成和错误事件；**产出**区分成员产出与 leader 汇总。
+- `todo_create`、`task_tool`、`covered_role_ids` 和自然语言描述都不会生成 Team 条目。Team 遥测不会创建 OpenOPC Agent、Session、WorkItem 或主 Kanban 卡片，也不会改变工单推进、审核、权限和调度。
+- Task 与 Company 模式使用同一视图。持久化遥测可在刷新或重连后恢复，并按项目、OpenOPC Task 和每次外部 invocation 严格隔离。旧运行没有结构化事件时会明确提示“内部遥测不可用”，不会猜测。
+
+该视图只观察 Jiuwen 现有的 `/tui` 流，不修改 Jiuwen harness，也不会建立第二条控制连接。
+
 </details>
 
 <details>

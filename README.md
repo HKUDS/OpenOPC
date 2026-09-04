@@ -626,6 +626,19 @@ Choose the execution agent in Staffing / Recruitment Review, or under **Company 
 
 The parent manager receives a capability summary compiled from the covered roles, skills, tools, and deliverables. JiuwenSwarm-team decides how work is divided internally.
 
+### Team Activity (read-only)
+
+When JiuwenSwarm-team emits its official Team events, **Execution Progress** still shows one organizational node and one OpenOPC WorkItem executor. Its second line summarizes the observed internal run, for example `3 members · 2 active · Leader synthesizing`. Select that node to open **Team Activity**:
+
+<img src="docs/assets/jiuwen-team-activity.png" alt="Read-only JiuwenSwarm Team Activity drawer showing the leader and three observed internal members" width="100%">
+
+- **Overview** shows the leader and only the internal members Jiuwen actually created. OpenOPC covered roles are listed separately and never become inferred members.
+- **Tasks** is a read-only internal Kanban; **Timeline** shows official member, task, message, retry, completion, and error events; **Output** keeps member outputs separate from the leader synthesis.
+- `todo_create`, `task_tool`, `covered_role_ids`, and natural-language claims never create Team rows. Team telemetry never creates an OpenOPC Agent, Session, WorkItem, or main Kanban card, and never changes WorkItem progress, review, permissions, or scheduling.
+- Task and Company modes use the same view. Stored telemetry survives refresh/reconnect and is isolated by project, OpenOPC task, and concrete external invocation. Older runs without structured events say that internal telemetry is unavailable instead of guessing.
+
+This view observes Jiuwen's existing `/tui` stream only. It does not modify the Jiuwen harness or open another control connection.
+
 </details>
 
 <details>

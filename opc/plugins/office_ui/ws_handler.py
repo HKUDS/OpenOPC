@@ -314,6 +314,8 @@ _PROJECT_SCOPED_ENVELOPE_TYPES = frozenset({
     "comms_message",
     "comms_state_dirty",
     "runtime_status_sync",
+    "external_team_activity_event",
+    "external_team_activity_snapshot",
 })
 
 
@@ -1802,6 +1804,16 @@ class WSHandler:
 
         runtime_engine = kw.pop("_runtime_engine", None) or self.engine
         pid = self._normalize_project_id(kw.pop("_project_id", None) or getattr(runtime_engine, "project_id", None))
+        external_team_event = kw.pop("external_team_event", None)
+        if isinstance(external_team_event, dict):
+            event = dict(external_team_event)
+            event["project_id"] = pid
+            await self.broadcast({
+                "type": "external_team_activity_event",
+                "payload": event,
+            })
+            if not text:
+                return
         raw_task_id = str(kw.get("task_id", "") or "").strip() or None
         task_id = await self._ui_task_id_for_runtime_task_id(raw_task_id, engine=runtime_engine)
         task_id = task_id or None
@@ -5422,6 +5434,46 @@ class WSHandler:
             handoff_context=handoff_context,
             handoff_to=handoff_to,
         )
+
+    async def _handle_external_team_activity_get(self, ws: Any, data: dict) -> None:
+        try:
+            _engine, project_id = await self._engine_for_request(data)
+            result = await self._ensure_office_services().runtime.external_team_activity(
+                project_id=project_id,
+                task_id=str(data.get("task_id", "") or "").strip(),
+                external_invocation_id=str(data.get("external_invocation_id", "") or "").strip(),
+                limit=max(1, min(int(data.get("limit", 100) or 100), 500)),
+                before_created_at=str(data.get("before_created_at", "") or "").strip(),
+                before_event_id=str(data.get("before_event_id", "") or "").strip(),
+            )
+            payload = dict(result.payload or {})
+            payload["view_generation"] = data.get("view_generation")
+            await self._safe_send_json(ws, {
+                "type": "external_team_activity_snapshot",
+                "payload": payload,
+            })
+        except Exception as exc:
+            if isinstance(exc, ServiceError):
+                payload = exc.to_payload()
+            else:
+                logger.opt(exception=True).debug(
+                    "Failed to read external team telemetry"
+                )
+                payload = {
+                    "reason": "telemetry_unavailable",
+                    "error": "telemetry_unavailable",
+                }
+            payload.update({
+                "available": False,
+                "project_id": str(data.get("project_id", "") or ""),
+                "task_id": str(data.get("task_id", "") or ""),
+                "external_invocation_id": str(data.get("external_invocation_id", "") or ""),
+                "view_generation": data.get("view_generation"),
+            })
+            await self._safe_send_json(ws, {
+                "type": "external_team_activity_snapshot",
+                "payload": payload,
+            })
 
     async def _handle_interaction_reply(self, ws: Any, data: dict) -> None:
         """Durably answer one explicit owner-facing ExecutionCheckpoint.
@@ -9344,6 +9396,7 @@ class WSHandler:
         "session_update_config": _handle_session_update_config,
         "native_permission_default_set": _handle_native_permission_default_set,
         "session_detail":      _handle_session_detail,
+        "external_team_activity_get": _handle_external_team_activity_get,
         "interaction_reply":   _handle_interaction_reply,
         "session_send":        _handle_session_send,
         "session_stop":        _handle_session_stop,

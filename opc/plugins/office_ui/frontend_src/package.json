@@ -7,8 +7,9 @@
     "dev": "vite",
     "build": "vite build",
     "typecheck": "tsc -b",
-    "test:contracts": "node --import tsx --test ./lib/projectIdPolicy.test.ts ./lib/theme.test.ts ./lib/wsClient.test.ts ./lib/markdownRepair.test.ts ./lib/externalAgents.test.ts ./devtools/EventTimelineStore.test.ts ./office/OfficePage.test.ts",
+    "test:contracts": "node --import tsx --test ./lib/projectIdPolicy.test.ts ./lib/theme.test.ts ./lib/wsClient.test.ts ./lib/markdownRepair.test.ts ./lib/externalAgents.test.ts ./stores/ExternalTeamActivityStore.test.ts ./chat/WorkItemProgressCard.test.tsx ./kanban/JiuwenTeamActivityPanel.test.tsx ./devtools/EventTimelineStore.test.ts ./office/OfficePage.test.ts",
     "test:scroll": "node --import tsx ./tests/message-list-scroll.spec.ts",
+    "test:team-activity": "node --import tsx ./tests/team-activity-visual.spec.ts",
     "preview": "vite preview"
   },
   "dependencies": {

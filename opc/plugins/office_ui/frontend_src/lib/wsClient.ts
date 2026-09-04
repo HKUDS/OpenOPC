@@ -23,6 +23,7 @@ import type {
   SessionSendMetadata,
 } from '../types/chat'
 import type { NativeApprovalLevel, TaskPreferredAgent } from '../types/kanban'
+import type { ExternalTeamActivitySnapshotPayload, ExternalTeamEventV1 } from '../types/externalTeamActivity'
 
 interface SocketHandlers {
   onSnapshot?: (snapshot: VisualSnapshot) => void
@@ -53,6 +54,8 @@ interface SocketHandlers {
   onEmployeeDetail?: (payload: EmployeeDetailPayload) => void
   onReorgList?: (payload: ReorgListPayload) => void
   onWorkItemProgress?: (payload: WorkItemProgressPayload) => void
+  onExternalTeamActivityEvent?: (payload: ExternalTeamEventV1) => void
+  onExternalTeamActivitySnapshot?: (payload: ExternalTeamActivitySnapshotPayload) => void
   onMarketListInstalled?: (payload: { packages: Array<Record<string, unknown>> }) => void
   onMarketBrowse?: (payload: { presets: Array<Record<string, unknown>> }) => void
   onMarketPreview?: (payload: Record<string, unknown>) => void
@@ -180,6 +183,7 @@ const PROJECT_SCOPED_MESSAGE_TYPES = new Set([
   'session_update_config',
   'session_delete',
   'session_detail',
+  'external_team_activity_get',
   'session_stop',
   'session_resume',
   'session_complete',
@@ -598,6 +602,30 @@ export class VisualSocketClient {
     })
   }
 
+  externalTeamActivityGet(
+    projectId: string,
+    taskId: string,
+    opts?: {
+      externalInvocationId?: string
+      limit?: number
+      beforeCreatedAt?: string
+      beforeEventId?: string
+      viewGeneration?: number
+    },
+  ): void {
+    const pid = this.requireProjectId(projectId, 'external_team_activity_get')
+    this.send({
+      type: 'external_team_activity_get',
+      project_id: pid,
+      task_id: taskId,
+      external_invocation_id: opts?.externalInvocationId,
+      limit: opts?.limit ?? 100,
+      before_created_at: opts?.beforeCreatedAt,
+      before_event_id: opts?.beforeEventId,
+      view_generation: opts?.viewGeneration,
+    })
+  }
+
   secretarySend(projectId: string, content: string): void {
     const pid = this.requireProjectId(projectId, 'secretary_send')
     this.send({ type: 'secretary_send', project_id: pid, content })
@@ -903,6 +931,12 @@ export class VisualSocketClient {
         break
       case 'work_item_progress':
         this.handlers.onWorkItemProgress?.(parsed.payload as unknown as WorkItemProgressPayload)
+        break
+      case 'external_team_activity_event':
+        this.handlers.onExternalTeamActivityEvent?.(parsed.payload as unknown as ExternalTeamEventV1)
+        break
+      case 'external_team_activity_snapshot':
+        this.handlers.onExternalTeamActivitySnapshot?.(parsed.payload as unknown as ExternalTeamActivitySnapshotPayload)
         break
       case 'kanban_view_data':
         this.handlers.onKanbanViewData?.(parsed.payload)

@@ -194,6 +194,24 @@ class ExternalAgentAdapter(abc.ABC):
             "opaque_team": self.execution_unit_kind() == "opaque_external_team",
         }
 
+    def extract_external_team_events(
+        self,
+        raw_frame: str,
+        stream_name: str,
+    ) -> list[dict[str, Any]]:
+        """Return provider-owned team telemetry carried by one stream frame.
+
+        External teams remain opaque execution units.  This optional hook is
+        display-only: the broker may persist/broadcast the returned records,
+        but must never translate them into OpenOPC agents, tasks, or work
+        items.  Providers without an official team event protocol return no
+        telemetry by default.
+        """
+
+        _ = raw_frame
+        _ = stream_name
+        return []
+
     def supports_interactive(self) -> bool:
         return False
 

@@ -10,6 +10,7 @@ import { useChatStore, type ChatStoreState } from './chat/ChatStore'
 import { useSessionStore, type SessionStoreState } from './stores/SessionStore'
 import { useProjectStore, type ProjectStoreState } from './stores/ProjectStore'
 import { ExecutionPanel } from './kanban/ExecutionPanel'
+import { JiuwenTeamActivityPanel } from './kanban/JiuwenTeamActivityPanel'
 import { ProjectSelector } from './components/ProjectSelector'
 import { OrgTab } from './org/OrgTab'
 import { notifyTaskAssigned } from './lib/taskChatBridge'
@@ -28,6 +29,8 @@ import { useI18n } from './i18n'
 import { OfficePage } from './office/OfficePage'
 import { EventTimelineStore } from './devtools/EventTimelineStore'
 import { DevToolsOverlay } from './devtools/DevToolsOverlay'
+import { useExternalTeamActivityStore, type ExternalTeamActivityRecord } from './stores/ExternalTeamActivityStore'
+import { isJiuwenOpaqueTeam } from './lib/externalTeamActivity'
 
 function readOutdoorOverrideUi(): 'auto' | 'day' | 'night' {
   try {
@@ -405,10 +408,16 @@ function roleSummaryFromLegacySession(session: Session): RoleWorkItemSummary {
 }
 
 /** Thin wrapper so the execution-panel lookup is a normal component, not a JSX IIFE. */
-function MaybeExecutionPanel({ taskId, sessions, agents, onClose }: {
+function MaybeExecutionPanel({ taskId, projectId, sessions, agents, getExternalTeamActivity, onLoadOlder, onSelectInvocation, runtimeOnly, onOpenRuntimeActivity, onClose }: {
   taskId: string | null
+  projectId: string
   sessions: Session[]
   agents: AgentInfo[]
+  getExternalTeamActivity: (projectId: string, taskId: string, invocationId?: string) => ExternalTeamActivityRecord | undefined
+  onLoadOlder: (taskId: string, record: ExternalTeamActivityRecord) => void
+  onSelectInvocation: (taskId: string, invocationId: string) => void
+  runtimeOnly: boolean
+  onOpenRuntimeActivity: () => void
   onClose: () => void
 }) {
   if (!taskId) return null
@@ -419,6 +428,22 @@ function MaybeExecutionPanel({ taskId, sessions, agents, onClose }: {
     for (const role of Object.values(payload)) {
       const row = role.workItems.find(workItem => workItem.executionTurnId === taskId)
       if (!row) continue
+      if (isJiuwenOpaqueTeam(row) && !runtimeOnly) {
+        const record = getExternalTeamActivity(projectId, taskId)
+        return (
+          <JiuwenTeamActivityPanel
+            key={`${projectId}:${taskId}`}
+            title={`${row.executorRoleName || row.executorRoleId || role.roleName || role.roleId} · JiuwenSwarm Team`}
+            coveredRoleIds={row.coveredRoleIds}
+            record={record}
+            fallbackSummary={row.externalTeamSummary}
+            onLoadOlder={record?.hasMore ? () => onLoadOlder(taskId, record) : undefined}
+            onSelectInvocation={invocationId => onSelectInvocation(taskId, invocationId)}
+            onOpenRuntimeActivity={onOpenRuntimeActivity}
+            onClose={onClose}
+          />
+        )
+      }
       return (
         <ExecutionPanel
           role={role}
@@ -433,6 +458,23 @@ function MaybeExecutionPanel({ taskId, sessions, agents, onClose }: {
 
   const focused = sessions.find(x => x.taskId === taskId || getExecutionTurnId(x) === taskId)
   if (!focused) return null
+  if (isJiuwenOpaqueTeam(focused) && !runtimeOnly) {
+    const runtimeTaskId = getExecutionTurnId(focused) || focused.taskId
+    const record = getExternalTeamActivity(projectId, runtimeTaskId)
+    return (
+      <JiuwenTeamActivityPanel
+        key={`${projectId}:${runtimeTaskId}`}
+        title={`${focused.workItemRoleName || focused.title || 'Task'} · JiuwenSwarm Team`}
+        coveredRoleIds={focused.coveredRoleIds}
+        record={record}
+        fallbackSummary={focused.externalTeamSummary}
+        onLoadOlder={record?.hasMore ? () => onLoadOlder(runtimeTaskId, record) : undefined}
+        onSelectInvocation={invocationId => onSelectInvocation(runtimeTaskId, invocationId)}
+        onOpenRuntimeActivity={onOpenRuntimeActivity}
+        onClose={onClose}
+      />
+    )
+  }
   const role = roleSummaryFromLegacySession(focused)
   return (
     <ExecutionPanel
@@ -520,6 +562,7 @@ export default function App() {
   const [toastType, setToastType] = useState<'success' | 'error'>('success')
   const [deletingAgentId, setDeletingAgentId] = useState<string | null>(null)
   const [executionPanelTaskId, setExecutionPanelTaskId] = useState<string | null>(null)
+  const [executionPanelRuntimeOnly, setExecutionPanelRuntimeOnly] = useState(false)
   const [outdoorOverride, setOutdoorOverride] = useState<'auto' | 'day' | 'night'>(() => readOutdoorOverrideUi())
 
   const normalizeProjectId = useCallback((value: unknown): string => {
@@ -687,6 +730,13 @@ export default function App() {
   const chatStore = useChatStore()
   const sessionStore = useSessionStore()
   const projectStore = useProjectStore()
+  const externalTeamActivityStore = useExternalTeamActivityStore()
+  const {
+    resetProject: resetExternalTeamProject,
+    markLoading: markExternalTeamLoading,
+    applyEvent: applyExternalTeamEvent,
+    applySnapshot: applyExternalTeamSnapshot,
+  } = externalTeamActivityStore
 
   // Per-session recruitment (role_id -> recruited names) for the org canvas.
   // The org_info payload is project-global, so the canvas otherwise can't show
@@ -706,12 +756,14 @@ export default function App() {
     chatStore.initFromBackend(nextProjectId, [], [])
     boardStore.initFromBackend(nextProjectId, [], [], [])
     sessionStore.initFromBackend(nextProjectId, [])
+    resetExternalTeamProject(nextProjectId)
     clearPendingSessionCreate()
     setExecutionPanelTaskId(null)
+    setExecutionPanelRuntimeOnly(false)
     setCommsState(null)
     setCommsMessage(null)
     setReorgProposals([])
-  }, [boardStore, chatStore, clearPendingSessionCreate, clearPendingSessionDetailRefreshes, normalizeProjectId, sessionStore])
+  }, [boardStore, chatStore, clearPendingSessionCreate, clearPendingSessionDetailRefreshes, normalizeProjectId, resetExternalTeamProject, sessionStore])
 
   const beginProjectSwitch = useCallback((projectId: string): string => {
     const nextProjectId = normalizeProjectId(projectId)
@@ -1162,6 +1214,7 @@ export default function App() {
             if (applyingProjectSwitch) {
               clearPendingSessionDetailRefreshes()
               setExecutionPanelTaskId(null)
+              setExecutionPanelRuntimeOnly(false)
               setCommsState(null)
               setCommsMessage(null)
             }
@@ -1313,6 +1366,7 @@ export default function App() {
             if (applyingProjectSwitch) {
               clearPendingSessionDetailRefreshes()
               setExecutionPanelTaskId(null)
+              setExecutionPanelRuntimeOnly(false)
               setCommsState(null)
               setCommsMessage(null)
             }
@@ -1987,6 +2041,16 @@ export default function App() {
           detail: payload.entry.detail,
         })
       },
+      onExternalTeamActivityEvent: (payload) => {
+        if (!payloadMatchesActiveProject(payload as unknown as Record<string, unknown>, false)) return
+        applyExternalTeamEvent(payload)
+      },
+      onExternalTeamActivitySnapshot: (payload) => {
+        if (!payloadMatchesActiveProject(payload as unknown as Record<string, unknown>, false)) return
+        const generation = payloadViewGeneration(payload as unknown as Record<string, unknown>)
+        if (generation !== null && generation !== projectViewGenerationRef.current) return
+        applyExternalTeamSnapshot(payload)
+      },
     })
     clientRef.current = client
     client.connect()
@@ -2056,6 +2120,45 @@ export default function App() {
     clientRef.current?.setExecutionMode('company', 'corporate', globalTaskPreferredAgent)
     clientRef.current?.orgInfo()
   }, [globalTaskPreferredAgent])
+
+  const handleOpenExecutionPanel = useCallback((taskId: string) => {
+    if (!taskId) return
+    setExecutionPanelRuntimeOnly(false)
+    setExecutionPanelTaskId(taskId)
+    const projectId = getActiveProjectId()
+    const isTeamTarget = sessionStore.sessions.some(session => (
+      ((session.taskId === taskId || getExecutionTurnId(session) === taskId) && isJiuwenOpaqueTeam(session))
+      || Object.values(session.roleWorkItems ?? {}).some(role => role.workItems.some(item => item.executionTurnId === taskId && isJiuwenOpaqueTeam(item)))
+    ))
+    if (!isTeamTarget) return
+    markExternalTeamLoading(projectId, taskId)
+    clientRef.current?.externalTeamActivityGet(projectId, taskId, {
+      limit: 100,
+      viewGeneration: projectViewGenerationRef.current,
+    })
+  }, [getActiveProjectId, markExternalTeamLoading, sessionStore.sessions])
+
+  const handleSelectTeamInvocation = useCallback((taskId: string, invocationId: string) => {
+    const projectId = getActiveProjectId()
+    markExternalTeamLoading(projectId, taskId, invocationId)
+    clientRef.current?.externalTeamActivityGet(projectId, taskId, {
+      externalInvocationId: invocationId,
+      limit: 100,
+      viewGeneration: projectViewGenerationRef.current,
+    })
+  }, [getActiveProjectId, markExternalTeamLoading])
+
+  const handleLoadOlderTeamActivity = useCallback((taskId: string, record: ExternalTeamActivityRecord) => {
+    const cursor = record.nextCursor
+    if (!cursor) return
+    clientRef.current?.externalTeamActivityGet(record.projectId, taskId, {
+      externalInvocationId: record.externalInvocationId,
+      beforeCreatedAt: cursor.beforeCreatedAt,
+      beforeEventId: cursor.beforeEventId,
+      limit: 100,
+      viewGeneration: projectViewGenerationRef.current,
+    })
+  }, [])
 
   useEffect(() => {
     if (!lastTaskDoneAgent) return
@@ -2537,7 +2640,8 @@ export default function App() {
               }
             })
           }}
-          onOpenExecutionPanel={(taskId) => setExecutionPanelTaskId(taskId)}
+          onOpenExecutionPanel={handleOpenExecutionPanel}
+          getExternalTeamActivity={(taskId, invocationId) => externalTeamActivityStore.getForTask(projectStore.activeProjectId, taskId, invocationId)}
           onCollabSync={() => clientRef.current?.collabSync(getActiveProjectId(), undefined, projectViewGenerationRef.current)}
         />
       )}
@@ -2676,9 +2780,18 @@ export default function App() {
       {/* ── Global Execution Panel (accessible from any page) ── */}
       <MaybeExecutionPanel
         taskId={executionPanelTaskId}
+        projectId={projectStore.activeProjectId}
         sessions={sessionStore.sessions}
         agents={swarmAgents}
-        onClose={() => setExecutionPanelTaskId(null)}
+        getExternalTeamActivity={externalTeamActivityStore.getForTask}
+        onLoadOlder={handleLoadOlderTeamActivity}
+        onSelectInvocation={handleSelectTeamInvocation}
+        runtimeOnly={executionPanelRuntimeOnly}
+        onOpenRuntimeActivity={() => setExecutionPanelRuntimeOnly(true)}
+        onClose={() => {
+          setExecutionPanelTaskId(null)
+          setExecutionPanelRuntimeOnly(false)
+        }}
       />
     </div>
   )

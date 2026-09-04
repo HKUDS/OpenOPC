@@ -186,6 +186,18 @@ class _ScriptAdapter(ExternalAgentAdapter):
         return AgentStatus.IDLE
 
 
+class _TeamTelemetryScriptAdapter(_ScriptAdapter):
+    agent_type = "jiuwenswarm"
+
+    def execution_unit_kind(self) -> str:
+        return "opaque_external_team"
+
+    def extract_external_team_events(self, raw_frame: str, stream_name: str):
+        if stream_name == "stdout" and raw_frame.strip() == "official-team-ready":
+            return [{"kind": "runtime_ready", "raw_event_type": "team.runtime_ready"}]
+        return []
+
+
 class _PromptScriptAdapter(_ScriptAdapter):
     def __init__(
         self,
@@ -535,6 +547,101 @@ class ExternalAgentMonitoringTests(unittest.IsolatedAsyncioTestCase):
             result = await asyncio.wait_for(run_task, timeout=3)
 
             self.assertEqual(result.status, TaskStatus.DONE, result.content)
+            await store.close()
+
+    async def test_external_team_telemetry_persistence_does_not_block_stream_broadcast(self) -> None:
+        class _BlockingTeamEventStore(_SessionStoreStub):
+            def __init__(self) -> None:
+                super().__init__()
+                self.runtime_event_save_started = asyncio.Event()
+                self.release_runtime_event_save = asyncio.Event()
+                self.saved_runtime_event: dict[str, Any] = {}
+
+            async def save_runtime_event(self, **kwargs) -> None:
+                self.saved_runtime_event = dict(kwargs)
+                self.runtime_event_save_started.set()
+                await self.release_runtime_event_save.wait()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = _BlockingTeamEventStore()
+            broker = ExternalAgentBroker(store, _ApprovalStub())
+            task = Task(id="team-telemetry", title="Team telemetry", project_id="proj1")
+            adapter = _TeamTelemetryScriptAdapter("print('official-team-ready')\n")
+            broadcast_seen = asyncio.Event()
+
+            async def on_progress(_text: str, **kwargs) -> None:
+                if kwargs.get("external_team_event"):
+                    broadcast_seen.set()
+
+            run_task = asyncio.create_task(
+                broker.run(adapter, task, tmpdir, on_progress=on_progress)
+            )
+            await asyncio.wait_for(store.runtime_event_save_started.wait(), timeout=1)
+            await asyncio.wait_for(broadcast_seen.wait(), timeout=1)
+            store.release_runtime_event_save.set()
+            result = await asyncio.wait_for(run_task, timeout=3)
+
+            self.assertEqual(result.status, TaskStatus.DONE, result.content)
+            self.assertEqual(result.artifacts["external_team_summary"]["mode"], "leader_only")
+            payload = store.saved_runtime_event["payload"]
+            self.assertEqual(payload["project_id"], "proj1")
+            self.assertEqual(payload["task_id"], "team-telemetry")
+            self.assertEqual(payload["opc_session_id"], "team-telemetry")
+            self.assertTrue(payload["external_invocation_id"])
+            await store.close()
+
+    async def test_external_team_telemetry_persistence_failure_only_degrades_telemetry(self) -> None:
+        class _FailingTeamEventStore(_SessionStoreStub):
+            async def save_runtime_event(self, **_kwargs) -> None:
+                raise OSError("telemetry store unavailable")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = _FailingTeamEventStore()
+            broker = ExternalAgentBroker(store, _ApprovalStub())
+            result = await broker.run(
+                _TeamTelemetryScriptAdapter("print('official-team-ready')\n"),
+                Task(id="team-telemetry-failure", title="Team telemetry", project_id="proj1"),
+                tmpdir,
+            )
+
+            self.assertEqual(result.status, TaskStatus.DONE, result.content)
+            self.assertTrue(result.artifacts["external_team_summary"]["telemetry_incomplete"])
+            await store.close()
+
+    async def test_terminal_team_error_is_observed_before_runtime_failure(self) -> None:
+        class _RecordingTeamEventStore(_SessionStoreStub):
+            def __init__(self) -> None:
+                super().__init__()
+                self.runtime_events: list[dict[str, Any]] = []
+
+            async def save_runtime_event(self, **kwargs) -> None:
+                self.runtime_events.append(dict(kwargs))
+
+        class _FailingTeamAdapter(_TeamTelemetryScriptAdapter):
+            def extract_external_team_events(self, raw_frame: str, stream_name: str):
+                if stream_name == "stdout" and raw_frame.strip() == "official-team-error":
+                    return [{
+                        "kind": "team_error",
+                        "error": "provider failed",
+                        "raw_event_type": "team.error",
+                    }]
+                return []
+
+            def detect_runtime_failure(self, text: str, stream_name: str, metadata=None):
+                _ = stream_name, metadata
+                return "provider failed" if text.strip() == "official-team-error" else None
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = _RecordingTeamEventStore()
+            result = await ExternalAgentBroker(store, _ApprovalStub()).run(
+                _FailingTeamAdapter("print('official-team-error')\n"),
+                Task(id="team-error", title="Team error", project_id="proj1"),
+                tmpdir,
+            )
+
+            self.assertEqual(result.status, TaskStatus.FAILED)
+            self.assertEqual(store.runtime_events[0]["payload"]["kind"], "team_error")
+            self.assertEqual(result.artifacts["external_team_summary"]["mode"], "failed")
             await store.close()
 
     async def test_external_agent_long_single_line_output_does_not_crash_monitor(self) -> None:

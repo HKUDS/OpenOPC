@@ -473,6 +473,7 @@ class JiuwenAdapter(ExternalAgentAdapter):
                 str(payload.get("session_id") or "").strip(),
                 str(payload.get("rid") or "").strip(),
                 str(payload.get("role") or "assistant").strip(),
+                str(payload.get("member_name") or payload.get("member_id") or "").strip(),
             )
         )
 
@@ -498,7 +499,7 @@ class JiuwenAdapter(ExternalAgentAdapter):
             rid = str(payload.get("rid") or "").strip()
             candidates: list[str] = []
             for candidate in self._progress_text:
-                candidate_session, candidate_rid, candidate_role = candidate.split("|", 2)
+                candidate_session, candidate_rid, candidate_role, _candidate_member = candidate.split("|", 3)
                 if session_id and candidate_session != session_id:
                     continue
                 if role and candidate_role != role:
@@ -508,7 +509,7 @@ class JiuwenAdapter(ExternalAgentAdapter):
             # the usage/final boundary.  Prefer the same rid, then the empty
             # delta rid, before falling back to every stream in this session.
             if rid:
-                preferred = [key for key in candidates if key.split("|", 2)[1] in {rid, ""}]
+                preferred = [key for key in candidates if key.split("|", 3)[1] in {rid, ""}]
                 keys = preferred or candidates
             else:
                 keys = candidates
@@ -922,8 +923,266 @@ class JiuwenSwarmAdapter(JiuwenAdapter):
     default_provider_mode = "team"
     display_name = "JiuwenSwarm-team"
 
+    _TEAM_EVENT_KIND = {
+        "team.member.spawned": "member_spawned",
+        "team.member.status_changed": "member_status_changed",
+        "team.member.execution_changed": "member_execution_changed",
+        "team.member.restarted": "member_restarted",
+        "team.member.shutdown": "member_shutdown",
+        "team.task.created": "task_created",
+        "team.task.claimed": "task_claimed",
+        "team.task.completed": "task_completed",
+        "team.task.cancelled": "task_cancelled",
+        "team.task.unblocked": "task_unblocked",
+        "team.message.p2p": "message_p2p",
+        "team.message.broadcast": "message_broadcast",
+    }
+
+    def __init__(self, config=None) -> None:
+        super().__init__(config=config)
+        self._team_member_output: dict[str, str] = {}
+
     def execution_unit_kind(self) -> str:
         return "opaque_external_team"
+
+    def build_invocation(
+        self,
+        task: Task,
+        workspace_path: str | None = None,
+    ) -> tuple[list[str], dict[str, Any]]:
+        # Member deltas are process-local observations.  A resumable provider
+        # session may be reused by a later invocation, so unfinished text from
+        # a disconnected process must never cross that invocation boundary.
+        self._team_member_output.clear()
+        return super().build_invocation(task, workspace_path=workspace_path)
+
+    @staticmethod
+    def _team_member_key(payload: dict[str, Any]) -> str:
+        return "|".join(
+            (
+                str(payload.get("session_id") or "").strip(),
+                str(payload.get("rid") or "").strip(),
+                str(payload.get("member_name") or payload.get("member_id") or "").strip(),
+            )
+        )
+
+    @classmethod
+    def _team_member_payload(cls, raw: dict[str, Any]) -> dict[str, Any] | None:
+        member_id = str(
+            raw.get("member_id") or raw.get("member_name") or raw.get("name") or ""
+        ).strip()
+        if not member_id:
+            return None
+        return {
+            "member_id": member_id,
+            "name": str(raw.get("display_name") or raw.get("name") or member_id).strip(),
+            "role": str(raw.get("role") or "").strip(),
+            "mode": str(raw.get("mode") or "").strip(),
+            "status": str(raw.get("new_status") or raw.get("status") or "").strip(),
+            "execution_status": str(raw.get("execution_status") or "").strip(),
+            "reason": str(raw.get("reason") or "").strip(),
+            "restart_count": raw.get("restart_count"),
+        }
+
+    @staticmethod
+    def _team_task_payload(raw: dict[str, Any]) -> dict[str, Any] | None:
+        task_id = str(raw.get("task_id") or raw.get("id") or "").strip()
+        if not task_id:
+            return None
+        return {
+            "task_id": task_id,
+            "title": str(raw.get("title") or raw.get("name") or "").strip(),
+            "content": str(raw.get("content") or raw.get("description") or "").strip(),
+            "status": str(raw.get("status") or raw.get("new_status") or "").strip(),
+            "assignee": str(
+                raw.get("assignee")
+                or raw.get("member_id")
+                or raw.get("claimed_by")
+                or ""
+            ).strip(),
+            "dependencies": [
+                str(item).strip()
+                for item in list(raw.get("dependencies") or [])
+                if str(item).strip()
+            ],
+        }
+
+    @classmethod
+    def _team_message_payload(cls, raw: dict[str, Any]) -> dict[str, Any] | None:
+        message_id = str(raw.get("message_id") or raw.get("id") or "").strip()
+        content = str(raw.get("content") or raw.get("message") or "").strip()
+        if not message_id and not content:
+            return None
+        return {
+            "message_id": message_id,
+            "from_member": str(raw.get("from_member") or raw.get("from_member_name") or "").strip(),
+            "to_member": str(raw.get("to_member") or raw.get("to_member_name") or "").strip(),
+            "protocol": str(raw.get("protocol") or "plain").strip() or "plain",
+            "content": cls._trim_progress_text(content, limit=16_000),
+        }
+
+    def _flush_team_member_output(self, payload: dict[str, Any]) -> list[dict[str, Any]]:
+        exact = self._team_member_key(payload)
+        keys = [exact] if exact in self._team_member_output else []
+        if not keys:
+            session_id = str(payload.get("session_id") or "").strip()
+            member_name = str(payload.get("member_name") or payload.get("member_id") or "").strip()
+            keys = [
+                key
+                for key in self._team_member_output
+                if (not session_id or key.split("|", 2)[0] == session_id)
+                and (not member_name or key.split("|", 2)[2] == member_name)
+            ]
+        events: list[dict[str, Any]] = []
+        for key in keys:
+            content = self._restore_stream_markdown(
+                self._trim_progress_text(self._team_member_output.pop(key, ""), limit=16_000)
+            )
+            if not content:
+                continue
+            member_name = key.split("|", 2)[2]
+            events.append({
+                "kind": "member_output",
+                "member": {"member_id": member_name, "name": member_name},
+                "output": content,
+                "raw_event_type": "chat.llm_usage",
+            })
+        return events
+
+    def extract_external_team_events(
+        self,
+        raw_frame: str,
+        stream_name: str,
+    ) -> list[dict[str, Any]]:
+        if stream_name != "stdout":
+            return []
+        event_type, payload = self._event(raw_frame)
+        if not event_type:
+            return []
+
+        role = str(payload.get("role") or "").strip().lower()
+        if event_type == "chat.delta" and role == "teammate":
+            if not str(payload.get("member_name") or payload.get("member_id") or "").strip():
+                return []
+            content = self._delta_text(payload)
+            if content:
+                key = self._team_member_key(payload)
+                self._team_member_output[key] = self._team_member_output.get(key, "") + content
+            return []
+
+        inner_type = (
+            str(payload.get("event_type") or "").strip()
+            if event_type == "chat.final"
+            else event_type
+        )
+        if inner_type == "chat.llm_usage" and role == "teammate":
+            return self._flush_team_member_output(payload)
+
+        events: list[dict[str, Any]] = []
+        if inner_type == "team.runtime_ready":
+            events.append({
+                "kind": "runtime_ready",
+                "team_id": str(payload.get("team_name") or payload.get("team_id") or "").strip(),
+                "raw_event_type": inner_type,
+            })
+        elif inner_type == "team.completed":
+            events.extend(self._flush_team_member_output(payload))
+            events.append({
+                "kind": "team_completed",
+                "team_id": str(payload.get("team_name") or payload.get("team_id") or "").strip(),
+                "metrics": {
+                    "member_count": payload.get("member_count"),
+                    "task_count": payload.get("task_count"),
+                },
+                "raw_event_type": inner_type,
+            })
+        elif inner_type == "team.error":
+            events.extend(self._flush_team_member_output(payload))
+            events.append({
+                "kind": "team_error",
+                "error": self._trim_progress_text(self._payload_text(payload), limit=8_000),
+                "raw_event_type": inner_type,
+            })
+        elif (
+            inner_type in {"team.member", "team.task", "team.message"}
+            or inner_type in self._TEAM_EVENT_KIND
+        ):
+            raw = payload.get("event") if isinstance(payload.get("event"), dict) else payload
+            raw = dict(raw or {})
+            raw_type = str(
+                raw.get("type")
+                or (inner_type if inner_type in self._TEAM_EVENT_KIND else "")
+                or inner_type
+            ).strip()
+            family = (
+                inner_type
+                if inner_type in {"team.member", "team.task", "team.message"}
+                else raw_type.rsplit(".", 1)[0]
+            )
+            item: dict[str, Any] = {
+                "kind": self._TEAM_EVENT_KIND.get(raw_type, "provider_event"),
+                "team_id": str(raw.get("team_id") or payload.get("team_id") or "").strip(),
+                "raw_event_type": raw_type,
+            }
+            raw_occurred_at = raw.get("timestamp") or raw.get("updated_at") or raw.get("created_at")
+            if raw_occurred_at:
+                item["occurred_at"] = raw_occurred_at
+            if item["kind"] == "provider_event":
+                item["summary"] = self._trim_progress_text(
+                    json.dumps(raw, ensure_ascii=False, default=str),
+                    limit=4_000,
+                )
+            elif family == "team.member":
+                member = self._team_member_payload(raw)
+                if member:
+                    if raw_type == "team.member.execution_changed" and not member["execution_status"]:
+                        member["execution_status"] = str(
+                            raw.get("new_status") or raw.get("status") or ""
+                        ).strip()
+                    item["member"] = member
+            elif family == "team.task":
+                task = self._team_task_payload(raw)
+                if task:
+                    item["task"] = task
+            else:
+                message = self._team_message_payload(raw)
+                if message:
+                    item["message"] = message
+            events.append(item)
+        elif event_type == "chat.final" and inner_type in {"", "chat.final"}:
+            content = self._payload_text(payload)
+            if content:
+                if role == "teammate":
+                    flushed = self._flush_team_member_output(payload)
+                    events.extend(flushed)
+                    member = self._team_member_payload(payload)
+                    if not flushed and member:
+                        events.append({
+                            "kind": "member_output",
+                            "member": member,
+                            "output": self._trim_progress_text(content, limit=16_000),
+                            "raw_event_type": "chat.final",
+                        })
+                else:
+                    events.append({
+                        "kind": "leader_output",
+                        "output": self._trim_progress_text(content, limit=24_000),
+                        "raw_event_type": "chat.final",
+                    })
+        elif inner_type.startswith("team.") and inner_type != "workflow.updated":
+            events.append({
+                "kind": "provider_event",
+                "summary": self._trim_progress_text(self._payload_text(payload), limit=4_000),
+                "raw_event_type": inner_type,
+            })
+
+        session_id = str(payload.get("session_id") or "").strip()
+        occurred_at = payload.get("timestamp") or payload.get("created_at") or ""
+        for item in events:
+            item.setdefault("provider_session_id", session_id)
+            if occurred_at:
+                item.setdefault("occurred_at", occurred_at)
+        return events
 
     @staticmethod
     def _artifact_index_from_deliverables(value: Any) -> list[dict[str, str]]:

@@ -9975,6 +9975,30 @@ class OPCEngine:
         # have closed or altered those flags while the intake still owns live
         # children. Routing to a review helper in that state gives the final
         # decider the wrong board and can create duplicate business work.
+        live_dependency_work_item_ids = {
+            linked_work_item_id_for_task(candidate)
+            for candidate in tasks
+            if candidate.status
+            not in {TaskStatus.DONE, TaskStatus.FAILED, TaskStatus.CANCELLED}
+            and linked_work_item_id_for_task(candidate)
+        }
+        delivery_waits_for_live_work = any(
+            turn_type_for_task(candidate, fallback="") == "deliver"
+            and bool(
+                {
+                    str(item).strip()
+                    for item in list(
+                        dict(getattr(candidate, "metadata", {}) or {}).get(
+                            "dependency_work_item_ids", []
+                        )
+                        or []
+                    )
+                    if str(item).strip()
+                }
+                & live_dependency_work_item_ids
+            )
+            for candidate in tasks
+        )
         live_board_owners: list[Task] = []
         for candidate in tasks:
             metadata = dict(getattr(candidate, "metadata", {}) or {})
@@ -9992,11 +10016,13 @@ class OPCEngine:
                 "aggregate",
             }:
                 continue
-            if candidate.status in {
-                TaskStatus.DONE,
-                TaskStatus.FAILED,
-                TaskStatus.CANCELLED,
-            }:
+            completed_owner_of_live_delivery = bool(
+                candidate.status == TaskStatus.DONE
+                and delivery_waits_for_live_work
+            )
+            if candidate.status in {TaskStatus.FAILED, TaskStatus.CANCELLED}:
+                continue
+            if candidate.status == TaskStatus.DONE and not completed_owner_of_live_delivery:
                 continue
             pending_child_ids = {
                 str(item).strip()
@@ -10009,8 +10035,12 @@ class OPCEngine:
                 for item in list(metadata.get(key, []) or [])
                 if str(item).strip()
             }
-            if pending_child_ids or self._metadata_flag_true(
-                metadata.get("delegated_children_pending", False)
+            if (
+                completed_owner_of_live_delivery
+                or pending_child_ids
+                or self._metadata_flag_true(
+                    metadata.get("delegated_children_pending", False)
+                )
             ):
                 live_board_owners.append(candidate)
         if live_board_owners:
@@ -10111,6 +10141,8 @@ class OPCEngine:
         resume_source: str = "primary_session_followup",
         context_updates: dict[str, Any] | None = None,
         metadata_updates: dict[str, Any] | None = None,
+        controller_admission: CompanyRunControllerAdmission | None = None,
+        resume_checkpoint_id: str = "",
     ) -> None:
         assert self.store
         # A resumed production company run is controller-owned before this
@@ -10127,16 +10159,32 @@ class OPCEngine:
         )
         durable_task = await self.store.get_task(task.id)
         if durable_task is not None:
+            task.__dict__.update(copy.deepcopy(durable_task.__dict__))
             candidate_context = CompanyControllerAttemptContext.from_task(
-                durable_task,
-                work_item_id=linked_work_item_id_for_task(durable_task),
+                task,
+                work_item_id=linked_work_item_id_for_task(task),
             )
             if candidate_context.complete and callable(execute_authoritative):
                 controller_context = candidate_context
                 durable_task_preimage = company_controller_task_preimage_hash(
-                    durable_task
+                    task
                 )
-                task.__dict__.update(copy.deepcopy(durable_task.__dict__))
+        checkpoint_id = str(resume_checkpoint_id or "").strip()
+        resume_projection = None
+        if controller_context is None and controller_admission is not None:
+            if not checkpoint_id:
+                raise CompanyRunControllerLeaseLost(
+                    "company follow-up has a run controller but no attempt/checkpoint fence"
+                )
+            resume_projection = getattr(
+                self.store,
+                "save_company_runtime_resume_projection_for_controller",
+                None,
+            )
+            if not callable(resume_projection):
+                raise CompanyRunControllerLeaseLost(
+                    "company controller follow-up requires a fenced resume projection"
+                )
         # Terminal guard (belt to the selection-level filter): FAILED and
         # CANCELLED have no legal reopen edge. Mutating the Task projection
         # first and letting the store reject the phase write afterwards is
@@ -10210,7 +10258,7 @@ class OPCEngine:
         progress = list(task.metadata.get("progress_log", []) or [])
         progress.append(f"Company follow-up routed to final decider ({resume_source}): {reply}")
         task.metadata["progress_log"] = progress[-20:]
-        if controller_context is None:
+        if controller_context is None and resume_projection is None:
             await self.store.save_task(task)
 
         work_item_id = linked_work_item_id_for_task(task)
@@ -10317,6 +10365,44 @@ class OPCEngine:
                     raise CompanyRunControllerLeaseLost(
                         "company follow-up lost its atomic Task/WorkItem fence"
                     )
+            elif resume_projection is not None:
+                if work_item is None or current_phase is None:
+                    raise CompanyRunControllerLeaseLost(
+                        "company resume follow-up target lost its linked WorkItem"
+                    )
+                task.status = task_status_for_phase(target_phase)
+                receipt = await resume_projection(
+                    task,
+                    run_id=controller_admission.run_id,
+                    project_id=controller_admission.project_id,
+                    root_session_id=controller_admission.root_session_id,
+                    owner_token=controller_admission.owner_token,
+                    generation=controller_admission.generation,
+                    checkpoint_id=checkpoint_id,
+                    checkpoint_types=_COMPANY_RUNTIME_SUSPEND_CHECKPOINT_TYPES,
+                    work_item_mutation=CompanyControllerWorkItemMutation(
+                        work_item_id=work_item_id,
+                        expected_phases=(current_phase,),
+                        expected_updated_at=work_item.updated_at,
+                        phase=target_phase,
+                        deliverable_summary="",
+                        blocked_reason="",
+                        clear_claim=True,
+                        metadata_updates=resume_metadata,
+                        metadata_unset=tuple(metadata_unset or ()),
+                        transition_reason="company_followup_rework",
+                        allow_approved_rework=(current_phase == Phase.APPROVED),
+                    ),
+                )
+                outcome = str(getattr(receipt, "outcome", "") or "")
+                if outcome == "stale":
+                    raise CompanyRunControllerLeaseLost(
+                        "company controller lease changed during follow-up resume"
+                    )
+                if not bool(getattr(receipt, "applied", False)):
+                    raise RuntimeError(
+                        "company follow-up lost its checkpoint/WorkItem boundary"
+                    )
             elif current_phase == Phase.APPROVED and callable(reopen_approved):
                 await reopen_approved(
                     work_item_id,
@@ -10345,7 +10431,11 @@ class OPCEngine:
                 "controller_lease_generation": controller_context.generation,
             }
         role_session_id = str(task.metadata.get("delegation_role_session_id", "") or "").strip()
-        if role_session_id and hasattr(self.store, "update_delegation_role_session"):
+        if (
+            resume_projection is None
+            and role_session_id
+            and hasattr(self.store, "update_delegation_role_session")
+        ):
             await self.store.update_delegation_role_session(
                 role_session_id,
                 focused_work_item_id="",
@@ -10359,7 +10449,11 @@ class OPCEngine:
                 **controller_write_kwargs,
             )
         seat_state_id = str(task.metadata.get("seat_state_id") or task.metadata.get("delegation_seat_state_id") or "").strip()
-        if seat_state_id and hasattr(self.store, "update_seat_state"):
+        if (
+            resume_projection is None
+            and seat_state_id
+            and hasattr(self.store, "update_seat_state")
+        ):
             await self.store.update_seat_state(
                 seat_state_id,
                 current_task_id="",
@@ -10388,6 +10482,7 @@ class OPCEngine:
         metadata_updates: dict[str, Any] | None = None,
         degrade_to_plain_resume_on_missing_target: bool = False,
         controller_admission: CompanyRunControllerAdmission | None = None,
+        resume_checkpoint_id: str = "",
         release_controller_admission_on_exit: bool = True,
     ) -> str | None:
         assert self.company_executor
@@ -10474,6 +10569,8 @@ class OPCEngine:
                 resume_source=resume_source,
                 context_updates=context_updates,
                 metadata_updates=metadata_updates,
+                controller_admission=admission,
+                resume_checkpoint_id=resume_checkpoint_id,
             )
         except BaseException:
             if release_controller_admission_on_exit and admission is not None:
@@ -16245,6 +16342,18 @@ class OPCEngine:
             raise _PermanentInteractionError(
                 "tool permission checkpoint ownership does not match the execution task"
             )
+        linked_work_item_id = linked_work_item_id_for_task(task)
+        if linked_work_item_id:
+            linked_work_item = await self.store.get_delegation_work_item(
+                linked_work_item_id
+            )
+            if (
+                linked_work_item is not None
+                and getattr(linked_work_item, "phase", None) in DONE_PHASES
+            ):
+                raise _PermanentInteractionError(
+                    "tool permission checkpoint belongs to a terminal company WorkItem"
+                )
 
         prior_results = await self.store.list_runtime_tool_results(runtime_session_id)
         if any(str(item.get("tool_call_id", "") or "") == tool_call_id for item in prior_results):
@@ -17871,8 +17980,6 @@ class OPCEngine:
                 except Exception:
                     work_item = None
                 if work_item is not None:
-                    if getattr(work_item, "phase", None) in DONE_PHASES:
-                        continue
                     work_item_metadata = dict(getattr(work_item, "metadata", {}) or {})
                     work_item_is_held = str(work_item_metadata.get("dispatch_hold", "") or "").strip() == "company_runtime_suspended"
             if (
@@ -18099,12 +18206,30 @@ class OPCEngine:
             ).strip()
 
         try:
+            target_role_id = str(
+                target_task.assigned_to
+                or dict(target_task.metadata or {}).get("work_item_role_id", "")
+                or ""
+            ).strip()
+            final_decider_resume_task_ids = {
+                task.id
+                for task in tasks
+                if task.status
+                not in {TaskStatus.DONE, TaskStatus.FAILED, TaskStatus.CANCELLED}
+                and str(
+                    task.assigned_to
+                    or dict(task.metadata or {}).get("work_item_role_id", "")
+                    or ""
+                ).strip()
+                == target_role_id
+            }
+            final_decider_resume_task_ids.add(target_task.id)
             handoff = await self._handoff_company_suspend_checkpoint(
                 checkpoint,
                 payload=payload,
                 parent_session_id=parent_session_id,
                 tasks=tasks,
-                resume_task_ids={target_task.id},
+                resume_task_ids=final_decider_resume_task_ids,
             )
         except CompanyRunControllerBusy as exc:
             return str(exc)
@@ -18127,6 +18252,7 @@ class OPCEngine:
                     session_id=parent_session_id,
                     degrade_to_plain_resume_on_missing_target=True,
                     controller_admission=controller_admission,
+                    resume_checkpoint_id=checkpoint.checkpoint_id,
                     release_controller_admission_on_exit=False,
                 )
                 if followup_result is None:

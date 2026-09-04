@@ -14,6 +14,9 @@ import { IconWorkItem } from './SvgIcons'
 import { getWorkItemAssignmentLabel, humanizeWorkItemRoleId } from '../lib/workItemIdentity'
 import { getExecutionTurnId } from '../lib/workItemRuntimeIds'
 import { executionAgentLabel } from '../lib/externalAgents'
+import type { ExternalTeamActivityRecord } from '../stores/ExternalTeamActivityStore'
+import type { ExternalTeamActivitySummary } from '../types/externalTeamActivity'
+import { externalTeamSummaryText, isJiuwenOpaqueTeam } from '../lib/externalTeamActivity'
 
 interface WorkItemProgressCardProps {
   workItemLog: WorkItemProgressEntry[]
@@ -34,6 +37,7 @@ interface WorkItemProgressCardProps {
   /** Company/org mode uses work-item rollups as the only role source. */
   isCompanyRuntime?: boolean
   onWorkItemClick?: (executionTurnId: string) => void
+  getExternalTeamActivity?: (taskId: string, invocationId?: string) => ExternalTeamActivityRecord | undefined
 }
 
 type WorkItemStatus = 'active' | 'done' | 'failed' | 'waiting' | 'pending'
@@ -45,6 +49,7 @@ interface WorkItemInfo {
   status: WorkItemStatus
   executionTurnId?: string
   executionAgent?: string
+  externalTeamSummary?: ExternalTeamActivitySummary
 }
 
 interface RoleTurnInfo {
@@ -81,6 +86,7 @@ interface RoleSummaryInfo {
    *  ``reflecting`` / ``tool_active`` the chip shows the orange pulse;
    *  otherwise the chip's colour is governed by ``status`` alone. */
   runtimeStatus?: AgentAnimStatus
+  externalTeamSummary?: ExternalTeamActivitySummary
 }
 
 /** Kanban-column labels used both on the role's aggregate chip and on
@@ -249,6 +255,7 @@ export function WorkItemProgressCard({
   childSessions,
   isCompanyRuntime = false,
   onWorkItemClick,
+  getExternalTeamActivity,
 }: WorkItemProgressCardProps) {
   // Build child session lookup for enriching display names
   const sessionByTaskId = useMemo(() => {
@@ -373,14 +380,16 @@ export function WorkItemProgressCard({
       const aggregatedStatus = AGGREGATED_TO_WORK_ITEM_STATUS[summary.aggregatedStatus] ?? 'pending'
       const aggregatedColumnId = workItemStatusToColumnId(aggregatedStatus)
       const latest = turns[turns.length - 1]
-      const opaqueTeamRow = ordered.find(row => row.executionUnitKind === 'opaque_external_team')
       // Chip click target: prefer the latest turn's runtime task. When the
       // last work item has no execution turn yet (queued / never dispatched),
       // walk back to find the most recent dispatched turn.
       const fallbackExecutionTurnId = [...turns].reverse().find(t => !!t.executionTurnId)?.executionTurnId ?? ''
+      const focusedExecutionTurnId = latest.executionTurnId || fallbackExecutionTurnId
+      const focusedRow = [...ordered].reverse().find(row => row.executionTurnId === focusedExecutionTurnId)
+      const opaqueTeamRow = isJiuwenOpaqueTeam(focusedRow) ? focusedRow : undefined
       summaries.push({
         roleKey: summary.roleKey,
-        executionTurnId: latest.executionTurnId || fallbackExecutionTurnId,
+        executionTurnId: focusedExecutionTurnId,
         title: opaqueTeamRow
           ? `${summary.roleName || summary.roleId} · JiuwenSwarm-team`
           : (summary.roleName || summary.roleId),
@@ -391,6 +400,12 @@ export function WorkItemProgressCard({
         turns,
         runtimeStatus: summary.runtimeStatus,
         executionAgent: formatExecutionAgent(opaqueTeamRow?.selectedExecutionAgent),
+        externalTeamSummary: opaqueTeamRow
+          ? (getExternalTeamActivity?.(
+              focusedExecutionTurnId,
+              opaqueTeamRow.externalTeamSummary?.externalInvocationId,
+            )?.summary ?? opaqueTeamRow.externalTeamSummary)
+          : undefined,
       })
     }
     // Stable order: roles first appearing in time go left.
@@ -400,7 +415,7 @@ export function WorkItemProgressCard({
       return aFirst - bFirst
     })
     return summaries
-  }, [displayRoleWorkItems])
+  }, [displayRoleWorkItems, getExternalTeamActivity])
 
   const roleSummariesFromSessions = useMemo<RoleSummaryInfo[]>(() => {
     const sessions = [...(childSessions ?? [])]
@@ -536,6 +551,7 @@ export function WorkItemProgressCard({
         status: role.status,
         executionTurnId: role.executionTurnId,
         executionAgent: role.executionAgent,
+        externalTeamSummary: role.externalTeamSummary,
       }))
     }
     return isCompanyRuntime ? [] : workItemLogWorkItems
@@ -564,6 +580,9 @@ export function WorkItemProgressCard({
                 <span className="wi-projection-label">{workItem.title}</span>
                 {workItem.executionAgent && (
                   <span className="wi-projection-agent">{workItem.executionAgent}</span>
+                )}
+                {workItem.externalTeamSummary && (
+                  <span className="wi-projection-team-summary">{externalTeamSummaryText(workItem.externalTeamSummary)}</span>
                 )}
                 {renderProjectionIcon(workItem.status)}
               </button>

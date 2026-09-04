@@ -183,6 +183,74 @@ class CompanyRuntimeSuspendResumeTests(unittest.IsolatedAsyncioTestCase):
         engine._schedule_interaction_consumption = lambda *_args: None
         return engine
 
+    async def test_resume_candidates_include_held_task_whose_work_item_finished_during_staged_resume(
+        self,
+    ) -> None:
+        store = await self._store()
+        work_item = DelegationWorkItem(
+            work_item_id="work-item-approved-while-held",
+            run_id="run-1",
+            role_id="cmo",
+            seat_id="seat-cmo",
+            title="CMO delivery",
+            projection_id="cmo-delivery",
+            phase=Phase.APPROVED,
+            metadata={"dispatch_hold": "company_runtime_suspended"},
+        )
+        task = Task(
+            id="task-approved-while-held",
+            title="CMO delivery",
+            status=TaskStatus.AWAITING_MANAGER_REVIEW,
+            project_id="proj1",
+            assigned_to="cmo",
+            metadata={"dispatch_hold": "company_runtime_suspended"},
+        )
+        set_linked_work_item_id(task, work_item.work_item_id)
+        await store.save_delegation_work_item(work_item)
+        await store.save_task(task)
+        await store.link_work_item_runtime_task(work_item.work_item_id, task.id)
+
+        candidate_ids = await self._engine(
+            store
+        )._company_suspend_resume_candidate_task_ids([task])
+
+        self.assertEqual(candidate_ids, {task.id})
+
+    async def test_runtime_projects_authoritative_work_item_hold_before_bootstrap(
+        self,
+    ) -> None:
+        store = await self._store()
+        work_item = DelegationWorkItem(
+            work_item_id="work-item-held-with-stale-task",
+            run_id="run-1",
+            role_id="cmo",
+            seat_id="seat-cmo",
+            title="CMO delivery",
+            projection_id="cmo-delivery",
+            phase=Phase.APPROVED,
+            metadata={"dispatch_hold": "company_runtime_suspended"},
+        )
+        task = Task(
+            id="task-with-stale-unheld-projection",
+            title="CMO delivery",
+            status=TaskStatus.AWAITING_MANAGER_REVIEW,
+            project_id="proj1",
+            assigned_to="cmo",
+            metadata={},
+        )
+        set_linked_work_item_id(task, work_item.work_item_id)
+        await store.save_delegation_work_item(work_item)
+        await store.save_task(task)
+        await store.link_work_item_runtime_task(work_item.work_item_id, task.id)
+
+        runtime = CompanyRuntime(org_engine=None, communication=None, store=store)
+        await runtime._project_work_item_dispatch_holds([task])
+
+        self.assertEqual(
+            task.metadata.get("dispatch_hold"),
+            "company_runtime_suspended",
+        )
+
     async def _publish_owner_checkpoint(
         self,
         store: OPCStore,
@@ -1536,7 +1604,15 @@ class CompanyRuntimeSuspendResumeTests(unittest.IsolatedAsyncioTestCase):
             project_id="proj1",
             assigned_to="ceo",
             metadata=mark_work_item_projection(
-                {"work_item_runtime": True, "dependency_work_item_ids": ["wi-worker"]},
+                {
+                    "work_item_runtime": True,
+                    "dependency_work_item_ids": ["wi-worker"],
+                    "execution_mode": "company_mode",
+                    "authoritative_output": True,
+                    "user_visible": True,
+                    "requires_user_feedback": True,
+                    "feedback_scope": "final",
+                },
                 projection_id="ceo-delivery",
                 turn_type="deliver",
             ),
@@ -1553,6 +1629,7 @@ class CompanyRuntimeSuspendResumeTests(unittest.IsolatedAsyncioTestCase):
                 turn_type="execute",
             ),
         )
+        set_linked_work_item_id(worker, "wi-worker")
 
         target = engine._company_followup_target_task(plan, [delivery, worker, intake])
 
@@ -2174,6 +2251,57 @@ class CompanyRuntimeSuspendResumeTests(unittest.IsolatedAsyncioTestCase):
                 refreshed_ceo_item,
                 {"wi-ceo": refreshed_ceo_item, "wi-child": child_item},
                 task_by_work_item_id={"wi-ceo": refreshed_task},
+            )
+        )
+
+    async def test_runnable_work_item_respects_suspended_task_projection(self) -> None:
+        item = DelegationWorkItem(
+            work_item_id="wi-worker",
+            run_id="run-1",
+            role_id="engineer",
+            seat_id="seat-engineer",
+            title="Worker",
+            kind="execute",
+            projection_id="worker-execute",
+            phase=Phase.READY,
+            metadata=mark_work_item_projection(
+                {"work_item_runtime": True, "runtime_model": "multi_team_org"},
+                projection_id="worker-execute",
+                turn_type="execute",
+            ),
+        )
+        task = Task(
+            id="task-worker",
+            title="Worker",
+            status=TaskStatus.RUNNING,
+            project_id="proj1",
+            assigned_to="engineer",
+            metadata=mark_work_item_projection(
+                {
+                    "work_item_runtime": True,
+                    "runtime_model": "multi_team_org",
+                    "dispatch_hold": "company_runtime_suspended",
+                },
+                projection_id="worker-execute",
+                turn_type="execute",
+            ),
+        )
+        set_linked_work_item_id(task, item.work_item_id)
+
+        self.assertFalse(
+            CompanyWorkItemExecutor._work_item_is_runnable(
+                item,
+                {item.work_item_id: item},
+                task_by_work_item_id={item.work_item_id: task},
+            )
+        )
+
+        task.metadata.pop("dispatch_hold")
+        self.assertTrue(
+            CompanyWorkItemExecutor._work_item_is_runnable(
+                item,
+                {item.work_item_id: item},
+                task_by_work_item_id={item.work_item_id: task},
             )
         )
 

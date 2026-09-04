@@ -770,6 +770,7 @@ def _build_role_work_items_for_session(
     task_by_work_item_id: dict[str, Any],
     event_adapter: "EventAdapter | None",
     progress_by_task: dict[str, list[dict[str, Any]]] | None = None,
+    external_team_summary_by_task: dict[str, dict[str, Any]] | None = None,
     group_by_executor: bool = False,
 ) -> dict[str, dict[str, Any]]:
     """Group DelegationWorkItems and emit per-role summaries.
@@ -930,6 +931,12 @@ def _build_role_work_items_for_session(
                 _public_activity_section(section)
                 for section in activity_sections
             ],
+            "external_team_summary": (
+                dict((external_team_summary_by_task or {}).get(execution_turn_id, {}))
+                if execution_turn_id
+                and isinstance((external_team_summary_by_task or {}).get(execution_turn_id), dict)
+                else None
+            ),
         }
 
         # Group by effective owner role. ``role_id`` is stable per logical
@@ -980,6 +987,7 @@ def _build_executor_role_work_items_for_session(
     task_by_work_item_id: dict[str, Any],
     event_adapter: "EventAdapter | None",
     progress_by_task: dict[str, list[dict[str, Any]]] | None = None,
+    external_team_summary_by_task: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, dict[str, Any]]:
     """Display-only rollup for Execution Progress.
 
@@ -993,6 +1001,7 @@ def _build_executor_role_work_items_for_session(
         task_by_work_item_id=task_by_work_item_id,
         event_adapter=event_adapter,
         progress_by_task=progress_by_task,
+        external_team_summary_by_task=external_team_summary_by_task,
         group_by_executor=True,
     )
 
@@ -2810,7 +2819,6 @@ async def reconcile_sessions(
         return 0
 
     tasks = [task for task in tasks if not is_runtime_auxiliary_task(task)]
-
     total_backfilled = 0
     hydrated = 0
     task_ids = {
@@ -3425,6 +3433,34 @@ async def build_collab_sync(
         except Exception:
             logger.warning("Failed to load tasks for collab_sync")
     tasks = [task for task in tasks if not is_runtime_auxiliary_task(task)]
+    # Display-only cache for opaque external teams.  It belongs to this
+    # collab-sync projection (the sole consumer), not transcript reconciliation.
+    # Failure only removes auxiliary telemetry from the snapshot.
+    external_team_summary_by_task: dict[str, dict[str, Any]] = {}
+    has_jiuwen_team_task = any(
+        _resolve_task_selected_execution_agent(task) == "jiuwenswarm"
+        and str((getattr(task, "metadata", {}) or {}).get("execution_unit_kind") or "").strip()
+        == "opaque_external_team"
+        for task in tasks
+    )
+    if has_jiuwen_team_task and engine.store and hasattr(engine.store, "list_external_sessions"):
+        try:
+            external_sessions = await engine.store.list_external_sessions(
+                project_id=project_id,
+                limit=max(100, len(tasks) * 4),
+            )
+            for external_session in external_sessions:
+                if str(getattr(external_session, "agent_type", "") or "").strip() != "jiuwenswarm":
+                    continue
+                task_id = str(getattr(external_session, "task_id", "") or "").strip()
+                metadata = dict(getattr(external_session, "metadata", {}) or {})
+                if str(metadata.get("execution_unit_kind") or "").strip() != "opaque_external_team":
+                    continue
+                summary = metadata.get("external_team_summary")
+                if task_id and task_id not in external_team_summary_by_task and isinstance(summary, dict):
+                    external_team_summary_by_task[task_id] = dict(summary)
+        except Exception:
+            logger.opt(exception=True).debug("Failed to load external team summaries")
     company_board_tasks: list[dict[str, Any]] = []
     company_board_columns: list[dict[str, Any]] = []
     company_boards: list[dict[str, Any]] = []
@@ -3874,6 +3910,7 @@ async def build_collab_sync(
                     task_by_work_item_id=company_task_by_work_item_id,
                     event_adapter=event_adapter,
                     progress_by_task=progress_by_task,
+                    external_team_summary_by_task=external_team_summary_by_task,
                 )
                 if not role_work_items_payload:
                     role_work_items_payload = None
@@ -3882,6 +3919,7 @@ async def build_collab_sync(
                     task_by_work_item_id=company_task_by_work_item_id,
                     event_adapter=event_adapter,
                     progress_by_task=progress_by_task,
+                    external_team_summary_by_task=external_team_summary_by_task,
                 )
                 if not executor_role_work_items_payload:
                     executor_role_work_items_payload = None
@@ -3948,6 +3986,10 @@ async def build_collab_sync(
             "external_team_binding_id": dict(identity_meta.get("external_team_binding", {}) or t_meta.get("external_team_binding", {}) or {}).get("binding_id"),
             "external_team_boundary_role_id": dict(identity_meta.get("external_team_binding", {}) or t_meta.get("external_team_binding", {}) or {}).get("boundary_role_id"),
             "covered_role_ids": list(identity_meta.get("covered_role_ids", []) or t_meta.get("covered_role_ids", []) or []),
+            "external_team_summary": (
+                external_team_summary_by_task.get(identity_task_id)
+                or external_team_summary_by_task.get(runtime_task_id)
+            ),
             "external_company_execution_fence": identity_meta.get("external_company_execution_fence") or t_meta.get("external_company_execution_fence"),
             "channel_id": channel_id,
             "title": t.title,

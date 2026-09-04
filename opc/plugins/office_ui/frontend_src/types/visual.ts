@@ -1,4 +1,5 @@
 import type { AgentAnimStatus, NativeApprovalLevel, TaskPreferredAgent } from './kanban'
+import type { ExternalTeamActivitySnapshotPayload, ExternalTeamEventV1 } from './externalTeamActivity'
 
 export type RoleId = string & { readonly __brand: 'RoleId' }
 export type TemplateId = string & { readonly __brand: 'TemplateId' }
@@ -96,6 +97,8 @@ export type SocketEnvelope =
   | { type: 'child_session_created'; payload: { project_id: string; session_id: string; parent_session_id: string; task_id: string; title: string; agent_id?: string; selected_execution_agent?: TaskPreferredAgent } }
   | { type: 'session_progress'; payload: SessionProgressPayload }
   | { type: 'work_item_progress'; payload: WorkItemProgressPayload }
+  | { type: 'external_team_activity_event'; payload: ExternalTeamEventV1 }
+  | { type: 'external_team_activity_snapshot'; payload: ExternalTeamActivitySnapshotPayload }
   | { type: 'org_info'; payload: OrgInfoPayload }
   | { type: 'project_run_updated'; payload: ProjectRunInfo }
   | { type: 'seat_digest_updated'; payload: { run_id?: string; seat_digests: SeatDigestInfo[] } }

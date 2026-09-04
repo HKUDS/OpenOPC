@@ -39,6 +39,7 @@ from opc.core.interaction_protocol import (
     OriginOwnerInteractionLease,
     PreparedOwnerInteractionPublication,
 )
+from opc.core.native_permissions import normalize_native_approval_level
 from opc.core.models import (
     AdaptiveRoleProfile,
     AdaptiveSignalSpec,
@@ -3081,6 +3082,18 @@ class CompanyWorkItemExecutor:
         report_execution_work_item = is_report_execution_work_item_metadata(metadata)
         if str(metadata.get("dispatch_hold", "") or "").strip():
             return False
+        projected_task = (
+            task_by_work_item_id.get(
+                str(getattr(work_item, "work_item_id", "") or "").strip()
+            )
+            if task_by_work_item_id is not None
+            else None
+        )
+        if projected_task is not None and any(
+            str(dict(projected_task.metadata or {}).get(key, "") or "").strip()
+            for key in _COMPANY_RUNTIME_CONTROL_TASK_METADATA_KEYS
+        ):
+            return False
         # Attempt-ledger brake: cards whose recent attempts keep crashing or
         # keep getting interrupted must not be re-enqueued — this check also
         # covers the review/report `or phase == RUNNING` arms below that
@@ -3132,11 +3145,7 @@ class CompanyWorkItemExecutor:
         if not (is_runnable(phase) or phase in runnable_in_progress or is_orphaned(work_item)):
             return False
         if str(metadata.get("runtime_model", "") or "").strip() == "multi_team_org":
-            followup_task = (
-                task_by_work_item_id.get(str(getattr(work_item, "work_item_id", "") or "").strip())
-                if task_by_work_item_id is not None
-                else None
-            )
+            followup_task = projected_task
             followup_task_pending = (
                 followup_task is not None
                 and followup_task.status == TaskStatus.PENDING
@@ -4029,6 +4038,19 @@ class CompanyWorkItemExecutor:
         for work_item in work_items:
             task = task_by_work_item_id.get(str(work_item.work_item_id or "").strip())
             if task is None:
+                continue
+            task_metadata = dict(task.metadata or {})
+            work_item_metadata = dict(work_item.metadata or {})
+            if (
+                any(
+                    str(task_metadata.get(key, "") or "").strip()
+                    for key in _COMPANY_RUNTIME_CONTROL_TASK_METADATA_KEYS
+                )
+                or str(work_item_metadata.get("dispatch_hold", "") or "").strip()
+            ):
+                # A suspend/quarantine hold freezes both sides of the runtime
+                # projection.  The staged-resume owner releases that boundary
+                # atomically before ordinary projection sync may write again.
                 continue
             changed = self._apply_work_item_projection_to_task(task, work_item)
             if changed and self.store and hasattr(self.store, "save_task"):
@@ -5348,6 +5370,16 @@ class CompanyWorkItemExecutor:
                 "workspace_root": str((root_task.metadata or {}).get("workspace_root", "") or "").strip(),
                 "comms_workspace_root": str((root_task.metadata or {}).get("comms_workspace_root", "") or "").strip(),
                 "comms_root": str((root_task.metadata or {}).get("comms_root", "") or "").strip(),
+                "native_approval_level": normalize_native_approval_level(
+                    root_metadata.get("native_approval_level")
+                ),
+                "native_permission_scope_id": str(
+                    root_metadata.get(
+                        "native_permission_scope_id",
+                        root_parent_session_id,
+                    )
+                    or root_parent_session_id
+                ).strip(),
                 "user_visible": bool(dict(getattr(work_item, "metadata", {}) or {}).get("user_visible", False)),
                 "authoritative_output": bool(dict(getattr(work_item, "metadata", {}) or {}).get("authoritative_output", False)),
                 "review_task": review_execution_work_item,
@@ -16734,6 +16766,47 @@ class CompanyWorkItemExecutor:
             candidates.append(candidate)
         return candidates
 
+    def _effective_pre_delivery_tasks(self, tasks: list[Task]) -> list[Task]:
+        """Exclude superseded auxiliary attempts from the delivery view.
+
+        Review and report work items are immutable attempt records.  A failed
+        older attempt remains durable after a later attempt succeeds, but it
+        must not be presented as a current blocker during final delivery.
+        """
+
+        latest_by_scope: dict[tuple[str, str], tuple[tuple[int, str, str], int]] = {}
+        scope_by_index: dict[int, tuple[str, str]] = {}
+        for index, task in enumerate(tasks):
+            turn_type = self._turn_type_for_task(task)
+            if turn_type not in {"review", "report"}:
+                continue
+            metadata = dict(task.metadata or {})
+            target_work_item_id = str(
+                metadata.get(f"{turn_type}_target_work_item_id", "") or ""
+            ).strip()
+            if not target_work_item_id:
+                continue
+            try:
+                attempt = int(metadata.get(f"{turn_type}_attempt", 0) or 0)
+            except (TypeError, ValueError):
+                attempt = 0
+            scope = (turn_type, target_work_item_id)
+            rank = (
+                attempt,
+                str(getattr(task, "created_at", "") or ""),
+                str(task.id or ""),
+            )
+            scope_by_index[index] = scope
+            current = latest_by_scope.get(scope)
+            if current is None or rank > current[0]:
+                latest_by_scope[scope] = (rank, index)
+        return [
+            task
+            for index, task in enumerate(tasks)
+            if index not in scope_by_index
+            or latest_by_scope[scope_by_index[index]][1] == index
+        ]
+
     def _task_open_issues(
         self,
         task: Task,
@@ -19330,6 +19403,7 @@ class CompanyWorkItemExecutor:
             # instance used by validation/rework; a stale delivery object must
             # not be observed again after this finalization turn.
             self._active_tasks = tasks
+            tasks = self._effective_pre_delivery_tasks(tasks)
             candidate_work_item_metadata_by_id: dict[
                 str, Mapping[str, Any]
             ] = {}

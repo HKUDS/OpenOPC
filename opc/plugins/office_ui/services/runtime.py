@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from opc.plugins.office_ui.snapshot_builder import build_collab_sync, build_snapshot
+from opc.layer3_agent.external_team_activity import reduce_external_team_events
 
 from .context import OfficeServiceContext
 from .models import ServiceError, ServiceEvent, ServiceResult
@@ -145,7 +146,11 @@ class RuntimeService:
         engine = await self.context.engine_for_project(project_id)
         store = getattr(engine, "store", None)
         task = await store.get_task(task_id) if store else None
-        if not task:
+        if (
+            not task
+            or str(getattr(task, "project_id", "default") or "default").strip()
+            != str(project_id or "default").strip()
+        ):
             raise ServiceError("task_not_found", "task_not_found", {"task_id": task_id})
         metadata = dict(getattr(task, "metadata", {}) or {})
         transcript = await store.get_session_transcript(task.session_id) if getattr(task, "session_id", None) else []
@@ -178,6 +183,251 @@ class RuntimeService:
             "transcript": transcript[-limit:],
             "runtime_sessions": runtime_sessions,
             "runtime_events": enriched_events,
+        })
+
+    async def external_team_activity(
+        self,
+        *,
+        project_id: str,
+        task_id: str,
+        external_invocation_id: str = "",
+        limit: int = 100,
+        before_created_at: str = "",
+        before_event_id: str = "",
+    ) -> ServiceResult:
+        """Return read-only Jiuwen Team telemetry for one runtime turn."""
+
+        engine = await self.context.engine_for_project(project_id)
+        store = getattr(engine, "store", None)
+        task = await store.get_task(task_id) if store else None
+        if (
+            not task
+            or str(getattr(task, "project_id", "default") or "default").strip()
+            != str(project_id or "default").strip()
+        ):
+            raise ServiceError("task_not_found", "task_not_found", {"task_id": task_id})
+        if not hasattr(store, "list_external_sessions"):
+            return ServiceResult({
+                "available": False,
+                "reason": "telemetry_unavailable",
+                "project_id": project_id,
+                "task_id": task_id,
+                "external_invocation_id": str(external_invocation_id or "").strip(),
+            })
+
+        sessions = await store.list_external_sessions(
+            project_id=project_id,
+            task_id=task_id,
+            limit=100,
+        )
+        requested_invocation = str(external_invocation_id or "").strip()
+        team_sessions: list[tuple[Any, dict[str, Any], str]] = []
+        for candidate in sessions:
+            metadata = dict(getattr(candidate, "metadata", {}) or {})
+            is_team = (
+                str(getattr(candidate, "agent_type", "") or "").strip() == "jiuwenswarm"
+                and str(metadata.get("execution_unit_kind") or "").strip()
+                == "opaque_external_team"
+            )
+            if not is_team:
+                continue
+            runtime_session_id = str(
+                metadata.get("runtime_session_id")
+                or getattr(candidate, "session_id", "")
+                or ""
+            ).strip()
+            if runtime_session_id:
+                team_sessions.append((candidate, metadata, runtime_session_id))
+
+        invocation_rows: list[dict[str, Any]] = []
+        invocation_owner: dict[str, tuple[Any, dict[str, Any], str]] = {}
+        seen_runtime_sessions: set[str] = set()
+        for candidate, metadata, runtime_session_id in team_sessions:
+            if runtime_session_id in seen_runtime_sessions:
+                continue
+            seen_runtime_sessions.add(runtime_session_id)
+            rows: list[dict[str, Any]] = []
+            if hasattr(store, "list_external_team_invocations"):
+                rows = await store.list_external_team_invocations(
+                    runtime_session_id,
+                    task_id,
+                )
+            if not rows:
+                current_invocation = str(
+                    metadata.get("external_invocation_id")
+                    or dict(metadata.get("external_team_summary", {}) or {}).get(
+                        "external_invocation_id"
+                    )
+                    or ""
+                ).strip()
+                if current_invocation:
+                    rows = [{
+                        "external_invocation_id": current_invocation,
+                        "started_at": "",
+                        "last_event_at": "",
+                        "event_count": 0,
+                        "member_count": int(
+                            dict(metadata.get("external_team_summary", {}) or {})
+                            .get("counts", {})
+                            .get("members", 0)
+                            or 0
+                        ),
+                        "task_count": int(
+                            dict(metadata.get("external_team_summary", {}) or {})
+                            .get("counts", {})
+                            .get("tasks", 0)
+                            or 0
+                        ),
+                        "message_count": 0,
+                        "output_count": 0,
+                    }]
+            for row in rows:
+                invocation_id = str(row.get("external_invocation_id") or "").strip()
+                if not invocation_id or invocation_id in invocation_owner:
+                    continue
+                normalized = {
+                    "external_invocation_id": invocation_id,
+                    "started_at": str(row.get("started_at") or ""),
+                    "last_event_at": str(row.get("last_event_at") or ""),
+                    "event_count": int(row.get("event_count") or 0),
+                    "member_count": int(row.get("member_count") or 0),
+                    "task_count": int(row.get("task_count") or 0),
+                    "message_count": int(row.get("message_count") or 0),
+                    "output_count": int(row.get("output_count") or 0),
+                }
+                invocation_rows.append(normalized)
+                invocation_owner[invocation_id] = (
+                    candidate,
+                    metadata,
+                    runtime_session_id,
+                )
+
+        if not invocation_rows:
+            return ServiceResult({
+                "available": False,
+                "reason": "no_team_telemetry",
+                "project_id": project_id,
+                "task_id": task_id,
+                "external_invocation_id": requested_invocation,
+            })
+
+        latest_invocation = max(
+            invocation_rows,
+            key=lambda row: (
+                str(row.get("last_event_at") or ""),
+                str(row.get("external_invocation_id") or ""),
+            ),
+        )["external_invocation_id"]
+        preferred_invocation = max(
+            invocation_rows,
+            key=lambda row: (
+                int(row.get("member_count") or 0) > 0,
+                int(row.get("task_count") or 0) > 0,
+                int(row.get("member_count") or 0),
+                int(row.get("task_count") or 0),
+                int(row.get("message_count") or 0),
+                str(row.get("last_event_at") or ""),
+            ),
+        )["external_invocation_id"]
+        requested_invocation = requested_invocation or preferred_invocation
+        owner = invocation_owner.get(requested_invocation)
+        if owner is None:
+            return ServiceResult({
+                "available": False,
+                "reason": "no_team_telemetry",
+                "project_id": project_id,
+                "task_id": task_id,
+                "external_invocation_id": requested_invocation,
+                "invocations": invocation_rows,
+            })
+        selected, metadata, runtime_session_id = owner
+        for row in invocation_rows:
+            row["is_preferred"] = (
+                row["external_invocation_id"] == preferred_invocation
+            )
+            row["is_latest"] = row["external_invocation_id"] == latest_invocation
+
+        page = {"events": [], "has_more": False, "next_cursor": None}
+        if runtime_session_id and hasattr(store, "list_external_team_events"):
+            page = await store.list_external_team_events(
+                runtime_session_id,
+                requested_invocation,
+                limit=limit,
+                before_created_at=before_created_at,
+                before_event_id=before_event_id,
+            )
+        normalized_events = [
+            dict(row.get("payload", {}) or {})
+            for row in list(page.get("events", []) or [])
+            if isinstance(row, dict) and isinstance(row.get("payload"), dict)
+        ]
+        projection_events: list[dict[str, Any]] = []
+        if hasattr(store, "list_external_team_projection_events"):
+            projection_rows = await store.list_external_team_projection_events(
+                runtime_session_id,
+                requested_invocation,
+            )
+            projection_events = [
+                dict(row.get("payload", {}) or {})
+                for row in projection_rows
+                if isinstance(row, dict) and isinstance(row.get("payload"), dict)
+            ]
+            # Always include sparse, high-signal lifecycle events in the first
+            # view even when output-heavy runs push them outside the latest
+            # pagination window.  Exact invocation scope is preserved.
+            highlights = {
+                "runtime_ready", "team_completed", "team_error",
+                "member_spawned", "member_restarted", "member_shutdown",
+                "task_created", "task_claimed", "task_completed",
+                "task_cancelled", "task_unblocked", "message_p2p",
+                "message_broadcast",
+            }
+            by_event_id = {
+                str(event.get("event_id") or ""): event
+                for event in normalized_events
+                if str(event.get("event_id") or "")
+            }
+            for event in projection_events:
+                event_id = str(event.get("event_id") or "")
+                if event_id and str(event.get("kind") or "") in highlights:
+                    by_event_id[event_id] = event
+            normalized_events = sorted(
+                by_event_id.values(),
+                key=lambda event: (
+                    int(event.get("sequence", 0) or 0),
+                    str(event.get("occurred_at") or ""),
+                    str(event.get("event_id") or ""),
+                ),
+            )
+        persisted_summary = metadata.get("external_team_summary")
+        current_invocation = str(metadata.get("external_invocation_id") or "").strip()
+        if projection_events:
+            summary = reduce_external_team_events(projection_events)
+        elif (
+            isinstance(persisted_summary, dict)
+            and current_invocation == requested_invocation
+        ):
+            summary = dict(persisted_summary)
+        else:
+            summary = reduce_external_team_events(normalized_events)
+        return ServiceResult({
+            "available": True,
+            "project_id": project_id,
+            "task_id": task_id,
+            "execution_turn_id": task_id,
+            "provider": "jiuwenswarm",
+            "execution_unit_kind": "opaque_external_team",
+            "external_invocation_id": requested_invocation,
+            "provider_session_id": str(
+                metadata.get("provider_session_id")
+                or metadata.get("resume_session_id")
+                or ""
+            ).strip(),
+            "invocations": invocation_rows,
+            "summary": summary,
+            "events": normalized_events,
+            "has_more": bool(page.get("has_more", False)),
+            "next_cursor": page.get("next_cursor"),
         })
 
     @staticmethod

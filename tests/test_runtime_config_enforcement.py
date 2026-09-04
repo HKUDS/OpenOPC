@@ -1062,6 +1062,8 @@ class RuntimeConfigEnforcementTests(unittest.IsolatedAsyncioTestCase):
             metadata={
                 "execution_mode": "company_mode",
                 "runtime_model": "multi_team_org",
+                "native_approval_level": "full-access",
+                "native_permission_scope_id": "sess-company",
                 "runtime_topology": {
                     "seats": [
                         {
@@ -1104,6 +1106,11 @@ class RuntimeConfigEnforcementTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(created.metadata["execution_agent_locked"])
         self.assertTrue(created.metadata["force_native_execution"])
         self.assertTrue(created.metadata["company_native_execution_enforced"])
+        self.assertEqual(created.metadata["native_approval_level"], "full-access")
+        self.assertEqual(
+            created.metadata["native_permission_scope_id"],
+            "sess-company",
+        )
         self.assertEqual(
             created.metadata["selected_execution_agent_source"],
             "company_isolation_boundary",

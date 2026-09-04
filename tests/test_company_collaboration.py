@@ -11471,6 +11471,73 @@ class CompanyExecutorRolePromptRoutingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(calls[0]["prompt_kind"], "ceo_pre_delivery_assessment")
         self.assertTrue(calls[0]["force_new_session"])
 
+    async def test_pre_delivery_view_ignores_superseded_failed_review_attempt(
+        self,
+    ) -> None:
+        executor = CompanyWorkItemExecutor(
+            org_engine=DummyOrgEngine(),
+            communication=SimpleNamespace(),
+            approval_engine=SimpleNamespace(),
+            memory=None,
+            execute_task=AsyncMock(),
+            save_task=AsyncMock(),
+        )
+        target_work_item_id = "wi-marketing"
+        failed_review = Task(
+            id="review-task-v1",
+            title="Marketing review v1",
+            assigned_to="ceo",
+            status=TaskStatus.FAILED,
+            metadata={
+                "work_item_projection_id": f"review::{target_work_item_id}::v1",
+                "work_item_turn_type": "review",
+                "review_target_work_item_id": target_work_item_id,
+                "review_attempt": 1,
+            },
+        )
+        approved_review = Task(
+            id="review-task-v2",
+            title="Marketing review v2",
+            assigned_to="ceo",
+            status=TaskStatus.DONE,
+            metadata={
+                "work_item_projection_id": f"review::{target_work_item_id}::v2",
+                "work_item_turn_type": "review",
+                "review_target_work_item_id": target_work_item_id,
+                "review_attempt": 2,
+            },
+        )
+        delivery = Task(
+            id="delivery-task",
+            title="Final delivery",
+            assigned_to="ceo",
+            status=TaskStatus.AWAITING_HUMAN,
+            metadata={
+                "work_item_projection_id": "delivery",
+                "work_item_turn_type": "deliver",
+            },
+        )
+
+        effective = executor._effective_pre_delivery_tasks(
+            [failed_review, approved_review, delivery]
+        )
+
+        self.assertEqual(
+            [task.id for task in effective],
+            [approved_review.id, delivery.id],
+        )
+        self.assertEqual(
+            [
+                issue
+                for task in effective
+                for issue in executor._task_open_issues(
+                    task,
+                    expected_final_delivery_task_id=delivery.id,
+                )
+            ],
+            [],
+        )
+
     async def test_ceo_pre_delivery_assessment_rejects_coercive_schema(
         self,
     ) -> None:

@@ -28219,9 +28219,14 @@ class OPCStore:
                 affected_task_ids.append(task_id)
 
                 target_status = persisted_task.status
-                if work_item is not None and work_item.phase not in DONE_PHASES:
-                    target_phase = resume_target_phase(work_item)
-                    validate_transition(work_item.phase, target_phase)
+                if work_item is not None:
+                    target_phase = (
+                        resume_target_phase(work_item)
+                        if work_item.phase not in DONE_PHASES
+                        else work_item.phase
+                    )
+                    if target_phase != work_item.phase:
+                        validate_transition(work_item.phase, target_phase)
                     work_item_metadata = dict(work_item.metadata or {})
                     for key in (
                         "dispatch_hold",
@@ -28471,14 +28476,17 @@ class OPCStore:
         generation: int,
         checkpoint_id: str,
         checkpoint_types: list[str] | tuple[str, ...] | set[str],
+        work_item_mutation: CompanyControllerWorkItemMutation | None = None,
     ) -> CompanyRuntimeControllerProjectionReceipt:
-        """Persist a prepared runtime Task without fabricating a new attempt.
+        """Persist a prepared runtime projection without fabricating an attempt.
 
         Resume clears the preceding generation's attempt credentials before
         any scheduler claim.  Such a Task cannot use the ordinary attempt
         fence, so this narrow projection command instead fences the write by
         the live run lease, the still-resuming checkpoint, and an unclaimed,
-        unheld linked WorkItem in one SQLite transaction.
+        unheld linked WorkItem in one SQLite transaction.  A follow-up may
+        also reopen that same linked WorkItem atomically; no unrelated card
+        or broad organizational state can be changed through this boundary.
         """
 
         self._require_db()
@@ -28527,6 +28535,22 @@ class OPCStore:
             raise ValueError(
                 "resume projection cannot fabricate controller attempt credentials"
             )
+        mutation = work_item_mutation
+        if mutation is not None and any(
+            (
+                mutation.metadata_list_appends,
+                mutation.metadata_list_removes,
+                mutation.latest_applied_report_work_item_id is not None,
+                mutation.allow_via_running,
+                mutation.required_pre_delivery_validation_attempt_seq is not None,
+                mutation.required_delivery_package_sha256 is not None,
+                mutation.required_pre_delivery_rework_count is not None,
+                mutation.pre_delivery_rework_count_limit is not None,
+            )
+        ):
+            raise ValueError(
+                "resume projection accepts only a direct linked WorkItem reopen"
+            )
         self._assert_project_write_scope(
             clean_project_id,
             operation="save_company_runtime_resume_projection_for_controller",
@@ -28536,7 +28560,8 @@ class OPCStore:
         transaction_db = _SQLiteConnectionAdapter(self.db_path)
         try:
             await transaction_db.execute("BEGIN IMMEDIATE")
-            checked_at = datetime.now().isoformat()
+            checked_at_value = datetime.now()
+            checked_at = checked_at_value.isoformat()
             async with transaction_db.execute(
                 """SELECT 1 FROM delegation_runs
                    WHERE run_id = ? AND project_id = ? AND session_id = ?
@@ -28576,7 +28601,7 @@ class OPCStore:
                     )
 
             async with transaction_db.execute(
-                """SELECT task.metadata, work_item.metadata,
+                """SELECT link.work_item_id, task.metadata, work_item.metadata,
                           work_item.claimed_by_role_runtime_session_id,
                           work_item.claimed_by_seat_id
                    FROM tasks AS task
@@ -28594,8 +28619,9 @@ class OPCStore:
                 return CompanyRuntimeControllerProjectionReceipt(
                     outcome="not_claimable"
                 )
-            persisted_task_metadata = _json_loads(projection_row[0], {})
-            work_item_metadata = _json_loads(projection_row[1], {})
+            linked_work_item_id = str(projection_row[0] or "").strip()
+            persisted_task_metadata = _json_loads(projection_row[1], {})
+            work_item_metadata = _json_loads(projection_row[2], {})
             if (
                 str(
                     persisted_task_metadata.get(
@@ -28605,15 +28631,181 @@ class OPCStore:
                 ).strip()
                 or str(work_item_metadata.get("dispatch_hold", "") or "").strip()
                 or str(work_item_metadata.get("claimed_task_id", "") or "").strip()
-                or str(projection_row[2] or "").strip()
                 or str(projection_row[3] or "").strip()
+                or str(projection_row[4] or "").strip()
             ):
                 await transaction_db.rollback()
                 return CompanyRuntimeControllerProjectionReceipt(
                     outcome="not_claimable"
                 )
+            phase_change: tuple[Phase, Phase, DelegationWorkItem] | None = None
+            if mutation is not None:
+                mutation_work_item_id = str(
+                    mutation.work_item_id or ""
+                ).strip()
+                if (
+                    not mutation_work_item_id
+                    or mutation_work_item_id != linked_work_item_id
+                ):
+                    raise ValueError(
+                        "resume projection mutation must target the linked WorkItem"
+                    )
+                async with transaction_db.execute(
+                    "SELECT * FROM delegation_work_items WHERE work_item_id = ?",
+                    (linked_work_item_id,),
+                ) as cursor:
+                    work_item_row = await cursor.fetchone()
+                    current_work_item = (
+                        self._row_to_delegation_work_item(
+                            work_item_row,
+                            cursor.description,
+                        )
+                        if work_item_row is not None
+                        else None
+                    )
+                if (
+                    current_work_item is None
+                    or str(current_work_item.run_id or "").strip()
+                    != clean_run_id
+                    or (
+                        mutation.expected_phases
+                        and current_work_item.phase
+                        not in set(mutation.expected_phases)
+                    )
+                    or (
+                        mutation.expected_updated_at is not None
+                        and current_work_item.updated_at
+                        != mutation.expected_updated_at
+                    )
+                ):
+                    await transaction_db.rollback()
+                    return CompanyRuntimeControllerProjectionReceipt(
+                        outcome="not_claimable"
+                    )
+                updated_work_item = copy.deepcopy(current_work_item)
+                previous_phase = updated_work_item.phase
+                if mutation.phase is not None:
+                    target_phase = coerce_phase(mutation.phase)
+                    if (
+                        mutation.allow_approved_rework
+                        and previous_phase == Phase.APPROVED
+                    ):
+                        if target_phase != Phase.READY_FOR_REWORK:
+                            raise InvalidPhaseTransition(
+                                "approved resume follow-up must reopen as ready_for_rework"
+                            )
+                    else:
+                        validate_transition(previous_phase, target_phase)
+                    updated_work_item.phase = target_phase
+                if mutation.summary is not None:
+                    updated_work_item.summary = str(mutation.summary or "")
+                if mutation.deliverable_summary is not None:
+                    updated_work_item.deliverable_summary = str(
+                        mutation.deliverable_summary or ""
+                    ).strip()
+                if mutation.blocked_reason is not None:
+                    updated_work_item.blocked_reason = str(
+                        mutation.blocked_reason or ""
+                    ).strip()
+                if mutation.handoff_status is not None:
+                    updated_work_item.handoff_status = str(
+                        mutation.handoff_status or ""
+                    ).strip()
+                if mutation.claimed_by_role_runtime_session_id is not None:
+                    updated_work_item.claimed_by_role_runtime_session_id = str(
+                        mutation.claimed_by_role_runtime_session_id or ""
+                    ).strip()
+                if mutation.claimed_by_seat_id is not None:
+                    updated_work_item.claimed_by_seat_id = str(
+                        mutation.claimed_by_seat_id or ""
+                    ).strip()
+                updated_metadata = dict(updated_work_item.metadata or {})
+                updated_metadata.update(
+                    copy.deepcopy(dict(mutation.metadata_updates or {}))
+                )
+                for key in tuple(mutation.metadata_unset or ()):
+                    updated_metadata.pop(str(key), None)
+                transition_reason = str(
+                    mutation.transition_reason or ""
+                ).strip()
+                if transition_reason:
+                    updated_metadata["last_transition_reason"] = transition_reason
+                if mutation.clear_claim or updated_work_item.phase in RUNNABLE_PHASES:
+                    updated_work_item.claimed_by_role_runtime_session_id = ""
+                    updated_work_item.claimed_by_seat_id = ""
+                    updated_metadata["claimed_by_role_session_id"] = ""
+                    updated_metadata["claimed_task_id"] = ""
+                if (
+                    self._metadata_has_work_item_projection_identity(updated_metadata)
+                    or str(updated_work_item.projection_id or "").strip()
+                    or str(updated_work_item.kind or "").strip()
+                ):
+                    updated_metadata, _ = migrate_work_item_projection_metadata(
+                        updated_metadata,
+                        projection_id_fallback=str(
+                            updated_work_item.projection_id
+                            or updated_work_item.work_item_id
+                            or ""
+                        ).strip(),
+                        turn_type_fallback=str(
+                            updated_work_item.kind or ""
+                        ).strip(),
+                    )
+                updated_work_item.metadata = updated_metadata
+                self._protect_delegate_work_identity(
+                    updated_work_item,
+                    existing=current_work_item,
+                )
+                updated_work_item.updated_at = checked_at_value
+                cursor = await transaction_db.execute(
+                    """UPDATE delegation_work_items
+                       SET phase = ?, summary = ?, deliverable_summary = ?,
+                           blocked_reason = ?, handoff_status = ?,
+                           claimed_by_role_runtime_session_id = ?,
+                           claimed_by_seat_id = ?, metadata = ?, updated_at = ?
+                       WHERE work_item_id = ? AND run_id = ?
+                         AND phase = ? AND updated_at = ?""",
+                    (
+                        updated_work_item.phase.value,
+                        updated_work_item.summary,
+                        updated_work_item.deliverable_summary,
+                        updated_work_item.blocked_reason,
+                        updated_work_item.handoff_status,
+                        updated_work_item.claimed_by_role_runtime_session_id,
+                        updated_work_item.claimed_by_seat_id,
+                        _json_dumps(updated_work_item.metadata),
+                        updated_work_item.updated_at.isoformat(),
+                        linked_work_item_id,
+                        clean_run_id,
+                        previous_phase.value,
+                        current_work_item.updated_at.isoformat(),
+                    ),
+                )
+                if int(getattr(cursor, "rowcount", 0) or 0) != 1:
+                    await transaction_db.rollback()
+                    return CompanyRuntimeControllerProjectionReceipt(
+                        outcome="not_claimable"
+                    )
+                phase_change = (
+                    previous_phase,
+                    updated_work_item.phase,
+                    updated_work_item,
+                )
             await self._save_task_row(task, commit=False, db=transaction_db)
             await transaction_db.commit()
+            if phase_change is not None:
+                try:
+                    await on_phase_transition(
+                        phase_change[0],
+                        phase_change[1],
+                        phase_change[2],
+                        store=self,
+                        notifications_only=True,
+                    )
+                except Exception:
+                    logger.opt(exception=True).debug(
+                        "on_phase_transition raised after resume follow-up projection"
+                    )
             return CompanyRuntimeControllerProjectionReceipt(outcome="applied")
         except BaseException:
             await transaction_db.rollback()
@@ -30702,6 +30894,148 @@ class OPCStore:
         ) as cursor:
             rows = await cursor.fetchall()
             cols = [d[0] for d in cursor.description]
+        results: list[dict[str, Any]] = []
+        for row in rows:
+            data = dict(zip(cols, row))
+            data["payload"] = _json_loads(data.get("payload"), {})
+            results.append(data)
+        return results
+
+    async def list_external_team_events(
+        self,
+        runtime_session_id: str,
+        external_invocation_id: str,
+        *,
+        limit: int = 100,
+        before_created_at: str = "",
+        before_event_id: str = "",
+    ) -> dict[str, Any]:
+        """Read one opaque-team invocation without scanning unrelated events."""
+
+        assert self._db
+        query = """
+            SELECT * FROM runtime_events
+            WHERE runtime_session_id = ?
+              AND event_type = 'external_team.activity'
+              AND json_extract(payload, '$.external_invocation_id') = ?
+        """
+        params: list[Any] = [runtime_session_id, external_invocation_id]
+        clean_before = str(before_created_at or "").strip()
+        clean_before_id = str(before_event_id or "").strip()
+        if clean_before:
+            if clean_before_id:
+                query += " AND (created_at < ? OR (created_at = ? AND event_id < ?))"
+                params.extend([clean_before, clean_before, clean_before_id])
+            else:
+                query += " AND created_at < ?"
+                params.append(clean_before)
+        page_limit = max(1, min(int(limit or 100), 500))
+        query += " ORDER BY created_at DESC, event_id DESC LIMIT ?"
+        params.append(page_limit + 1)
+        async with self._db.execute(query, params) as cursor:
+            rows = await cursor.fetchall()
+            cols = [d[0] for d in cursor.description]
+        has_more = len(rows) > page_limit
+        rows = rows[:page_limit]
+        results: list[dict[str, Any]] = []
+        for row in reversed(rows):
+            data = dict(zip(cols, row))
+            data["payload"] = _json_loads(data.get("payload"), {})
+            results.append(data)
+        next_cursor = None
+        if has_more and results:
+            next_cursor = {
+                "before_created_at": results[0].get("created_at", ""),
+                "before_event_id": results[0].get("event_id", ""),
+            }
+        return {
+            "events": results,
+            "has_more": has_more,
+            "next_cursor": next_cursor,
+        }
+
+    async def list_external_team_invocations(
+        self,
+        runtime_session_id: str,
+        task_id: str,
+    ) -> list[dict[str, Any]]:
+        """List compact invocation facts for one opaque-team task.
+
+        The query deliberately returns counts rather than merging invocations:
+        callers can choose a display run while every event read remains scoped
+        to one exact ``external_invocation_id``.
+        """
+
+        assert self._db
+        async with self._db.execute(
+            """
+            SELECT
+                json_extract(payload, '$.external_invocation_id') AS external_invocation_id,
+                MIN(created_at) AS started_at,
+                MAX(created_at) AS last_event_at,
+                COUNT(*) AS event_count,
+                COUNT(DISTINCT CASE
+                    WHEN json_extract(payload, '$.kind') = 'member_spawned'
+                    THEN json_extract(payload, '$.member.member_id') END
+                ) AS member_count,
+                COUNT(DISTINCT CASE
+                    WHEN json_extract(payload, '$.kind') LIKE 'task_%'
+                    THEN json_extract(payload, '$.task.task_id') END
+                ) AS task_count,
+                SUM(CASE
+                    WHEN json_extract(payload, '$.kind') LIKE 'message_%' THEN 1 ELSE 0 END
+                ) AS message_count,
+                SUM(CASE
+                    WHEN json_extract(payload, '$.kind') IN ('member_output', 'leader_output')
+                    THEN 1 ELSE 0 END
+                ) AS output_count
+            FROM runtime_events
+            WHERE runtime_session_id = ?
+              AND event_type = 'external_team.activity'
+              AND json_extract(payload, '$.task_id') = ?
+              AND COALESCE(json_extract(payload, '$.external_invocation_id'), '') != ''
+            GROUP BY json_extract(payload, '$.external_invocation_id')
+            ORDER BY started_at ASC, external_invocation_id ASC
+            """,
+            (runtime_session_id, task_id),
+        ) as cursor:
+            rows = await cursor.fetchall()
+            cols = [description[0] for description in cursor.description]
+        return [dict(zip(cols, row)) for row in rows]
+
+    async def list_external_team_projection_events(
+        self,
+        runtime_session_id: str,
+        external_invocation_id: str,
+    ) -> list[dict[str, Any]]:
+        """Read the bounded structured lifecycle needed for a team projection.
+
+        Token-like member output is intentionally excluded.  This keeps the
+        selector/summary query compact while retaining official membership,
+        task, message, retry, and completion observations.
+        """
+
+        assert self._db
+        async with self._db.execute(
+            """
+            SELECT * FROM runtime_events
+            WHERE runtime_session_id = ?
+              AND event_type = 'external_team.activity'
+              AND json_extract(payload, '$.external_invocation_id') = ?
+              AND json_extract(payload, '$.kind') IN (
+                  'runtime_ready', 'team_completed', 'team_error',
+                  'member_spawned', 'member_status_changed',
+                  'member_execution_changed', 'member_restarted',
+                  'member_shutdown', 'task_created', 'task_claimed',
+                  'task_completed', 'task_cancelled', 'task_unblocked',
+                  'message_p2p', 'message_broadcast'
+              )
+            ORDER BY created_at ASC, event_id ASC
+            """,
+            (runtime_session_id, external_invocation_id),
+        ) as cursor:
+            rows = await cursor.fetchall()
+            cols = [description[0] for description in cursor.description]
         results: list[dict[str, Any]] = []
         for row in rows:
             data = dict(zip(cols, row))

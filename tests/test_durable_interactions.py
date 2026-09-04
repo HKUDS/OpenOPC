@@ -31,6 +31,7 @@ from opc.core.models import (
 from opc.database.store import OPCStore, TaskRuntimeToolLedgerSnapshot
 from opc.engine import OPCEngine
 from opc.layer2_organization.approval import ApprovalEngine
+from opc.layer2_organization.work_item_links import set_linked_work_item_id
 from opc.layer0_interaction.coordinator import (
     InteractionCoordinator,
     InteractionDecisionLease,
@@ -229,6 +230,86 @@ def _bare_engine(store: OPCStore) -> OPCEngine:
     engine._initialized = True
     engine._shutting_down = False
     return engine
+
+
+def test_terminal_company_work_item_does_not_resume_stale_tool_permission(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        store = OPCStore(tmp_path / "tasks.db")
+        await store.initialize()
+        try:
+            checkpoint = _tool_checkpoint()
+            task = Task(
+                id="worker",
+                session_id="worker-session",
+                project_id="project-a",
+                title="failed review",
+                status=TaskStatus.FAILED,
+                metadata={"work_item_runtime": True},
+            )
+            work_item = DelegationWorkItem(
+                work_item_id="review-failed",
+                run_id="run-1",
+                role_id="ceo",
+                seat_id="seat-ceo",
+                title="failed review",
+                phase=Phase.FAILED,
+            )
+            set_linked_work_item_id(task, work_item.work_item_id)
+            await store.save_task(task)
+            await store.save_delegation_work_item(work_item)
+            await store.link_work_item_runtime_task(work_item.work_item_id, task.id)
+            tool_call = dict(checkpoint.payload["tool_call"])
+            await store.save_runtime_tool_call(
+                runtime_session_id=tool_call["runtime_session_id"],
+                task_id=task.id,
+                session_id=task.session_id,
+                message_id="assistant-message",
+                tool_call_id=tool_call["id"],
+                tool_name=tool_call["name"],
+                arguments=tool_call["arguments"],
+            )
+            await _publish_owner_checkpoint(store, checkpoint)
+            await store.accept_execution_checkpoint_decision(
+                checkpoint.checkpoint_id,
+                project_id="project-a",
+                checkpoint_type="tool_permission",
+                request_id="answer",
+                decision_hash="answer-hash",
+                decision={"option_id": "approve_once"},
+            )
+            claimed = await store.claim_answered_execution_checkpoint(
+                checkpoint.checkpoint_id,
+                project_id="project-a",
+                checkpoint_type="tool_permission",
+                consumer_id="recovery",
+            )
+            assert claimed.acquired and claimed.checkpoint is not None
+            engine = _bare_engine(store)
+            engine.approval_engine = _approval_engine(
+                store, engine.interaction_coordinator
+            )
+            lease = InteractionDecisionLease(
+                checkpoint=claimed.checkpoint,
+                decision={"option_id": "approve_once"},
+                consumer_id="recovery",
+                claim_id=claimed.claim_id,
+            )
+
+            with pytest.raises(
+                ValueError,
+                match="terminal company WorkItem",
+            ):
+                await engine._resume_permission_checkpoint(lease)
+
+            persisted = await store.get_task(task.id)
+            assert persisted is not None
+            assert persisted.status == TaskStatus.FAILED
+        finally:
+            await store.close()
+
+    asyncio.run(scenario())
 
 
 def test_cross_process_coordinator_polling_and_idempotent_submit(tmp_path: Path) -> None:

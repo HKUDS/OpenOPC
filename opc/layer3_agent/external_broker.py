@@ -43,6 +43,11 @@ from opc.layer3_agent.external_session_identity import (
     provider_token_from_external_session,
     select_best_external_resume_session,
 )
+from opc.layer3_agent.external_team_activity import (
+    EXTERNAL_TEAM_RUNTIME_EVENT_TYPE,
+    empty_external_team_summary,
+    reduce_external_team_event,
+)
 from opc.layer3_agent.preflight import (
     assert_external_agent_write_contract,
     ExternalAgentPreflightError,
@@ -951,6 +956,16 @@ class ExternalAgentBroker:
         on_progress: Callable[[str], Coroutine[Any, Any, None]] | None = None,
         allow_prompt_handling: bool = False,
     ) -> TaskResult:
+        external_invocation_id = str(
+            metadata.get("external_invocation_id") or ""
+        ).strip()
+        if (
+            adapter.execution_unit_kind() == "opaque_external_team"
+            and not external_invocation_id
+        ):
+            raise RuntimeError(
+                "opaque external team launch requires external_invocation_id"
+            )
         # Company-mode external agents get the opc-collab CLI surface.
         # Task mode runs do not load the communication surface at all.
         comms_env: dict[str, str] = self._memory_env(task)
@@ -1210,6 +1225,11 @@ class ExternalAgentBroker:
             # to report a false "no observable output/activity" timeout even
             # while the provider is actively streaming.
             "provider_session_id": configured_provider_session_id,
+            # Display-only provider telemetry.  It is never consulted by the
+            # scheduler, WorkItem state machine, approval engine, or result
+            # validation path.
+            "external_team_summary": None,
+            "external_team_sequence": 0,
         }
         provider_session_lock = asyncio.Lock()
         stream_line_counts: dict[str, int] = {}
@@ -1264,9 +1284,19 @@ class ExternalAgentBroker:
                         await self._save_runtime_session(**payload)
                     elif kind == "transcript":
                         await self._save_runtime_transcript_entry(**payload)
+                    elif kind == "runtime_event":
+                        await self.store.save_runtime_event(**payload)
                 except asyncio.CancelledError:
                     raise
                 except Exception:
+                    if kind == "runtime_event":
+                        summary = dict(
+                            state.get("external_team_summary")
+                            or empty_external_team_summary()
+                        )
+                        summary["telemetry_incomplete"] = True
+                        state["external_team_summary"] = summary
+                        metadata["external_team_summary"] = summary
                     logger.opt(exception=True).debug(
                         "ExternalAgentBroker: deferred stream persistence failed"
                     )
@@ -1274,6 +1304,107 @@ class ExternalAgentBroker:
                     stream_persistence_queue.task_done()
 
         stream_persistence_task = asyncio.create_task(_persist_stream_events())
+
+        async def _observe_external_team_activity(text: str, stream_name: str) -> None:
+            try:
+                provider_team_events = adapter.extract_external_team_events(
+                    text,
+                    stream_name,
+                )
+            except Exception:
+                provider_team_events = []
+                if adapter.execution_unit_kind() == "opaque_external_team":
+                    summary = dict(
+                        state.get("external_team_summary")
+                        or empty_external_team_summary()
+                    )
+                    summary["telemetry_incomplete"] = True
+                    state["external_team_summary"] = summary
+                    metadata["external_team_summary"] = summary
+                logger.opt(exception=True).debug(
+                    "ExternalAgentBroker: provider team telemetry parse failed"
+                )
+            for provider_event in provider_team_events:
+                if not isinstance(provider_event, dict):
+                    continue
+                state["external_team_sequence"] += 1
+                sequence = int(state["external_team_sequence"])
+                raw_occurred_at = provider_event.get("occurred_at")
+                if isinstance(raw_occurred_at, (int, float)):
+                    occurred_at = datetime.fromtimestamp(
+                        raw_occurred_at / 1000.0
+                        if raw_occurred_at > 1_000_000_000_000
+                        else raw_occurred_at
+                    ).isoformat()
+                else:
+                    occurred_at = (
+                        str(raw_occurred_at or "").strip()
+                        or datetime.now().isoformat()
+                    )
+                task_metadata = dict(task.metadata or {})
+                enriched_team_event = {
+                    **provider_event,
+                    "schema_version": 1,
+                    "event_id": f"external-team:{external_invocation_id}:{sequence}",
+                    "provider": adapter.agent_type,
+                    "project_id": str(task.project_id or "default").strip() or "default",
+                    "task_id": str(task.id or "").strip(),
+                    "opc_session_id": str(
+                        task.session_id or task.parent_session_id or task.id or ""
+                    ).strip(),
+                    "origin_task_id": str(
+                        task_metadata.get("origin_task_id") or task.id or ""
+                    ).strip(),
+                    "execution_turn_id": str(task.id or "").strip(),
+                    "work_item_id": str(
+                        linked_work_item_id_for_task(task) or ""
+                    ).strip(),
+                    "work_item_projection_id": str(
+                        projection_id_for_task(task) or ""
+                    ).strip(),
+                    "role_id": str(
+                        task_metadata.get("work_item_role_id")
+                        or task.assigned_to
+                        or ""
+                    ).strip(),
+                    "external_invocation_id": external_invocation_id,
+                    "provider_session_id": str(
+                        provider_event.get("provider_session_id")
+                        or state.get("provider_session_id")
+                        or metadata.get("provider_session_id")
+                        or metadata.get("resume_session_id")
+                        or ""
+                    ).strip(),
+                    "sequence": sequence,
+                    "occurred_at": occurred_at,
+                }
+                summary = reduce_external_team_event(
+                    state.get("external_team_summary"),
+                    enriched_team_event,
+                )
+                state["external_team_summary"] = summary
+                metadata["external_team_summary"] = summary
+                stream_persistence_queue.put_nowait((
+                    "runtime_event",
+                    {
+                        "runtime_session_id": session_id,
+                        "event_type": EXTERNAL_TEAM_RUNTIME_EVENT_TYPE,
+                        "payload": enriched_team_event,
+                    },
+                ))
+                if on_progress:
+                    try:
+                        await on_progress(
+                            "",
+                            external_team_event=enriched_team_event,
+                        )
+                    except Exception:
+                        # Team telemetry is observability only.  A UI
+                        # disconnect or renderer failure must not stop
+                        # draining the provider process.
+                        logger.opt(exception=True).debug(
+                            "ExternalAgentBroker: team telemetry broadcast failed"
+                        )
 
         async def _consume(stream: asyncio.StreamReader | None, sink: list[str], stream_name: str) -> None:
             if stream is None:
@@ -1326,6 +1457,11 @@ class ExternalAgentBroker:
                                         },
                                     )
                                 )
+                if text.strip():
+                    # Observe the provider frame before fatal handling so a
+                    # terminal team.error remains visible.  This does not
+                    # alter the existing runtime status/update ordering.
+                    await _observe_external_team_activity(text, stream_name)
                 try:
                     fatal_reason = adapter.detect_runtime_failure(text, stream_name, metadata)
                 except TypeError:
@@ -1389,6 +1525,7 @@ class ExternalAgentBroker:
                                 },
                             )
                         )
+                if text.strip():
                     stream_line_counts[stream_name] = stream_line_counts.get(stream_name, 0) + 1
                     transcript_entry = self._stream_transcript_entry(
                         text,
@@ -1844,6 +1981,8 @@ class ExternalAgentBroker:
             "session_id": session_id,
             "process_cleanup": state.get("process_cleanup") or {},
         }
+        if state.get("external_team_summary"):
+            artifacts["external_team_summary"] = state["external_team_summary"]
         if raw_log_path:
             artifacts["raw_output_log_path"] = raw_log_path
         if resume_session_id:
@@ -2816,6 +2955,10 @@ class ExternalAgentBroker:
                 "model": metadata.get("model", "(cli default)"),
                 "session_mode": metadata.get("session_mode", "auto"),
                 "agent_type": adapter.agent_type,
+                "provider_mode": metadata.get("provider_mode", ""),
+                "execution_unit_kind": metadata.get("execution_unit_kind", ""),
+                "external_invocation_id": metadata.get("external_invocation_id", ""),
+                "external_team_summary": metadata.get("external_team_summary"),
                 "runtime_session_id": session_id,
                 "delegation_role_session_id": delegation_role_session_id,
                 "external_resume_scope_id": resume_lookup_session_id,
@@ -2917,6 +3060,13 @@ class ExternalAgentBroker:
                 "model": metadata.get("model", "(cli default)"),
                 "session_mode": metadata.get("session_mode", "auto"),
                 "agent_type": adapter.agent_type,
+                "provider_mode": metadata.get("provider_mode", ""),
+                "execution_unit_kind": metadata.get("execution_unit_kind", ""),
+                "external_invocation_id": metadata.get("external_invocation_id", ""),
+                "external_team_summary": (
+                    (result.artifacts or {}).get("external_team_summary")
+                    or metadata.get("external_team_summary")
+                ),
                 "delegation_role_session_id": delegation_role_session_id,
                 "external_resume_scope_id": resume_lookup_session_id,
                 "company_run_id": str(

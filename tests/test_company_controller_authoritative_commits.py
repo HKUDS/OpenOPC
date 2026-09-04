@@ -1083,6 +1083,50 @@ class CompanyControllerAuthoritativeCommitTests(unittest.IsolatedAsyncioTestCase
             self.assertNotIn(key, child_task.metadata)
             self.assertNotIn(key, linked_child.metadata)
 
+    async def test_projection_sync_leaves_suspended_task_and_work_item_frozen(
+        self,
+    ) -> None:
+        item = self._runtime_item(
+            "wi-held-approved",
+            phase=Phase.APPROVED,
+            metadata={
+                "dispatch_hold": "company_runtime_suspended",
+                "attempt_seq": 1,
+                "attempt_settled": True,
+            },
+        )
+        task = self._runtime_task(
+            "task-held-approved",
+            item.work_item_id,
+            metadata={"dispatch_hold": "company_runtime_suspended"},
+        )
+        task.status = TaskStatus.AWAITING_MANAGER_REVIEW
+        await self.store1.save_delegation_work_item(item)
+        await self.store1.save_task(task)
+        await self.store1.link_work_item_runtime_task(item.work_item_id, task.id)
+        before = await self.store2.get_task(task.id)
+        assert before is not None
+
+        lease = await self.store1.acquire_delegation_run_controller_lease(
+            "run-1",
+            project_id="project-1",
+            root_session_id="root-1",
+            owner_token="owner-a",
+            lease_seconds=60,
+        )
+        self.assertTrue(lease.acquired)
+        self._set_executor_controller(
+            self.executor1,
+            owner_token="owner-a",
+            generation=lease.generation,
+        )
+
+        item.summary = "approved while another resume stage still owns the hold"
+        await self.executor1._sync_task_projection_from_work_items([task], [item])
+
+        self.assertEqual(task, before)
+        self.assertEqual(await self.store2.get_task(task.id), before)
+
     async def test_unclaimed_task_projection_takeover_and_generic_save_have_zero_writes(
         self,
     ) -> None:

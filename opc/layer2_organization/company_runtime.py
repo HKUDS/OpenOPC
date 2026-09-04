@@ -632,6 +632,48 @@ class CompanyRuntime:
                 )
         await self.refresh_inbox_state(tasks)
 
+    @staticmethod
+    def _task_is_dispatch_held(task: Task) -> bool:
+        return bool(
+            str(
+                dict(getattr(task, "metadata", {}) or {}).get(
+                    "dispatch_hold", ""
+                )
+                or ""
+            ).strip()
+        )
+
+    async def _project_work_item_dispatch_holds(self, tasks: list[Task]) -> None:
+        """Mirror authoritative WorkItem holds into the in-memory Task view.
+
+        A staged resume may finish a WorkItem while its Task projection is
+        deliberately frozen.  Bootstrap must still treat that role as held;
+        otherwise refreshing its role session crosses the controller fence
+        before the remaining resume atomically releases the scope.
+        """
+
+        get_work_item = getattr(self.store, "get_delegation_work_item", None)
+        if not callable(get_work_item):
+            return
+        for task in tasks:
+            work_item_id = linked_work_item_id_for_task(task)
+            if not work_item_id:
+                continue
+            work_item = await get_work_item(work_item_id)
+            if work_item is None:
+                continue
+            hold = str(
+                dict(getattr(work_item, "metadata", {}) or {}).get(
+                    "dispatch_hold", ""
+                )
+                or ""
+            ).strip()
+            if hold and not self._task_is_dispatch_held(task):
+                task.metadata = {
+                    **dict(getattr(task, "metadata", {}) or {}),
+                    "dispatch_hold": hold,
+                }
+
     async def _bootstrap_work_item_runtime_sessions(self, tasks: list[Task]) -> None:
         runtime_tasks = [
             task
@@ -640,6 +682,7 @@ class CompanyRuntime:
         ]
         if not runtime_tasks:
             return
+        await self._project_work_item_dispatch_holds(runtime_tasks)
         root_task = sorted(runtime_tasks, key=lambda item: item.created_at)[0]
         run_id = str((root_task.metadata or {}).get("delegation_run_id", "") or "").strip()
         runtime_topology = dict((root_task.metadata or {}).get("runtime_topology", {}) or {})
@@ -675,6 +718,18 @@ class CompanyRuntime:
             for seat in seats
             if str(seat.get("role_id", "") or "").strip()
         }
+        if any(self._task_is_dispatch_held(task) for task in runtime_tasks):
+            active_role_ids.intersection_update(
+                self._role_id(task)
+                for task in runtime_tasks
+                if not self._task_is_dispatch_held(task)
+            )
+            seats = [
+                seat
+                for seat in seats
+                if str(seat.get("role_id", "") or "").strip()
+                in active_role_ids
+            ]
         await self._bootstrap_role_sessions(
             runtime_tasks,
             allowed_role_ids=active_role_ids,
@@ -1168,9 +1223,19 @@ class CompanyRuntime:
     async def refresh_inbox_state(self, tasks: list[Task]) -> None:
         if not self.communication or not hasattr(self.communication, "read_inbox"):
             return
-        task_scope_ids = self._task_scope_ids(tasks)
+        staged_resume = any(self._task_is_dispatch_held(task) for task in tasks)
+        writable_tasks = (
+            [task for task in tasks if not self._task_is_dispatch_held(task)]
+            if staged_resume
+            else tasks
+        )
+        task_scope_ids = self._task_scope_ids(writable_tasks)
         representative_task_by_key: dict[str, Task] = {}
-        for task in sorted(tasks, key=lambda item: item.created_at, reverse=True):
+        for task in sorted(
+            writable_tasks,
+            key=lambda item: item.created_at,
+            reverse=True,
+        ):
             key = self._queue_key_for_task(task)
             if key and key not in representative_task_by_key:
                 representative_task_by_key[key] = task
@@ -1179,6 +1244,8 @@ class CompanyRuntime:
             representative_task = representative_task_by_key.get(self._queue_key_for_session(session))
             if representative_task is None:
                 representative_task = representative_task_by_key.get(session.role_id)
+            if staged_resume and representative_task is None:
+                continue
             messages = await self.communication.read_inbox(
                 agent_id=session.role_id,
                 task=representative_task,

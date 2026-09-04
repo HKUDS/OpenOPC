@@ -410,6 +410,35 @@ class WSHandlerRuntimeEventRoutingTests(unittest.IsolatedAsyncioTestCase):
         engine.escalation = None
         return WSHandler(engine, MagicMock(), MagicMock(), MagicMock())
 
+    async def test_external_team_telemetry_uses_separate_display_only_channel(self) -> None:
+        engine = MagicMock()
+        engine.project_id = "project-a"
+        engine.store = SimpleNamespace(get_task=AsyncMock(return_value=None))
+        event_adapter = MagicMock()
+        handler = WSHandler(engine, MagicMock(), MagicMock(), event_adapter)
+        handler.broadcast = AsyncMock()
+
+        await handler.on_progress(
+            "",
+            external_team_event={
+                "schema_version": 1,
+                "event_id": "event-a",
+                "provider": "jiuwenswarm",
+                "project_id": "wrong-project",
+                "task_id": "task-a",
+                "external_invocation_id": "invocation-a",
+                "sequence": 1,
+                "occurred_at": "2026-09-03T10:00:00",
+                "kind": "runtime_ready",
+            },
+        )
+
+        handler.broadcast.assert_awaited_once()
+        envelope = handler.broadcast.await_args.args[0]
+        self.assertEqual(envelope["type"], "external_team_activity_event")
+        self.assertEqual(envelope["payload"]["project_id"], "project-a")
+        event_adapter.parse_progress.assert_not_called()
+
     async def test_forwarded_delegation_progress_uses_sanitized_summary(self) -> None:
         engine = MagicMock()
         engine.store = SimpleNamespace(get_task=AsyncMock(return_value=None))

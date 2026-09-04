@@ -28,6 +28,7 @@ import {
 import { getRuntimeOrgView } from '../lib/runtimeOrg'
 import { getLinkedRuntimeTaskId } from '../lib/workItemRuntimeIds'
 import { ContextPanel } from './ContextPanel'
+import type { ExternalTeamActivityRecord } from '../stores/ExternalTeamActivityStore'
 import { useResizePanel } from './useResizePanel'
 import { useI18n } from '../i18n'
 
@@ -322,6 +323,7 @@ interface WorkspacePageProps {
     opts?: { beforeCreatedAt?: number; beforeMessageId?: string; limit?: number; detailLevel?: 'summary' | 'full'; include?: string[] },
   ) => Promise<void> | void
   onOpenExecutionPanel?: (taskId: string) => void
+  getExternalTeamActivity?: (taskId: string, invocationId?: string) => ExternalTeamActivityRecord | undefined
   onCollabSync?: () => void
   orgInfoData?: OrgInfoPayload | null
   onNavigateToOrg?: () => void
@@ -365,6 +367,7 @@ export function WorkspacePage({
   onSessionComplete,
   onLoadSessionDetail,
   onOpenExecutionPanel,
+  getExternalTeamActivity,
   onCollabSync,
   orgInfoData,
   onNavigateToOrg,
@@ -1314,6 +1317,7 @@ export function WorkspacePage({
         onCloseTaskDetail={() => setActiveView({ kind: 'activity' })}
         onOpenChildDetail={handleOpenWorkItemSession}
         onOpenExecutionPanel={onOpenExecutionPanel}
+        getExternalTeamActivity={getExternalTeamActivity}
         onSelectSessionTab={focusSession}
         onCloseSessionTab={handleCloseSessionView}
         onToggleMultiSessionView={handleToggleMultiSessionView}

@@ -7,7 +7,14 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from opc.core.models import DelegationRun, DelegationWorkItem, ExecutionCheckpoint, Phase
+from opc.core.models import (
+    DelegationRun,
+    DelegationWorkItem,
+    ExecutionCheckpoint,
+    ExternalSession,
+    Phase,
+    Task,
+)
 from opc.database.store import OPCStore
 from opc.plugins.office_ui.snapshot_builder import (
     _build_company_runtime_control_by_task,
@@ -1546,6 +1553,92 @@ class CollabSyncCompanyModeTests(unittest.IsolatedAsyncioTestCase):
                 )
                 self.assertEqual(len(result.get("boards", [])), 1)
                 self.assertEqual(result["boards"][0]["board_id"], "proj-task-mode")
+            finally:
+                await store.close()
+
+    async def test_collab_sync_projects_external_team_summary_in_its_own_scope(self) -> None:
+        """Regression: Team summary loading must live in build_collab_sync.
+
+        It was previously initialized inside reconcile_sessions, leaving the
+        collab-sync session projection with an undefined local variable.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = OPCStore(Path(tmpdir) / "tasks.db")
+            await store.initialize()
+            task = Task(
+                id="team-task",
+                title="Team task",
+                project_id="proj-team",
+                session_id="team-session",
+                metadata={
+                    "mode": "task",
+                    "selected_execution_agent": "jiuwenswarm",
+                    "execution_unit_kind": "opaque_external_team",
+                },
+            )
+            await store.save_task(task)
+            summary = {
+                "external_invocation_id": "inv-team",
+                "mode": "team_active",
+                "counts": {"members": 2, "active_members": 1},
+            }
+            await store.save_external_session(
+                ExternalSession(
+                    agent_type="jiuwenswarm",
+                    project_id="proj-team",
+                    session_id="provider-team",
+                    opc_session_id="team-session",
+                    task_id="team-task",
+                    metadata={
+                        "execution_unit_kind": "opaque_external_team",
+                        "external_invocation_id": "inv-team",
+                        "external_team_summary": summary,
+                    },
+                )
+            )
+
+            created_at = task.created_at.timestamp()
+            channel = {
+                "channel_id": "session:team-task",
+                "type": "session",
+                "name": "Team task",
+                "office_id": None,
+                "participants": ["user"],
+                "created_at": created_at,
+            }
+            chat_store = MagicMock()
+            chat_store.get_channels = AsyncMock(return_value=[])
+            chat_store.get_messages = AsyncMock(return_value=[])
+            chat_store.get_session_channels = AsyncMock(return_value=[])
+            chat_store.get_channel_stats = AsyncMock(return_value={})
+            chat_store.get_progress_many = AsyncMock(return_value={})
+            chat_store.create_session_channel = AsyncMock(return_value=channel)
+            chat_store.delete_channel = AsyncMock(return_value=None)
+            chat_store.delete_activity_messages_for_task = AsyncMock(return_value=None)
+            chat_store.delete_progress = AsyncMock(return_value=None)
+
+            engine = MagicMock()
+            engine.store = store
+            engine.project_id = "proj-team"
+            engine.llm = None
+            engine.config.autonomy.native_approval_level = "auto"
+            engine.get_latest_pending_checkpoint_for_session = AsyncMock(return_value=None)
+            engine._task_runtime_is_live = AsyncMock(return_value=False)
+            try:
+                with patch(
+                    "opc.plugins.office_ui.snapshot_builder.reconcile_sessions",
+                    new=AsyncMock(return_value=0),
+                ):
+                    result = await build_collab_sync(
+                        engine,
+                        MagicMock(),
+                        chat_store,
+                        exec_mode="task",
+                    )
+                self.assertEqual(
+                    result["sessions"][0]["external_team_summary"],
+                    summary,
+                )
             finally:
                 await store.close()
 
