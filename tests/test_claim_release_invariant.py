@@ -716,3 +716,71 @@ async def test_controller_takeover_rejects_mixed_linked_envelope_atomically(
             assert await store.get_task(task.id) == before_tasks[task.id]
     finally:
         await store.close()
+
+
+@_async_test
+async def test_controller_takeover_skips_never_dispatched_consistent_pair(
+    tmp_path: Path,
+) -> None:
+    """An empty envelope on both sides is symmetric, not mixed."""
+    store = OPCStore(tmp_path / "tasks.db")
+    await store.initialize()
+    try:
+        await store.save_delegation_run(
+            DelegationRun(
+                run_id="claim-invariant-run",
+                project_id="default",
+                session_id="claim-invariant-root",
+                execution_model="multi_team_org",
+                status="running",
+                lifecycle_status="active",
+            )
+        )
+        suffix = "never-dispatched"
+        task = Task(
+            id=f"{suffix}-task",
+            project_id="default",
+            session_id="claim-invariant-root",
+            title=suffix,
+            # task_status_for_phase(WAITING_DEPENDENCIES) is BLOCKED, so the
+            # pair agrees even though neither side carries a credential.
+            status=TaskStatus.BLOCKED,
+            metadata={
+                "delegation_run_id": "claim-invariant-run",
+                "work_item_projection_id": suffix,
+                "work_item_runtime": True,
+            },
+        )
+        item = _work_item(
+            suffix,
+            phase=Phase.WAITING_DEPENDENCIES,
+            claimed_session=f"role-runtime::{suffix}",
+            claimed_seat="seat::executor",
+            metadata={
+                "claimed_by_role_session_id": f"role-runtime::{suffix}",
+                "claimed_task_id": task.id,
+            },
+        )
+        await store.save_delegation_work_item(item)
+        await store.save_task(task)
+        assert await store.link_work_item_runtime_task(item.work_item_id, task.id)
+        lease = await store.acquire_delegation_run_controller_lease(
+            "claim-invariant-run",
+            project_id="default",
+            root_session_id="claim-invariant-root",
+            owner_token="claim-invariant-recovery",
+            lease_seconds=60,
+        )
+        assert lease.acquired
+
+        # Must not raise: a card that was never dispatched has no attempt
+        # credential to reconcile on either side.
+        await store.settle_stale_delegation_run_claims_for_controller(
+            "claim-invariant-run",
+            project_id="default",
+            root_session_id="claim-invariant-root",
+            owner_token="claim-invariant-recovery",
+            generation=lease.generation,
+        )
+    finally:
+        await store.close()
