@@ -5,6 +5,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+from loguru import logger
+
 from .context import OfficeServiceContext
 from .models import ServiceError, ServiceEvent, ServiceResult
 
@@ -218,6 +220,16 @@ class MarketService:
             return []
 
     async def _clean_orphaned_assignments(self, removed_role_ids: set[str]) -> None:
+        """Clear ``assigned_to`` on every Task still pointing at a removed role.
+
+        Each Task is saved independently: one Task failing to save must not
+        abort the whole cleanup and leave the *rest* of the Tasks still
+        pointing at a role that no longer exists. A single outer
+        ``try/except Exception: pass`` around the loop used to do exactly
+        that -- silently stopping after the first failure with no error
+        surfaced anywhere, which defeats the purpose of this best-effort
+        cleanup. (Same bug shape as ``AgentService._clean_orphaned_assignments``.)
+        """
         if not removed_role_ids:
             return
         store = getattr(self.context.engine, "store", None)
@@ -225,12 +237,22 @@ class MarketService:
             return
         try:
             tasks = await store.get_tasks(project_id=getattr(self.context.engine, "project_id", None) or "default")
-            for task in tasks:
-                if getattr(task, "assigned_to", "") in removed_role_ids:
-                    task.assigned_to = ""
-                    await store.save_task(task)
         except Exception:
-            pass
+            logger.opt(exception=True).warning(
+                f"_clean_orphaned_assignments: failed to list tasks for removed_role_ids={removed_role_ids!r}"
+            )
+            return
+        for task in tasks:
+            if getattr(task, "assigned_to", "") not in removed_role_ids:
+                continue
+            try:
+                task.assigned_to = ""
+                await store.save_task(task)
+            except Exception:
+                logger.opt(exception=True).warning(
+                    "_clean_orphaned_assignments: failed to clear assigned_to "
+                    f"on task {getattr(task, 'id', '')!r}"
+                )
 
     async def _org_events(self) -> list[ServiceEvent]:
         from .org import OrgService

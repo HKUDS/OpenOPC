@@ -7,6 +7,8 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+from loguru import logger
+
 from opc.layer2_organization.company_runtime_identity import is_runtime_auxiliary_task
 
 from .context import OfficeServiceContext
@@ -207,17 +209,37 @@ class AgentService:
         return ServiceResult({"detail": detail})
 
     async def _clean_orphaned_assignments(self, role_id: str) -> None:
+        """Clear ``assigned_to`` on every Task still pointing at a deleted role.
+
+        Each Task is saved independently: one Task failing to save (a
+        transient DB lock, a validation error on that row, ...) must not
+        abort the whole cleanup and leave the *rest* of the Tasks still
+        pointing at the now-deleted role. A single outer ``try/except:
+        pass`` around the loop used to do exactly that -- silently stopping
+        after the first failure with no error surfaced anywhere, which
+        defeats the purpose of this best-effort cleanup.
+        """
         store = getattr(self.context.engine, "store", None)
         if not store:
             return
         try:
             tasks = await store.get_tasks(project_id=getattr(self.context.engine, "project_id", None) or "default")
-            for task in tasks:
-                if getattr(task, "assigned_to", "") == role_id:
-                    task.assigned_to = ""
-                    await store.save_task(task)
         except Exception:
-            pass
+            logger.opt(exception=True).warning(
+                f"_clean_orphaned_assignments: failed to list tasks for role_id={role_id!r}"
+            )
+            return
+        for task in tasks:
+            if getattr(task, "assigned_to", "") != role_id:
+                continue
+            try:
+                task.assigned_to = ""
+                await store.save_task(task)
+            except Exception:
+                logger.opt(exception=True).warning(
+                    "_clean_orphaned_assignments: failed to clear assigned_to "
+                    f"on task {getattr(task, 'id', '')!r} for role_id={role_id!r}"
+                )
 
     def _persist_config(self) -> None:
         if self.context.persist_runtime_config is not None:

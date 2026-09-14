@@ -24264,28 +24264,42 @@ class OPCStore:
         await self._db.commit()
 
     async def save_session_message(self, message: SessionMessageRecord) -> None:
+        """Insert one session message and touch its session in one transaction.
+
+        Both writes are wrapped in an explicit ``BEGIN IMMEDIATE`` / commit-or
+        -rollback block. Without this, the two statements ran on the Store's
+        single shared, long-lived connection with no rollback on failure: if
+        the second write raised, the first write's effect stayed pending
+        (neither committed nor rolled back) and could be silently flushed to
+        disk by a later, unrelated ``commit()`` on the same connection.
+        """
         assert self._db
-        await self._db.execute(
-            """INSERT OR REPLACE INTO session_messages
-            (message_id, session_id, role, task_id, agent_id, parent_message_id, summary_flag, metadata, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (
-                message.message_id,
-                message.session_id,
-                message.role,
-                message.task_id,
-                message.agent_id,
-                message.parent_message_id,
-                int(message.summary_flag),
-                _json_dumps(message.metadata),
-                message.created_at.isoformat(),
-            ),
-        )
-        await self._db.execute(
-            "UPDATE sessions SET updated_at = ? WHERE session_id = ?",
-            (message.created_at.isoformat(), message.session_id),
-        )
-        await self._db.commit()
+        await self._db.execute("BEGIN IMMEDIATE")
+        try:
+            await self._db.execute(
+                """INSERT OR REPLACE INTO session_messages
+                (message_id, session_id, role, task_id, agent_id, parent_message_id, summary_flag, metadata, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    message.message_id,
+                    message.session_id,
+                    message.role,
+                    message.task_id,
+                    message.agent_id,
+                    message.parent_message_id,
+                    int(message.summary_flag),
+                    _json_dumps(message.metadata),
+                    message.created_at.isoformat(),
+                ),
+            )
+            await self._db.execute(
+                "UPDATE sessions SET updated_at = ? WHERE session_id = ?",
+                (message.created_at.isoformat(), message.session_id),
+            )
+            await self._db.commit()
+        except BaseException:
+            await self._db.rollback()
+            raise
 
     def _row_to_session_message(self, row: Any, description: Any) -> SessionMessageRecord:
         cols = [d[0] for d in description]
