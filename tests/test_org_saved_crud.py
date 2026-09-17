@@ -178,6 +178,216 @@ def test_write_active_org_config_never_writes_reserved_corporate_saved_org(tmp_p
     assert (config_dir / "company_orgs" / f"org_{cfg.org.organization_id}_config.yaml").exists()
 
 
+def _make_org_activation_fixture(tmp_path, *, delegate_profile: str = "corporate", delegate_org_id: str = "corporate"):
+    """Handler + service context in org/custom mode with a project delegate.
+
+    The delegate mirrors a real one built by ``OPCEngine._get_project_delegate``:
+    a deep copy of the root config taken when it was created, so it can carry a
+    stale profile relative to the org the user has since activated.
+    """
+    from opc.core.config import OPCConfig
+    from opc.plugins.office_ui import ws_handler as wh
+    from opc.plugins.office_ui.services.context import ModeState, OfficeServiceContext
+
+    delegate_config = OPCConfig()
+    delegate_config.org.company_profile = delegate_profile
+    delegate_config.org.organization_id = delegate_org_id
+    delegate_org_engine = SimpleNamespace(config=delegate_config, reload_from_config=MagicMock())
+    delegate = SimpleNamespace(
+        project_id="shipdocs",
+        opc_home=tmp_path / ".opc",
+        config=delegate_config,
+        org_engine=delegate_org_engine,
+        talent_market=SimpleNamespace(config=delegate_config),
+        _ensure_attachment_store=MagicMock(),
+    )
+
+    root_config = OPCConfig()
+    root = SimpleNamespace(
+        project_id="default",
+        opc_home=tmp_path / ".opc",
+        config=root_config,
+        org_engine=SimpleNamespace(config=root_config, reload_from_config=MagicMock()),
+        _get_project_delegate=AsyncMock(return_value=delegate),
+    )
+
+    handler = wh.WSHandler.__new__(wh.WSHandler)
+    handler.engine = root
+    handler.chat_store = MagicMock()
+    handler.dispatcher = MagicMock()
+    handler._exec_mode = "org"
+    handler._company_profile = "custom"
+    handler._active_project_id = "default"
+    handler._config_lock = asyncio.Lock()
+
+    context = OfficeServiceContext(
+        engine=root,
+        agent_store=MagicMock(),
+        chat_store=MagicMock(),
+        event_adapter=MagicMock(),
+        mode_state=ModeState(exec_mode="org", company_profile="custom", task_preferred_agent="native"),
+    )
+    context.config_lock = handler._config_lock
+    context.on_engine_activated = handler._on_service_engine_activated
+    return handler, context, delegate
+
+
+def _assert_activation_rolled_back(handler, context, delegate, root) -> None:
+    """Neither binding may point at the project whose activation failed."""
+    assert handler.engine is root
+    assert handler._active_project_id == "default"
+    assert context.active_engine is root
+    assert context.active_project_id == "default"
+    assert delegate.config.org.company_profile == "corporate"
+    assert delegate.config.org.organization_id == "corporate"
+
+
+def test_project_activation_reloads_active_saved_org(tmp_path):
+    from opc.core.org_config import write_org_index
+
+    config_dir = tmp_path / ".opc" / "config"
+    _write_saved_org(config_dir, "splinter", organization_name="Splinter AI Company", roles_count=1)
+    write_org_index(config_dir, "splinter")
+
+    handler, context, delegate = _make_org_activation_fixture(tmp_path)
+
+    async def run():
+        engine = await context.activate_project("shipdocs")
+        assert engine is delegate
+
+    asyncio.run(run())
+
+    assert handler.engine is delegate
+    assert handler._active_project_id == "shipdocs"
+    assert context.active_engine is delegate
+    assert context.active_project_id == "shipdocs"
+    assert delegate.config.org.company_profile == "custom"
+    assert delegate.config.org.organization_id == "splinter"
+    assert [role.id for role in delegate.config.org.roles] == ["role_0"]
+    assert delegate.org_engine.config is delegate.config
+    delegate.org_engine.reload_from_config.assert_called_once_with()
+    delegate._ensure_attachment_store.assert_called_once_with()
+    assert context.is_custom_org_editable()
+
+
+def test_project_activation_rolls_back_when_org_runtime_reload_fails(tmp_path):
+    """A failed org reload must not leave either binding on the new project."""
+    from opc.core.org_config import write_org_index
+    from opc.plugins.office_ui.services.models import ServiceError
+
+    config_dir = tmp_path / ".opc" / "config"
+    _write_saved_org(config_dir, "splinter", organization_name="Splinter AI Company", roles_count=1)
+    write_org_index(config_dir, "splinter")
+
+    handler, context, delegate = _make_org_activation_fixture(tmp_path)
+    root = handler.engine
+    delegate.org_engine.reload_from_config.side_effect = RuntimeError("runtime reload exploded")
+
+    async def run():
+        with pytest.raises(ServiceError) as excinfo:
+            await context.activate_project("shipdocs")
+        assert excinfo.value.code == "org_restore_failed"
+
+    asyncio.run(run())
+
+    _assert_activation_rolled_back(handler, context, delegate, root)
+    assert delegate.org_engine.config is delegate.config
+    delegate._ensure_attachment_store.assert_not_called()
+
+
+def test_project_activation_fails_atomically_on_unreadable_org_index(tmp_path):
+    """A malformed org index fails the switch instead of half-applying it."""
+    from opc.core.org_config import org_index_path
+    from opc.plugins.office_ui.services.models import ServiceError
+
+    config_dir = tmp_path / ".opc" / "config"
+    _write_saved_org(config_dir, "splinter", organization_name="Splinter AI Company", roles_count=1)
+    index_path = org_index_path(config_dir)
+    index_path.parent.mkdir(parents=True, exist_ok=True)
+    index_path.write_text(
+        yaml.dump({"schema_version": 1, "active_organization_id": "../escape"}),
+        encoding="utf-8",
+    )
+
+    handler, context, delegate = _make_org_activation_fixture(tmp_path)
+    root = handler.engine
+
+    async def run():
+        with pytest.raises(ServiceError) as excinfo:
+            await context.activate_project("shipdocs")
+        assert excinfo.value.code == "org_restore_failed"
+
+    asyncio.run(run())
+
+    _assert_activation_rolled_back(handler, context, delegate, root)
+    delegate.org_engine.reload_from_config.assert_not_called()
+
+
+def test_project_activation_fails_atomically_when_active_org_missing(tmp_path):
+    """No recorded org + corporate delegate is contradictory in org mode."""
+    from opc.plugins.office_ui.services.models import ServiceError
+
+    handler, context, delegate = _make_org_activation_fixture(tmp_path)
+    root = handler.engine
+
+    async def run():
+        with pytest.raises(ServiceError) as excinfo:
+            await context.activate_project("shipdocs")
+        assert excinfo.value.code == "org_restore_failed"
+
+    asyncio.run(run())
+
+    _assert_activation_rolled_back(handler, context, delegate, root)
+    assert not context.is_custom_org_editable()
+
+
+def test_project_activation_keeps_delegate_that_already_carries_custom_org(tmp_path):
+    """An unsaved in-memory org already copied into the delegate is consistent."""
+    handler, context, delegate = _make_org_activation_fixture(
+        tmp_path, delegate_profile="custom", delegate_org_id="splinter"
+    )
+
+    async def run():
+        engine = await context.activate_project("shipdocs")
+        assert engine is delegate
+
+    asyncio.run(run())
+
+    assert handler.engine is delegate
+    assert context.active_engine is delegate
+    assert delegate.config.org.organization_id == "splinter"
+    delegate.org_engine.reload_from_config.assert_not_called()
+    assert context.is_custom_org_editable()
+
+
+def test_project_activation_waits_for_config_lock(tmp_path):
+    """Project activation serializes with org mutations on ``config_lock``."""
+    from opc.core.org_config import write_org_index
+
+    config_dir = tmp_path / ".opc" / "config"
+    _write_saved_org(config_dir, "splinter", organization_name="Splinter AI Company", roles_count=1)
+    write_org_index(config_dir, "splinter")
+
+    handler, context, delegate = _make_org_activation_fixture(tmp_path)
+
+    async def run():
+        async with handler._config_lock:
+            activation = asyncio.create_task(context.activate_project("shipdocs"))
+            for _ in range(10):
+                await asyncio.sleep(0)
+            assert not activation.done()
+            # The org mutation holding the lock still owns the config.
+            assert delegate.config.org.company_profile == "corporate"
+            delegate.org_engine.reload_from_config.assert_not_called()
+        await activation
+
+    asyncio.run(run())
+
+    assert delegate.config.org.company_profile == "custom"
+    assert delegate.config.org.organization_id == "splinter"
+    delegate.org_engine.reload_from_config.assert_called_once_with()
+
+
 def test_org_service_rejects_corporate_write_operations(tmp_path):
     from opc.core.config import OPCConfig
     from opc.plugins.office_ui.services.context import ModeState, OfficeServiceContext

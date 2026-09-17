@@ -28,6 +28,7 @@ from opc.core.config import (
     slugify_organization_name,
 )
 from opc.core.org_config import (
+    RESERVED_ORG_CONFIG_IDS,
     allocate_org_config_id,
     apply_org_config_payload_to_config,
     build_org_config_payload_from_config,
@@ -456,11 +457,104 @@ class WSHandler:
         self.services = OfficeServices(self.services_context)
         self._wire_engine_callbacks(engine)
 
-    def _on_service_engine_activated(self, engine: Any, project_id: str) -> None:
+    async def _on_service_engine_activated(self, engine: Any, project_id: str) -> None:
+        """Bind the handler to ``engine`` as a single all-or-nothing step.
+
+        Activation is a two-phase commit: the handler bindings move to the new
+        project engine, then the active saved org is restored into it.  If the
+        restore fails the previous bindings are put back and the error is
+        re-raised so ``OfficeServiceContext.activate_project`` also rolls back
+        ``active_engine``.  Without that, a failed restore left the handler and
+        the service context on the new project while ``_handle_switch_project``
+        reported ``ok=false`` and kept the client mapped to the old one, so
+        later session/work-item requests targeted a project the UI never
+        switched to.
+        """
+        previous_engine = getattr(self, "engine", None)
+        previous_dispatcher = getattr(self, "dispatcher", None)
+        previous_project_id = getattr(self, "_active_project_id", None)
         self.engine = engine
         self.dispatcher = Dispatcher(engine, self.chat_store)
         self._active_project_id = self._normalize_project_id(project_id)
+        try:
+            await self._restore_active_saved_org_into_engine(engine)
+        except BaseException:
+            self.engine = previous_engine
+            self.dispatcher = previous_dispatcher
+            self._active_project_id = previous_project_id
+            raise
         self._refresh_engine_attachment_store()
+
+    def _engine_org_binding_is_consistent(self, engine: Any) -> bool:
+        """True when ``engine``'s config already carries an editable saved org.
+
+        Mirrors ``OfficeServiceContext.is_custom_org_editable`` on the config
+        side: a delegate that reports the ``custom`` profile with a
+        non-reserved organization id is consistent with org/custom mode and
+        needs no restore.
+        """
+        cfg_org = getattr(getattr(engine, "config", None), "org", None)
+        profile = str(getattr(cfg_org, "company_profile", "") or "").strip().lower()
+        org_id = str(getattr(cfg_org, "organization_id", "") or "").strip().lower()
+        return profile == "custom" and bool(org_id) and org_id not in RESERVED_ORG_CONFIG_IDS
+
+    async def _restore_active_saved_org_into_engine(self, engine: Any) -> None:
+        """Re-apply the active saved org to a freshly activated project engine.
+
+        Project delegates are built from a deep copy of the root config taken
+        when the delegate was first created, so a delegate created before the
+        user selected a saved org still carries the ``corporate`` profile.  In
+        org/custom mode that contradicts the global mode: ``is_custom_org_editable()``
+        returns false and org/talent writes fail with ``org_read_only``.
+
+        The restore therefore has exactly one outcome besides success: it
+        raises ``ServiceError("org_restore_failed")`` so the switch fails
+        atomically and visibly.  Silent best-effort recovery is deliberately
+        not an option here — it is what leaves the contradictory state above.
+
+        Mutating the engine config races org mutations and live project
+        runtimes, both of which serialize on ``_config_lock``, so the restore
+        takes that lock too.
+        """
+        exec_mode = str(getattr(self, "_exec_mode", "") or "").strip().lower()
+        if exec_mode not in {"org", "custom"}:
+            return
+        if getattr(engine, "config", None) is None or getattr(engine, "org_engine", None) is None:
+            return
+        config_dir = Path(getattr(engine, "opc_home", None) or Path.cwd() / ".opc") / "config"
+        config_lock = getattr(self, "_config_lock", None)
+        if config_lock is None:
+            self._restore_active_saved_org_locked(engine, config_dir)
+            return
+        async with config_lock:
+            self._restore_active_saved_org_locked(engine, config_dir)
+
+    def _restore_active_saved_org_locked(self, engine: Any, config_dir: Path) -> None:
+        """``_restore_active_saved_org_into_engine`` body; call under ``_config_lock``."""
+        project_id = getattr(self, "_active_project_id", None)
+        try:
+            active_org_id = read_org_index(config_dir)
+        except Exception as exc:
+            raise ServiceError(
+                "org_restore_failed",
+                f"Cannot read the active organization index: {exc}",
+                {"project_id": project_id},
+            ) from exc
+        if active_org_id:
+            if not self._load_active_org_config_into_engine(active_org_id):
+                reason = getattr(self, "_last_org_load_error", "") or "unknown error"
+                raise ServiceError(
+                    "org_restore_failed",
+                    f"Cannot restore organization '{active_org_id}': {reason}",
+                    {"project_id": project_id, "organization_id": active_org_id},
+                )
+            return
+        if not self._engine_org_binding_is_consistent(engine):
+            raise ServiceError(
+                "org_restore_failed",
+                "No active organization is recorded while org mode is active.",
+                {"project_id": project_id},
+            )
 
     def _ensure_office_services(self) -> OfficeServices:
         """Create service wiring for tests that instantiate WSHandler via __new__."""
@@ -3986,9 +4080,25 @@ class WSHandler:
             self._last_org_load_error = str(exc)
             logger.warning(f"Failed to load org architecture for org mode: {exc}")
             return False
+        previous_config = getattr(self.engine, "config", None)
         self._rebind_engine_config(loaded_config)
-        if self.engine.org_engine:
-            self.engine.org_engine.reload_from_config()
+        org_engine = getattr(self.engine, "org_engine", None)
+        if org_engine:
+            try:
+                org_engine.reload_from_config()
+            except Exception as exc:
+                # Roll the engine back to the config that was live before this
+                # call: reporting failure while leaving the new config bound
+                # would keep the engine on an org its runtime never loaded.
+                self._last_org_load_error = str(exc)
+                logger.warning(f"Failed to reload org runtime for org mode: {exc}")
+                if previous_config is not None and previous_config is not loaded_config:
+                    self._rebind_engine_config(previous_config)
+                    try:
+                        org_engine.reload_from_config()
+                    except Exception as restore_exc:
+                        logger.warning(f"Failed to restore previous org runtime: {restore_exc}")
+                return False
         return True
 
     def _resolve_preset_name(self) -> str:

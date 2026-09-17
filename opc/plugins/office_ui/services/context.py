@@ -67,7 +67,7 @@ class OfficeServiceContext:
         self.load_active_org_config: LoadOrgConfigHook | None = None
         self.set_active_saved_org_name: SetActiveOrgHook | None = None
         self.get_active_saved_org_name: GetActiveOrgHook | None = None
-        self.on_engine_activated: Callable[[Any, str], None] | None = None
+        self.on_engine_activated: Callable[[Any, str], Any] | None = None
         self.persist_runtime_config: PersistRuntimeConfigHook | None = None
         self.rebind_engine_config: RebindEngineConfigHook | None = None
         self.sync_role_map: AsyncNoArgHook | None = None
@@ -178,15 +178,31 @@ class OfficeServiceContext:
         return engine
 
     async def activate_project(self, project_id: str) -> Any:
+        """Make ``project_id`` the active project, or leave the previous one bound.
+
+        ``on_engine_activated`` may fail (restoring the active saved org into a
+        freshly built delegate can raise).  The context bindings are rolled
+        back in that case so a failed activation cannot leave ``active_engine``
+        on the new project while the caller reports the switch as failed.
+        """
         engine = await self.engine_for_project(project_id)
+        previous_engine = self.active_engine
+        previous_project_id = self.active_project_id
         self.active_engine = engine
         self.active_project_id = self.normalize_project_id(getattr(engine, "project_id", None) or project_id)
-        if self.on_engine_activated is not None:
-            self.on_engine_activated(engine, self.active_project_id)
-        else:
-            ensure_attachment_store = getattr(engine, "_ensure_attachment_store", None)
-            if callable(ensure_attachment_store):
-                ensure_attachment_store()
+        try:
+            if self.on_engine_activated is not None:
+                activated = self.on_engine_activated(engine, self.active_project_id)
+                if inspect.isawaitable(activated):
+                    await activated
+            else:
+                ensure_attachment_store = getattr(engine, "_ensure_attachment_store", None)
+                if callable(ensure_attachment_store):
+                    ensure_attachment_store()
+        except BaseException:
+            self.active_engine = previous_engine
+            self.active_project_id = previous_project_id
+            raise
         return engine
 
     def get_task_lock(self, task_id: str) -> asyncio.Lock:
