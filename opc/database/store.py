@@ -19653,6 +19653,15 @@ class OPCStore:
                         # persisted the claim and primary link, then
                         # terminalized the WorkItem/Task without controller
                         # owner/generation fields.
+                        # The same holds before a card is ever dispatched: an
+                        # empty envelope on *both* sides is symmetric, not
+                        # mixed.  The phase is therefore not required to be
+                        # terminal — `linked_task_status ==
+                        # expected_linked_task_status` already proves the pair
+                        # agrees under `task_status_for_phase`, and every other
+                        # conjunct pins identity.  Requiring DONE_PHASES here
+                        # made a consistent `waiting_dependencies`/`blocked`
+                        # pair raise and wedged the session for good.
                         # Under the winning run lease it is safe to release
                         # that exact terminal claim, but it is *not* safe to
                         # invent a Task attempt.  A later genuine rework claim
@@ -19697,7 +19706,7 @@ class OPCStore:
                             == explicit_work_item_projection_id
                             and linked_task_projection_id
                             == explicit_work_item_projection_id
-                            and prior_phase in DONE_PHASES
+                            and prior_phase is not None
                             and linked_task_status
                             == expected_linked_task_status
                         )
